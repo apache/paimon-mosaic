@@ -565,6 +565,33 @@ impl ColumnPageReader {
         page_data: Vec<u8>,
         num_rows: usize,
     ) -> io::Result<Self> {
+        Self::new_with_page_data_start(
+            col_type,
+            encoding,
+            has_nulls,
+            const_value,
+            page_data,
+            0,
+            num_rows,
+        )
+    }
+
+    pub(crate) fn new_with_page_data_start(
+        col_type: DataType,
+        encoding: u8,
+        has_nulls: bool,
+        const_value: Value,
+        data: Vec<u8>,
+        page_data_start: usize,
+        num_rows: usize,
+    ) -> io::Result<Self> {
+        if page_data_start > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "column page data start out of bounds",
+            ));
+        }
+
         let mut reader = ColumnPageReader {
             col_type,
             encoding,
@@ -573,8 +600,8 @@ impl ColumnPageReader {
             dict_values: Vec::new(),
             dict_bit_width: 0,
             null_bitmap: Vec::new(),
-            data: page_data,
-            data_cursor: 0,
+            data,
+            data_cursor: page_data_start,
             num_rows,
         };
         reader.init_page()?;
@@ -583,7 +610,7 @@ impl ColumnPageReader {
 
     fn init_page(&mut self) -> io::Result<()> {
         let null_bitmap_bytes = self.num_rows.div_ceil(8);
-        let mut pos = 0;
+        let mut pos = self.data_cursor;
 
         match self.encoding {
             ENCODING_ALL_NULL => {}

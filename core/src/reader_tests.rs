@@ -2829,6 +2829,54 @@ fn test_read_ranges_coalesces_adjacent() {
 }
 
 #[test]
+fn test_read_ranges_shared_reuses_coalesced_buffer() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingInputFile {
+        data: Vec<u8>,
+        read_count: AtomicUsize,
+    }
+
+    impl InputFile for CountingInputFile {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+            self.read_count.fetch_add(1, Ordering::Relaxed);
+            let start = offset as usize;
+            buf.copy_from_slice(&self.data[start..start + buf.len()]);
+            Ok(())
+        }
+    }
+
+    let data: Vec<u8> = (0..512).map(|i| (i % 256) as u8).collect();
+    let input = CountingInputFile {
+        data: data.clone(),
+        read_count: AtomicUsize::new(0),
+    };
+
+    let ranges = vec![(0u64, 64usize), (64, 64), (200, 32)];
+    let results = input.read_ranges_shared(&ranges).unwrap();
+
+    assert_eq!(input.read_count.load(Ordering::Relaxed), 1);
+    assert_eq!(results[0].as_slice(), &data[0..64]);
+    assert_eq!(results[1].as_slice(), &data[64..128]);
+    assert_eq!(results[2].as_slice(), &data[200..232]);
+    assert!(Arc::ptr_eq(&results[0].data, &results[1].data));
+    assert!(Arc::ptr_eq(&results[0].data, &results[2].data));
+}
+
+#[test]
+fn test_read_range_buffer_new_validates_bounds() {
+    let data = Arc::new(vec![1, 2, 3, 4]);
+
+    let buffer = ReadRangeBuffer::new(data.clone(), 1, 2).unwrap();
+    assert_eq!(buffer.as_slice(), &[2, 3]);
+
+    match ReadRangeBuffer::new(data, 3, 2) {
+        Ok(_) => panic!("expected out-of-bounds range to fail"),
+        Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+    }
+}
+
+#[test]
 fn test_read_ranges_splits_large_gap() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
