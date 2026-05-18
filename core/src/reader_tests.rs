@@ -581,7 +581,6 @@ fn test_roundtrip_with_zstd() {
 }
 
 #[test]
-#[allow(clippy::approx_constant)]
 fn test_roundtrip_all_types() {
     let columns = vec![
         ("f_boolean".to_string(), DataType::Boolean, true),
@@ -634,8 +633,8 @@ fn test_roundtrip_all_types() {
         Value::SmallInt(1234),
         Value::Integer(999999),
         Value::BigInt(123456789012345),
-        Value::Float(3.14),
-        Value::Double(2.718281828),
+        Value::Float(1.25),
+        Value::Double(9.876543210),
         Value::String("hello world".as_bytes().to_vec()),
         Value::Bytes(vec![1, 2, 3, 4, 5]),
         Value::DecimalCompact(1234567),
@@ -674,8 +673,8 @@ fn test_roundtrip_all_types() {
         batch_col_i64(&batch, "f_bigint").value(0),
         123456789012345i64
     );
-    assert!((batch_col_f32(&batch, "f_float").value(0) - 3.14).abs() < 0.001);
-    assert!((batch_col_f64(&batch, "f_double").value(0) - 2.718281828).abs() < 1e-9);
+    assert!((batch_col_f32(&batch, "f_float").value(0) - 1.25).abs() < 0.001);
+    assert!((batch_col_f64(&batch, "f_double").value(0) - 9.876543210).abs() < 1e-9);
     assert_eq!(batch_col_string(&batch, "f_string").value(0), "hello world");
     assert_eq!(
         batch_col_binary(&batch, "f_bytes").value(0),
