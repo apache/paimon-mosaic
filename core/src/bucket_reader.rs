@@ -587,17 +587,16 @@ impl ColumnPageReader {
 
         match self.encoding {
             ENCODING_ALL_NULL => {}
-            ENCODING_CONST => {
-                if self.has_nulls {
-                    if pos + null_bitmap_bytes > self.data.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "column page truncated: null bitmap",
-                        ));
-                    }
-                    self.null_bitmap = self.data[pos..pos + null_bitmap_bytes].to_vec();
+            ENCODING_CONST if self.has_nulls => {
+                if pos + null_bitmap_bytes > self.data.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "column page truncated: null bitmap",
+                    ));
                 }
+                self.null_bitmap = self.data[pos..pos + null_bitmap_bytes].to_vec();
             }
+            ENCODING_CONST => {}
             ENCODING_DICT => {
                 let num_entries = varint::decode(&self.data, &mut pos)? as usize;
                 self.dict_bit_width = bit_width(num_entries);
@@ -1152,12 +1151,10 @@ fn read_all_plain(
             Ok(RawColumnData::Boolean(buf))
         }
         DataVariant::Int8 => {
-            let mut out = Vec::with_capacity(non_null_count);
-            let mut cursor = data_cursor;
-            for _ in 0..non_null_count {
-                out.push(data[cursor] as i8);
-                cursor += 1;
-            }
+            let out: Vec<i8> = data[data_cursor..data_cursor + non_null_count]
+                .iter()
+                .map(|&b| b as i8)
+                .collect();
             Ok(RawColumnData::Int8(out))
         }
         DataVariant::Int16 => {

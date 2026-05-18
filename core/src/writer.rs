@@ -247,17 +247,15 @@ impl<S: OutputFile> MosaicWriter<S> {
             let paged_output = if try_paged {
                 let paged = bw.finish_paged();
                 let num_pages = paged.column_pages.iter().filter(|p| p.is_some()).count();
-                let avg_ok = if num_pages > 0 {
-                    let total: usize = paged
-                        .column_pages
-                        .iter()
-                        .filter_map(|p| p.as_ref())
-                        .map(|p| p.len())
-                        .sum();
-                    total / num_pages >= self.page_size_threshold
-                } else {
-                    false
-                };
+                let total: usize = paged
+                    .column_pages
+                    .iter()
+                    .filter_map(|p| p.as_ref())
+                    .map(|p| p.len())
+                    .sum();
+                let avg_ok = total
+                    .checked_div(num_pages)
+                    .is_some_and(|avg| avg >= self.page_size_threshold);
                 if avg_ok {
                     Some(paged)
                 } else {
