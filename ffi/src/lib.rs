@@ -256,7 +256,7 @@ pub unsafe extern "C" fn mosaic_writer_estimated_file_size(
 }
 
 /// Write an Arrow RecordBatch to the writer via the Arrow C Data Interface.
-/// The caller provides FFI_ArrowArray and FFI_ArrowSchema pointers that represent the batch.
+/// The caller provides ArrowArray and ArrowSchema pointers that represent the batch.
 /// Ownership of both structs transfers to the callee; the caller's structs are zeroed.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
@@ -393,7 +393,7 @@ pub unsafe extern "C" fn mosaic_reader_num_row_groups(
 }
 
 /// Export the reader's schema via the Arrow C Data Interface.
-/// Writes into caller-provided FFI_ArrowSchema struct.
+/// Writes into caller-provided ArrowSchema struct.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub unsafe extern "C" fn mosaic_reader_export_schema(
@@ -759,7 +759,7 @@ pub unsafe extern "C" fn mosaic_record_batch_num_columns(
 }
 
 /// Export the record batch via the Arrow C Data Interface.
-/// Writes into caller-provided FFI_ArrowArray and FFI_ArrowSchema structs.
+/// Writes into caller-provided ArrowArray and ArrowSchema structs.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub unsafe extern "C" fn mosaic_record_batch_export(

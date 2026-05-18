@@ -53,19 +53,31 @@ struct OutputFile {
 
 namespace detail {
 
-inline int32_t stream_write(void* ctx, const uint8_t* data, size_t len) {
-    auto* cbs = static_cast<OutputFile*>(ctx);
-    return cbs->write_fn(data, len);
+inline int32_t stream_write(void* ctx, const uint8_t* data, size_t len) noexcept {
+    try {
+        auto* cbs = static_cast<OutputFile*>(ctx);
+        return cbs->write_fn(data, len);
+    } catch (...) {
+        return -1;
+    }
 }
 
-inline int32_t stream_flush(void* ctx) {
-    auto* cbs = static_cast<OutputFile*>(ctx);
-    return cbs->flush_fn();
+inline int32_t stream_flush(void* ctx) noexcept {
+    try {
+        auto* cbs = static_cast<OutputFile*>(ctx);
+        return cbs->flush_fn();
+    } catch (...) {
+        return -1;
+    }
 }
 
-inline int64_t stream_get_pos(void* ctx) {
-    auto* cbs = static_cast<OutputFile*>(ctx);
-    return cbs->get_pos_fn();
+inline int64_t stream_get_pos(void* ctx) noexcept {
+    try {
+        auto* cbs = static_cast<OutputFile*>(ctx);
+        return cbs->get_pos_fn();
+    } catch (...) {
+        return -1;
+    }
 }
 
 } // namespace detail
@@ -104,7 +116,7 @@ public:
         c_opts.num_stats_columns = opts.num_stats_columns;
         c_opts.page_size_threshold = opts.page_size_threshold;
 
-        handle_ = mosaic_writer_open(stream, static_cast<FFI_ArrowSchema*>(arrow_schema), c_opts);
+        handle_ = mosaic_writer_open(stream, static_cast<ArrowSchema*>(arrow_schema), c_opts);
         if (!handle_) throw Error("failed to open writer");
     }
 
@@ -137,8 +149,8 @@ public:
     void write(void* ffi_array, void* ffi_schema) {
         check(mosaic_writer_write_batch(
             handle_,
-            static_cast<FFI_ArrowArray*>(ffi_array),
-            static_cast<FFI_ArrowSchema*>(ffi_schema)));
+            static_cast<ArrowArray*>(ffi_array),
+            static_cast<ArrowSchema*>(ffi_schema)));
     }
 
     int64_t estimated_file_size() const {
@@ -179,12 +191,16 @@ struct InputFile {
 
 namespace detail {
 
-inline int32_t input_read_at(void* ctx, uint64_t offset, uint8_t* buf, size_t len) {
-    auto* cbs = static_cast<InputFile*>(ctx);
-    return cbs->read_at_fn(offset, buf, len);
+inline int32_t input_read_at(void* ctx, uint64_t offset, uint8_t* buf, size_t len) noexcept {
+    try {
+        auto* cbs = static_cast<InputFile*>(ctx);
+        return cbs->read_at_fn(offset, buf, len);
+    } catch (...) {
+        return -1;
+    }
 }
 
-inline uint64_t input_length(void* ctx) {
+inline uint64_t input_length(void* ctx) noexcept {
     auto* cbs = static_cast<InputFile*>(ctx);
     return cbs->file_length;
 }
@@ -211,7 +227,7 @@ public:
     }
 
     void export_schema(void* out_schema) const {
-        check(mosaic_reader_export_schema(handle_, static_cast<FFI_ArrowSchema*>(out_schema)));
+        check(mosaic_reader_export_schema(handle_, static_cast<ArrowSchema*>(out_schema)));
     }
 
     void read_row_group(uint32_t rg_index, void* out_array, void* out_schema) {
@@ -221,8 +237,8 @@ public:
         mosaic_row_group_reader_free(rg);
         if (!rb) throw Error("read_columns failed");
         int rc = mosaic_record_batch_export(rb,
-            static_cast<FFI_ArrowArray*>(out_array),
-            static_cast<FFI_ArrowSchema*>(out_schema));
+            static_cast<ArrowArray*>(out_array),
+            static_cast<ArrowSchema*>(out_schema));
         mosaic_record_batch_free(rb);
         if (rc != 0) throw Error("record_batch_export failed");
     }
@@ -235,8 +251,8 @@ public:
         mosaic_row_group_reader_free(rg);
         if (!rb) throw Error("read_columns failed");
         int rc = mosaic_record_batch_export(rb,
-            static_cast<FFI_ArrowArray*>(out_array),
-            static_cast<FFI_ArrowSchema*>(out_schema));
+            static_cast<ArrowArray*>(out_array),
+            static_cast<ArrowSchema*>(out_schema));
         mosaic_record_batch_free(rb);
         if (rc != 0) throw Error("record_batch_export failed");
     }
