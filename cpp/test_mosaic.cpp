@@ -158,10 +158,18 @@ static void test_null_values() {
         arrow::field("name", arrow::utf8()),
     });
 
-    auto id_arr = arrow::ArrayFromJSON(arrow::int32(), "[1, 2, 3]");
-    auto name_arr = arrow::ArrayFromJSON(arrow::utf8(), R"(["hello", null, "world"])");
+    arrow::Int32Builder id_b;
+    assert(id_b.Append(1).ok());
+    assert(id_b.Append(2).ok());
+    assert(id_b.Append(3).ok());
 
-    auto batch = arrow::RecordBatch::Make(schema, 3, {id_arr.ValueUnsafe(), name_arr.ValueUnsafe()});
+    arrow::StringBuilder name_b;
+    assert(name_b.Append("hello").ok());
+    assert(name_b.AppendNull().ok());
+    assert(name_b.Append("world").ok());
+
+    auto batch = arrow::RecordBatch::Make(schema, 3, {
+        id_b.Finish().ValueUnsafe(), name_b.Finish().ValueUnsafe()});
     auto data_vec = write_and_get(schema, batch);
 
     MemBuffer buf;
@@ -192,16 +200,36 @@ static void test_all_types() {
         arrow::field("f_binary", arrow::binary()),
     });
 
+    arrow::BooleanBuilder bool_b;
+    assert(bool_b.Append(true).ok());
+    arrow::Int8Builder i8_b;
+    assert(i8_b.Append(42).ok());
+    arrow::Int16Builder i16_b;
+    assert(i16_b.Append(1234).ok());
+    arrow::Int32Builder i32_b;
+    assert(i32_b.Append(100000).ok());
+    arrow::Int64Builder i64_b;
+    assert(i64_b.Append(9999999999LL).ok());
+    arrow::FloatBuilder f32_b;
+    assert(f32_b.Append(3.14f).ok());
+    arrow::DoubleBuilder f64_b;
+    assert(f64_b.Append(2.718281828).ok());
+    arrow::StringBuilder utf8_b;
+    assert(utf8_b.Append("hello").ok());
+    arrow::BinaryBuilder bin_b;
+    uint8_t bin_data[] = {0x01, 0x02};
+    assert(bin_b.Append(bin_data, 2).ok());
+
     auto batch = arrow::RecordBatch::Make(schema, 1, {
-        arrow::ArrayFromJSON(arrow::boolean(), "[true]").ValueUnsafe(),
-        arrow::ArrayFromJSON(arrow::int8(), "[42]").ValueUnsafe(),
-        arrow::ArrayFromJSON(arrow::int16(), "[1234]").ValueUnsafe(),
-        arrow::ArrayFromJSON(arrow::int32(), "[100000]").ValueUnsafe(),
-        arrow::ArrayFromJSON(arrow::int64(), "[9999999999]").ValueUnsafe(),
-        arrow::ArrayFromJSON(arrow::float32(), "[3.14]").ValueUnsafe(),
-        arrow::ArrayFromJSON(arrow::float64(), "[2.718281828]").ValueUnsafe(),
-        arrow::ArrayFromJSON(arrow::utf8(), R"(["hello"])").ValueUnsafe(),
-        arrow::ArrayFromJSON(arrow::binary(), R"(["AQI="])").ValueUnsafe(),
+        bool_b.Finish().ValueUnsafe(),
+        i8_b.Finish().ValueUnsafe(),
+        i16_b.Finish().ValueUnsafe(),
+        i32_b.Finish().ValueUnsafe(),
+        i64_b.Finish().ValueUnsafe(),
+        f32_b.Finish().ValueUnsafe(),
+        f64_b.Finish().ValueUnsafe(),
+        utf8_b.Finish().ValueUnsafe(),
+        bin_b.Finish().ValueUnsafe(),
     });
 
     auto data_vec = write_and_get(schema, batch);
@@ -343,10 +371,17 @@ static void test_schema_roundtrip() {
         arrow::field("score", arrow::float64(), true),
     });
 
+    arrow::Int32Builder sr_id_b;
+    assert(sr_id_b.Append(1).ok());
+    arrow::StringBuilder sr_name_b;
+    assert(sr_name_b.Append("x").ok());
+    arrow::DoubleBuilder sr_score_b;
+    assert(sr_score_b.Append(1.0).ok());
+
     auto batch = arrow::RecordBatch::Make(schema, 1, {
-        arrow::ArrayFromJSON(arrow::int32(), "[1]").ValueUnsafe(),
-        arrow::ArrayFromJSON(arrow::utf8(), R"(["x"])").ValueUnsafe(),
-        arrow::ArrayFromJSON(arrow::float64(), "[1.0]").ValueUnsafe(),
+        sr_id_b.Finish().ValueUnsafe(),
+        sr_name_b.Finish().ValueUnsafe(),
+        sr_score_b.Finish().ValueUnsafe(),
     });
 
     auto data_vec = write_and_get(schema, batch);
