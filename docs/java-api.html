@@ -1,0 +1,386 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Java API - Mosaic</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="js/main.js"></script>
+</head>
+<body>
+    <button class="menu-toggle" aria-label="Menu">&#9776;</button>
+    <div class="overlay"></div>
+
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <h2>Mosaic</h2>
+            <p>Columnar-bucket hybrid format</p>
+        </div>
+        <nav>
+            <ul>
+                <li><a href="index.html">Home</a></li>
+                <li><a href="design.html">Design</a></li>
+                <li><a href="rust-api.html">Rust API</a></li>
+                <li><a href="java-api.html" class="active">Java API</a></li>
+                <li><a href="python-api.html">Python API</a></li>
+                <li><a href="cpp-api.html">C++ API</a></li>
+            </ul>
+        </nav>
+        <div class="sidebar-footer">
+            <button class="theme-toggle">Dark Mode</button>
+        </div>
+    </aside>
+
+    <main class="main">
+        <div class="content">
+            <h1>Java API</h1>
+            <p class="subtitle">Write and read Mosaic files from Java using Arrow Java (<code>VectorSchemaRoot</code>).</p>
+
+            <h2>Setup</h2>
+            <p>
+                The Java API lives in the <code>java/</code> directory and depends on the
+                <code>mosaic_jni</code> native library. Build the native library first:
+            </p>
+<pre><code>cargo build --release -p mosaic-jni</code></pre>
+            <p>
+                Ensure <code>libmosaic_jni.dylib</code> (macOS) or <code>libmosaic_jni.so</code> (Linux)
+                is on <code>java.library.path</code>. The library is loaded automatically via:
+            </p>
+<pre><code>System.loadLibrary(<span class="str">"mosaic_jni"</span>);</code></pre>
+            <p>
+                Add the Arrow Java dependencies to your <code>pom.xml</code>:
+            </p>
+<pre><code><span class="cmt">&lt;!-- Arrow BOM for version management --&gt;</span>
+&lt;dependencyManagement&gt;
+    &lt;dependencies&gt;
+        &lt;dependency&gt;
+            &lt;groupId&gt;org.apache.arrow&lt;/groupId&gt;
+            &lt;artifactId&gt;arrow-bom&lt;/artifactId&gt;
+            &lt;version&gt;18.1.0&lt;/version&gt;
+            &lt;type&gt;pom&lt;/type&gt;
+            &lt;scope&gt;import&lt;/scope&gt;
+        &lt;/dependency&gt;
+    &lt;/dependencies&gt;
+&lt;/dependencyManagement&gt;
+
+&lt;dependencies&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;org.apache.arrow&lt;/groupId&gt;
+        &lt;artifactId&gt;arrow-vector&lt;/artifactId&gt;
+    &lt;/dependency&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;org.apache.arrow&lt;/groupId&gt;
+        &lt;artifactId&gt;arrow-memory-netty&lt;/artifactId&gt;
+        &lt;scope&gt;runtime&lt;/scope&gt;
+    &lt;/dependency&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;org.apache.arrow&lt;/groupId&gt;
+        &lt;artifactId&gt;arrow-c-data&lt;/artifactId&gt;
+    &lt;/dependency&gt;
+&lt;/dependencies&gt;</code></pre>
+
+            <h2>Writing a File</h2>
+
+            <h3>1. Define an Arrow Schema</h3>
+<pre><code><span class="kw">import</span> org.apache.arrow.vector.types.pojo.*;
+<span class="kw">import</span> org.apache.arrow.vector.types.*;
+
+<span class="ty">Schema</span> arrowSchema = <span class="kw">new</span> <span class="ty">Schema</span>(<span class="ty">Arrays</span>.asList(
+    <span class="ty">Field</span>.notNullable(<span class="str">"id"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Int</span>(<span class="num">32</span>, <span class="kw">true</span>)),
+    <span class="ty">Field</span>.nullable(<span class="str">"name"</span>, <span class="ty">ArrowType.Utf8</span>.INSTANCE),
+    <span class="ty">Field</span>.nullable(<span class="str">"score"</span>, <span class="kw">new</span> <span class="ty">ArrowType.FloatingPoint</span>(DOUBLE)),
+    <span class="ty">Field</span>.nullable(<span class="str">"amount"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Decimal</span>(<span class="num">10</span>, <span class="num">2</span>, <span class="num">128</span>)),
+    <span class="ty">Field</span>.nullable(<span class="str">"ts"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Timestamp</span>(TimeUnit.MILLISECOND, <span class="kw">null</span>))
+));</code></pre>
+
+            <h3>2. Create Writer and Write Batches</h3>
+            <p>
+                Build Arrow <code>VectorSchemaRoot</code> objects with Arrow Java and pass them
+                directly to <code>write()</code>. Data is transferred via the
+                <a href="https://arrow.apache.org/docs/format/CDataInterface.html">Arrow C Data Interface</a>
+                for zero-copy interop with the native library:
+            </p>
+<pre><code><span class="ty">BufferAllocator</span> allocator = <span class="kw">new</span> <span class="ty">RootAllocator</span>();
+
+<span class="ty">Schema</span> arrowSchema = <span class="kw">new</span> <span class="ty">Schema</span>(<span class="ty">Arrays</span>.asList(
+    <span class="ty">Field</span>.notNullable(<span class="str">"id"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Int</span>(<span class="num">32</span>, <span class="kw">true</span>)),
+    <span class="ty">Field</span>.nullable(<span class="str">"name"</span>, <span class="ty">ArrowType.Utf8</span>.INSTANCE),
+    <span class="ty">Field</span>.nullable(<span class="str">"score"</span>, <span class="kw">new</span> <span class="ty">ArrowType.FloatingPoint</span>(DOUBLE))
+));
+
+<span class="ty">WriterOptions</span> opts = <span class="kw">new</span> <span class="ty">WriterOptions</span>()
+    .numBuckets(<span class="num">2</span>);
+
+<span class="ty">ByteArrayOutputStream</span> baos = <span class="kw">new</span> <span class="ty">ByteArrayOutputStream</span>();
+<span class="kw">try</span> (<span class="ty">MosaicWriter</span> writer = <span class="kw">new</span> <span class="ty">MosaicWriter</span>(baos, arrowSchema, opts, allocator);
+     <span class="ty">VectorSchemaRoot</span> root = <span class="ty">VectorSchemaRoot</span>.create(arrowSchema, allocator)) {
+
+    <span class="ty">IntVector</span> ids = (<span class="ty">IntVector</span>) root.getVector(<span class="str">"id"</span>);
+    <span class="ty">VarCharVector</span> names = (<span class="ty">VarCharVector</span>) root.getVector(<span class="str">"name"</span>);
+    <span class="ty">Float8Vector</span> scores = (<span class="ty">Float8Vector</span>) root.getVector(<span class="str">"score"</span>);
+
+    ids.allocateNew(<span class="num">1000</span>);
+    names.allocateNew(<span class="num">1000</span>);
+    scores.allocateNew(<span class="num">1000</span>);
+
+    <span class="kw">for</span> (<span class="kw">int</span> i = <span class="num">0</span>; i &lt; <span class="num">1000</span>; i++) {
+        ids.set(i, i);
+        names.setSafe(i, (<span class="str">"user_"</span> + i).getBytes());
+        scores.set(i, i * <span class="num">1.5</span>);
+    }
+    root.setRowCount(<span class="num">1000</span>);
+
+    writer.write(root);
+}
+
+<span class="kw">byte</span>[] data = baos.toByteArray();</code></pre>
+
+            <h3>WriterOptions</h3>
+            <table>
+                <thead>
+                    <tr><th>Option</th><th>Default</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>numBuckets(int)</code></td><td>0</td><td>Number of buckets (0 = auto)</td></tr>
+                    <tr><td><code>compression(int)</code></td><td>ZSTD (1)</td><td>0 = none, 1 = Zstd</td></tr>
+                    <tr><td><code>zstdLevel(int)</code></td><td>1</td><td>Zstd compression level</td></tr>
+                    <tr><td><code>rowGroupMaxSize(long)</code></td><td>256 MB</td><td>Max uncompressed bytes per row group</td></tr>
+                    <tr><td><code>maxDictTotalBytes(int)</code></td><td>32 KB</td><td>Max dictionary size per column</td></tr>
+                    <tr><td><code>maxDictEntries(int)</code></td><td>255</td><td>Max distinct values for DICT encoding</td></tr>
+                    <tr><td><code>statsColumns(int...)</code></td><td>(empty)</td><td>Column indices to build min/max stats for filter pushdown</td></tr>
+                    <tr><td><code>pageSizeThreshold(int)</code></td><td>32 KB</td><td>Min avg column page size to enable paged mode (per-column compression)</td></tr>
+                </tbody>
+            </table>
+
+            <h3>Writer Methods</h3>
+            <table>
+                <thead>
+                    <tr><th>Method</th><th>Return</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>write(VectorSchemaRoot)</code></td><td><code>void</code></td><td>Write an Arrow batch (zero-copy via C Data Interface)</td></tr>
+                    <tr><td><code>estimatedFileSize()</code></td><td><code>long</code></td><td>Estimated output file size in bytes (for file rolling)</td></tr>
+                    <tr><td><code>close()</code></td><td><code>void</code></td><td>Flush remaining data and write footer</td></tr>
+                </tbody>
+            </table>
+
+            <h2>Reading a File</h2>
+
+            <h3>1. Open the Reader</h3>
+            <p>
+                The reader accepts any <code>InputFile</code> implementation (inspired by Parquet's <code>InputFile</code>),
+                giving you full control over the I/O source &mdash; local files, memory-mapped buffers,
+                remote storage adapters, etc.:
+            </p>
+<pre><code><span class="kw">public interface</span> <span class="ty">InputFile</span> {
+    <span class="kw">void</span> <span class="fn">readFully</span>(<span class="kw">long</span> position, <span class="kw">byte</span>[] buffer, <span class="kw">int</span> offset, <span class="kw">int</span> length) <span class="kw">throws</span> <span class="ty">IOException</span>;
+}</code></pre>
+<pre><code><span class="ty">BufferAllocator</span> allocator = <span class="kw">new</span> <span class="ty">RootAllocator</span>();
+<span class="ty">InputFile</span> inputFile = ...;
+<span class="kw">long</span> fileLength = ...;
+<span class="ty">MosaicReader</span> reader = <span class="ty">MosaicReader</span>.open(inputFile, fileLength, allocator);</code></pre>
+
+            <h3>2. Inspect the Schema</h3>
+            <p>
+                The reader exposes the file schema as a standard Arrow <code>Schema</code> object:
+            </p>
+<pre><code><span class="ty">Schema</span> schema = reader.getSchema();
+<span class="kw">for</span> (<span class="ty">Field</span> field : schema.getFields()) {
+    System.out.printf(<span class="str">"name=%s type=%s nullable=%b%n"</span>,
+        field.getName(), field.getType(), field.isNullable());
+}
+
+<span class="kw">int</span> nameCol = schema.getFields().indexOf(schema.findField(<span class="str">"name"</span>));
+<span class="kw">int</span> scoreCol = schema.getFields().indexOf(schema.findField(<span class="str">"score"</span>));</code></pre>
+
+            <h3>Reader Methods</h3>
+            <table>
+                <thead>
+                    <tr><th>Method</th><th>Return</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>getSchema()</code></td><td><code>Schema</code></td><td>Arrow Schema for the file</td></tr>
+                    <tr><td><code>numRowGroups()</code></td><td><code>int</code></td><td>Row group count</td></tr>
+                    <tr><td><code>readRowGroup(rg, allocator)</code></td><td><code>VectorSchemaRoot</code></td><td>Read all columns of a row group</td></tr>
+                    <tr><td><code>readRowGroup(rg, cols, allocator)</code></td><td><code>VectorSchemaRoot</code></td><td>Read projected columns of a row group</td></tr>
+                    <tr><td><code>getRowGroupStatistics(rg)</code></td><td><code>List&lt;ColumnStatistics&gt;</code></td><td>Column statistics for a row group</td></tr>
+                </tbody>
+            </table>
+
+            <h3>3. Read Row Groups as Arrow VectorSchemaRoot</h3>
+            <p>
+                Each row group is read directly as an Arrow <code>VectorSchemaRoot</code> via
+                <code>readRowGroup()</code>:
+            </p>
+<pre><code><span class="kw">for</span> (<span class="kw">int</span> rg = <span class="num">0</span>; rg &lt; reader.numRowGroups(); rg++) {
+    <span class="kw">try</span> (<span class="ty">VectorSchemaRoot</span> batch = reader.readRowGroup(rg, allocator)) {
+
+        System.out.println(<span class="str">"rows: "</span> + batch.getRowCount());
+
+        <span class="ty">IntVector</span> ids = (<span class="ty">IntVector</span>) batch.getVector(<span class="str">"id"</span>);
+        <span class="ty">VarCharVector</span> names = (<span class="ty">VarCharVector</span>) batch.getVector(<span class="str">"name"</span>);
+
+        <span class="kw">for</span> (<span class="kw">int</span> i = <span class="num">0</span>; i &lt; batch.getRowCount(); i++) {
+            <span class="kw">if</span> (!names.isNull(i)) {
+                System.out.printf(<span class="str">"id=%d name=%s%n"</span>,
+                    ids.get(i), <span class="kw">new</span> <span class="ty">String</span>(names.get(i)));
+            }
+        }
+    }
+}</code></pre>
+
+            <h3>Projection Pushdown</h3>
+            <p>
+                Use <code>readRowGroup(rgIndex, projectedColumns, allocator)</code> to read only specific columns.
+                Only the buckets containing the projected columns are decompressed, significantly
+                reducing I/O and memory for wide tables.
+            </p>
+<pre><code><span class="cmt">// Only read "name" and "score" columns</span>
+<span class="kw">int</span>[] projected = { nameCol, scoreCol };
+<span class="kw">try</span> (<span class="ty">VectorSchemaRoot</span> batch = reader.readRowGroup(rg, projected, allocator)) {
+    <span class="cmt">// batch contains only the projected columns</span>
+}</code></pre>
+
+            <h3>Column Statistics (Filter Pushdown)</h3>
+            <p>
+                When stats columns are configured during writing, the reader can access per-row-group
+                min/max statistics to skip row groups that don't match a filter predicate:
+            </p>
+<pre><code><span class="ty">WriterOptions</span> opts = <span class="kw">new</span> <span class="ty">WriterOptions</span>()
+    .statsColumns(<span class="num">0</span>, <span class="num">2</span>);  <span class="cmt">// build stats for columns 0 and 2</span></code></pre>
+<pre><code><span class="cmt">// Reading stats</span>
+<span class="kw">for</span> (<span class="kw">int</span> rg = <span class="num">0</span>; rg &lt; reader.numRowGroups(); rg++) {
+    <span class="ty">List</span>&lt;<span class="ty">ColumnStatistics</span>&gt; stats = reader.getRowGroupStatistics(rg);
+    <span class="kw">for</span> (<span class="ty">ColumnStatistics</span> stat : stats) {
+        <span class="kw">int</span> colIdx = stat.getColumnIndex();
+        <span class="kw">long</span> nullCount = stat.getNullCount();
+        <span class="kw">if</span> (stat.hasMinMax()) {
+            <span class="kw">byte</span>[] min = stat.getMin();  <span class="cmt">// big-endian wire format</span>
+            <span class="kw">byte</span>[] max = stat.getMax();
+        }
+    }
+}</code></pre>
+
+            <h4>ColumnStatistics</h4>
+            <table>
+                <thead>
+                    <tr><th>Method</th><th>Return</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>getColumnIndex()</code></td><td><code>int</code></td><td>Column index in the schema</td></tr>
+                    <tr><td><code>getNullCount()</code></td><td><code>long</code></td><td>Number of null values</td></tr>
+                    <tr><td><code>hasMinMax()</code></td><td><code>boolean</code></td><td>Whether min/max are available</td></tr>
+                    <tr><td><code>getMin()</code></td><td><code>byte[]</code></td><td>Min value as big-endian bytes (null if all-null)</td></tr>
+                    <tr><td><code>getMax()</code></td><td><code>byte[]</code></td><td>Max value as big-endian bytes (null if all-null)</td></tr>
+                </tbody>
+            </table>
+            <p>
+                Min/max values are returned as big-endian byte arrays matching the type's wire format
+                (e.g., 4 bytes for INTEGER, 8 bytes for BIGINT/DOUBLE, raw UTF-8 bytes for STRING).
+            </p>
+
+            <h2>Complete Example</h2>
+<pre><code><span class="kw">import</span> io.mosaic.*;
+<span class="kw">import</span> org.apache.arrow.memory.*;
+<span class="kw">import</span> org.apache.arrow.vector.*;
+<span class="kw">import</span> org.apache.arrow.vector.types.pojo.*;
+<span class="kw">import</span> org.apache.arrow.vector.types.*;
+<span class="kw">import</span> java.io.*;
+<span class="kw">import</span> java.util.*;
+
+<span class="cmt">// 1. Write</span>
+<span class="ty">BufferAllocator</span> allocator = <span class="kw">new</span> <span class="ty">RootAllocator</span>();
+
+<span class="ty">Schema</span> arrowSchema = <span class="kw">new</span> <span class="ty">Schema</span>(<span class="ty">Arrays</span>.asList(
+    <span class="ty">Field</span>.nullable(<span class="str">"id"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Int</span>(<span class="num">32</span>, <span class="kw">true</span>)),
+    <span class="ty">Field</span>.nullable(<span class="str">"name"</span>, <span class="ty">ArrowType.Utf8</span>.INSTANCE),
+    <span class="ty">Field</span>.nullable(<span class="str">"score"</span>, <span class="kw">new</span> <span class="ty">ArrowType.FloatingPoint</span>(DOUBLE))
+));
+
+<span class="ty">WriterOptions</span> opts = <span class="kw">new</span> <span class="ty">WriterOptions</span>()
+    .numBuckets(<span class="num">2</span>);
+
+<span class="ty">ByteArrayOutputStream</span> baos = <span class="kw">new</span> <span class="ty">ByteArrayOutputStream</span>();
+<span class="kw">try</span> (<span class="ty">MosaicWriter</span> writer = <span class="kw">new</span> <span class="ty">MosaicWriter</span>(baos, arrowSchema, opts, allocator);
+     <span class="ty">VectorSchemaRoot</span> root = <span class="ty">VectorSchemaRoot</span>.create(arrowSchema, allocator)) {
+
+    <span class="ty">IntVector</span> ids = (<span class="ty">IntVector</span>) root.getVector(<span class="str">"id"</span>);
+    <span class="ty">VarCharVector</span> names = (<span class="ty">VarCharVector</span>) root.getVector(<span class="str">"name"</span>);
+    <span class="ty">Float8Vector</span> scores = (<span class="ty">Float8Vector</span>) root.getVector(<span class="str">"score"</span>);
+
+    ids.allocateNew(<span class="num">100</span>);
+    names.allocateNew(<span class="num">100</span>);
+    scores.allocateNew(<span class="num">100</span>);
+
+    <span class="kw">for</span> (<span class="kw">int</span> i = <span class="num">0</span>; i &lt; <span class="num">100</span>; i++) {
+        ids.set(i, i);
+        names.setSafe(i, (<span class="str">"user_"</span> + i).getBytes());
+        scores.set(i, i * <span class="num">1.5</span>);
+    }
+    root.setRowCount(<span class="num">100</span>);
+    writer.write(root);
+}
+
+<span class="kw">byte</span>[] data = baos.toByteArray();
+
+<span class="cmt">// 2. Read</span>
+<span class="ty">MosaicReader</span> reader = <span class="ty">MosaicReader</span>.open(
+    (pos, buf, off, len) -&gt; System.arraycopy(data, (<span class="kw">int</span>) pos, buf, off, len),
+    data.length,
+    allocator);
+
+<span class="kw">try</span> (reader) {
+    <span class="kw">for</span> (<span class="kw">int</span> rg = <span class="num">0</span>; rg &lt; reader.numRowGroups(); rg++) {
+        <span class="kw">try</span> (<span class="ty">VectorSchemaRoot</span> batch = reader.readRowGroup(rg, allocator)) {
+
+            <span class="ty">IntVector</span> readIds = (<span class="ty">IntVector</span>) batch.getVector(<span class="num">0</span>);
+            <span class="ty">VarCharVector</span> readNames = (<span class="ty">VarCharVector</span>) batch.getVector(<span class="num">1</span>);
+            <span class="ty">Float8Vector</span> readScores = (<span class="ty">Float8Vector</span>) batch.getVector(<span class="num">2</span>);
+
+            <span class="kw">for</span> (<span class="kw">int</span> i = <span class="num">0</span>; i &lt; batch.getRowCount(); i++) {
+                System.out.printf(<span class="str">"id=%d name=%s score=%.1f%n"</span>,
+                    readIds.get(i),
+                    <span class="kw">new</span> <span class="ty">String</span>(readNames.get(i)),
+                    readScores.get(i));
+            }
+        }
+    }
+}</code></pre>
+
+            <div class="warning">
+                <strong>Column ordering</strong>
+                The reader preserves the original schema column order.
+                Use <code>reader.getSchema()</code> to inspect the schema and locate columns by name.
+            </div>
+
+            <div class="tip">
+                <strong>Resource management</strong>
+                All Mosaic Java objects (<code>MosaicWriter</code>,
+                <code>MosaicReader</code>)
+                implement <code>AutoCloseable</code>. Use try-with-resources to ensure native memory
+                is freed promptly. <code>VectorSchemaRoot</code> from <code>readRowGroup()</code>
+                should also be closed when done.
+            </div>
+        </div>
+    </main>
+</body>
+</html>

@@ -1,0 +1,194 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mosaic</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="js/main.js"></script>
+</head>
+<body>
+    <button class="menu-toggle" aria-label="Menu">&#9776;</button>
+    <div class="overlay"></div>
+
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <h2>Mosaic</h2>
+            <p>Columnar-bucket hybrid format</p>
+        </div>
+        <nav>
+            <ul>
+                <li><a href="index.html" class="active">Home</a></li>
+                <li><a href="design.html">Design</a></li>
+                <li><a href="rust-api.html">Rust API</a></li>
+                <li><a href="java-api.html">Java API</a></li>
+                <li><a href="python-api.html">Python API</a></li>
+                <li><a href="cpp-api.html">C++ API</a></li>
+            </ul>
+        </nav>
+        <div class="sidebar-footer">
+            <button class="theme-toggle">Dark Mode</button>
+        </div>
+    </aside>
+
+    <main class="main">
+        <div class="content">
+            <h1>Mosaic</h1>
+            <p class="subtitle">A columnar-bucket hybrid format optimized for wide tables.</p>
+
+            <div class="badges">
+                <span class="badge rust">Rust</span>
+                <span class="badge java">Java</span>
+                <span class="badge python">Python</span>
+                <span class="badge cpp">C/C++</span>
+            </div>
+
+            <h2>Overview</h2>
+            <p>
+                Mosaic is a columnar-bucket hybrid format optimized for wide tables (10,000+ columns).
+                Columns are sorted by name and evenly distributed into buckets using range-based assignment,
+                stored column-oriented within each bucket, and independently compressed.
+                This enables efficient projection pushdown at bucket granularity &mdash;
+                reading 10 columns out of 10,000 only decompresses the buckets that contain those 10 columns.
+                Range-based assignment ensures that columns with similar name prefixes land in the same bucket,
+                improving both compression ratio and projection locality.
+            </p>
+            <p>
+                Mosaic is implemented as a Rust core library with bindings for Java (via JNI),
+                Python (via ctypes FFI), and C/C++ (via FFI),
+                enabling high-performance read and write access across multiple language ecosystems.
+            </p>
+
+            <h2>Key Features</h2>
+            <div class="features">
+                <div class="feature">
+                    <h3>Columnar-Bucket Hybrid</h3>
+                    <p>Columns sorted by name are distributed into buckets via range-based assignment, enabling projection pushdown at bucket granularity. Similar name prefixes land in the same bucket.</p>
+                </div>
+                <div class="feature">
+                    <h3>Adaptive Encoding</h3>
+                    <p>Each column is automatically encoded as ALL_NULL, CONST, DICT, or PLAIN based on its data distribution.</p>
+                </div>
+                <div class="feature">
+                    <h3>Zstd Compression</h3>
+                    <p>Optional Zstandard compression per bucket and schema block, with configurable compression level. Each bucket is independently compressed.</p>
+                </div>
+                <div class="feature">
+                    <h3>BPE Name Compression</h3>
+                    <p>Byte Pair Encoding compresses column names in the schema block, reducing metadata overhead for wide tables.</p>
+                </div>
+                <div class="feature">
+                    <h3>Rich Type System</h3>
+                    <p>18 data types from Boolean to TimestampLtz, with support for fixed-width and variable-length encodings.</p>
+                </div>
+                <div class="feature">
+                    <h3>Multi-Language</h3>
+                    <p>Rust core with Java JNI bindings, Python ctypes bindings, and C/C++ FFI headers. Write once in Rust, use everywhere.</p>
+                </div>
+            </div>
+
+            <h2>Supported Types</h2>
+            <table>
+                <thead>
+                    <tr><th>Type</th><th>Width</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>Boolean</code></td><td>1</td><td>true / false</td></tr>
+                    <tr><td><code>TinyInt</code></td><td>1</td><td>Signed 8-bit integer</td></tr>
+                    <tr><td><code>SmallInt</code></td><td>2</td><td>Signed 16-bit integer</td></tr>
+                    <tr><td><code>Integer</code></td><td>4</td><td>Signed 32-bit integer</td></tr>
+                    <tr><td><code>BigInt</code></td><td>8</td><td>Signed 64-bit integer</td></tr>
+                    <tr><td><code>Float</code></td><td>4</td><td>32-bit IEEE 754</td></tr>
+                    <tr><td><code>Double</code></td><td>8</td><td>64-bit IEEE 754</td></tr>
+                    <tr><td><code>Date</code></td><td>4</td><td>Days since epoch</td></tr>
+                    <tr><td><code>Time</code></td><td>4</td><td>Milliseconds since midnight</td></tr>
+                    <tr><td><code>Char(n)</code></td><td>variable</td><td>Fixed-length string</td></tr>
+                    <tr><td><code>VarChar(n)</code></td><td>variable</td><td>Variable-length string with max length</td></tr>
+                    <tr><td><code>String</code></td><td>variable</td><td>Unbounded UTF-8 string</td></tr>
+                    <tr><td><code>Binary(n)</code></td><td>variable</td><td>Fixed-length byte array</td></tr>
+                    <tr><td><code>VarBinary(n)</code></td><td>variable</td><td>Variable-length byte array with max length</td></tr>
+                    <tr><td><code>Bytes</code></td><td>variable</td><td>Unbounded byte array</td></tr>
+                    <tr><td><code>Decimal(p, s)</code></td><td>8 or variable</td><td>Exact numeric; compact (p&le;18) or large</td></tr>
+                    <tr><td><code>Timestamp(p)</code></td><td>8 or 12</td><td>Millis (p&le;3) or millis + nanos (p&gt;3)</td></tr>
+                    <tr><td><code>TimestampLtz(p)</code></td><td>8 or 12</td><td>Same as Timestamp, with local timezone</td></tr>
+                </tbody>
+            </table>
+
+            <h2>Benchmark</h2>
+            <p>
+                Test setup: 10,000 columns (90% STRING, 10% INT), column names ~80 bytes each, Zstd compression (level 9).
+            </p>
+
+            <h3>File Size (10 rows)</h3>
+            <table>
+                <thead>
+                    <tr><th>Format</th><th>Size</th><th>vs Mosaic</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>Parquet</td><td>9,696 KB</td><td>14.8x</td></tr>
+                    <tr><td>ORC</td><td>6,377 KB</td><td>9.7x</td></tr>
+                    <tr><td><strong>Mosaic</strong></td><td><strong>654 KB</strong></td><td><strong>1x</strong></td></tr>
+                </tbody>
+            </table>
+
+            <h3>Projection Read (500 rows)</h3>
+            <p>File size &mdash; Parquet: 57.4 MB, ORC: 95.4 MB, Mosaic: 11.5 MB</p>
+            <table>
+                <thead>
+                    <tr><th>Projected Columns</th><th>Parquet</th><th>ORC</th><th>Mosaic</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>10 / 10,000</td><td>53,170 us</td><td>72,729 us</td><td><strong>25,081 us</strong></td></tr>
+                    <tr><td>1 / 10,000</td><td>50,919 us</td><td>70,712 us</td><td><strong>2,374 us</strong></td></tr>
+                </tbody>
+            </table>
+
+            <h3>Projection Read (4,500 rows)</h3>
+            <p>File size &mdash; Parquet: 458.4 MB, ORC: 827.9 MB, Mosaic: 100.2 MB</p>
+            <table>
+                <thead>
+                    <tr><th>Projected Columns</th><th>Parquet</th><th>ORC</th><th>Mosaic</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>10 / 10,000</td><td>369,627 us</td><td>89,344 us</td><td><strong>67,314 us</strong></td></tr>
+                    <tr><td>1 / 10,000</td><td>360,458 us</td><td>81,934 us</td><td><strong>26,924 us</strong></td></tr>
+                </tbody>
+            </table>
+
+            <div class="tip">
+                <strong>Why is Mosaic faster for projection?</strong>
+                Projection pushdown operates at bucket granularity. With 10,000 columns distributed across 100 buckets,
+                reading 1 column only decompresses the 1 bucket that contains it &mdash; roughly 1% of the file.
+                Range-based assignment keeps columns with similar name prefixes co-located, so typical projections
+                touch very few buckets.
+            </div>
+
+            <h2>Status</h2>
+            <p>
+                Mosaic is under active development as part of the
+                <a href="https://paimon.apache.org/">Apache Paimon</a> ecosystem.
+                Both the write path and read path are fully implemented with round-trip test coverage.
+            </p>
+        </div>
+    </main>
+</body>
+</html>

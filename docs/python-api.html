@@ -1,0 +1,342 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Python API - Mosaic</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="js/main.js"></script>
+</head>
+<body>
+    <button class="menu-toggle" aria-label="Menu">&#9776;</button>
+    <div class="overlay"></div>
+
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <h2>Mosaic</h2>
+            <p>Columnar-bucket hybrid format</p>
+        </div>
+        <nav>
+            <ul>
+                <li><a href="index.html">Home</a></li>
+                <li><a href="design.html">Design</a></li>
+                <li><a href="rust-api.html">Rust API</a></li>
+                <li><a href="java-api.html">Java API</a></li>
+                <li><a href="python-api.html" class="active">Python API</a></li>
+                <li><a href="cpp-api.html">C++ API</a></li>
+            </ul>
+        </nav>
+        <div class="sidebar-footer">
+            <button class="theme-toggle">Dark Mode</button>
+        </div>
+    </aside>
+
+    <main class="main">
+        <div class="content">
+            <h1>Python API</h1>
+            <p class="subtitle">Write and read Mosaic files from Python using PyArrow (<code>pa.RecordBatch</code>).</p>
+
+            <h2>Setup</h2>
+            <p>
+                The Python API lives in the <code>python/</code> directory and depends on the
+                <code>mosaic_ffi</code> shared library and <code>pyarrow</code>.
+                Build the native library first, then install the Python package:
+            </p>
+<pre><code><span class="cmt"># 1. Build the native library</span>
+cargo build --release -p mosaic-ffi
+
+<span class="cmt"># 2. Install the Python package (bundles the native lib automatically)</span>
+cd python
+pip install .</code></pre>
+            <p>
+                If you prefer a development install without bundling, use <code>pip install -e .</code>
+                and point the runtime to the native library via one of:
+            </p>
+<pre><code><span class="cmt"># Option A: MOSAIC_LIB_PATH (recommended)</span>
+export MOSAIC_LIB_PATH=/path/to/target/release
+
+<span class="cmt"># Option B: System library path</span>
+export DYLD_LIBRARY_PATH=../target/release  <span class="cmt"># macOS</span>
+export LD_LIBRARY_PATH=../target/release    <span class="cmt"># Linux</span></code></pre>
+
+            <h2>Writing a File</h2>
+
+            <h3>1. Define an Arrow Schema</h3>
+<pre><code><span class="kw">import</span> pyarrow <span class="kw">as</span> pa
+
+pa_schema = pa.schema([
+    pa.field(<span class="str">"id"</span>, pa.int32(), nullable=<span class="kw">False</span>),
+    pa.field(<span class="str">"name"</span>, pa.utf8()),
+    pa.field(<span class="str">"score"</span>, pa.float64()),
+    pa.field(<span class="str">"amount"</span>, pa.decimal128(<span class="num">10</span>, <span class="num">2</span>)),
+    pa.field(<span class="str">"ts"</span>, pa.timestamp(<span class="str">"ms"</span>)),
+])</code></pre>
+
+            <h3>2. Create Writer and Write Batches</h3>
+            <p>
+                Build PyArrow <code>RecordBatch</code> objects and pass them to
+                <code>write()</code>. The Arrow C Data Interface is used internally
+                for zero-copy transfer to the native library:
+            </p>
+<pre><code><span class="kw">import</span> io
+<span class="kw">import</span> pyarrow <span class="kw">as</span> pa
+<span class="kw">from</span> <span class="ty">mosaic</span> <span class="kw">import</span> MosaicWriter, WriterOptions
+
+pa_schema = pa.schema([
+    pa.field(<span class="str">"id"</span>, pa.int32()),
+    pa.field(<span class="str">"name"</span>, pa.utf8()),
+    pa.field(<span class="str">"score"</span>, pa.float64()),
+])
+
+opts = WriterOptions(
+    num_buckets=<span class="num">2</span>,
+    compression=WriterOptions.COMPRESSION_ZSTD,
+    zstd_level=<span class="num">1</span>,
+)
+
+batch = pa.record_batch([
+    pa.array(range(<span class="num">1000</span>), type=pa.int32()),
+    pa.array([<span class="str">f"user_{i}"</span> <span class="kw">for</span> i <span class="kw">in</span> range(<span class="num">1000</span>)]),
+    pa.array([i * <span class="num">1.5</span> <span class="kw">for</span> i <span class="kw">in</span> range(<span class="num">1000</span>)]),
+], names=[<span class="str">"id"</span>, <span class="str">"name"</span>, <span class="str">"score"</span>])
+
+buf = io.BytesIO()
+<span class="kw">with</span> MosaicWriter(buf, pa_schema, opts) <span class="kw">as</span> writer:
+    writer.write(batch)
+
+data = buf.getvalue()</code></pre>
+
+            <h3>WriterOptions</h3>
+            <table>
+                <thead>
+                    <tr><th>Parameter</th><th>Default</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>num_buckets</code></td><td>0</td><td>Number of buckets (0 = auto)</td></tr>
+                    <tr><td><code>compression</code></td><td>ZSTD (1)</td><td>0 = none, 1 = Zstd</td></tr>
+                    <tr><td><code>zstd_level</code></td><td>1</td><td>Zstd compression level</td></tr>
+                    <tr><td><code>row_group_max_size</code></td><td>256 MB</td><td>Max uncompressed bytes per row group</td></tr>
+                    <tr><td><code>max_dict_total_bytes</code></td><td>32 KB</td><td>Max dictionary size per column</td></tr>
+                    <tr><td><code>max_dict_entries</code></td><td>255</td><td>Max distinct values for DICT encoding</td></tr>
+                    <tr><td><code>stats_columns</code></td><td>[]</td><td>Column indices to build min/max stats for filter pushdown</td></tr>
+                    <tr><td><code>page_size_threshold</code></td><td>32 KB</td><td>Min avg column page size to enable paged mode (per-column compression)</td></tr>
+                </tbody>
+            </table>
+
+            <h3>Writer Methods</h3>
+            <table>
+                <thead>
+                    <tr><th>Method</th><th>Return</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>write(batch)</code></td><td><code>None</code></td><td>Write a <code>pyarrow.RecordBatch</code> or <code>pyarrow.Table</code></td></tr>
+                    <tr><td><code>estimated_file_size()</code></td><td><code>int</code></td><td>Estimated output file size in bytes (for file rolling)</td></tr>
+                    <tr><td><code>close()</code></td><td><code>None</code></td><td>Flush remaining data and write footer</td></tr>
+                </tbody>
+            </table>
+
+            <h2>Reading a File</h2>
+
+            <h3>1. Open the Reader</h3>
+            <p>
+                Use <code>from_input_file</code> with callbacks to read from any data source
+                (memory buffers, remote storage, etc.):
+            </p>
+<pre><code><span class="kw">from</span> <span class="ty">mosaic</span> <span class="kw">import</span> MosaicReader
+
+<span class="kw">def</span> <span class="fn">read_at</span>(offset, length):
+    <span class="kw">return</span> data[offset:offset + length]
+
+reader = MosaicReader.from_input_file(read_at, len(data))</code></pre>
+
+            <h3>2. Inspect the Schema</h3>
+            <p>
+                The reader exposes the file schema as a standard PyArrow <code>Schema</code> object:
+            </p>
+<pre><code>print(reader.schema)
+<span class="kw">for</span> field <span class="kw">in</span> reader.schema:
+    print(<span class="str">f"name={field.name} type={field.type} nullable={field.nullable}"</span>)
+
+name_col = reader.schema.get_field_index(<span class="str">"name"</span>)
+score_col = reader.schema.get_field_index(<span class="str">"score"</span>)</code></pre>
+
+            <h3>Reader Methods</h3>
+            <table>
+                <thead>
+                    <tr><th>Method / Property</th><th>Return</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>schema</code></td><td><code>pa.Schema</code></td><td>Arrow Schema for the file</td></tr>
+                    <tr><td><code>num_row_groups</code></td><td><code>int</code></td><td>Row group count</td></tr>
+                    <tr><td><code>read_row_group(rg, columns=None)</code></td><td><code>pa.RecordBatch</code></td><td>Read a row group (optionally with projection)</td></tr>
+                    <tr><td><code>read_all(columns=None)</code></td><td><code>pa.Table</code></td><td>Read entire file as a Table</td></tr>
+                    <tr><td><code>get_row_group_statistics(rg)</code></td><td><code>list[ColumnStatistics]</code></td><td>Column statistics for a row group</td></tr>
+                </tbody>
+            </table>
+
+            <h3>3. Read Row Groups as Arrow RecordBatch</h3>
+<pre><code><span class="kw">for</span> rg <span class="kw">in</span> range(reader.num_row_groups):
+    batch = reader.read_row_group(rg)
+    print(<span class="str">f"rows: {batch.num_rows}"</span>)
+
+    ids = batch.column(<span class="str">"id"</span>)
+    names = batch.column(<span class="str">"name"</span>)
+    <span class="kw">for</span> i <span class="kw">in</span> range(batch.num_rows):
+        print(<span class="str">f"id={ids[i].as_py()} name={names[i].as_py()}"</span>)</code></pre>
+
+            <h3>Projection Pushdown</h3>
+            <p>
+                Use <code>read_row_group(rg_index, columns=[...])</code> to read only specific columns.
+                Only the buckets containing the projected columns are decompressed, significantly
+                reducing I/O and memory for wide tables.
+            </p>
+<pre><code><span class="cmt"># Only read "name" and "score" columns</span>
+projected = [name_col, score_col]
+batch = reader.read_row_group(rg, columns=projected)
+<span class="cmt"># batch contains only the projected columns</span></code></pre>
+
+            <h3>Column Statistics (Filter Pushdown)</h3>
+            <p>
+                When stats columns are configured during writing, the reader can access per-row-group
+                min/max statistics to skip row groups that don't match a filter predicate:
+            </p>
+<pre><code>opts = WriterOptions(stats_columns=[<span class="num">0</span>, <span class="num">2</span>])  <span class="cmt"># build stats for columns 0 and 2</span></code></pre>
+<pre><code><span class="cmt"># Reading stats</span>
+<span class="kw">for</span> rg <span class="kw">in</span> range(reader.num_row_groups):
+    <span class="kw">for</span> stat <span class="kw">in</span> reader.get_row_group_statistics(rg):
+        col_idx = stat.column_index
+        null_count = stat.null_count
+        <span class="kw">if</span> stat.has_min_max:
+            min_val = stat.min   <span class="cmt"># bytes, big-endian wire format</span>
+            max_val = stat.max</code></pre>
+
+            <h4>ColumnStatistics</h4>
+            <table>
+                <thead>
+                    <tr><th>Attribute</th><th>Type</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>column_index</code></td><td><code>int</code></td><td>Column index in the schema</td></tr>
+                    <tr><td><code>null_count</code></td><td><code>int</code></td><td>Number of null values</td></tr>
+                    <tr><td><code>has_min_max</code></td><td><code>bool</code></td><td>Whether min/max are available</td></tr>
+                    <tr><td><code>min</code></td><td><code>bytes</code></td><td>Min value as big-endian bytes (None if all-null)</td></tr>
+                    <tr><td><code>max</code></td><td><code>bytes</code></td><td>Max value as big-endian bytes (None if all-null)</td></tr>
+                </tbody>
+            </table>
+            <p>
+                Min/max values are returned as <code>bytes</code> in big-endian format matching the type's
+                wire format (e.g., 4 bytes for INTEGER, 8 bytes for BIGINT/DOUBLE, raw UTF-8 bytes for STRING).
+            </p>
+
+            <h2>Convenience Functions</h2>
+            <p>
+                Use <code>write_table()</code> and <code>read_table()</code> for quick Table-level I/O.
+                They use the same OutputFile / InputFile interfaces as
+                <code>MosaicWriter</code> and <code>MosaicReader</code>:
+            </p>
+<pre><code><span class="kw">import</span> io
+<span class="kw">import</span> pyarrow <span class="kw">as</span> pa
+<span class="kw">import</span> mosaic
+
+table = pa.table({
+    <span class="str">"id"</span>: pa.array(range(<span class="num">100</span>), type=pa.int32()),
+    <span class="str">"name"</span>: pa.array([<span class="str">f"user_{i}"</span> <span class="kw">for</span> i <span class="kw">in</span> range(<span class="num">100</span>)]),
+})
+
+<span class="cmt"># Write a Table (OutputFile: file-like object with write/flush)</span>
+buf = io.BytesIO()
+mosaic.write_table(table, buf)
+
+<span class="cmt"># Read a Table (InputFile: read_at callback + file_length)</span>
+data = buf.getvalue()
+table = mosaic.read_table(
+    <span class="kw">lambda</span> offset, length: data[offset:offset + length],
+    len(data),
+)</code></pre>
+
+            <h3>write_table / read_table</h3>
+            <table>
+                <thead>
+                    <tr><th>Function</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>write_table(table, stream, options=None)</code></td><td>Write a <code>pa.Table</code> via an OutputFile (file-like object)</td></tr>
+                    <tr><td><code>read_table(read_at_fn, file_length, columns=None)</code></td><td>Read a <code>pa.Table</code> via an InputFile (<code>read_at</code> callback + length)</td></tr>
+                </tbody>
+            </table>
+
+            <h2>Complete Example</h2>
+<pre><code><span class="kw">import</span> io
+<span class="kw">import</span> pyarrow <span class="kw">as</span> pa
+<span class="kw">from</span> <span class="ty">mosaic</span> <span class="kw">import</span> MosaicWriter, MosaicReader, WriterOptions
+
+<span class="cmt"># 1. Write</span>
+pa_schema = pa.schema([
+    pa.field(<span class="str">"id"</span>, pa.int32()),
+    pa.field(<span class="str">"name"</span>, pa.utf8()),
+    pa.field(<span class="str">"score"</span>, pa.float64()),
+])
+
+batch = pa.record_batch([
+    pa.array(range(<span class="num">100</span>), type=pa.int32()),
+    pa.array([<span class="str">f"user_{i}"</span> <span class="kw">for</span> i <span class="kw">in</span> range(<span class="num">100</span>)]),
+    pa.array([i * <span class="num">1.5</span> <span class="kw">for</span> i <span class="kw">in</span> range(<span class="num">100</span>)]),
+], names=[<span class="str">"id"</span>, <span class="str">"name"</span>, <span class="str">"score"</span>])
+
+opts = WriterOptions(num_buckets=<span class="num">2</span>)
+
+buf = io.BytesIO()
+<span class="kw">with</span> MosaicWriter(buf, pa_schema, opts) <span class="kw">as</span> writer:
+    writer.write(batch)
+
+data = buf.getvalue()
+
+<span class="cmt"># 2. Read</span>
+reader = MosaicReader.from_input_file(
+    <span class="kw">lambda</span> offset, length: data[offset:offset + length],
+    len(data),
+)
+<span class="kw">with</span> reader:
+    <span class="kw">for</span> rg <span class="kw">in</span> range(reader.num_row_groups):
+        batch = reader.read_row_group(rg)
+        <span class="kw">for</span> i <span class="kw">in</span> range(batch.num_rows):
+            print(<span class="str">f"id={batch.column('id')[i].as_py()} "</span>
+                  <span class="str">f"name={batch.column('name')[i].as_py()} "</span>
+                  <span class="str">f"score={batch.column('score')[i].as_py():.1f}"</span>)</code></pre>
+
+            <div class="warning">
+                <strong>Column ordering</strong>
+                The reader preserves the original schema column order.
+                Use <code>reader.schema</code> to inspect the schema and locate columns by name.
+            </div>
+
+            <div class="tip">
+                <strong>Resource management</strong>
+                <code>MosaicWriter</code> and
+                <code>MosaicReader</code>
+                are context managers. Use <code>with</code> statements to ensure native memory
+                is freed promptly.
+            </div>
+        </div>
+    </main>
+</body>
+</html>

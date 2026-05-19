@@ -1,0 +1,399 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>C++ API - Mosaic</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="js/main.js"></script>
+</head>
+<body>
+    <button class="menu-toggle" aria-label="Menu">&#9776;</button>
+    <div class="overlay"></div>
+
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <h2>Mosaic</h2>
+            <p>Columnar-bucket hybrid format</p>
+        </div>
+        <nav>
+            <ul>
+                <li><a href="index.html">Home</a></li>
+                <li><a href="design.html">Design</a></li>
+                <li><a href="rust-api.html">Rust API</a></li>
+                <li><a href="java-api.html">Java API</a></li>
+                <li><a href="python-api.html">Python API</a></li>
+                <li><a href="cpp-api.html">C++ API</a></li>
+            </ul>
+        </nav>
+        <div class="sidebar-footer">
+            <button class="theme-toggle">Dark Mode</button>
+        </div>
+    </aside>
+
+    <main class="main">
+        <div class="content">
+            <h1>C++ API</h1>
+            <p class="subtitle">Use Mosaic from C or C++ via the FFI bindings.</p>
+
+            <h2>Overview</h2>
+            <p>
+                The <code>ffi/</code> crate generates a shared library (<code>libmosaic_ffi</code>) and a
+                C header (<code>mosaic.h</code>) via <a href="https://github.com/mozilla/cbindgen">cbindgen</a>.
+                The C++ header (<code>mosaic.hpp</code>) is a hand-written RAII wrapper on top of the C API.
+            </p>
+
+            <h2>Building</h2>
+<pre><code><span class="cmt"># Build the FFI shared library</span>
+cargo build --release -p mosaic-ffi
+
+<span class="cmt"># C header generated at include/mosaic.h</span>
+<span class="cmt"># C++ RAII wrapper:     include/mosaic.hpp (checked in, not generated)</span></code></pre>
+
+            <h2>Linking</h2>
+            <p>Link against the shared library and include the appropriate header:</p>
+<pre><code><span class="cmt"># macOS</span>
+g++ -std=c++17 -I include/ example.cpp \
+    -L target/release -lmosaic_ffi -o example
+
+<span class="cmt"># Linux</span>
+g++ -std=c++17 -I include/ example.cpp \
+    -L target/release -lmosaic_ffi -Wl,-rpath,target/release -o example</code></pre>
+
+            <h2>Writing (C++)</h2>
+            <p>
+                Data is written as Arrow RecordBatches via the
+                <a href="https://arrow.apache.org/docs/format/CDataInterface.html">Arrow C Data Interface</a>.
+                Build your data as Arrow arrays, export via <code>ArrowArray</code> / <code>ArrowSchema</code>,
+                then pass to the writer:
+            </p>
+<pre><code><span class="kw">#include</span> <span class="str">"mosaic.hpp"</span>
+<span class="kw">#include</span> &lt;arrow/api.h&gt;
+<span class="kw">#include</span> &lt;arrow/c/bridge.h&gt;
+
+<span class="kw">int</span> <span class="fn">main</span>() {
+    <span class="kw">try</span> {
+        <span class="cmt">// 1. Set up output stream callbacks</span>
+        <span class="kw">auto</span>* fp = std::fopen(<span class="str">"output.mosaic"</span>, <span class="str">"wb"</span>);
+        <span class="kw">auto</span> file = std::shared_ptr&lt;FILE&gt;(fp, [](<span class="ty">FILE</span>* f) { std::fclose(f); });
+        <span class="kw">int64_t</span> pos = <span class="num">0</span>;
+
+        <span class="ty">mosaic</span>::<span class="ty">OutputFile</span> cbs;
+        cbs.write_fn = [file, pos](<span class="kw">const uint8_t</span>* data, <span class="kw">size_t</span> len) <span class="kw">mutable</span> -&gt; <span class="kw">int</span> {
+            <span class="kw">size_t</span> written = std::fwrite(data, <span class="num">1</span>, len, file.get());
+            pos += <span class="kw">static_cast</span>&lt;<span class="kw">int64_t</span>&gt;(written);
+            <span class="kw">return</span> (written == len) ? <span class="num">0</span> : <span class="num">-1</span>;
+        };
+        cbs.flush_fn = [file]() -&gt; <span class="kw">int</span> { <span class="kw">return</span> std::fflush(file.get()); };
+        cbs.get_pos_fn = [file, pos]() <span class="kw">mutable</span> -&gt; <span class="kw">int64_t</span> { <span class="kw">return</span> pos; };
+
+        <span class="cmt">// 2. Build an Arrow RecordBatch and write it</span>
+        arrow::Int32Builder age_builder;
+        arrow::StringBuilder name_builder;
+        arrow::DoubleBuilder score_builder;
+        <span class="kw">for</span> (<span class="kw">int</span> i = <span class="num">0</span>; i &lt; <span class="num">10000</span>; i++) {
+            name_builder.Append(<span class="str">"user_"</span> + std::to_string(i));
+            age_builder.Append(<span class="num">20</span> + (i % <span class="num">50</span>));
+            score_builder.Append(i * <span class="num">1.5</span>);
+        }
+        <span class="kw">auto</span> batch = arrow::RecordBatch::Make(
+            arrow::schema({
+                arrow::field(<span class="str">"name"</span>, arrow::utf8()),
+                arrow::field(<span class="str">"age"</span>, arrow::int32()),
+                arrow::field(<span class="str">"score"</span>, arrow::float64()),
+            }),
+            <span class="num">10000</span>,
+            {name_builder.Finish().ValueOrDie(),
+             age_builder.Finish().ValueOrDie(),
+             score_builder.Finish().ValueOrDie()});
+
+        <span class="cmt">// 3. Export via Arrow C Data Interface, create writer, and write</span>
+        ArrowArray ffi_array;
+        ArrowSchema ffi_schema;
+        arrow::ExportRecordBatch(*batch, &amp;ffi_array, &amp;ffi_schema);
+
+        <span class="ty">mosaic</span>::<span class="ty">Writer</span> writer(std::move(cbs), &amp;ffi_schema, {
+            .num_buckets = <span class="num">2</span>,
+            .compression = <span class="num">1</span>,  <span class="cmt">// ZSTD</span>
+            .zstd_level = <span class="num">1</span>,
+        });
+        writer.write(&amp;ffi_array, &amp;ffi_schema);
+
+        <span class="cmt">// 4. Close (also happens on destructor)</span>
+        writer.close();
+
+    } <span class="kw">catch</span> (<span class="kw">const</span> <span class="ty">mosaic</span>::<span class="ty">Error</span>&amp; e) {
+        fprintf(stderr, <span class="str">"Error: %s\n"</span>, e.what());
+        <span class="kw">return</span> <span class="num">1</span>;
+    }
+    <span class="kw">return</span> <span class="num">0</span>;
+}</code></pre>
+
+            <h2>C++ API Reference</h2>
+
+            <h3>Writer Options</h3>
+            <table>
+                <thead>
+                    <tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>num_buckets</code></td><td>uint32_t</td><td>0</td><td>Number of buckets (0 = auto)</td></tr>
+                    <tr><td><code>compression</code></td><td>uint8_t</td><td>1</td><td>0=none, 1=zstd</td></tr>
+                    <tr><td><code>zstd_level</code></td><td>int32_t</td><td>1</td><td>Zstd compression level</td></tr>
+                    <tr><td><code>row_group_max_size</code></td><td>uint64_t</td><td>256 MB</td><td>Max row group size</td></tr>
+                    <tr><td><code>max_dict_total_bytes</code></td><td>uint32_t</td><td>32 KB</td><td>Max dict size per column</td></tr>
+                    <tr><td><code>max_dict_entries</code></td><td>uint32_t</td><td>255</td><td>Max dict entries per column</td></tr>
+                    <tr><td><code>stats_columns</code></td><td>const uint32_t*</td><td>NULL</td><td>Column indices to build min/max stats for</td></tr>
+                    <tr><td><code>num_stats_columns</code></td><td>uint32_t</td><td>0</td><td>Length of stats_columns array</td></tr>
+                    <tr><td><code>page_size_threshold</code></td><td>uint32_t</td><td>32 KB</td><td>Min avg column page size to enable paged mode</td></tr>
+                </tbody>
+            </table>
+
+            <h3>Writer Methods</h3>
+            <table>
+                <thead>
+                    <tr><th>Method</th><th>Return</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>write(&amp;ffi_array, &amp;ffi_schema)</code></td><td><code>void</code></td><td>Write an Arrow RecordBatch via C Data Interface</td></tr>
+                    <tr><td><code>estimated_file_size()</code></td><td><code>int64_t</code></td><td>Estimated output file size in bytes (for file rolling)</td></tr>
+                    <tr><td><code>close()</code></td><td><code>void</code></td><td>Flush remaining data and write footer</td></tr>
+                </tbody>
+            </table>
+
+            <h2>Reading a File</h2>
+
+            <h3>1. Open the Reader</h3>
+            <p>
+                Construct a <code>Reader</code> by providing an <code>InputFile</code>
+                with your I/O implementation:
+            </p>
+<pre><code><span class="cmt">// Example: memory-mapped reader</span>
+<span class="ty">mosaic</span>::<span class="ty">InputFile</span> input;
+input.read_at_fn = [data](<span class="kw">uint64_t</span> offset, <span class="kw">uint8_t</span>* buf, <span class="kw">size_t</span> len) -&gt; <span class="kw">int</span> {
+    std::memcpy(buf, data + offset, len);
+    <span class="kw">return</span> <span class="num">0</span>;
+};
+
+<span class="kw">auto</span> reader = <span class="ty">mosaic</span>::make_reader(std::move(input), file_size);</code></pre>
+
+            <h3>2. Inspect the Schema</h3>
+            <p>
+                Export the schema via the
+                <a href="https://arrow.apache.org/docs/format/CDataInterface.html">Arrow C Data Interface</a>
+                and import into Arrow C++:
+            </p>
+<pre><code>ArrowSchema ffi_schema;
+reader.export_schema(&amp;ffi_schema);
+<span class="kw">auto</span> schema = arrow::ImportSchema(&amp;ffi_schema).ValueOrDie();</code></pre>
+
+            <h3>Reader Methods</h3>
+            <table>
+                <thead>
+                    <tr><th>Method</th><th>Return</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>num_row_groups()</code></td><td><code>uint32_t</code></td><td>Row group count</td></tr>
+                    <tr><td><code>export_schema(&amp;ffi_schema)</code></td><td><code>void</code></td><td>Export schema via Arrow C Data Interface</td></tr>
+                    <tr><td><code>read_row_group(rg, &amp;array, &amp;schema)</code></td><td><code>void</code></td><td>Read all columns of a row group</td></tr>
+                    <tr><td><code>read_row_group(rg, cols, n, &amp;array, &amp;schema)</code></td><td><code>void</code></td><td>Read projected columns of a row group</td></tr>
+                    <tr><td><code>get_row_group_statistics(rg)</code></td><td><code>vector&lt;ColumnStatistics&gt;</code></td><td>Column statistics for a row group</td></tr>
+                </tbody>
+            </table>
+
+            <h3>3. Read Row Groups as Arrow RecordBatch</h3>
+            <p>
+                Each row group is read directly via <code>read_row_group()</code>, which exports
+                via the <a href="https://arrow.apache.org/docs/format/CDataInterface.html">Arrow C Data Interface</a>
+                for zero-copy import into Arrow C++:
+            </p>
+<pre><code><span class="kw">#include</span> &lt;arrow/c/bridge.h&gt;
+<span class="kw">#include</span> <span class="str">"mosaic.hpp"</span>
+
+<span class="kw">for</span> (<span class="kw">uint32_t</span> rg = <span class="num">0</span>; rg &lt; reader.num_row_groups(); rg++) {
+    ArrowArray ffi_array;
+    ArrowSchema ffi_schema;
+    reader.read_row_group(rg, &amp;ffi_array, &amp;ffi_schema);
+
+    <span class="cmt">// Import into Arrow C++</span>
+    <span class="kw">auto</span> batch = arrow::ImportRecordBatch(&amp;ffi_array, &amp;ffi_schema).ValueOrDie();
+    printf(<span class="str">"row group %u: %lld rows, %d cols\n"</span>,
+        rg, batch-&gt;num_rows(), batch-&gt;num_columns());
+
+    <span class="cmt">// Access columns via Arrow C++ API</span>
+    <span class="kw">auto</span> ages = std::static_pointer_cast&lt;arrow::Int32Array&gt;(
+        batch-&gt;GetColumnByName(<span class="str">"age"</span>));
+    <span class="kw">for</span> (<span class="kw">int64_t</span> i = <span class="num">0</span>; i &lt; ages-&gt;length(); i++) {
+        <span class="kw">if</span> (!ages-&gt;IsNull(i)) {
+            printf(<span class="str">"age=%d\n"</span>, ages-&gt;Value(i));
+        }
+    }
+}</code></pre>
+
+            <h3>Projection Pushdown</h3>
+            <p>
+                Use <code>read_row_group</code> with column indices to read only specific columns.
+                Only the buckets containing the projected columns are decompressed, reducing
+                I/O and memory for wide tables. The returned batch contains only the projected columns.
+            </p>
+<pre><code><span class="kw">uint32_t</span> projected[] = { <span class="num">0</span>, <span class="num">2</span> };
+ArrowArray ffi_array;
+ArrowSchema ffi_schema;
+reader.read_row_group(<span class="num">0</span>, projected, <span class="num">2</span>, &amp;ffi_array, &amp;ffi_schema);
+<span class="kw">auto</span> batch = arrow::ImportRecordBatch(&amp;ffi_array, &amp;ffi_schema).ValueOrDie();
+<span class="cmt">// batch contains only the projected columns</span></code></pre>
+
+            <h3>Column Statistics (Filter Pushdown)</h3>
+            <p>
+                When stats columns are configured during writing, the reader can access per-row-group
+                min/max statistics to skip row groups that don't match a filter predicate:
+            </p>
+<pre><code><span class="cmt">// Writing with stats (arrow_schema is an ArrowSchema* from C Data Interface)</span>
+<span class="ty">mosaic</span>::<span class="ty">Writer</span> writer(std::move(cbs), arrow_schema, {
+    .compression = <span class="num">1</span>,
+});</code></pre>
+<pre><code><span class="cmt">// Reading stats</span>
+<span class="kw">for</span> (<span class="kw">uint32_t</span> rg = <span class="num">0</span>; rg &lt; reader.num_row_groups(); rg++) {
+    <span class="kw">auto</span> stats = reader.get_row_group_statistics(rg);
+    <span class="kw">for</span> (<span class="kw">const auto</span>&amp; stat : stats) {
+        <span class="kw">uint32_t</span> col_idx = stat.column_index;
+        <span class="kw">uint64_t</span> null_count = stat.null_count;
+        <span class="kw">if</span> (stat.has_min_max()) {
+            <span class="cmt">// stat.min_value / stat.max_value are std::vector&lt;uint8_t&gt;</span>
+        }
+    }
+}</code></pre>
+
+            <h4>ColumnStatistics</h4>
+            <table>
+                <thead>
+                    <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>column_index</code></td><td><code>uint32_t</code></td><td>Column index in the schema</td></tr>
+                    <tr><td><code>null_count</code></td><td><code>uint64_t</code></td><td>Number of null values</td></tr>
+                    <tr><td><code>has_min_max()</code></td><td><code>bool</code></td><td>Whether min/max are available</td></tr>
+                    <tr><td><code>min_value</code></td><td><code>vector&lt;uint8_t&gt;</code></td><td>Min value as big-endian bytes (empty if all-null)</td></tr>
+                    <tr><td><code>max_value</code></td><td><code>vector&lt;uint8_t&gt;</code></td><td>Max value as big-endian bytes (empty if all-null)</td></tr>
+                </tbody>
+            </table>
+            <p>
+                Min/max values are returned as big-endian byte arrays matching the type's wire format
+                (e.g., 4 bytes for INTEGER, 8 bytes for BIGINT/DOUBLE, raw UTF-8 bytes for STRING).
+            </p>
+
+            <h2>Complete Example</h2>
+<pre><code><span class="kw">#include</span> <span class="str">"mosaic.hpp"</span>
+<span class="kw">#include</span> &lt;arrow/api.h&gt;
+<span class="kw">#include</span> &lt;arrow/c/bridge.h&gt;
+<span class="kw">#include</span> &lt;cstdio&gt;
+<span class="kw">#include</span> &lt;cstring&gt;
+<span class="kw">#include</span> &lt;vector&gt;
+
+<span class="kw">int</span> <span class="fn">main</span>() {
+    <span class="kw">try</span> {
+        <span class="cmt">// 1. Write to a buffer</span>
+        std::vector&lt;<span class="kw">uint8_t</span>&gt; buf;
+        {
+            <span class="ty">mosaic</span>::<span class="ty">OutputFile</span> w_cbs;
+            w_cbs.write_fn = [&amp;buf](<span class="kw">const uint8_t</span>* data, <span class="kw">size_t</span> len) -&gt; <span class="kw">int</span> {
+                buf.insert(buf.end(), data, data + len);
+                <span class="kw">return</span> <span class="num">0</span>;
+            };
+            w_cbs.flush_fn = []() -&gt; <span class="kw">int</span> { <span class="kw">return</span> <span class="num">0</span>; };
+            w_cbs.get_pos_fn = [&amp;buf]() -&gt; <span class="kw">int64_t</span> {
+                <span class="kw">return</span> <span class="kw">static_cast</span>&lt;<span class="kw">int64_t</span>&gt;(buf.size());
+            };
+
+            <span class="cmt">// Build an Arrow RecordBatch</span>
+            arrow::Int32Builder id_builder;
+            arrow::StringBuilder name_builder;
+            arrow::DoubleBuilder score_builder;
+            <span class="kw">for</span> (<span class="kw">int</span> i = <span class="num">0</span>; i &lt; <span class="num">100</span>; i++) {
+                id_builder.Append(i);
+                name_builder.Append(<span class="str">"user_"</span> + std::to_string(i));
+                score_builder.Append(i * <span class="num">1.5</span>);
+            }
+            <span class="kw">auto</span> batch = arrow::RecordBatch::Make(
+                arrow::schema({
+                    arrow::field(<span class="str">"id"</span>, arrow::int32(), <span class="kw">false</span>),
+                    arrow::field(<span class="str">"name"</span>, arrow::utf8()),
+                    arrow::field(<span class="str">"score"</span>, arrow::float64()),
+                }),
+                <span class="num">100</span>,
+                {id_builder.Finish().ValueOrDie(),
+                 name_builder.Finish().ValueOrDie(),
+                 score_builder.Finish().ValueOrDie()});
+
+            <span class="cmt">// Export via Arrow C Data Interface and create writer</span>
+            ArrowArray ffi_array;
+            ArrowSchema ffi_schema;
+            arrow::ExportRecordBatch(*batch, &amp;ffi_array, &amp;ffi_schema);
+
+            <span class="ty">mosaic</span>::<span class="ty">Writer</span> writer(std::move(w_cbs), &amp;ffi_schema, {
+                .num_buckets = <span class="num">2</span>,
+            });
+            writer.write(&amp;ffi_array, &amp;ffi_schema);
+            writer.close();
+        }
+
+        <span class="cmt">// 2. Read from the buffer</span>
+        <span class="ty">mosaic</span>::<span class="ty">InputFile</span> input;
+        input.read_at_fn = [&amp;buf](<span class="kw">uint64_t</span> offset, <span class="kw">uint8_t</span>* dst, <span class="kw">size_t</span> len) -&gt; <span class="kw">int</span> {
+            std::memcpy(dst, buf.data() + offset, len);
+            <span class="kw">return</span> <span class="num">0</span>;
+        };
+
+        <span class="kw">auto</span> reader = <span class="ty">mosaic</span>::make_reader(std::move(input), buf.size());
+
+        ArrowArray ffi_array;
+        ArrowSchema ffi_schema;
+        reader.read_row_group(<span class="num">0</span>, &amp;ffi_array, &amp;ffi_schema);
+        <span class="kw">auto</span> result = arrow::ImportRecordBatch(&amp;ffi_array, &amp;ffi_schema).ValueOrDie();
+
+        <span class="kw">auto</span> ids = std::static_pointer_cast&lt;arrow::Int32Array&gt;(result-&gt;GetColumnByName(<span class="str">"id"</span>));
+        <span class="kw">auto</span> names = std::static_pointer_cast&lt;arrow::StringArray&gt;(result-&gt;GetColumnByName(<span class="str">"name"</span>));
+        <span class="kw">auto</span> scores = std::static_pointer_cast&lt;arrow::DoubleArray&gt;(result-&gt;GetColumnByName(<span class="str">"score"</span>));
+
+    } <span class="kw">catch</span> (<span class="kw">const</span> <span class="ty">mosaic</span>::<span class="ty">Error</span>&amp; e) {
+        fprintf(stderr, <span class="str">"Error: %s\n"</span>, e.what());
+        <span class="kw">return</span> <span class="num">1</span>;
+    }
+    <span class="kw">return</span> <span class="num">0</span>;
+}</code></pre>
+
+            <div class="warning">
+                <strong>Column ordering</strong>
+                The reader preserves the original schema column order.
+                Use <code>export_schema()</code> to inspect the schema via Arrow C Data Interface.
+            </div>
+
+            <div class="tip">
+                <strong>Resource management</strong>
+                All C++ wrapper classes (<code>Writer</code>,
+                <code>Reader</code>)
+                are move-only RAII types. Resources are freed automatically when objects go out of scope.
+            </div>
+        </div>
+    </main>
+</body>
+</html>

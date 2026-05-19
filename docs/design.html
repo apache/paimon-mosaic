@@ -1,0 +1,781 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design &amp; Format Specification - Mosaic</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="js/main.js"></script>
+</head>
+<body>
+    <button class="menu-toggle" aria-label="Menu">&#9776;</button>
+    <div class="overlay"></div>
+
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <h2>Mosaic</h2>
+            <p>Columnar-bucket hybrid format</p>
+        </div>
+        <nav>
+            <ul>
+                <li><a href="index.html">Home</a></li>
+                <li><a href="design.html" class="active">Design</a></li>
+                <li><a href="rust-api.html">Rust API</a></li>
+                <li><a href="java-api.html">Java API</a></li>
+                <li><a href="python-api.html">Python API</a></li>
+                <li><a href="cpp-api.html">C++ API</a></li>
+            </ul>
+        </nav>
+        <div class="sidebar-footer">
+            <button class="theme-toggle">Dark Mode</button>
+        </div>
+    </aside>
+
+    <main class="main">
+        <div class="content">
+            <h1>Design &amp; Format Specification</h1>
+            <p class="subtitle">Architecture, binary layout, and internal data structures of Mosaic v1.</p>
+
+            <!-- ============================================================ -->
+            <h2>File Format Layout</h2>
+            <p>A Mosaic file consists of four sections, written sequentially:</p>
+<svg class="arch-svg" viewBox="0 0 700 470" xmlns="http://www.w3.org/2000/svg">
+  <!-- Bucket Data Section -->
+  <rect x="15" y="8" width="525" height="210" rx="8"
+        fill="var(--bg-secondary)" stroke="var(--border)" stroke-width="1.2"/>
+  <rect x="15" y="8" width="5" height="210" rx="2.5" fill="#818cf8"/>
+  <text x="38" y="32" fill="var(--text)" font-size="13" font-weight="600"
+        font-family="system-ui, sans-serif">Bucket Data</text>
+
+  <!-- Row Group 0 -->
+  <text x="38" y="54" fill="var(--text-secondary)" font-size="10.5"
+        font-family="system-ui, sans-serif">Row Group 0</text>
+  <rect x="38" y="60" width="488" height="52" rx="5"
+        fill="var(--bg)" stroke="var(--border)" stroke-width="0.8" stroke-dasharray="4,2"/>
+  <rect x="50"  y="68" width="82" height="30" rx="4" fill="var(--accent-light)" stroke="var(--accent)" stroke-width="1"/>
+  <text x="91"  y="87" fill="var(--accent)" font-size="10" text-anchor="middle" font-family="system-ui, sans-serif">Bucket 0</text>
+  <rect x="142" y="68" width="82" height="30" rx="4" fill="var(--accent-light)" stroke="var(--accent)" stroke-width="1"/>
+  <text x="183" y="87" fill="var(--accent)" font-size="10" text-anchor="middle" font-family="system-ui, sans-serif">Bucket 1</text>
+  <rect x="234" y="68" width="82" height="30" rx="4" fill="var(--accent-light)" stroke="var(--accent)" stroke-width="1"/>
+  <text x="275" y="87" fill="var(--accent)" font-size="10" text-anchor="middle" font-family="system-ui, sans-serif">Bucket 2</text>
+  <text x="332" y="88" fill="var(--text-secondary)" font-size="14" font-family="system-ui, sans-serif">...</text>
+  <rect x="362" y="68" width="100" height="30" rx="4" fill="var(--accent-light)" stroke="var(--accent)" stroke-width="1"/>
+  <text x="412" y="87" fill="var(--accent)" font-size="10" text-anchor="middle" font-family="system-ui, sans-serif">Bucket N-1</text>
+
+  <!-- Row Group 1 -->
+  <text x="38" y="132" fill="var(--text-secondary)" font-size="10.5"
+        font-family="system-ui, sans-serif">Row Group 1</text>
+  <rect x="38" y="138" width="488" height="52" rx="5"
+        fill="var(--bg)" stroke="var(--border)" stroke-width="0.8" stroke-dasharray="4,2"/>
+  <rect x="50"  y="146" width="82" height="30" rx="4" fill="var(--accent-light)" stroke="var(--accent)" stroke-width="1"/>
+  <text x="91"  y="165" fill="var(--accent)" font-size="10" text-anchor="middle" font-family="system-ui, sans-serif">Bucket 0</text>
+  <rect x="142" y="146" width="82" height="30" rx="4" fill="var(--accent-light)" stroke="var(--accent)" stroke-width="1"/>
+  <text x="183" y="165" fill="var(--accent)" font-size="10" text-anchor="middle" font-family="system-ui, sans-serif">Bucket 1</text>
+  <rect x="234" y="146" width="82" height="30" rx="4" fill="var(--accent-light)" stroke="var(--accent)" stroke-width="1"/>
+  <text x="275" y="165" fill="var(--accent)" font-size="10" text-anchor="middle" font-family="system-ui, sans-serif">Bucket 2</text>
+  <text x="332" y="166" fill="var(--text-secondary)" font-size="14" font-family="system-ui, sans-serif">...</text>
+  <rect x="362" y="146" width="100" height="30" rx="4" fill="var(--accent-light)" stroke="var(--accent)" stroke-width="1"/>
+  <text x="412" y="165" fill="var(--accent)" font-size="10" text-anchor="middle" font-family="system-ui, sans-serif">Bucket N-1</text>
+
+  <text x="270" y="208" fill="var(--text-secondary)" font-size="14" text-anchor="middle"
+        font-family="system-ui, sans-serif">&#x22ee;</text>
+
+  <!-- Schema Block -->
+  <rect x="15" y="232" width="525" height="52" rx="8"
+        fill="var(--bg-secondary)" stroke="var(--border)" stroke-width="1.2"/>
+  <rect x="15" y="232" width="5" height="52" rx="2.5" fill="#60a5fa"/>
+  <text x="38" y="255" fill="var(--text)" font-size="13" font-weight="600"
+        font-family="system-ui, sans-serif">Schema Block</text>
+  <text x="38" y="273" fill="var(--text-secondary)" font-size="10.5"
+        font-family="system-ui, sans-serif">4B uncompressed size | compressed schema bytes</text>
+
+  <!-- Row Group Index -->
+  <rect x="15" y="298" width="525" height="52" rx="8"
+        fill="var(--bg-secondary)" stroke="var(--border)" stroke-width="1.2"/>
+  <rect x="15" y="298" width="5" height="52" rx="2.5" fill="#4ade80"/>
+  <text x="38" y="321" fill="var(--text)" font-size="13" font-weight="600"
+        font-family="system-ui, sans-serif">Row Group Index</text>
+  <text x="38" y="339" fill="var(--text-secondary)" font-size="10.5"
+        font-family="system-ui, sans-serif">numRows | nonEmpty | [bucketId, offset, compSize, uncompSize] ... | columnStats</text>
+
+  <!-- Footer -->
+  <rect x="15" y="364" width="525" height="86" rx="8"
+        fill="var(--bg-secondary)" stroke="var(--border)" stroke-width="1.2"/>
+  <rect x="15" y="364" width="5" height="86" rx="2.5" fill="#fbbf24"/>
+  <text x="38" y="387" fill="var(--text)" font-size="13" font-weight="600"
+        font-family="system-ui, sans-serif">Footer (32 bytes)</text>
+  <text x="38" y="405" fill="var(--text-secondary)" font-size="10.5"
+        font-family="system-ui, sans-serif">indexOffset(8) | schemaOffset(8) | numBuckets(4) | numRowGroups(4)</text>
+  <text x="38" y="423" fill="var(--text-secondary)" font-size="10.5"
+        font-family="system-ui, sans-serif">compression(1) | version(1) | reserved(2) | magic "MOSA"(4)</text>
+
+  <!-- Offset annotations (right side) -->
+  <line x1="575" y1="418" x2="575" y2="250"
+        stroke="var(--text-secondary)" stroke-width="0.8" stroke-dasharray="3,3" opacity="0.4"/>
+  <circle cx="575" cy="418" r="3.5" fill="#fbbf24"/>
+  <text x="584" y="422" fill="#fbbf24" font-size="9.5" font-family="system-ui, sans-serif">Footer</text>
+
+  <!-- Arrow to Schema Block -->
+  <line x1="575" y1="258" x2="544" y2="258" stroke="#60a5fa" stroke-width="1.5"/>
+  <polygon points="544,255 536,258 544,261" fill="#60a5fa"/>
+  <text x="584" y="254" fill="#60a5fa" font-size="9.5" font-family="system-ui, sans-serif">schema</text>
+  <text x="584" y="265" fill="#60a5fa" font-size="9.5" font-family="system-ui, sans-serif">Offset</text>
+
+  <!-- Arrow to Row Group Index -->
+  <line x1="575" y1="324" x2="544" y2="324" stroke="#4ade80" stroke-width="1.5"/>
+  <polygon points="544,321 536,324 544,327" fill="#4ade80"/>
+  <text x="584" y="320" fill="#4ade80" font-size="9.5" font-family="system-ui, sans-serif">index</text>
+  <text x="584" y="331" fill="#4ade80" font-size="9.5" font-family="system-ui, sans-serif">Offset</text>
+</svg>
+
+            <p>Reading starts from the footer (last 32 bytes), which provides absolute offsets to locate the schema block and row group index.</p>
+
+            <!-- ============================================================ -->
+            <h2>Columnar-Bucket Hybrid</h2>
+            <p>
+                Mosaic is a columnar-bucket hybrid format. Columns are sorted by name and evenly distributed
+                into buckets using range-based assignment:
+            </p>
+<pre><code><span class="fn">bucket_id</span> = sorted_position * num_buckets / num_columns</code></pre>
+
+<svg class="arch-svg" viewBox="0 0 680 190" xmlns="http://www.w3.org/2000/svg">
+  <!-- Top label -->
+  <text x="340" y="14" fill="var(--text-secondary)" font-size="10.5" text-anchor="middle"
+        font-family="system-ui, sans-serif">Columns (sorted by name)</text>
+
+  <!-- Column boxes -->
+  <rect x="24"  y="24" width="72" height="26" rx="4" fill="var(--bg-secondary)" stroke="#818cf8" stroke-width="1.2"/>
+  <text x="60"  y="41" fill="var(--text)" font-size="9" text-anchor="middle" font-family="SF Mono, Consolas, monospace">amount</text>
+  <rect x="104" y="24" width="72" height="26" rx="4" fill="var(--bg-secondary)" stroke="#818cf8" stroke-width="1.2"/>
+  <text x="140" y="41" fill="var(--text)" font-size="9" text-anchor="middle" font-family="SF Mono, Consolas, monospace">city</text>
+  <rect x="184" y="24" width="72" height="26" rx="4" fill="var(--bg-secondary)" stroke="#818cf8" stroke-width="1.2"/>
+  <text x="220" y="41" fill="var(--text)" font-size="9" text-anchor="middle" font-family="SF Mono, Consolas, monospace">email</text>
+
+  <rect x="264" y="24" width="72" height="26" rx="4" fill="var(--bg-secondary)" stroke="#60a5fa" stroke-width="1.2"/>
+  <text x="300" y="41" fill="var(--text)" font-size="9" text-anchor="middle" font-family="SF Mono, Consolas, monospace">id</text>
+  <rect x="344" y="24" width="72" height="26" rx="4" fill="var(--bg-secondary)" stroke="#60a5fa" stroke-width="1.2"/>
+  <text x="380" y="41" fill="var(--text)" font-size="9" text-anchor="middle" font-family="SF Mono, Consolas, monospace">name</text>
+  <rect x="424" y="24" width="72" height="26" rx="4" fill="var(--bg-secondary)" stroke="#60a5fa" stroke-width="1.2"/>
+  <text x="460" y="41" fill="var(--text)" font-size="9" text-anchor="middle" font-family="SF Mono, Consolas, monospace">phone</text>
+
+  <rect x="504" y="24" width="72" height="26" rx="4" fill="var(--bg-secondary)" stroke="#4ade80" stroke-width="1.2"/>
+  <text x="540" y="41" fill="var(--text)" font-size="9" text-anchor="middle" font-family="SF Mono, Consolas, monospace">score</text>
+  <rect x="584" y="24" width="72" height="26" rx="4" fill="var(--bg-secondary)" stroke="#4ade80" stroke-width="1.2"/>
+  <text x="620" y="41" fill="var(--text)" font-size="9" text-anchor="middle" font-family="SF Mono, Consolas, monospace">zip</text>
+
+  <!-- Connecting lines -->
+  <line x1="60"  y1="50" x2="133" y2="120" stroke="#818cf8" stroke-width="1" opacity="0.45"/>
+  <line x1="140" y1="50" x2="133" y2="120" stroke="#818cf8" stroke-width="1" opacity="0.45"/>
+  <line x1="220" y1="50" x2="133" y2="120" stroke="#818cf8" stroke-width="1" opacity="0.45"/>
+  <line x1="300" y1="50" x2="340" y2="120" stroke="#60a5fa" stroke-width="1" opacity="0.45"/>
+  <line x1="380" y1="50" x2="340" y2="120" stroke="#60a5fa" stroke-width="1" opacity="0.45"/>
+  <line x1="460" y1="50" x2="340" y2="120" stroke="#60a5fa" stroke-width="1" opacity="0.45"/>
+  <line x1="540" y1="50" x2="547" y2="120" stroke="#4ade80" stroke-width="1" opacity="0.45"/>
+  <line x1="620" y1="50" x2="547" y2="120" stroke="#4ade80" stroke-width="1" opacity="0.45"/>
+
+  <!-- Bucket boxes -->
+  <rect x="40"  y="120" width="186" height="48" rx="6" fill="var(--bg-secondary)" stroke="#818cf8" stroke-width="1.5"/>
+  <text x="133" y="140" fill="#818cf8" font-size="11" font-weight="600" text-anchor="middle"
+        font-family="system-ui, sans-serif">Bucket 0</text>
+  <text x="133" y="157" fill="var(--text-secondary)" font-size="9" text-anchor="middle"
+        font-family="SF Mono, Consolas, monospace">amount, city, email</text>
+
+  <rect x="247" y="120" width="186" height="48" rx="6" fill="var(--bg-secondary)" stroke="#60a5fa" stroke-width="1.5"/>
+  <text x="340" y="140" fill="#60a5fa" font-size="11" font-weight="600" text-anchor="middle"
+        font-family="system-ui, sans-serif">Bucket 1</text>
+  <text x="340" y="157" fill="var(--text-secondary)" font-size="9" text-anchor="middle"
+        font-family="SF Mono, Consolas, monospace">id, name, phone</text>
+
+  <rect x="454" y="120" width="186" height="48" rx="6" fill="var(--bg-secondary)" stroke="#4ade80" stroke-width="1.5"/>
+  <text x="547" y="140" fill="#4ade80" font-size="11" font-weight="600" text-anchor="middle"
+        font-family="system-ui, sans-serif">Bucket 2</text>
+  <text x="547" y="157" fill="var(--text-secondary)" font-size="9" text-anchor="middle"
+        font-family="SF Mono, Consolas, monospace">score, zip</text>
+
+  <!-- Bottom label -->
+  <text x="340" y="186" fill="var(--text-secondary)" font-size="9.5" text-anchor="middle" font-style="italic"
+        font-family="system-ui, sans-serif">Example: 8 columns, 3 buckets</text>
+</svg>
+
+            <p>
+                Within each bucket, data is stored column-oriented and independently compressed.
+                This design enables efficient projection pushdown at bucket granularity &mdash;
+                reading 10 columns out of 10,000 only decompresses the buckets that contain those 10 columns.
+            </p>
+            <p>
+                Range-based assignment ensures that columns with similar name prefixes
+                (e.g., <code>sensor_temp_1</code>, <code>sensor_temp_2</code>) land in the same bucket,
+                improving both compression ratio and projection locality.
+            </p>
+            <p>
+                The default is <strong>100 buckets</strong>, automatically clamped to <code>min(num_columns, 100)</code>.
+                The bucket assignment is deterministic and derived from the sorted column order &mdash;
+                it is not stored in the file.
+            </p>
+
+            <!-- ============================================================ -->
+            <h2>Encoding Strategy</h2>
+            <p>Each column within a bucket is independently encoded. The writer selects the most compact encoding for each column:</p>
+            <table>
+                <thead>
+                    <tr><th>Encoding</th><th>Tag</th><th>When Used</th><th>Storage</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>PLAIN</strong></td><td>0</td>
+                        <td>Fallback for everything else</td>
+                        <td>Raw values (fixed-width or varint-prefixed) + null bitmap</td>
+                    </tr>
+                    <tr>
+                        <td><strong>CONST</strong></td><td>1</td>
+                        <td>All non-null values are identical</td>
+                        <td>One value + null bitmap</td>
+                    </tr>
+                    <tr>
+                        <td><strong>DICT</strong></td><td>2</td>
+                        <td>Number of distinct values &le; 255 and total dict size &le; 32 KB</td>
+                        <td>Dictionary + bit-packed indices + null bitmap</td>
+                    </tr>
+                    <tr>
+                        <td><strong>ALL_NULL</strong></td><td>3</td>
+                        <td>Every value in the column is null</td>
+                        <td>Zero bytes (no data, no bitmap)</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>Column Encoding Selection</h3>
+            <p>The encoding for each column is chosen automatically during writing based on value distribution and cost:</p>
+            <ul>
+                <li><strong>ALL_NULL</strong>: 0 non-null values</li>
+                <li><strong>CONST</strong>: exactly 1 distinct non-null value (any number of nulls allowed)</li>
+                <li><strong>DICT</strong>: 2&ndash;255 distinct non-null values, <strong>and</strong> the
+                    dictionary-encoded size is smaller than plain &mdash; the writer compares
+                    <code>varint(numEntries) + sum(entryBytes) + ceil(nonNullCount * bitWidth / 8)</code>
+                    against the raw value buffer size</li>
+                <li><strong>PLAIN</strong>: 256+ distinct values, dict tracking was abandoned, or dict encoding
+                    would be larger than plain</li>
+            </ul>
+            <p>
+                CONST detection is independent of dictionary tracking &mdash; it uses a lightweight byte comparison
+                against the first non-null value, so it works for all types and value sizes (including long strings).
+            </p>
+            <p>
+                Dictionary encoding works for all data types including variable-width types (VARCHAR, VARBINARY, DECIMAL).
+                Variable-width dictionary tracking is bounded by a configurable cumulative byte
+                budget (default 32 KB) and abandoned when cardinality exceeds 255 or total dictionary entry bytes
+                exceed the budget.
+            </p>
+
+            <h3>Bit-packed Dictionary Indices</h3>
+            <p>
+                Dictionary indices are bit-packed using <code>bitWidth = ceil(log2(numEntries))</code> bits per
+                non-null cell, packed LSB-first within each byte. The reader derives <code>bitWidth</code> from
+                <code>numEntries</code> (already stored in dict metadata).
+            </p>
+            <p>Examples: 2 distinct values &rarr; 1 bit/cell, 4 &rarr; 2 bits, 16 &rarr; 4 bits, 256 &rarr; 8 bits.</p>
+
+            <div class="note">
+                <strong>Note</strong>
+                Null rows do not consume any bits in the bit-packed index array.
+                Only non-null rows have corresponding dictionary indices.
+            </div>
+
+            <!-- ============================================================ -->
+            <h2>Bucket Internal Structure</h2>
+            <p>
+                Each bucket stores column data in one of two modes, chosen automatically based on the
+                uncompressed data size. The mode determines how compression is applied.
+            </p>
+
+            <h3>Monolithic Mode</h3>
+            <p>
+                When the average column page size is <strong>smaller than 32 KB</strong> (configurable via
+                <code>page_size_threshold</code>), the entire bucket is compressed as a single zstd block.
+                Individual column pages that are too small yield poor zstd compression ratios,
+                so monolithic compression is more efficient in this case.
+            </p>
+
+<!-- Monolithic Bucket SVG -->
+<svg class="arch-svg" viewBox="0 0 680 260" xmlns="http://www.w3.org/2000/svg">
+  <!-- Outer bucket frame -->
+  <rect x="30" y="8" width="620" height="240" rx="8"
+        fill="var(--bg-secondary)" stroke="var(--border)" stroke-width="1.2"/>
+  <rect x="30" y="8" width="5" height="240" rx="2.5" fill="#818cf8"/>
+  <text x="54" y="30" fill="var(--text)" font-size="13" font-weight="600"
+        font-family="system-ui, sans-serif">Monolithic Bucket (single zstd block)</text>
+
+  <!-- Encoding Flags -->
+  <rect x="54" y="42" width="580" height="28" rx="4" fill="var(--bg)" stroke="var(--border)" stroke-width="0.8"/>
+  <text x="344" y="60" fill="var(--text-secondary)" font-size="10" text-anchor="middle"
+        font-family="system-ui, sans-serif">Encoding Flags (2 bits/column)</text>
+
+  <!-- Has-Nulls Flags -->
+  <rect x="54" y="76" width="580" height="28" rx="4" fill="var(--bg)" stroke="var(--border)" stroke-width="0.8"/>
+  <text x="344" y="94" fill="var(--text-secondary)" font-size="10" text-anchor="middle"
+        font-family="system-ui, sans-serif">Has-Nulls Flags (1 bit/column)</text>
+
+  <!-- CONST metadata -->
+  <rect x="54" y="110" width="280" height="28" rx="4" fill="var(--bg)" stroke="#fbbf24" stroke-width="0.8"/>
+  <text x="194" y="128" fill="#fbbf24" font-size="10" text-anchor="middle"
+        font-family="system-ui, sans-serif">CONST Metadata</text>
+
+  <!-- DICT metadata -->
+  <rect x="354" y="110" width="280" height="28" rx="4" fill="var(--bg)" stroke="#f97316" stroke-width="0.8"/>
+  <text x="494" y="128" fill="#f97316" font-size="10" text-anchor="middle"
+        font-family="system-ui, sans-serif">DICT Metadata (entries per column)</text>
+
+  <!-- Null Bitmaps -->
+  <rect x="54" y="144" width="580" height="28" rx="4" fill="var(--bg)" stroke="#60a5fa" stroke-width="0.8"/>
+  <text x="344" y="162" fill="#60a5fa" font-size="10" text-anchor="middle"
+        font-family="system-ui, sans-serif">Null Bitmaps (columns with nulls, excluding ALL_NULL)</text>
+
+  <!-- Column Data -->
+  <rect x="54" y="178" width="185" height="28" rx="4" fill="var(--accent-light)" stroke="var(--accent)" stroke-width="0.8"/>
+  <text x="146" y="196" fill="var(--accent)" font-size="10" text-anchor="middle"
+        font-family="system-ui, sans-serif">Col 0 data (PLAIN)</text>
+  <rect x="249" y="178" width="185" height="28" rx="4" fill="var(--accent-light)" stroke="var(--accent)" stroke-width="0.8"/>
+  <text x="341" y="196" fill="var(--accent)" font-size="10" text-anchor="middle"
+        font-family="system-ui, sans-serif">Col 1 data (DICT)</text>
+  <rect x="444" y="178" width="190" height="28" rx="4" fill="var(--accent-light)" stroke="var(--accent)" stroke-width="0.8"/>
+  <text x="539" y="196" fill="var(--accent)" font-size="10" text-anchor="middle"
+        font-family="system-ui, sans-serif">Col 2 data (PLAIN)</text>
+
+  <!-- Compression arrow -->
+  <text x="344" y="230" fill="var(--text-secondary)" font-size="10" text-anchor="middle" font-style="italic"
+        font-family="system-ui, sans-serif">All of the above compressed together as one zstd block</text>
+</svg>
+
+            <h3>Paged Mode</h3>
+            <p>
+                When the average column page size is <strong>&ge; 32 KB</strong>, the bucket switches to paged mode.
+                The bucket begins with a <strong>fixed-length page directory</strong> followed by <strong>self-describing,
+                independently compressed column slots</strong>. The directory size is deterministic from the schema
+                (<code>num_columns_in_bucket &times; 4</code> bytes), enabling projection queries to read only
+                the target columns' data with exactly 2 range-read operations on remote storage.
+            </p>
+
+<!-- Paged Bucket SVG -->
+<svg class="arch-svg" viewBox="0 0 680 380" xmlns="http://www.w3.org/2000/svg">
+  <!-- Outer bucket frame -->
+  <rect x="30" y="8" width="620" height="360" rx="8"
+        fill="var(--bg-secondary)" stroke="var(--border)" stroke-width="1.2"/>
+  <rect x="30" y="8" width="5" height="360" rx="2.5" fill="#818cf8"/>
+  <text x="54" y="30" fill="var(--text)" font-size="13" font-weight="600"
+        font-family="system-ui, sans-serif">Paged Bucket</text>
+
+  <!-- Directory section -->
+  <rect x="54" y="42" width="580" height="70" rx="6"
+        fill="var(--bg)" stroke="#fbbf24" stroke-width="1.2" stroke-dasharray="4,2"/>
+  <text x="64" y="60" fill="#fbbf24" font-size="11" font-weight="600"
+        font-family="system-ui, sans-serif">Page Directory (fixed-length, uncompressed)</text>
+
+  <rect x="68" y="68" width="120" height="28" rx="3" fill="var(--bg-secondary)" stroke="var(--border)" stroke-width="0.6"/>
+  <text x="128" y="86" fill="var(--text-secondary)" font-size="9" text-anchor="middle"
+        font-family="system-ui, sans-serif">Col 0: size (u32 LE)</text>
+
+  <rect x="198" y="68" width="120" height="28" rx="3" fill="var(--bg-secondary)" stroke="var(--border)" stroke-width="0.6"/>
+  <text x="258" y="86" fill="var(--text-secondary)" font-size="9" text-anchor="middle"
+        font-family="system-ui, sans-serif">Col 1: size (u32 LE)</text>
+
+  <rect x="328" y="68" width="120" height="28" rx="3" fill="var(--bg-secondary)" stroke="var(--border)" stroke-width="0.6"/>
+  <text x="388" y="86" fill="var(--text-secondary)" font-size="9" text-anchor="middle"
+        font-family="system-ui, sans-serif">Col 2: 0 (ALL_NULL)</text>
+
+  <rect x="458" y="68" width="120" height="28" rx="3" fill="var(--bg-secondary)" stroke="var(--border)" stroke-width="0.6"/>
+  <text x="518" y="86" fill="var(--text-secondary)" font-size="9" text-anchor="middle"
+        font-family="system-ui, sans-serif">Col 3: size (u32 LE)</text>
+
+  <!-- Column slots section -->
+  <text x="64" y="140" fill="var(--text)" font-size="11" font-weight="600"
+        font-family="system-ui, sans-serif">Column Slots (each self-describing, independently zstd compressed)</text>
+
+  <!-- Slot 0 -->
+  <rect x="54" y="155" width="185" height="80" rx="5"
+        fill="var(--bg)" stroke="#818cf8" stroke-width="1.2"/>
+  <text x="146" y="173" fill="#818cf8" font-size="10" font-weight="600" text-anchor="middle"
+        font-family="system-ui, sans-serif">Slot 0 (Col A - PLAIN)</text>
+  <text x="146" y="190" fill="var(--text-secondary)" font-size="8.5" text-anchor="middle"
+        font-family="system-ui, sans-serif">uncompressed_size (varint)</text>
+  <text x="146" y="205" fill="var(--text-secondary)" font-size="8.5" text-anchor="middle"
+        font-family="system-ui, sans-serif">+ zstd(encoding | flags</text>
+  <text x="146" y="220" fill="var(--text-secondary)" font-size="8.5" text-anchor="middle"
+        font-family="system-ui, sans-serif">| bitmap | data)</text>
+
+  <!-- Slot 1 -->
+  <rect x="249" y="155" width="185" height="80" rx="5"
+        fill="var(--bg)" stroke="#60a5fa" stroke-width="1.2"/>
+  <text x="341" y="173" fill="#60a5fa" font-size="10" font-weight="600" text-anchor="middle"
+        font-family="system-ui, sans-serif">Slot 1 (Col B - DICT)</text>
+  <text x="341" y="190" fill="var(--text-secondary)" font-size="8.5" text-anchor="middle"
+        font-family="system-ui, sans-serif">uncompressed_size (varint)</text>
+  <text x="341" y="205" fill="var(--text-secondary)" font-size="8.5" text-anchor="middle"
+        font-family="system-ui, sans-serif">+ zstd(encoding | flags</text>
+  <text x="341" y="220" fill="var(--text-secondary)" font-size="8.5" text-anchor="middle"
+        font-family="system-ui, sans-serif">| dict | bitmap | indices)</text>
+
+  <!-- Slot 2 = ALL_NULL, no data -->
+  <text x="539" y="175" fill="var(--text-secondary)" font-size="9" text-anchor="middle" font-style="italic"
+        font-family="system-ui, sans-serif">Col C (ALL_NULL)</text>
+  <text x="539" y="192" fill="var(--text-secondary)" font-size="9" text-anchor="middle" font-style="italic"
+        font-family="system-ui, sans-serif">size=0 in directory</text>
+  <text x="539" y="209" fill="var(--text-secondary)" font-size="9" text-anchor="middle" font-style="italic"
+        font-family="system-ui, sans-serif">no on-disk slot</text>
+
+  <!-- Slot 3 -->
+  <rect x="444" y="240" width="190" height="80" rx="5"
+        fill="var(--bg)" stroke="#4ade80" stroke-width="1.2"/>
+  <text x="539" y="258" fill="#4ade80" font-size="10" font-weight="600" text-anchor="middle"
+        font-family="system-ui, sans-serif">Slot 3 (Col D - CONST)</text>
+  <text x="539" y="275" fill="var(--text-secondary)" font-size="8.5" text-anchor="middle"
+        font-family="system-ui, sans-serif">uncompressed_size (varint)</text>
+  <text x="539" y="290" fill="var(--text-secondary)" font-size="8.5" text-anchor="middle"
+        font-family="system-ui, sans-serif">+ zstd(encoding | flags</text>
+  <text x="539" y="305" fill="var(--text-secondary)" font-size="8.5" text-anchor="middle"
+        font-family="system-ui, sans-serif">| const_value | bitmap)</text>
+
+  <!-- Projection annotation -->
+  <rect x="54" y="330" width="580" height="30" rx="5"
+        fill="var(--accent-light)" stroke="var(--accent)" stroke-width="0.8" stroke-dasharray="4,2"/>
+  <text x="344" y="345" fill="var(--accent)" font-size="10" font-weight="600" text-anchor="middle"
+        font-family="system-ui, sans-serif">Projection: SELECT col_A, col_D &rarr; read directory (fixed) + only Slot 0 &amp; Slot 3</text>
+  <text x="344" y="358" fill="var(--text-secondary)" font-size="9" text-anchor="middle"
+        font-family="system-ui, sans-serif">2 range-reads on remote storage &mdash; skip all other columns entirely</text>
+</svg>
+
+            <h4>Page Directory</h4>
+            <p>
+                The directory is an array of <code>num_columns_in_bucket</code> entries, each a 4-byte <code>u32</code>
+                (little-endian) representing the total on-disk slot size for that column. A value of <code>0</code>
+                means the column is ALL_NULL and has no on-disk data. The directory size is deterministic:
+                <code>num_columns_in_bucket &times; 4</code> bytes, computable from the schema alone.
+            </p>
+
+            <h4>Column Slot Format</h4>
+            <p>Each non-ALL_NULL column has a slot on disk immediately after the directory:</p>
+<pre><code>On-disk slot:
+    uncompressed_size  (varint, uncompressed prefix)
+    compressed_data    (zstd compressed page_content)
+
+page_content (after decompression):
+    encoding           (1 byte: PLAIN=0, CONST=1, DICT=2)
+    flags              (1 byte: bit 0 = has_nulls)
+    [meta]             (encoding-specific, see below)
+    [data]             (null bitmap if has_nulls, then column data)</code></pre>
+
+            <h4>Page Content by Encoding</h4>
+            <table>
+                <thead>
+                    <tr><th>Encoding</th><th>On-Disk Slot?</th><th>page_content layout</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>ALL_NULL</td><td>No (size=0)</td><td>&mdash;</td></tr>
+                    <tr><td>CONST (no nulls)</td><td>Yes (tiny)</td><td>encoding + flags + const_value</td></tr>
+                    <tr><td>CONST (has nulls)</td><td>Yes</td><td>encoding + flags + const_value + null_bitmap</td></tr>
+                    <tr><td>DICT</td><td>Yes</td><td>encoding + flags + dict_table + [null_bitmap] + bit-packed indices</td></tr>
+                    <tr><td>PLAIN</td><td>Yes</td><td>encoding + flags + [null_bitmap] + raw column data</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Projected Read Path</h4>
+            <ol>
+                <li>Compute <code>dir_size = num_columns_in_bucket &times; 4</code> (known from schema)</li>
+                <li>Range-read the directory from <code>bucket_offset</code></li>
+                <li>For each projected column, compute slot offset via prefix-sum of directory entries</li>
+                <li>Range-read only the projected columns' slots (merge adjacent slots into a single IO)</li>
+                <li>For each slot: parse <code>uncompressed_size</code> varint, then <code>zstd::decompress</code></li>
+                <li>Parse <code>page_content</code>: encoding, flags, meta, data &rarr; build column reader</li>
+            </ol>
+
+            <h4>Monolithic vs Paged Signaling</h4>
+            <p>
+                Each bucket in the row group index is described by a pair
+                <code>(compressed_size, bulk_decompress_size)</code>.
+                This pair encodes three layout variants with zero additional bytes:
+            </p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Condition</th>
+                        <th>Layout</th>
+                        <th>Meaning</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>compressed_size == 0</code></td>
+                        <td>Empty</td>
+                        <td>No data on disk for this bucket; skip entirely.</td>
+                    </tr>
+                    <tr>
+                        <td><code>compressed_size &gt; 0 &amp;&amp; bulk_decompress_size &gt; 0</code></td>
+                        <td>Monolithic</td>
+                        <td>
+                            The on-disk blob is a single compressed block.
+                            <code>bulk_decompress_size</code> is the decompressed size
+                            (used to allocate the output buffer before decompression).
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><code>compressed_size &gt; 0 &amp;&amp; bulk_decompress_size == 0</code></td>
+                        <td>Paged</td>
+                        <td>
+                            The on-disk content is
+                            <code>[directory (num_cols &times; u32le slot sizes)]</code>
+                            followed by per-column compressed slots.
+                            Each slot is independently decompressible.
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+            <p>
+                This encoding is unambiguous: a non-empty monolithic bucket always has
+                <code>bulk_decompress_size &gt; 0</code> because a decompressed payload
+                cannot be zero bytes. The combination
+                <code>compressed_size == 0 &amp;&amp; bulk_decompress_size != 0</code>
+                is invalid and must be rejected by the reader.
+            </p>
+            <h5>Validation Invariants</h5>
+            <ul>
+                <li>Paged buckets require <code>compression == ZSTD</code>.</li>
+                <li>The paged directory size is <code>num_cols &times; 4</code> bytes;
+                    <code>dir_size + sum(slot_sizes) == compressed_size</code> must hold exactly.</li>
+                <li>All varint-encoded sizes (<code>compressed_size</code>,
+                    <code>bulk_decompress_size</code>) and u32 LE slot sizes must fit in
+                    <code>u32</code>; values exceeding <code>u32::MAX</code> are rejected
+                    at write time.</li>
+            </ul>
+
+            <!-- ============================================================ -->
+            <h2>Compression</h2>
+            <p>Both bucket data and the schema block support compression:</p>
+            <table>
+                <thead>
+                    <tr><th>ID</th><th>Name</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>0</td><td>None</td><td>No compression</td></tr>
+                    <tr><td>1</td><td>Zstd</td><td>Zstandard compression (default level 1)</td></tr>
+                </tbody>
+            </table>
+            <p>
+                In monolithic mode, compression is applied to the entire bucket as one block.
+                In paged mode, the page directory is uncompressed (fixed-length, enabling direct offset computation),
+                while each column slot is independently zstd-compressed.
+                Paged mode is only used when the compression method is Zstd.
+            </p>
+
+            <!-- ============================================================ -->
+            <h2>Row Groups</h2>
+            <p>
+                Large files are split into row groups to bound memory usage during writing.
+                Each row group contains up to <code>row_group_max_size</code> bytes of uncompressed bucket data
+                (default: 256 MB). The row group index in the file footer records offsets and sizes for each
+                bucket in each row group, enabling random access to any row group.
+            </p>
+
+            <!-- ============================================================ -->
+            <h2>Footer (32 bytes, big-endian)</h2>
+            <table>
+                <thead>
+                    <tr><th>Offset</th><th>Size</th><th>Field</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>0</td><td>8</td><td><code>indexOffset</code></td><td>Absolute offset of Row Group Index</td></tr>
+                    <tr><td>8</td><td>8</td><td><code>schemaBlockOffset</code></td><td>Absolute offset of Schema Block</td></tr>
+                    <tr><td>16</td><td>4</td><td><code>numBuckets</code></td><td>Total number of buckets</td></tr>
+                    <tr><td>20</td><td>4</td><td><code>numRowGroups</code></td><td>Total number of row groups</td></tr>
+                    <tr><td>24</td><td>1</td><td><code>compression</code></td><td>0 = none, 1 = zstd</td></tr>
+                    <tr><td>25</td><td>1</td><td><code>version</code></td><td>Format version (currently 1)</td></tr>
+                    <tr><td>26</td><td>2</td><td><em>(reserved)</em></td><td>Padding, set to 0</td></tr>
+                    <tr><td>28</td><td>4</td><td><code>magic</code></td><td><code>MOSA</code> (0x4D4F5341)</td></tr>
+                </tbody>
+            </table>
+
+            <!-- ============================================================ -->
+            <h2>Row Group Index</h2>
+            <p>Varint-encoded, only non-empty buckets are stored. For each row group:</p>
+<pre><code>varint   numRows
+varint   nonEmptyCount
+repeated nonEmptyCount times:
+    varint    bucketId
+    8 bytes   bucketOffset       (big-endian, absolute file offset)
+    varint    compressedSize     (total bytes: monolithic blob or directory + column slots)
+    varint    bulkDecompressSize (&gt; 0 = monolithic, = 0 = paged)
+
+--- Column Statistics (appended after bucket entries) ---
+varint   numStats              (0 if no stats configured)
+repeated numStats times:
+    varint    columnIndex      (global column index)
+    varint    nullCount
+    [if nullCount &lt; numRows]:
+        value   minValue       (serialized using standard value encoding)
+        value   maxValue       (serialized using standard value encoding)</code></pre>
+            <p>Empty buckets (no data) are omitted entirely, saving space for sparse schemas.</p>
+
+            <!-- ============================================================ -->
+            <h2>Column Statistics</h2>
+            <p>
+                Mosaic supports optional per-column min/max statistics at row group granularity, enabling
+                filter pushdown: query engines can skip entire row groups whose value range does not overlap
+                with a filter predicate.
+            </p>
+            <ul>
+                <li><strong>Opt-in</strong>: Statistics are only collected for columns specified in
+                    <code>WriterOptions.stats_columns</code>. By default, no stats are built.</li>
+                <li><strong>Zero overhead when disabled</strong>: When no stats columns are configured,
+                    each row group adds only 1 byte (a varint <code>0</code>) to the row group index.</li>
+                <li><strong>Supported types</strong>: All orderable types &mdash; numeric (BOOLEAN through DOUBLE),
+                    DATE, TIME, TIMESTAMP, compact DECIMAL, and string types (CHAR, VARCHAR, STRING).</li>
+                <li><strong>Storage</strong>: Stats are stored inline in the row group index after each
+                    row group's bucket entries.</li>
+            </ul>
+
+            <h3>Filter Pushdown</h3>
+            <p>
+                Query engines can use column statistics to skip entire row groups whose min/max range does not
+                overlap with a filter predicate. For example, a filter <code>age &gt; 50</code> can skip any
+                row group where <code>max(age) &le; 50</code>.
+            </p>
+
+            <!-- ============================================================ -->
+            <h2>Schema Block</h2>
+            <p>
+                Prefixed with a 4-byte big-endian int (uncompressed size), followed by the schema data
+                (compressed with the file's compression method).
+            </p>
+            <p>
+                Columns are serialized in <strong>name-sorted order</strong>. Column names are compressed using
+                one of two encodings, chosen dynamically by the writer based on which produces smaller output:
+            </p>
+            <ul>
+                <li><strong>Front coding</strong> (mode 0): Each name shares a prefix with the previous name;
+                    only the suffix is stored.</li>
+                <li><strong>BPE + front coding</strong> (mode 1): Byte Pair Encoding is applied first to
+                    compress repeated substrings across column names (e.g., <code>_status</code>,
+                    <code>_value</code>), then front coding is applied to the
+                    BPE-encoded names. BPE uses token bytes 0x80&ndash;0xFF (up to 128 merge rules), and is
+                    only applicable when all column names are ASCII-only.</li>
+            </ul>
+
+            <h3>Schema Block Layout</h3>
+<pre><code>varint   numColumns
+varint   numBuckets
+1 byte   nameEncoding          (0 = front coding, 1 = BPE + front coding)
+
+--- if nameEncoding == 1 (BPE) ---
+varint   numRules
+repeated numRules times:
+    1 byte   left               (left token of merge rule)
+    1 byte   right              (right token of merge rule)
+
+--- per column (repeated numColumns times, name-sorted order) ---
+varint   sharedPrefixLen       (bytes shared with previous column name)
+varint   suffixLen             (bytes of new suffix)
+bytes    suffix                (suffixLen bytes, raw or BPE-encoded)
+TypeDescriptor</code></pre>
+            <p>
+                The first column has <code>sharedPrefixLen = 0</code>. To reconstruct a column name,
+                take the first <code>sharedPrefixLen</code> bytes from the previous name and append
+                the suffix. If BPE is used, decode the reconstructed byte sequence by recursively
+                expanding tokens &ge; 0x80 using the merge rules.
+            </p>
+
+            <h3>TypeDescriptor</h3>
+<pre><code>1 byte   typeId
+1 byte   nullable      (0 = not null, 1 = nullable)
+[type-specific params]</code></pre>
+            <table>
+                <thead>
+                    <tr><th>typeId</th><th>Type</th><th>Params</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>0</td><td>BOOLEAN</td><td>(none)</td></tr>
+                    <tr><td>1</td><td>TINYINT</td><td>(none)</td></tr>
+                    <tr><td>2</td><td>SMALLINT</td><td>(none)</td></tr>
+                    <tr><td>3</td><td>INTEGER</td><td>(none)</td></tr>
+                    <tr><td>4</td><td>BIGINT</td><td>(none)</td></tr>
+                    <tr><td>5</td><td>FLOAT</td><td>(none)</td></tr>
+                    <tr><td>6</td><td>DOUBLE</td><td>(none)</td></tr>
+                    <tr><td>7</td><td>DATE</td><td>(none)</td></tr>
+                    <tr><td>8</td><td>CHAR</td><td>varint length</td></tr>
+                    <tr><td>9</td><td>VARCHAR</td><td>varint length</td></tr>
+                    <tr><td>10</td><td>STRING</td><td>(none) &mdash; VARCHAR with MAX_LENGTH</td></tr>
+                    <tr><td>11</td><td>BINARY</td><td>varint length</td></tr>
+                    <tr><td>12</td><td>VARBINARY</td><td>varint length</td></tr>
+                    <tr><td>13</td><td>BYTES</td><td>(none) &mdash; VARBINARY with MAX_LENGTH</td></tr>
+                    <tr><td>14</td><td>DECIMAL</td><td>varint precision, varint scale</td></tr>
+                    <tr><td>15</td><td>TIME</td><td>varint precision</td></tr>
+                    <tr><td>16</td><td>TIMESTAMP</td><td>varint precision</td></tr>
+                    <tr><td>17</td><td>TIMESTAMP_LTZ</td><td>varint precision</td></tr>
+                </tbody>
+            </table>
+            <p>Complex types (ARRAY, MAP, ROW, etc.), VARIANT, and BLOB are not supported.</p>
+
+            <!-- ============================================================ -->
+            <h2>Value Serialization</h2>
+            <p>Values are serialized in the same format for PLAIN data, CONST metadata, and DICT entries:</p>
+            <table>
+                <thead>
+                    <tr><th>Type</th><th>Encoding</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>BOOLEAN</td><td>1 byte (0 or 1)</td></tr>
+                    <tr><td>TINYINT</td><td>1 byte</td></tr>
+                    <tr><td>SMALLINT</td><td>2 bytes big-endian</td></tr>
+                    <tr><td>INTEGER / DATE / TIME</td><td>4 bytes big-endian</td></tr>
+                    <tr><td>BIGINT</td><td>8 bytes big-endian</td></tr>
+                    <tr><td>FLOAT</td><td>4 bytes IEEE 754 (big-endian)</td></tr>
+                    <tr><td>DOUBLE</td><td>8 bytes IEEE 754 (big-endian)</td></tr>
+                    <tr><td>DECIMAL (compact, precision &le; 18)</td><td>8 bytes big-endian (unscaled long)</td></tr>
+                    <tr><td>DECIMAL (large, precision &gt; 18)</td><td>varint length + unscaled BigInteger bytes</td></tr>
+                    <tr><td>TIMESTAMP (precision &le; 3)</td><td>8 bytes (epoch millis, big-endian)</td></tr>
+                    <tr><td>TIMESTAMP (precision 4&ndash;6)</td><td>8 bytes (epoch micros, big-endian)</td></tr>
+                    <tr><td>TIMESTAMP (precision &gt; 6)</td><td>8 bytes (epoch millis) + 4 bytes (nanos of millis)</td></tr>
+                    <tr><td>CHAR / VARCHAR / STRING</td><td>varint length + UTF-8 bytes</td></tr>
+                    <tr><td>BINARY / VARBINARY / BYTES</td><td>varint length + raw bytes</td></tr>
+                </tbody>
+            </table>
+
+            <!-- ============================================================ -->
+            <h2>Varint Encoding</h2>
+            <p>
+                Unsigned 32-bit integers are encoded as 1&ndash;5 bytes using LEB128.
+                Each byte contributes 7 data bits; the high bit indicates whether more bytes follow
+                (1 = more, 0 = last byte).
+            </p>
+<pre><code><span class="num">0</span>       &rarr; <span class="num">0x00</span>              (1 byte)
+<span class="num">127</span>     &rarr; <span class="num">0x7F</span>              (1 byte)
+<span class="num">128</span>     &rarr; <span class="num">0x80 0x01</span>         (2 bytes)
+<span class="num">16383</span>   &rarr; <span class="num">0xFF 0x7F</span>         (2 bytes)
+<span class="num">16384</span>   &rarr; <span class="num">0x80 0x80 0x01</span>    (3 bytes)</code></pre>
+
+            <!-- ============================================================ -->
+            <h2>Limitations</h2>
+            <ol>
+                <li>Complex types (ARRAY, MAP, MULTISET, ROW) are not supported.</li>
+                <li>Mosaic format is designed for wide tables and may not be efficient for narrow tables with few columns.</li>
+            </ol>
+        </div>
+    </main>
+</body>
+</html>
