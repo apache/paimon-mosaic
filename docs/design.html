@@ -692,12 +692,17 @@ repeated numRules times:
 varint   sharedPrefixLen       (bytes shared with previous column name)
 varint   suffixLen             (bytes of new suffix)
 bytes    suffix                (suffixLen bytes, raw or BPE-encoded)
+varint   globalColumnIndex     (original column index before name-sorting)
 TypeDescriptor</code></pre>
             <p>
                 The first column has <code>sharedPrefixLen = 0</code>. To reconstruct a column name,
                 take the first <code>sharedPrefixLen</code> bytes from the previous name and append
                 the suffix. If BPE is used, decode the reconstructed byte sequence by recursively
                 expanding tokens &ge; 0x80 using the merge rules.
+            </p>
+            <p>
+                The <code>globalColumnIndex</code> records the original column position before name-sorting.
+                This allows the reader to restore the original schema column order when returning data to the caller.
             </p>
 
             <h3>TypeDescriptor</h3>
@@ -726,7 +731,7 @@ TypeDescriptor</code></pre>
                     <tr><td>14</td><td>DECIMAL</td><td>varint precision, varint scale</td></tr>
                     <tr><td>15</td><td>TIME</td><td>varint precision</td></tr>
                     <tr><td>16</td><td>TIMESTAMP</td><td>varint precision</td></tr>
-                    <tr><td>17</td><td>TIMESTAMP_LTZ</td><td>varint precision</td></tr>
+                    <tr><td>17</td><td>TIMESTAMP_LTZ</td><td>varint precision, varint timezoneLength, bytes timezone</td></tr>
                 </tbody>
             </table>
             <p>Complex types (ARRAY, MAP, ROW, etc.), VARIANT, and BLOB are not supported.</p>

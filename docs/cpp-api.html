@@ -95,16 +95,14 @@ g++ -std=c++17 -I include/ example.cpp \
         <span class="cmt">// 1. Set up output stream callbacks</span>
         <span class="kw">auto</span>* fp = std::fopen(<span class="str">"output.mosaic"</span>, <span class="str">"wb"</span>);
         <span class="kw">auto</span> file = std::shared_ptr&lt;FILE&gt;(fp, [](<span class="ty">FILE</span>* f) { std::fclose(f); });
-        <span class="kw">int64_t</span> pos = <span class="num">0</span>;
 
         <span class="ty">mosaic</span>::<span class="ty">OutputFile</span> cbs;
-        cbs.write_fn = [file, pos](<span class="kw">const uint8_t</span>* data, <span class="kw">size_t</span> len) <span class="kw">mutable</span> -&gt; <span class="kw">int</span> {
+        cbs.write_fn = [file](<span class="kw">const uint8_t</span>* data, <span class="kw">size_t</span> len) -&gt; <span class="kw">int</span> {
             <span class="kw">size_t</span> written = std::fwrite(data, <span class="num">1</span>, len, file.get());
-            pos += <span class="kw">static_cast</span>&lt;<span class="kw">int64_t</span>&gt;(written);
             <span class="kw">return</span> (written == len) ? <span class="num">0</span> : <span class="num">-1</span>;
         };
         cbs.flush_fn = [file]() -&gt; <span class="kw">int</span> { <span class="kw">return</span> std::fflush(file.get()); };
-        cbs.get_pos_fn = [file, pos]() <span class="kw">mutable</span> -&gt; <span class="kw">int64_t</span> { <span class="kw">return</span> pos; };
+        cbs.get_pos_fn = [file]() -&gt; <span class="kw">int64_t</span> { <span class="kw">return</span> std::ftell(file.get()); };
 
         <span class="cmt">// 2. Build an Arrow RecordBatch and write it</span>
         arrow::Int32Builder age_builder;
@@ -268,8 +266,11 @@ reader.read_row_group(<span class="num">0</span>, projected, <span class="num">2
                 min/max statistics to skip row groups that don't match a filter predicate:
             </p>
 <pre><code><span class="cmt">// Writing with stats (arrow_schema is an ArrowSchema* from C Data Interface)</span>
+<span class="kw">uint32_t</span> stats_cols[] = { <span class="num">0</span>, <span class="num">2</span> };
 <span class="ty">mosaic</span>::<span class="ty">Writer</span> writer(std::move(cbs), arrow_schema, {
     .compression = <span class="num">1</span>,
+    .stats_columns = stats_cols,
+    .num_stats_columns = <span class="num">2</span>,
 });</code></pre>
 <pre><code><span class="cmt">// Reading stats</span>
 <span class="kw">for</span> (<span class="kw">uint32_t</span> rg = <span class="num">0</span>; rg &lt; reader.num_row_groups(); rg++) {

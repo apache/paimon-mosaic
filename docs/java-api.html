@@ -107,7 +107,7 @@
 <span class="ty">Schema</span> arrowSchema = <span class="kw">new</span> <span class="ty">Schema</span>(<span class="ty">Arrays</span>.asList(
     <span class="ty">Field</span>.notNullable(<span class="str">"id"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Int</span>(<span class="num">32</span>, <span class="kw">true</span>)),
     <span class="ty">Field</span>.nullable(<span class="str">"name"</span>, <span class="ty">ArrowType.Utf8</span>.INSTANCE),
-    <span class="ty">Field</span>.nullable(<span class="str">"score"</span>, <span class="kw">new</span> <span class="ty">ArrowType.FloatingPoint</span>(DOUBLE)),
+    <span class="ty">Field</span>.nullable(<span class="str">"score"</span>, <span class="kw">new</span> <span class="ty">ArrowType.FloatingPoint</span>(FloatingPointPrecision.DOUBLE)),
     <span class="ty">Field</span>.nullable(<span class="str">"amount"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Decimal</span>(<span class="num">10</span>, <span class="num">2</span>, <span class="num">128</span>)),
     <span class="ty">Field</span>.nullable(<span class="str">"ts"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Timestamp</span>(TimeUnit.MILLISECOND, <span class="kw">null</span>))
 ));</code></pre>
@@ -124,7 +124,7 @@
 <span class="ty">Schema</span> arrowSchema = <span class="kw">new</span> <span class="ty">Schema</span>(<span class="ty">Arrays</span>.asList(
     <span class="ty">Field</span>.notNullable(<span class="str">"id"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Int</span>(<span class="num">32</span>, <span class="kw">true</span>)),
     <span class="ty">Field</span>.nullable(<span class="str">"name"</span>, <span class="ty">ArrowType.Utf8</span>.INSTANCE),
-    <span class="ty">Field</span>.nullable(<span class="str">"score"</span>, <span class="kw">new</span> <span class="ty">ArrowType.FloatingPoint</span>(DOUBLE))
+    <span class="ty">Field</span>.nullable(<span class="str">"score"</span>, <span class="kw">new</span> <span class="ty">ArrowType.FloatingPoint</span>(FloatingPointPrecision.DOUBLE))
 ));
 
 <span class="ty">WriterOptions</span> opts = <span class="kw">new</span> <span class="ty">WriterOptions</span>()
@@ -313,7 +313,7 @@
 <span class="ty">Schema</span> arrowSchema = <span class="kw">new</span> <span class="ty">Schema</span>(<span class="ty">Arrays</span>.asList(
     <span class="ty">Field</span>.nullable(<span class="str">"id"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Int</span>(<span class="num">32</span>, <span class="kw">true</span>)),
     <span class="ty">Field</span>.nullable(<span class="str">"name"</span>, <span class="ty">ArrowType.Utf8</span>.INSTANCE),
-    <span class="ty">Field</span>.nullable(<span class="str">"score"</span>, <span class="kw">new</span> <span class="ty">ArrowType.FloatingPoint</span>(DOUBLE))
+    <span class="ty">Field</span>.nullable(<span class="str">"score"</span>, <span class="kw">new</span> <span class="ty">ArrowType.FloatingPoint</span>(FloatingPointPrecision.DOUBLE))
 ));
 
 <span class="ty">WriterOptions</span> opts = <span class="kw">new</span> <span class="ty">WriterOptions</span>()

@@ -227,7 +227,7 @@ writer.close().unwrap();
 
             <h3>Reading Stats</h3>
 <pre><code><span class="kw">for</span> rg_idx <span class="kw">in</span> <span class="num">0</span>..reader.num_row_groups() {
-    <span class="kw">let</span> stats = reader.row_group_stats(rg_idx);
+    <span class="kw">let</span> stats = reader.row_group_stats(rg_idx)?;
     <span class="kw">for</span> stat <span class="kw">in</span> stats {
         println!(<span class="str">"col={} nulls={} min={:?} max={:?}"</span>,
             stat.column_index, stat.null_count, stat.min, stat.max);
