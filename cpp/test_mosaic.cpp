@@ -22,6 +22,7 @@
 #include <arrow/api.h>
 #include <arrow/c/bridge.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
