@@ -15,8 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[workspace]
-members = ["core", "ffi", "jni"]
-resolver = "2"
+[package]
+name = "mosaic-jni"
+version = "0.1.0"
+edition = "2021"
+description = "Mosaic file format — JNI bindings for Java"
+license = "Apache-2.0"
 
-[profile.release]
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mosaic-core = { path = "../core" }
+jni = "0.21"
+arrow-schema = "58"
+arrow-array = { version = "58", features = ["ffi"] }
