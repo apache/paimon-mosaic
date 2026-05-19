@@ -129,11 +129,11 @@ g++ -std=c++17 -I include/ example.cpp \
         ArrowSchema ffi_schema;
         arrow::ExportRecordBatch(*batch, &amp;ffi_array, &amp;ffi_schema);
 
-        <span class="ty">mosaic</span>::<span class="ty">Writer</span> writer(std::move(cbs), &amp;ffi_schema, {
-            .num_buckets = <span class="num">2</span>,
-            .compression = <span class="num">1</span>,  <span class="cmt">// ZSTD</span>
-            .zstd_level = <span class="num">1</span>,
-        });
+        <span class="ty">mosaic</span>::<span class="ty">WriterOptions</span> opts;
+        opts.compression = <span class="num">1</span>;  <span class="cmt">// ZSTD</span>
+        opts.zstd_level = <span class="num">1</span>;
+        opts.num_buckets = <span class="num">2</span>;
+        <span class="ty">mosaic</span>::<span class="ty">Writer</span> writer(std::move(cbs), &amp;ffi_schema, opts);
         writer.write(&amp;ffi_array, &amp;ffi_schema);
 
         <span class="cmt">// 4. Close (also happens on destructor)</span>
@@ -267,11 +267,11 @@ reader.read_row_group(<span class="num">0</span>, projected, <span class="num">2
             </p>
 <pre><code><span class="cmt">// Writing with stats (arrow_schema is an ArrowSchema* from C Data Interface)</span>
 <span class="kw">uint32_t</span> stats_cols[] = { <span class="num">0</span>, <span class="num">2</span> };
-<span class="ty">mosaic</span>::<span class="ty">Writer</span> writer(std::move(cbs), arrow_schema, {
-    .compression = <span class="num">1</span>,
-    .stats_columns = stats_cols,
-    .num_stats_columns = <span class="num">2</span>,
-});</code></pre>
+<span class="ty">mosaic</span>::<span class="ty">WriterOptions</span> opts;
+opts.compression = <span class="num">1</span>;
+opts.stats_columns = stats_cols;
+opts.num_stats_columns = <span class="num">2</span>;
+<span class="ty">mosaic</span>::<span class="ty">Writer</span> writer(std::move(cbs), arrow_schema, opts);</code></pre>
 <pre><code><span class="cmt">// Reading stats</span>
 <span class="kw">for</span> (<span class="kw">uint32_t</span> rg = <span class="num">0</span>; rg &lt; reader.num_row_groups(); rg++) {
     <span class="kw">auto</span> stats = reader.get_row_group_statistics(rg);
@@ -350,9 +350,9 @@ reader.read_row_group(<span class="num">0</span>, projected, <span class="num">2
             ArrowSchema ffi_schema;
             arrow::ExportRecordBatch(*batch, &amp;ffi_array, &amp;ffi_schema);
 
-            <span class="ty">mosaic</span>::<span class="ty">Writer</span> writer(std::move(w_cbs), &amp;ffi_schema, {
-                .num_buckets = <span class="num">2</span>,
-            });
+            <span class="ty">mosaic</span>::<span class="ty">WriterOptions</span> w_opts;
+            w_opts.num_buckets = <span class="num">2</span>;
+            <span class="ty">mosaic</span>::<span class="ty">Writer</span> writer(std::move(w_cbs), &amp;ffi_schema, w_opts);
             writer.write(&amp;ffi_array, &amp;ffi_schema);
             writer.close();
         }

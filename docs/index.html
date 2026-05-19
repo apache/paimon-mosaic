@@ -128,7 +128,7 @@
                     <tr><td><code>VarBinary(n)</code></td><td>variable</td><td>Variable-length byte array with max length</td></tr>
                     <tr><td><code>Bytes</code></td><td>variable</td><td>Unbounded byte array</td></tr>
                     <tr><td><code>Decimal(p, s)</code></td><td>8 or variable</td><td>Exact numeric; compact (p&le;18) or large</td></tr>
-                    <tr><td><code>Timestamp(p)</code></td><td>8 or 12</td><td>Millis (p&le;3) or millis + nanos (p&gt;3)</td></tr>
+                    <tr><td><code>Timestamp(p)</code></td><td>8 or 12</td><td>Millis (p&le;3), micros (p&le;6), or millis + nanos (p&gt;6)</td></tr>
                     <tr><td><code>TimestampLtz(p)</code></td><td>8 or 12</td><td>Same as Timestamp, with local timezone</td></tr>
                 </tbody>
             </table>
