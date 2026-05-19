@@ -63,3 +63,42 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  cpp-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Rust Cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Arrow C++
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-transport-https lsb-release ca-certificates curl
+          curl -fsSL https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb -o /tmp/arrow-apt.deb
+          sudo apt-get install -y /tmp/arrow-apt.deb
+          sudo apt-get update
+          sudo apt-get install -y libarrow-dev
+
+      - name: Build FFI library
+        run: cargo build --release -p mosaic-ffi
+
+      - name: Build C++ test
+        run: |
+          cmake -S cpp -B cpp/build \
+            -DMOSAIC_FFI_LIB=${{ github.workspace }}/target/release/libmosaic_ffi.so
+          cmake --build cpp/build
+
+      - name: Run C++ test
+        run: cpp/build/test_mosaic
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release

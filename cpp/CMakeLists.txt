@@ -15,8 +15,25 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[workspace]
-members = ["core", "ffi"]
-resolver = "2"
+cmake_minimum_required(VERSION 3.16)
+project(mosaic-cpp-test CXX)
 
-[profile.release]
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(Arrow REQUIRED)
+
+set(MOSAIC_FFI_LIB "" CACHE FILEPATH "Path to libmosaic_ffi shared library")
+if(NOT MOSAIC_FFI_LIB)
+    if(APPLE)
+        set(MOSAIC_FFI_LIB "${CMAKE_SOURCE_DIR}/../target/release/libmosaic_ffi.dylib")
+    elseif(WIN32)
+        set(MOSAIC_FFI_LIB "${CMAKE_SOURCE_DIR}/../target/release/mosaic_ffi.dll")
+    else()
+        set(MOSAIC_FFI_LIB "${CMAKE_SOURCE_DIR}/../target/release/libmosaic_ffi.so")
+    endif()
+endif()
+
+add_executable(test_mosaic test_mosaic.cpp)
+target_include_directories(test_mosaic PRIVATE ${CMAKE_SOURCE_DIR}/../include)
+target_link_libraries(test_mosaic Arrow::arrow_shared ${MOSAIC_FFI_LIB})
