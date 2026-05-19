@@ -302,7 +302,10 @@ class TestRoundtrip:
 
     def test_zero_rows(self):
         pa_schema = pa.schema(
-            [pa.field("v", pa.int32()), pa.field("s", pa.utf8())]
+            [
+                pa.field("v", pa.int32(), nullable=False),
+                pa.field("s", pa.utf8(), nullable=True),
+            ]
         )
         batch = pa.record_batch(
             [pa.array([], type=pa.int32()), pa.array([], type=pa.utf8())],
@@ -316,6 +319,8 @@ class TestRoundtrip:
             assert table.schema.names == ["v", "s"]
             assert table.schema.field("v").type == pa.int32()
             assert table.schema.field("s").type == pa.utf8()
+            assert not table.schema.field("v").nullable
+            assert table.schema.field("s").nullable
 
 
 class TestProjection:

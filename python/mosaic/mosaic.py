@@ -306,10 +306,10 @@ class MosaicReader:
             batches.append(self.read_row_group(rg, columns=columns))
         if batches:
             return pa.Table.from_batches(batches, schema=batches[0].schema)
+        schema = self._schema
         if columns is not None:
-            projected_schema = pa.schema([self._schema.field(i) for i in columns])
-            return pa.table({f.name: pa.array([], type=f.type) for f in projected_schema})
-        return pa.table({f.name: pa.array([], type=f.type) for f in self._schema})
+            schema = pa.schema([self._schema.field(i) for i in columns])
+        return pa.Table.from_batches([], schema=schema)
 
     def get_row_group_statistics(self, rg_index):
         n_out = ctypes.c_uint32(0)
