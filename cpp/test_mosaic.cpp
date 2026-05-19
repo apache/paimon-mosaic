@@ -411,21 +411,39 @@ static void test_multiple_row_groups() {
         arrow::field("data", arrow::int64()),
     });
 
-    arrow::Int32Builder id_b;
-    arrow::Int64Builder data_b;
-    for (int i = 0; i < 500; i++) {
-        assert(id_b.Append(i).ok());
-        assert(data_b.Append(static_cast<int64_t>(i) * 3).ok());
-    }
-    auto batch = arrow::RecordBatch::Make(schema, 500, {
-        id_b.Finish().ValueUnsafe(), data_b.Finish().ValueUnsafe(),
-    });
-
     mosaic::WriterOptions opts;
     opts.compression = 0;
     opts.num_buckets = 1;
     opts.row_group_max_size = 200;
-    auto data_vec = write_and_get(schema, batch, opts);
+
+    MemBuffer write_buf;
+    struct ArrowSchema c_schema;
+    auto st = arrow::ExportSchema(*schema, &c_schema);
+    assert(st.ok());
+    mosaic::Writer writer(make_output(write_buf), &c_schema, opts);
+
+    const int total_rows = 500;
+    const int batch_size = 50;
+    for (int start = 0; start < total_rows; start += batch_size) {
+        int end = std::min(start + batch_size, total_rows);
+        int n = end - start;
+        arrow::Int32Builder id_b;
+        arrow::Int64Builder data_b;
+        for (int i = start; i < end; i++) {
+            assert(id_b.Append(i).ok());
+            assert(data_b.Append(static_cast<int64_t>(i) * 3).ok());
+        }
+        auto batch = arrow::RecordBatch::Make(schema, n, {
+            id_b.Finish().ValueUnsafe(), data_b.Finish().ValueUnsafe(),
+        });
+        struct ArrowArray c_array;
+        struct ArrowSchema c_batch_schema;
+        st = arrow::ExportRecordBatch(*batch, &c_array, &c_batch_schema);
+        assert(st.ok());
+        writer.write(&c_array, &c_batch_schema);
+    }
+    writer.close();
+    auto data_vec = write_buf.data;
 
     MemBuffer buf;
     buf.data = data_vec;
