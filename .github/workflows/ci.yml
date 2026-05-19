@@ -131,3 +131,37 @@ jobs:
       - name: Run Java tests
         working-directory: java
         run: mvn test "-DargLine=-Djava.library.path=${{ github.workspace }}/target/release"
+
+  python-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Rust Cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build FFI library
+        run: cargo build --release -p mosaic-ffi
+
+      - name: Install Python dependencies
+        working-directory: python
+        run: pip install pyarrow pytest
+
+      - name: Run Python tests
+        working-directory: python
+        run: pytest -v
+        env:
+          MOSAIC_LIB_PATH: ${{ github.workspace }}/target/release
