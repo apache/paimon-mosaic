@@ -599,6 +599,7 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
 
         // Per-bucket directory parse results (slot_sizes, slot_file_offsets) for paged buckets
         let mut paged_dir_info: Vec<Option<(Vec<usize>, Vec<u64>)>> = vec![None; self.num_buckets];
+        let mut partial_paged_buckets: Vec<usize> = Vec::new();
 
         for (ri, &b) in r1_bucket_ids.iter().enumerate() {
             let buf = r1_buffers[ri].as_slice();
@@ -722,15 +723,20 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                         }
 
                         paged_dir_info[b] = Some((slot_sizes, slot_file_offsets));
+                        partial_paged_buckets.push(b);
                     }
                 }
                 BucketLayout::Empty => {}
             }
         }
 
-        // Round 2: batch read all paged column slots
-        if !r2_ranges.is_empty() {
-            let r2_buffers = self.input.read_ranges_shared(&r2_ranges)?;
+        // Round 2: batch read all paged column slots.
+        if !partial_paged_buckets.is_empty() {
+            let r2_buffers = if r2_ranges.is_empty() {
+                Vec::new()
+            } else {
+                self.input.read_ranges_shared(&r2_ranges)?
+            };
 
             struct SlotLocation {
                 group_idx: usize,
@@ -749,9 +755,8 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                 let buf = r2_buffers[group_idx].as_slice();
                 let group_base = r2_ranges[group_idx].0;
                 for info in group {
-                    let (_, ref slot_file_offsets) =
+                    let (slot_sizes, slot_file_offsets) =
                         paged_dir_info[info.bucket_id].as_ref().unwrap();
-                    let (ref slot_sizes, _) = paged_dir_info[info.bucket_id].as_ref().unwrap();
                     let rel_start = (slot_file_offsets[info.col_idx] - group_base) as usize;
                     let slot_len = slot_sizes[info.col_idx];
                     let Some(rel_end) = rel_start.checked_add(slot_len) else {
@@ -774,14 +779,12 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                 }
             }
 
-            // Build ColumnPageReaders for each paged bucket
-            for b in 0..self.num_buckets {
-                if !matches!(bucket_kinds[b], BucketLayout::Paged { .. }) {
-                    continue;
-                }
+            // Build ColumnPageReaders for partial paged buckets. ALL_NULL slots do not
+            // need round 2 IO, but still need readers when projected.
+            for &b in &partial_paged_buckets {
                 let global_indices = &self.schema.bucket_to_global[b];
                 let num_columns = global_indices.len();
-                let (ref slot_sizes, _) = paged_dir_info[b].as_ref().unwrap();
+                let (slot_sizes, _) = paged_dir_info[b].as_ref().unwrap();
 
                 let mut column_readers: Vec<Option<ColumnPageReader>> =
                     Vec::with_capacity(num_columns);

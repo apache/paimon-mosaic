@@ -3240,6 +3240,52 @@ fn test_paged_all_null_columns_in_projection() {
 }
 
 #[test]
+fn test_paged_all_null_only_projection() {
+    let columns = vec![
+        ("real".to_string(), DataType::Int32, true),
+        ("null_col".to_string(), DataType::Int64, true),
+    ];
+    let rows: Vec<Vec<Value>> = (0..100)
+        .map(|i| vec![Value::Integer(i), Value::Null])
+        .collect();
+
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            compression: COMPRESSION_ZSTD,
+            page_size_threshold: 1,
+            num_buckets: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    let reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
+
+    let idx_null = reader
+        .schema()
+        .columns
+        .iter()
+        .position(|c| c.name == "null_col")
+        .unwrap();
+    let mut rg = reader.row_group_reader_projected(0, &[idx_null]).unwrap();
+    let batch = rg.read_columns().unwrap();
+
+    assert_eq!(batch.num_rows(), 100);
+    assert_eq!(batch.num_columns(), 1);
+
+    let null_col = batch_col_i64(&batch, "null_col");
+    for i in 0..100usize {
+        assert!(null_col.is_null(i));
+    }
+}
+
+#[test]
 fn test_paged_adjacent_columns_coalesced_read() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
