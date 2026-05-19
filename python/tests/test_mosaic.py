@@ -301,15 +301,21 @@ class TestRoundtrip:
             assert rb.column("v")[0].as_py() == 42
 
     def test_zero_rows(self):
-        pa_schema = pa.schema([pa.field("v", pa.int32())])
+        pa_schema = pa.schema(
+            [pa.field("v", pa.int32()), pa.field("s", pa.utf8())]
+        )
         batch = pa.record_batch(
-            [pa.array([], type=pa.int32())], names=["v"]
+            [pa.array([], type=pa.int32()), pa.array([], type=pa.utf8())],
+            names=["v", "s"],
         )
         data = _write_to_bytes(pa_schema, batch)
 
         with _reader_from_bytes(data) as reader:
             table = reader.read_all()
             assert table.num_rows == 0
+            assert table.schema.names == ["v", "s"]
+            assert table.schema.field("v").type == pa.int32()
+            assert table.schema.field("s").type == pa.utf8()
 
 
 class TestProjection:
