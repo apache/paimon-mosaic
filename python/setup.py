@@ -21,7 +21,7 @@ import os
 import platform
 import shutil
 
-from setuptools import setup
+from setuptools import Distribution, setup
 from setuptools.command.build_py import build_py
 
 
@@ -63,4 +63,14 @@ class BuildPyWithNativeLib(build_py):
         super().run()
 
 
-setup(cmdclass={"build_py": BuildPyWithNativeLib})
+class BinaryDistribution(Distribution):
+    """Force the wheel to be platform-specific."""
+
+    def has_ext_modules(self):
+        return True
+
+
+setup(
+    cmdclass={"build_py": BuildPyWithNativeLib},
+    distclass=BinaryDistribution,
+)

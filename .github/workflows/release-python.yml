@@ -1,0 +1,148 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Publish the mosaic-format Python package to PyPI.
+#
+# Trigger: push a version tag (e.g. v0.1.0, v0.1.0-rc1).
+# Pre-release tags (containing '-') publish to TestPyPI; release tags publish to PyPI.
+#
+# Token auth: add secrets PYPI_API_TOKEN / TEST_PYPI_API_TOKEN for publishing.
+
+name: Release Python
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build sdist
+        working-directory: python
+        run: python -m build --sdist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-sdist
+          path: python/dist/*.tar.gz
+
+  wheels:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib_name: libmosaic_ffi.so
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            lib_name: libmosaic_ffi.so
+          - os: macos-13
+            target: x86_64-apple-darwin
+            lib_name: libmosaic_ffi.dylib
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            lib_name: libmosaic_ffi.dylib
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            lib_name: mosaic_ffi.dll
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Build native library
+        run: cargo build --release -p mosaic-ffi
+
+      - name: Copy native library into package
+        shell: bash
+        run: cp target/release/${{ matrix.lib_name }} python/mosaic/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build wheel setuptools
+
+      - name: Build wheel
+        working-directory: python
+        run: python -m build --wheel
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: python/dist/*.whl
+
+  release:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: [sdist, wheels]
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish to TestPyPI
+        if: contains(github.ref, '-')
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+          packages-dir: dist
+          password: ${{ secrets.TEST_PYPI_API_TOKEN }}
+
+      - name: Publish to PyPI
+        if: ${{ !contains(github.ref, '-') }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+          packages-dir: dist
+          password: ${{ secrets.PYPI_API_TOKEN }}
