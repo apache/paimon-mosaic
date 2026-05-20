@@ -166,7 +166,7 @@
                     <tr><td><code>rowGroupMaxSize(long)</code></td><td>256 MB</td><td>Max uncompressed bytes per row group</td></tr>
                     <tr><td><code>maxDictTotalBytes(int)</code></td><td>32 KB</td><td>Max dictionary size per column</td></tr>
                     <tr><td><code>maxDictEntries(int)</code></td><td>255</td><td>Max distinct values for DICT encoding</td></tr>
-                    <tr><td><code>statsColumns(int...)</code></td><td>(empty)</td><td>Column indices to build min/max stats for filter pushdown</td></tr>
+                    <tr><td><code>statsColumns(String...)</code></td><td>(empty)</td><td>Column names to build min/max stats for filter pushdown</td></tr>
                     <tr><td><code>pageSizeThreshold(int)</code></td><td>32 KB</td><td>Min avg column page size to enable paged mode (per-column compression)</td></tr>
                 </tbody>
             </table>
@@ -181,7 +181,7 @@
                     <tr><td><code>estimatedFileSize()</code></td><td><code>long</code></td><td>Estimated output file size in bytes (for file rolling)</td></tr>
                     <tr><td><code>close()</code></td><td><code>void</code></td><td>Flush remaining data and write footer</td></tr>
                     <tr><td><code>numRowGroups()</code></td><td><code>int</code></td><td>Number of row groups written (available after close)</td></tr>
-                    <tr><td><code>getRowGroupStatistics(rg)</code></td><td><code>List&lt;ColumnStatistics&gt;</code></td><td>Column statistics for a row group (available after close)</td></tr>
+                    <tr><td><code>getRowGroupStatistics(rg)</code></td><td><code>Map&lt;String, ColumnStatistics&gt;</code></td><td>Column statistics for a row group, keyed by column name (available after close)</td></tr>
                 </tbody>
             </table>
 
@@ -203,16 +203,14 @@
 
             <h3>2. Inspect the Schema</h3>
             <p>
-                The reader exposes the file schema as a standard Arrow <code>Schema</code> object:
+                The reader exposes the file schema as a standard Arrow <code>Schema</code> object.
+                Columns are in name-sorted order (the storage order):
             </p>
 <pre><code><span class="ty">Schema</span> schema = reader.getSchema();
 <span class="kw">for</span> (<span class="ty">Field</span> field : schema.getFields()) {
     System.out.printf(<span class="str">"name=%s type=%s nullable=%b%n"</span>,
         field.getName(), field.getType(), field.isNullable());
-}
-
-<span class="kw">int</span> nameCol = schema.getFields().indexOf(schema.findField(<span class="str">"name"</span>));
-<span class="kw">int</span> scoreCol = schema.getFields().indexOf(schema.findField(<span class="str">"score"</span>));</code></pre>
+}</code></pre>
 
             <h3>Reader Methods</h3>
             <table>
@@ -220,12 +218,12 @@
                     <tr><th>Method</th><th>Return</th><th>Description</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td><code>getSchema()</code></td><td><code>Schema</code></td><td>Arrow Schema for the file</td></tr>
+                    <tr><td><code>getSchema()</code></td><td><code>Schema</code></td><td>Arrow Schema for the file (columns in name-sorted order)</td></tr>
                     <tr><td><code>numRowGroups()</code></td><td><code>int</code></td><td>Row group count</td></tr>
                     <tr><td><code>rowGroupNumRows(rg)</code></td><td><code>int</code></td><td>Number of rows in a specific row group</td></tr>
-                    <tr><td><code>readRowGroup(rg, allocator)</code></td><td><code>VectorSchemaRoot</code></td><td>Read all columns of a row group</td></tr>
-                    <tr><td><code>readRowGroup(rg, cols, allocator)</code></td><td><code>VectorSchemaRoot</code></td><td>Read projected columns of a row group</td></tr>
-                    <tr><td><code>getRowGroupStatistics(rg)</code></td><td><code>List&lt;ColumnStatistics&gt;</code></td><td>Column statistics for a row group</td></tr>
+                    <tr><td><code>project(String[])</code></td><td><code>void</code></td><td>Set projection: subsequent reads return only the named columns in the specified order</td></tr>
+                    <tr><td><code>readRowGroup(rg, allocator)</code></td><td><code>VectorSchemaRoot</code></td><td>Read a row group (all columns or projected columns if project() was called)</td></tr>
+                    <tr><td><code>getRowGroupStatistics(rg)</code></td><td><code>Map&lt;String, ColumnStatistics&gt;</code></td><td>Column statistics for a row group, keyed by column name</td></tr>
                 </tbody>
             </table>
 
@@ -253,15 +251,19 @@
 
             <h3>Projection Pushdown</h3>
             <p>
-                Use <code>readRowGroup(rgIndex, projectedColumns, allocator)</code> to read only specific columns.
+                Use <code>project()</code> to select and reorder columns by name.
                 Only the buckets containing the projected columns are decompressed, significantly
-                reducing I/O and memory for wide tables.
+                reducing I/O and memory for wide tables. The output preserves the order you specify:
             </p>
-<pre><code><span class="cmt">// Only read "name" and "score" columns</span>
-<span class="kw">int</span>[] projected = { nameCol, scoreCol };
-<span class="kw">try</span> (<span class="ty">VectorSchemaRoot</span> batch = reader.readRowGroup(rg, projected, allocator)) {
-    <span class="cmt">// batch contains only the projected columns</span>
-}</code></pre>
+<pre><code><span class="cmt">// Only read "name" and "score" columns, in that order</span>
+reader.project(<span class="kw">new</span> <span class="ty">String</span>[]{<span class="str">"name"</span>, <span class="str">"score"</span>});
+<span class="kw">try</span> (<span class="ty">VectorSchemaRoot</span> batch = reader.readRowGroup(rg, allocator)) {
+    <span class="cmt">// batch contains only "name" and "score", in that order</span>
+}
+
+<span class="cmt">// Empty projection: count-only read (0 columns, row count preserved)</span>
+reader.project(<span class="kw">new</span> <span class="ty">String</span>[]{});
+<span class="kw">int</span> rowCount = reader.rowGroupNumRows(rg);</code></pre>
 
             <h3>Column Statistics (Filter Pushdown)</h3>
             <p>
@@ -269,26 +271,28 @@
                 from the writer (after close) and from the reader. This allows you to obtain
                 min/max statistics immediately after writing without re-reading the file:
             </p>
+<pre><code><span class="ty">WriterOptions</span> opts = <span class="kw">new</span> <span class="ty">WriterOptions</span>()
+    .statsColumns(<span class="str">"id"</span>, <span class="str">"score"</span>);  <span class="cmt">// build stats for "id" and "score" columns</span></code></pre>
 <pre><code><span class="cmt">// Get stats directly from the writer after close</span>
 <span class="ty">MosaicWriter</span> writer = <span class="kw">new</span> <span class="ty">MosaicWriter</span>(baos, arrowSchema, opts, allocator);
 writer.write(root);
 writer.close();
 
 <span class="kw">for</span> (<span class="kw">int</span> rg = <span class="num">0</span>; rg &lt; writer.numRowGroups(); rg++) {
-    <span class="ty">List</span>&lt;<span class="ty">ColumnStatistics</span>&gt; stats = writer.getRowGroupStatistics(rg);
+    <span class="ty">Map</span>&lt;<span class="ty">String</span>, <span class="ty">ColumnStatistics</span>&gt; stats = writer.getRowGroupStatistics(rg);
+    <span class="ty">ColumnStatistics</span> idStats = stats.get(<span class="str">"id"</span>);
     <span class="cmt">// use stats for indexing, metadata, etc.</span>
 }</code></pre>
             <p>
                 The reader can also access per-row-group statistics to skip row groups
                 that don't match a filter predicate:
             </p>
-<pre><code><span class="ty">WriterOptions</span> opts = <span class="kw">new</span> <span class="ty">WriterOptions</span>()
-    .statsColumns(<span class="num">0</span>, <span class="num">2</span>);  <span class="cmt">// build stats for columns 0 and 2</span></code></pre>
-<pre><code><span class="cmt">// Reading stats</span>
+<pre><code><span class="cmt">// Reading stats from the reader</span>
 <span class="kw">for</span> (<span class="kw">int</span> rg = <span class="num">0</span>; rg &lt; reader.numRowGroups(); rg++) {
-    <span class="ty">List</span>&lt;<span class="ty">ColumnStatistics</span>&gt; stats = reader.getRowGroupStatistics(rg);
-    <span class="kw">for</span> (<span class="ty">ColumnStatistics</span> stat : stats) {
-        <span class="kw">int</span> colIdx = stat.getColumnIndex();
+    <span class="ty">Map</span>&lt;<span class="ty">String</span>, <span class="ty">ColumnStatistics</span>&gt; stats = reader.getRowGroupStatistics(rg);
+    <span class="kw">for</span> (<span class="ty">Map.Entry</span>&lt;<span class="ty">String</span>, <span class="ty">ColumnStatistics</span>&gt; entry : stats.entrySet()) {
+        <span class="ty">String</span> colName = entry.getKey();
+        <span class="ty">ColumnStatistics</span> stat = entry.getValue();
         <span class="kw">long</span> nullCount = stat.getNullCount();
         <span class="kw">if</span> (stat.hasMinMax()) {
             <span class="kw">byte</span>[] min = stat.getMin();  <span class="cmt">// big-endian wire format</span>
@@ -303,7 +307,6 @@ writer.close();
                     <tr><th>Method</th><th>Return</th><th>Description</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td><code>getColumnIndex()</code></td><td><code>int</code></td><td>Column index in the schema</td></tr>
                     <tr><td><code>getNullCount()</code></td><td><code>long</code></td><td>Number of null values</td></tr>
                     <tr><td><code>hasMinMax()</code></td><td><code>boolean</code></td><td>Whether min/max are available</td></tr>
                     <tr><td><code>getMin()</code></td><td><code>byte[]</code></td><td>Min value as big-endian bytes (null if all-null)</td></tr>
@@ -385,8 +388,9 @@ writer.close();
 
             <div class="warning">
                 <strong>Column ordering</strong>
-                The reader preserves the original schema column order.
-                Use <code>reader.getSchema()</code> to inspect the schema and locate columns by name.
+                Columns are stored in name-sorted order regardless of the input schema order.
+                The reader returns columns in storage (name-sorted) order by default.
+                Use <code>project()</code> to select and reorder output columns.
             </div>
 
             <div class="tip">

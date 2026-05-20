@@ -692,7 +692,6 @@ repeated numRules times:
 varint   sharedPrefixLen       (bytes shared with previous column name)
 varint   suffixLen             (bytes of new suffix)
 bytes    suffix                (suffixLen bytes, raw or BPE-encoded)
-varint   globalColumnIndex     (original column index before name-sorting)
 TypeDescriptor</code></pre>
             <p>
                 The first column has <code>sharedPrefixLen = 0</code>. To reconstruct a column name,
@@ -701,8 +700,7 @@ TypeDescriptor</code></pre>
                 expanding tokens &ge; 0x80 using the merge rules.
             </p>
             <p>
-                The <code>globalColumnIndex</code> records the original column position before name-sorting.
-                This allows the reader to restore the original schema column order when returning data to the caller.
+                Columns are stored and returned in name-sorted order.
             </p>
 
             <h3>TypeDescriptor</h3>

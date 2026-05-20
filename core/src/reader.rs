@@ -195,16 +195,42 @@ pub trait ReaderAccess {
         rg_index: usize,
         columns: &[usize],
     ) -> io::Result<RowGroupReader>;
+    fn row_group_reader_by_names(
+        &self,
+        rg_index: usize,
+        column_names: &[&str],
+    ) -> io::Result<RowGroupReader> {
+        let schema = self.schema();
+        let mut indices = Vec::with_capacity(column_names.len());
+        for name in column_names {
+            let idx = schema
+                .columns
+                .iter()
+                .position(|c| c.name == *name)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("column '{}' not found in schema", name),
+                    )
+                })?;
+            indices.push(idx);
+        }
+        self.row_group_reader_projected(rg_index, &indices)
+    }
+    fn project(&mut self, column_names: &[&str]) -> io::Result<()>;
     fn row_group_stats(&self, rg_index: usize) -> io::Result<&[ColumnStats]>;
     fn row_group_num_rows(&self, rg_index: usize) -> io::Result<usize>;
 }
 
+/// Schema and output columns are in storage order (name-sorted).
+/// Use `project()` to select and reorder output columns.
 pub struct MosaicReader<I: InputFile> {
     input: I,
     schema: MosaicSchema,
     row_group_metas: Vec<RowGroupMeta>,
     compression: u8,
     num_buckets: usize,
+    projected_columns: Option<Vec<usize>>,
 }
 
 fn read_range(input: &dyn InputFile, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -395,7 +421,28 @@ impl<I: InputFile> MosaicReader<I> {
             row_group_metas,
             compression,
             num_buckets,
+            projected_columns: None,
         })
+    }
+
+    pub fn project(&mut self, column_names: &[&str]) -> io::Result<()> {
+        let mut indices = Vec::with_capacity(column_names.len());
+        for name in column_names {
+            let idx = self
+                .schema
+                .columns
+                .iter()
+                .position(|c| c.name == *name)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("column '{}' not found in schema", name),
+                    )
+                })?;
+            indices.push(idx);
+        }
+        self.projected_columns = Some(indices);
+        Ok(())
     }
 
     pub fn input(&self) -> &I {
@@ -493,8 +540,13 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
     }
 
     fn row_group_reader(&self, rg_index: usize) -> io::Result<RowGroupReader> {
-        let all_columns: Vec<usize> = (0..self.schema.columns.len()).collect();
-        self.row_group_reader_projected(rg_index, &all_columns)
+        match &self.projected_columns {
+            Some(cols) => self.row_group_reader_projected(rg_index, cols),
+            None => {
+                let all_columns: Vec<usize> = (0..self.schema.columns.len()).collect();
+                self.row_group_reader_projected(rg_index, &all_columns)
+            }
+        }
     }
 
     #[allow(clippy::needless_range_loop)]
@@ -846,7 +898,28 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
             num_cols,
             meta.num_rows,
             projected,
+            columns.to_vec(),
         ))
+    }
+
+    fn project(&mut self, column_names: &[&str]) -> io::Result<()> {
+        let mut indices = Vec::with_capacity(column_names.len());
+        for name in column_names {
+            let idx = self
+                .schema
+                .columns
+                .iter()
+                .position(|c| c.name == *name)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("column '{}' not found in schema", name),
+                    )
+                })?;
+            indices.push(idx);
+        }
+        self.projected_columns = Some(indices);
+        Ok(())
     }
 }
 
@@ -867,6 +940,7 @@ pub struct RowGroupReader {
     num_rows: usize,
     num_columns: usize,
     projected_columns: Vec<bool>,
+    output_order: Vec<usize>,
 }
 
 impl RowGroupReader {
@@ -877,6 +951,7 @@ impl RowGroupReader {
         num_columns: usize,
         num_rows: usize,
         projected_columns: Vec<bool>,
+        output_order: Vec<usize>,
     ) -> Self {
         let active_buckets: Vec<usize> = bucket_states
             .iter()
@@ -891,6 +966,7 @@ impl RowGroupReader {
             num_rows,
             num_columns,
             projected_columns,
+            output_order,
         }
     }
 
@@ -933,8 +1009,8 @@ impl RowGroupReader {
 
         let mut fields = Vec::new();
         let mut batch_arrays = Vec::new();
-        for (i, arr_opt) in arrays.into_iter().enumerate() {
-            if let Some(arr) = arr_opt {
+        for &i in &self.output_order {
+            if let Some(arr) = arrays[i].take() {
                 let col_meta = &self.schema.columns[i];
                 fields.push(Field::new(
                     &col_meta.name,

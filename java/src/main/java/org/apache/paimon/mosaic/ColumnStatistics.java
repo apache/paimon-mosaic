@@ -21,20 +21,14 @@ package org.apache.paimon.mosaic;
 
 public class ColumnStatistics {
 
-    private final int columnIndex;
     private final long nullCount;
     private final byte[] min;
     private final byte[] max;
 
-    ColumnStatistics(int columnIndex, long nullCount, byte[] min, byte[] max) {
-        this.columnIndex = columnIndex;
+    ColumnStatistics(long nullCount, byte[] min, byte[] max) {
         this.nullCount = nullCount;
         this.min = min;
         this.max = max;
-    }
-
-    public int getColumnIndex() {
-        return columnIndex;
     }
 
     public long getNullCount() {

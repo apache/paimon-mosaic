@@ -59,6 +59,32 @@ def _check_error(msg="operation failed"):
     raise RuntimeError(msg)
 
 
+def _fetch_rg_stats(num_stats_fn, stats_fn, handle, rg_index):
+    n_out = ctypes.c_uint32(0)
+    rc = num_stats_fn(handle, rg_index, ctypes.byref(n_out))
+    if rc != 0:
+        _check_error("num_stats failed")
+    n = n_out.value
+    if n == 0:
+        return {}
+    names = (ctypes.c_char_p * n)()
+    null_counts = (ctypes.c_uint64 * n)()
+    min_ptrs = (ctypes.POINTER(ctypes.c_uint8) * n)()
+    min_lens = (ctypes.c_size_t * n)()
+    max_ptrs = (ctypes.POINTER(ctypes.c_uint8) * n)()
+    max_lens = (ctypes.c_size_t * n)()
+    rc = stats_fn(handle, rg_index, names, null_counts, min_ptrs, min_lens, max_ptrs, max_lens)
+    if rc != 0:
+        _check_error("row_group_stats failed")
+    result = {}
+    for i in range(n):
+        col_name = names[i].decode("utf-8")
+        min_val = ctypes.string_at(min_ptrs[i], min_lens[i]) if min_ptrs[i] and min_lens[i] > 0 else None
+        max_val = ctypes.string_at(max_ptrs[i], max_lens[i]) if max_ptrs[i] and max_lens[i] > 0 else None
+        result[col_name] = ColumnStatistics(null_counts[i], min_val, max_val)
+    return result
+
+
 class WriterOptions:
     COMPRESSION_NONE = 0
     COMPRESSION_ZSTD = 1
@@ -93,8 +119,10 @@ class WriterOptions:
         opts.max_dict_entries = self.max_dict_entries
         refs = []
         if self.stats_columns:
-            arr = (ctypes.c_uint32 * len(self.stats_columns))(*self.stats_columns)
+            encoded = [s.encode("utf-8") for s in self.stats_columns]
+            arr = (ctypes.c_char_p * len(encoded))(*encoded)
             refs.append(arr)
+            refs.append(encoded)
             opts.stats_columns = arr
             opts.num_stats_columns = len(self.stats_columns)
         else:
@@ -105,6 +133,12 @@ class WriterOptions:
 
 
 class MosaicWriter:
+    """Columns are stored in name-sorted order regardless of input schema order.
+
+    The reader returns columns in storage (name-sorted) order by default;
+    use :meth:`MosaicReader.project` to control output column order.
+    """
+
     def __init__(self, stream, schema, options=None):
         if not isinstance(schema, pa.Schema):
             raise TypeError(f"expected pyarrow.Schema, got {type(schema)}")
@@ -195,11 +229,7 @@ class MosaicWriter:
         return len(self._row_group_stats)
 
     def get_row_group_statistics(self, rg_index):
-        """Returns column statistics for the given row group.
-
-        The returned list follows the same order as the stats_columns
-        specified in WriterOptions.
-        """
+        """Returns column statistics for the given row group, keyed by column name."""
         if self._row_group_stats is None:
             raise RuntimeError("writer is not closed yet")
         return self._row_group_stats[rg_index]
@@ -221,26 +251,10 @@ class MosaicWriter:
         lib.mosaic_writer_num_row_groups(self._handle, ctypes.byref(n_rg))
         all_stats = []
         for rg in range(n_rg.value):
-            n_stats = ctypes.c_uint32(0)
-            lib.mosaic_writer_row_group_num_stats(self._handle, rg, ctypes.byref(n_stats))
-            rg_stats = []
-            for i in range(n_stats.value):
-                col_idx = ctypes.c_uint32(0)
-                null_count = ctypes.c_uint64(0)
-                lib.mosaic_writer_row_group_stat_column_index(
-                    self._handle, rg, i, ctypes.byref(col_idx))
-                lib.mosaic_writer_row_group_stat_null_count(
-                    self._handle, rg, i, ctypes.byref(null_count))
-                min_len = ctypes.c_size_t(0)
-                max_len = ctypes.c_size_t(0)
-                min_ptr = lib.mosaic_writer_row_group_stat_min(
-                    self._handle, rg, i, ctypes.byref(min_len))
-                max_ptr = lib.mosaic_writer_row_group_stat_max(
-                    self._handle, rg, i, ctypes.byref(max_len))
-                min_val = bytes(min_ptr[:min_len.value]) if min_ptr and min_len.value > 0 else None
-                max_val = bytes(max_ptr[:max_len.value]) if max_ptr and max_len.value > 0 else None
-                rg_stats.append(ColumnStatistics(col_idx.value, null_count.value, min_val, max_val))
-            all_stats.append(rg_stats)
+            all_stats.append(_fetch_rg_stats(
+                lib.mosaic_writer_row_group_num_stats,
+                lib.mosaic_writer_row_group_stats,
+                self._handle, rg))
         self._row_group_stats = all_stats
 
     def __enter__(self):
@@ -254,8 +268,7 @@ class MosaicWriter:
 
 
 class ColumnStatistics:
-    def __init__(self, column_index, null_count, min, max):
-        self.column_index = column_index
+    def __init__(self, null_count, min, max):
         self.null_count = null_count
         self.min = min
         self.max = max
@@ -266,6 +279,11 @@ class ColumnStatistics:
 
 
 class MosaicReader:
+    """Schema and output columns are in storage order (name-sorted).
+
+    Use :meth:`project` to select and reorder output columns.
+    """
+
     def __init__(self, handle, refs=None):
         self._handle = handle
         self._refs = refs
@@ -321,14 +339,16 @@ class MosaicReader:
             _check_error("num_row_groups failed")
         return out.value
 
-    def read_row_group(self, rg_index, columns=None):
-        if columns is not None:
-            arr = (ctypes.c_uint32 * len(columns))(*columns)
-            rg_handle = lib.mosaic_reader_open_row_group_projected(
-                self._handle, rg_index, arr, len(columns),
-            )
-        else:
-            rg_handle = lib.mosaic_reader_open_row_group(self._handle, rg_index)
+    def project(self, columns):
+        """Set projection on the reader. Subsequent reads only return the named columns."""
+        c_strs = [c.encode("utf-8") for c in columns]
+        arr = (ctypes.c_char_p * len(columns))(*c_strs)
+        rc = lib.mosaic_reader_set_projection(self._handle, arr, len(columns))
+        if rc != 0:
+            _check_error("set_projection failed")
+
+    def read_row_group(self, rg_index):
+        rg_handle = lib.mosaic_reader_open_row_group(self._handle, rg_index)
         if not rg_handle:
             _check_error(f"failed to open row group {rg_index}")
         rb_handle = lib.mosaic_row_group_reader_read_columns(rg_handle)
@@ -351,16 +371,13 @@ class MosaicReader:
         finally:
             lib.mosaic_record_batch_free(rb_handle)
 
-    def read_all(self, columns=None):
+    def read_all(self):
         batches = []
         for rg in range(self.num_row_groups):
-            batches.append(self.read_row_group(rg, columns=columns))
+            batches.append(self.read_row_group(rg))
         if batches:
             return pa.Table.from_batches(batches, schema=batches[0].schema)
-        schema = self._schema
-        if columns is not None:
-            schema = pa.schema([self._schema.field(i) for i in columns])
-        return pa.Table.from_batches([], schema=schema)
+        return pa.Table.from_batches([], schema=self._schema)
 
     def row_group_num_rows(self, rg_index):
         out = ctypes.c_uint32(0)
@@ -370,40 +387,11 @@ class MosaicReader:
         return out.value
 
     def get_row_group_statistics(self, rg_index):
-        """Returns column statistics for the given row group.
-
-        The returned list follows the same order as the stats_columns
-        specified in WriterOptions when the file was written.
-        """
-        n_out = ctypes.c_uint32(0)
-        rc = lib.mosaic_reader_row_group_num_stats(self._handle, rg_index, ctypes.byref(n_out))
-        if rc != 0:
-            _check_error("row_group_num_stats failed")
-        n = n_out.value
-        result = []
-        for i in range(n):
-            col_idx_out = ctypes.c_uint32(0)
-            rc = lib.mosaic_reader_row_group_stat_column_index(
-                self._handle, rg_index, i, ctypes.byref(col_idx_out)
-            )
-            if rc != 0:
-                _check_error("stat_column_index failed")
-            col_idx = col_idx_out.value
-            null_count_out = ctypes.c_uint64(0)
-            rc = lib.mosaic_reader_row_group_stat_null_count(
-                self._handle, rg_index, i, ctypes.byref(null_count_out)
-            )
-            if rc != 0:
-                _check_error("stat_null_count failed")
-            null_count = null_count_out.value
-            out_len = ctypes.c_size_t(0)
-            ptr = lib.mosaic_reader_row_group_stat_min(self._handle, rg_index, i, ctypes.byref(out_len))
-            min_val = ctypes.string_at(ptr, out_len.value) if ptr and out_len.value > 0 else None
-            out_len = ctypes.c_size_t(0)
-            ptr = lib.mosaic_reader_row_group_stat_max(self._handle, rg_index, i, ctypes.byref(out_len))
-            max_val = ctypes.string_at(ptr, out_len.value) if ptr and out_len.value > 0 else None
-            result.append(ColumnStatistics(col_idx, null_count, min_val, max_val))
-        return result
+        """Returns column statistics for the given row group, keyed by column name."""
+        return _fetch_rg_stats(
+            lib.mosaic_reader_row_group_num_stats,
+            lib.mosaic_reader_row_group_stats,
+            self._handle, rg_index)
 
     def close(self):
         if self._handle:
@@ -432,4 +420,6 @@ def write_table(table, stream, options=None):
 
 def read_table(read_at_fn, file_length, columns=None):
     with MosaicReader.from_input_file(read_at_fn, file_length) as reader:
-        return reader.read_all(columns=columns)
+        if columns:
+            reader.project(columns)
+        return reader.read_all()

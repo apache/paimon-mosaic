@@ -120,7 +120,7 @@ writer.close().unwrap();
                     <tr><td><code>estimated_file_size()</code></td><td><code>u64</code></td><td>Estimated output file size in bytes (for file rolling)</td></tr>
                     <tr><td><code>close()</code></td><td><code>io::Result&lt;()&gt;</code></td><td>Flush remaining data and write footer</td></tr>
                     <tr><td><code>num_row_groups()</code></td><td><code>usize</code></td><td>Number of row groups written (available after close)</td></tr>
-                    <tr><td><code>row_group_stats(rg_index)</code></td><td><code>&amp;[ColumnStats]</code></td><td>Column statistics for a row group (available after close)</td></tr>
+                    <tr><td><code>row_group_stats(rg_index)</code></td><td><code>&amp;[ColumnStats]</code></td><td>Column statistics for a row group (available after close); each entry has a <code>column_index</code> into the sorted schema</td></tr>
                 </tbody>
             </table>
 
@@ -139,13 +139,13 @@ writer.close().unwrap();
 <h3>1. Open and Inspect the Schema</h3>
             <p>
                 Pass your <code>InputFile</code> implementation and the file length directly
-                to <code>MosaicReader::new</code>:
+                to <code>MosaicReader::new</code>. Columns are in name-sorted order (the storage order):
             </p>
 <pre><code><span class="kw">use</span> mosaic_core::reader::{MosaicReader, InputFile, ReaderAccess};
 
 <span class="kw">let</span> reader = MosaicReader::new(my_input_file, file_len).unwrap();
 
-<span class="cmt">// Iterate over all columns</span>
+<span class="cmt">// Iterate over all columns (name-sorted order)</span>
 <span class="kw">for</span> col <span class="kw">in</span> &amp;reader.schema().columns {
     println!(<span class="str">"name={} type={:?} nullable={}"</span>,
         col.name, col.data_type, col.nullable);
@@ -193,25 +193,28 @@ writer.close().unwrap();
 
             <h3>Projection Pushdown</h3>
             <p>
-                Use <code>row_group_reader_projected</code> to read only specific columns.
+                Use <code>project()</code> to select and reorder columns by name.
                 Only the buckets containing the projected columns are decompressed &mdash;
                 reading 1 column out of 10,000 only touches 1 bucket instead of all 100.
-                The returned batch contains only the projected columns.
+                The output preserves the order you specify:
             </p>
-<pre><code><span class="kw">let</span> name_col = reader.schema().columns.iter()
-    .position(|c| c.name == <span class="str">"name"</span>).unwrap();
-<span class="kw">let</span> score_col = reader.schema().columns.iter()
-    .position(|c| c.name == <span class="str">"score"</span>).unwrap();
+<pre><code><span class="cmt">// Project "name" and "score" columns, in that order</span>
+<span class="kw">let</span> <span class="kw">mut</span> reader = MosaicReader::new(my_input_file, file_len).unwrap();
+reader.project(&amp;[<span class="str">"name"</span>, <span class="str">"score"</span>]).unwrap();
 
-<span class="kw">let</span> <span class="kw">mut</span> rg = reader.row_group_reader_projected(rg_idx, &amp;[name_col, score_col]).unwrap();
+<span class="kw">let</span> <span class="kw">mut</span> rg = reader.row_group_reader(<span class="num">0</span>).unwrap();
 <span class="kw">let</span> batch = rg.read_columns().unwrap();
-<span class="cmt">// batch contains only 2 columns: "name" and "score"</span>
-<span class="cmt">// Use batch.schema().field(i).name() to identify columns</span></code></pre>
+<span class="cmt">// batch contains only 2 columns: "name" and "score", in that order</span>
+
+<span class="cmt">// Empty projection: count-only read (0 columns, row count preserved)</span>
+reader.project(&amp;[]).unwrap();
+<span class="kw">let</span> num_rows = reader.row_group_num_rows(<span class="num">0</span>)?;</code></pre>
 
             <div class="note">
                 <strong>Column ordering</strong>
-                The reader preserves the original schema column order.
-                Use <code>reader.schema().columns[i].name</code> or positional lookup to access columns.
+                Columns are stored in name-sorted order regardless of the input schema order.
+                The reader returns columns in storage (name-sorted) order by default.
+                Use <code>project()</code> to select and reorder output columns.
             </div>
 
 
@@ -223,7 +226,7 @@ writer.close().unwrap();
 
             <h3>Writing with Stats</h3>
 <pre><code><span class="kw">let</span> <span class="kw">mut</span> writer = MosaicWriter::new(output, &amp;arrow_schema, WriterOptions {
-    stats_columns: <span class="kw">vec!</span>[<span class="num">0</span>, <span class="num">2</span>],  <span class="cmt">// build stats for columns 0 and 2</span>
+    stats_columns: <span class="kw">vec!</span>[<span class="str">"age"</span>.into(), <span class="str">"score"</span>.into()],  <span class="cmt">// build stats for "age" and "score"</span>
     ..Default::default()
 })?;</code></pre>
 

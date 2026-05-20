@@ -22,7 +22,9 @@ package org.apache.paimon.mosaic;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
@@ -31,12 +33,17 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+/**
+ * Columns are stored in name-sorted order regardless of input schema order.
+ * The reader returns columns in storage (name-sorted) order by default;
+ * use {@link MosaicReader#project} to control output column order.
+ */
 public class MosaicWriter implements AutoCloseable {
 
     private long handle;
     private boolean closed;
     private final BufferAllocator allocator;
-    private List<List<ColumnStatistics>> rowGroupStats;
+    private List<Map<String, ColumnStatistics>> rowGroupStats;
 
     public MosaicWriter(OutputStream outputStream, Schema arrowSchema, BufferAllocator allocator) {
         this(outputStream, arrowSchema, new WriterOptions(), allocator);
@@ -107,10 +114,9 @@ public class MosaicWriter implements AutoCloseable {
     }
 
     /**
-     * Returns column statistics for the given row group. The returned list follows the same order
-     * as the {@code statsColumns} specified in {@link WriterOptions}.
+     * Returns column statistics for the given row group, keyed by column name.
      */
-    public List<ColumnStatistics> getRowGroupStatistics(int rgIndex) {
+    public Map<String, ColumnStatistics> getRowGroupStatistics(int rgIndex) {
         if (rowGroupStats == null) {
             throw new IllegalStateException("writer is not closed yet");
         }
@@ -133,22 +139,21 @@ public class MosaicWriter implements AutoCloseable {
 
     private void collectStatistics() {
         int numRg = NativeLib.nativeWriterNumRowGroups(handle);
-        List<List<ColumnStatistics>> allStats = new ArrayList<>(numRg);
+        List<Map<String, ColumnStatistics>> allStats = new ArrayList<>(numRg);
         for (int rg = 0; rg < numRg; rg++) {
-            int n = NativeLib.nativeWriterRowGroupNumStats(handle, rg);
-            if (n <= 0) {
-                allStats.add(Collections.emptyList());
+            String[] names = NativeLib.nativeWriterRowGroupStatNames(handle, rg);
+            if (names == null || names.length == 0) {
+                allStats.add(Collections.emptyMap());
                 continue;
             }
-            List<ColumnStatistics> rgStats = new ArrayList<>(n);
-            for (int i = 0; i < n; i++) {
-                rgStats.add(new ColumnStatistics(
-                        NativeLib.nativeWriterRowGroupStatColumnIndex(handle, rg, i),
-                        NativeLib.nativeWriterRowGroupStatNullCount(handle, rg, i),
-                        NativeLib.nativeWriterRowGroupStatMin(handle, rg, i),
-                        NativeLib.nativeWriterRowGroupStatMax(handle, rg, i)));
+            long[] nullCounts = NativeLib.nativeWriterRowGroupStatNullCounts(handle, rg);
+            byte[][] mins = NativeLib.nativeWriterRowGroupStatMins(handle, rg);
+            byte[][] maxs = NativeLib.nativeWriterRowGroupStatMaxs(handle, rg);
+            Map<String, ColumnStatistics> rgStats = new LinkedHashMap<>(names.length);
+            for (int i = 0; i < names.length; i++) {
+                rgStats.put(names[i], new ColumnStatistics(nullCounts[i], mins[i], maxs[i]));
             }
-            allStats.add(Collections.unmodifiableList(rgStats));
+            allStats.add(Collections.unmodifiableMap(rgStats));
         }
         this.rowGroupStats = Collections.unmodifiableList(allStats);
     }
