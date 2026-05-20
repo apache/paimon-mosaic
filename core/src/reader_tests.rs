@@ -3622,3 +3622,69 @@ fn test_writer_stats_matches_reader_stats() {
         assert_eq!(format!("{:?}", ws.max), format!("{:?}", rs.max));
     }
 }
+
+#[test]
+fn test_row_group_num_rows() {
+    let columns = vec![
+        ("id".to_string(), DataType::Int32, false),
+        ("val".to_string(), DataType::Int64, true),
+    ];
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            compression: COMPRESSION_NONE,
+            row_group_max_size: 200,
+            num_buckets: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let total_rows = 500;
+    let rows: Vec<Vec<Value>> = (0..total_rows)
+        .map(|i| vec![Value::Integer(i), Value::BigInt(i as i64 * 2)])
+        .collect();
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    let reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
+
+    assert!(reader.num_row_groups() > 1);
+
+    let mut total = 0usize;
+    for rg_idx in 0..reader.num_row_groups() {
+        let num_rows = reader.row_group_num_rows(rg_idx).unwrap();
+        assert!(num_rows > 0);
+        let mut rg = reader.row_group_reader(rg_idx).unwrap();
+        let batch = rg.read_columns().unwrap();
+        assert_eq!(num_rows, batch.num_rows());
+        total += num_rows;
+    }
+    assert_eq!(total, total_rows as usize);
+}
+
+#[test]
+fn test_row_group_num_rows_out_of_range() {
+    let columns = vec![("x".to_string(), DataType::Int32, false)];
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions::default(),
+    )
+    .unwrap();
+    let rows: Vec<Vec<Value>> = (0..10).map(|i| vec![Value::Integer(i)]).collect();
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    let reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
+
+    assert_eq!(reader.num_row_groups(), 1);
+    assert_eq!(reader.row_group_num_rows(0).unwrap(), 10);
+    assert!(reader.row_group_num_rows(1).is_err());
+    assert!(reader.row_group_num_rows(999).is_err());
+}

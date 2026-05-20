@@ -902,4 +902,70 @@ public class MosaicRoundtripTest {
             }
         }
     }
+
+    @Test
+    public void testRowGroupNumRows() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.nullable("id", new ArrowType.Int(32, true)),
+                Field.nullable("data", new ArrowType.Int(64, true))
+        ));
+
+        WriterOptions opts = new WriterOptions().compression(0).numBuckets(1).rowGroupMaxSize(200);
+
+        int totalRows = 500;
+        int batchSize = 10;
+        byte[] data = writeToBytes(arrowSchema, opts, writer -> {
+            for (int start = 0; start < totalRows; start += batchSize) {
+                try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+                    IntVector idVec = (IntVector) root.getVector("id");
+                    BigIntVector dataVec = (BigIntVector) root.getVector("data");
+                    idVec.allocateNew(batchSize);
+                    dataVec.allocateNew(batchSize);
+                    for (int i = 0; i < batchSize; i++) {
+                        idVec.set(i, start + i);
+                        dataVec.set(i, (long) (start + i) * 2);
+                    }
+                    root.setRowCount(batchSize);
+                    writer.write(root);
+                }
+            }
+        });
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            assertTrue(reader.numRowGroups() > 1);
+            int sum = 0;
+            for (int rg = 0; rg < reader.numRowGroups(); rg++) {
+                int numRows = reader.rowGroupNumRows(rg);
+                assertTrue(numRows > 0);
+                try (VectorSchemaRoot batch = reader.readRowGroup(rg, allocator)) {
+                    assertEquals(numRows, batch.getRowCount());
+                }
+                sum += numRows;
+            }
+            assertEquals(totalRows, sum);
+        }
+    }
+
+    @Test
+    public void testRowGroupNumRowsSingleRowGroup() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.nullable("x", new ArrowType.Int(32, true))
+        ));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            IntVector xVec = (IntVector) root.getVector("x");
+            xVec.allocateNew(10);
+            for (int i = 0; i < 10; i++) {
+                xVec.set(i, i);
+            }
+            root.setRowCount(10);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            assertEquals(1, reader.numRowGroups());
+            assertEquals(10, reader.rowGroupNumRows(0));
+        }
+    }
 }

@@ -724,3 +724,51 @@ class TestWriter:
                     assert ws.has_min_max == rs.has_min_max
                     assert ws.min == rs.min
                     assert ws.max == rs.max
+
+    def test_row_group_num_rows(self):
+        pa_schema = pa.schema(
+            [pa.field("id", pa.int32()), pa.field("data", pa.int64())]
+        )
+
+        opts = WriterOptions(
+            compression=WriterOptions.COMPRESSION_NONE,
+            num_buckets=1,
+            row_group_max_size=200,
+        )
+        buf = io.BytesIO()
+        with MosaicWriter(buf, pa_schema, opts) as writer:
+            for start in range(0, 500, 50):
+                batch = pa.record_batch(
+                    [
+                        pa.array(list(range(start, start + 50)), type=pa.int32()),
+                        pa.array(
+                            [i * 2 for i in range(start, start + 50)],
+                            type=pa.int64(),
+                        ),
+                    ],
+                    names=["id", "data"],
+                )
+                writer.write(batch)
+        data = buf.getvalue()
+
+        with _reader_from_bytes(data) as reader:
+            assert reader.num_row_groups > 1
+            total = 0
+            for rg in range(reader.num_row_groups):
+                num_rows = reader.row_group_num_rows(rg)
+                assert num_rows > 0
+                rb = reader.read_row_group(rg)
+                assert num_rows == rb.num_rows
+                total += num_rows
+            assert total == 500
+
+    def test_row_group_num_rows_single(self):
+        pa_schema = pa.schema([pa.field("x", pa.int32())])
+        batch = pa.record_batch(
+            [pa.array(list(range(10)), type=pa.int32())], names=["x"]
+        )
+        data = _write_to_bytes(pa_schema, batch)
+
+        with _reader_from_bytes(data) as reader:
+            assert reader.num_row_groups == 1
+            assert reader.row_group_num_rows(0) == 10
