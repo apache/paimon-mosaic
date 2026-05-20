@@ -24,6 +24,9 @@ java/target/
 java/src/main/resources/native/
 *.class
 
+# C++
+cpp/build/
+
 # Python
 __pycache__/
 *.pyc
