@@ -195,6 +195,11 @@ class MosaicWriter:
         return len(self._row_group_stats)
 
     def get_row_group_statistics(self, rg_index):
+        """Returns column statistics for the given row group.
+
+        The returned list follows the same order as the stats_columns
+        specified in WriterOptions.
+        """
         if self._row_group_stats is None:
             raise RuntimeError("writer is not closed yet")
         return self._row_group_stats[rg_index]
@@ -365,6 +370,11 @@ class MosaicReader:
         return out.value
 
     def get_row_group_statistics(self, rg_index):
+        """Returns column statistics for the given row group.
+
+        The returned list follows the same order as the stats_columns
+        specified in WriterOptions when the file was written.
+        """
         n_out = ctypes.c_uint32(0)
         rc = lib.mosaic_reader_row_group_num_stats(self._handle, rg_index, ctypes.byref(n_out))
         if rc != 0:
