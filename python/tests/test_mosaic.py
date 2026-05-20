@@ -348,12 +348,11 @@ class TestProjection:
         data = _write_to_bytes(pa_schema, batch, opts)
 
         with _reader_from_bytes(data) as reader:
-            a_col = reader.schema.get_field_index("a")
-            b_col = reader.schema.get_field_index("b")
+            reader.project(["a", "b"])
 
             total_rows = 0
             for rg in range(reader.num_row_groups):
-                rb = reader.read_row_group(rg, columns=[a_col, b_col])
+                rb = reader.read_row_group(rg)
                 assert rb.num_columns == 2
                 total_rows += rb.num_rows
 
@@ -380,10 +379,64 @@ class TestProjection:
         data = _write_to_bytes(pa_schema, batch)
 
         with _reader_from_bytes(data) as reader:
-            b_col = reader.schema.get_field_index("b")
-            rb = reader.read_row_group(0, columns=[b_col])
+            reader.project(["b"])
+            rb = reader.read_row_group(0)
             assert rb.num_columns == 1
             assert rb.num_rows == 10
+
+    def test_projection_preserves_order(self):
+        pa_schema = pa.schema(
+            [
+                pa.field("a", pa.int32()),
+                pa.field("b", pa.utf8()),
+                pa.field("c", pa.float64()),
+            ]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array(list(range(10)), type=pa.int32()),
+                pa.array([f"s{i}" for i in range(10)]),
+                pa.array([float(i) * 0.5 for i in range(10)]),
+            ],
+            names=["a", "b", "c"],
+        )
+
+        opts = WriterOptions(num_buckets=2)
+        data = _write_to_bytes(pa_schema, batch, opts)
+
+        with _reader_from_bytes(data) as reader:
+            reader.project(["c", "a", "b"])
+            rb = reader.read_row_group(0)
+            assert rb.num_columns == 3
+            assert rb.schema.names == ["c", "a", "b"]
+            assert rb.column("c").to_pylist() == [i * 0.5 for i in range(10)]
+            assert rb.column("a").to_pylist() == list(range(10))
+            assert rb.column("b").to_pylist() == [f"s{i}" for i in range(10)]
+
+    def test_projection_empty(self):
+        pa_schema = pa.schema(
+            [
+                pa.field("a", pa.int32()),
+                pa.field("b", pa.utf8()),
+            ]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array(list(range(5)), type=pa.int32()),
+                pa.array([f"v{i}" for i in range(5)]),
+            ],
+            names=["a", "b"],
+        )
+
+        data = _write_to_bytes(pa_schema, batch)
+
+        with _reader_from_bytes(data) as reader:
+            reader.project([])
+            rb = reader.read_row_group(0)
+            assert rb.num_columns == 0
+            assert rb.num_rows == 5
 
 
 class TestSchema:
@@ -436,16 +489,17 @@ class TestStatistics:
             names=["id", "name", "score"],
         )
 
-        opts = WriterOptions(stats_columns=[0, 2])
+        opts = WriterOptions(stats_columns=["id", "score"])
         data = _write_to_bytes(pa_schema, batch, opts)
 
         with _reader_from_bytes(data) as reader:
             for rg in range(reader.num_row_groups):
                 stats = reader.get_row_group_statistics(rg)
                 assert len(stats) > 0
-                for stat in stats:
+                assert isinstance(stats, dict)
+                for name, stat in stats.items():
                     assert isinstance(stat, ColumnStatistics)
-                    assert stat.column_index in (0, 2)
+                    assert name in ("id", "score")
                     assert stat.null_count == 0
                     assert stat.has_min_max
                     assert stat.min is not None
@@ -453,7 +507,7 @@ class TestStatistics:
                     assert len(stat.min) > 0
                     assert len(stat.max) > 0
 
-                id_stat = next(s for s in stats if s.column_index == 0)
+                id_stat = stats["id"]
                 min_id = struct.unpack(">i", id_stat.min)[0]
                 max_id = struct.unpack(">i", id_stat.max)[0]
                 assert min_id == 0
@@ -472,14 +526,14 @@ class TestStatistics:
             names=["a", "b"],
         )
 
-        opts = WriterOptions(stats_columns=[0, 1], num_buckets=1)
+        opts = WriterOptions(stats_columns=["a", "b"], num_buckets=1)
         data = _write_to_bytes(pa_schema, batch, opts)
 
         with _reader_from_bytes(data) as reader:
             stats = reader.get_row_group_statistics(0)
             assert len(stats) == 2
 
-            a_stat = next(s for s in stats if s.column_index == 0)
+            a_stat = stats["a"]
             assert a_stat.null_count == 1
             assert a_stat.has_min_max
             min_a = struct.unpack(">i", a_stat.min)[0]
@@ -487,7 +541,7 @@ class TestStatistics:
             assert min_a == 5
             assert max_a == 20
 
-            b_stat = next(s for s in stats if s.column_index == 1)
+            b_stat = stats["b"]
             assert b_stat.null_count == 2
             assert b_stat.has_min_max
             min_b = struct.unpack(">q", b_stat.min)[0]
@@ -502,16 +556,44 @@ class TestStatistics:
             [pa.array([None, None, None], type=pa.int32())], names=["x"]
         )
 
-        opts = WriterOptions(stats_columns=[0], num_buckets=1)
+        opts = WriterOptions(stats_columns=["x"], num_buckets=1)
         data = _write_to_bytes(pa_schema, batch, opts)
 
         with _reader_from_bytes(data) as reader:
             stats = reader.get_row_group_statistics(0)
             assert len(stats) == 1
-            assert stats[0].null_count == 3
-            assert not stats[0].has_min_max
-            assert stats[0].min is None
-            assert stats[0].max is None
+            assert stats["x"].null_count == 3
+            assert not stats["x"].has_min_max
+            assert stats["x"].min is None
+            assert stats["x"].max is None
+
+
+    def test_stats_empty_string_min(self):
+        pa_schema = pa.schema([pa.field("s", pa.utf8())])
+
+        batch = pa.record_batch(
+            [pa.array(["", "b"])], names=["s"]
+        )
+
+        opts = WriterOptions(stats_columns=["s"], num_buckets=1)
+        buf = io.BytesIO()
+        with MosaicWriter(buf, pa_schema, opts) as writer:
+            writer.write(batch)
+
+        writer_stats = writer.get_row_group_statistics(0)
+        assert "s" in writer_stats
+        s_stat = writer_stats["s"]
+        assert s_stat.has_min_max
+        assert s_stat.min == b""
+        assert s_stat.max == b"b"
+        assert s_stat.null_count == 0
+
+        data = buf.getvalue()
+        with _reader_from_bytes(data) as reader:
+            stats = reader.get_row_group_statistics(0)
+            assert stats["s"].has_min_max
+            assert stats["s"].min == b""
+            assert stats["s"].max == b"b"
 
 
 class TestConvenience:
@@ -607,7 +689,7 @@ class TestWriter:
             names=["id", "name", "score"],
         )
 
-        opts = WriterOptions(stats_columns=[0, 2])
+        opts = WriterOptions(stats_columns=["id", "score"])
         buf = io.BytesIO()
         writer = MosaicWriter(buf, pa_schema, opts)
         writer.write(batch)
@@ -616,15 +698,16 @@ class TestWriter:
         assert writer.num_row_groups >= 1
         stats = writer.get_row_group_statistics(0)
         assert len(stats) > 0
-        for stat in stats:
+        assert isinstance(stats, dict)
+        for name, stat in stats.items():
             assert isinstance(stat, ColumnStatistics)
-            assert stat.column_index in (0, 2)
+            assert name in ("id", "score")
             assert stat.null_count == 0
             assert stat.has_min_max
             assert stat.min is not None
             assert stat.max is not None
 
-        id_stat = next(s for s in stats if s.column_index == 0)
+        id_stat = stats["id"]
         min_id = struct.unpack(">i", id_stat.min)[0]
         max_id = struct.unpack(">i", id_stat.max)[0]
         assert min_id == 0
@@ -643,7 +726,7 @@ class TestWriter:
             names=["a", "b"],
         )
 
-        opts = WriterOptions(stats_columns=[0, 1], num_buckets=1)
+        opts = WriterOptions(stats_columns=["a", "b"], num_buckets=1)
         buf = io.BytesIO()
         writer = MosaicWriter(buf, pa_schema, opts)
         writer.write(batch)
@@ -653,7 +736,7 @@ class TestWriter:
         stats = writer.get_row_group_statistics(0)
         assert len(stats) == 2
 
-        a_stat = next(s for s in stats if s.column_index == 0)
+        a_stat = stats["a"]
         assert a_stat.null_count == 1
         assert a_stat.has_min_max
         min_a = struct.unpack(">i", a_stat.min)[0]
@@ -661,7 +744,7 @@ class TestWriter:
         assert min_a == 5
         assert max_a == 20
 
-        b_stat = next(s for s in stats if s.column_index == 1)
+        b_stat = stats["b"]
         assert b_stat.null_count == 2
         assert b_stat.has_min_max
         min_b = struct.unpack(">q", b_stat.min)[0]
@@ -676,7 +759,7 @@ class TestWriter:
             [pa.array([None, None, None], type=pa.int32())], names=["x"]
         )
 
-        opts = WriterOptions(stats_columns=[0], num_buckets=1)
+        opts = WriterOptions(stats_columns=["x"], num_buckets=1)
         buf = io.BytesIO()
         writer = MosaicWriter(buf, pa_schema, opts)
         writer.write(batch)
@@ -685,10 +768,10 @@ class TestWriter:
         assert writer.num_row_groups == 1
         stats = writer.get_row_group_statistics(0)
         assert len(stats) == 1
-        assert stats[0].null_count == 3
-        assert not stats[0].has_min_max
-        assert stats[0].min is None
-        assert stats[0].max is None
+        assert stats["x"].null_count == 3
+        assert not stats["x"].has_min_max
+        assert stats["x"].min is None
+        assert stats["x"].max is None
 
     def test_writer_stats_matches_reader_stats(self):
         pa_schema = pa.schema(
@@ -706,7 +789,7 @@ class TestWriter:
             names=["id", "score"],
         )
 
-        opts = WriterOptions(stats_columns=[0, 1], num_buckets=1)
+        opts = WriterOptions(stats_columns=["id", "score"], num_buckets=1)
         buf = io.BytesIO()
         writer = MosaicWriter(buf, pa_schema, opts)
         writer.write(batch)
@@ -718,12 +801,12 @@ class TestWriter:
                 w_stats = writer.get_row_group_statistics(rg)
                 r_stats = reader.get_row_group_statistics(rg)
                 assert len(w_stats) == len(r_stats)
-                for ws, rs in zip(w_stats, r_stats):
-                    assert ws.column_index == rs.column_index
-                    assert ws.null_count == rs.null_count
-                    assert ws.has_min_max == rs.has_min_max
-                    assert ws.min == rs.min
-                    assert ws.max == rs.max
+                assert set(w_stats.keys()) == set(r_stats.keys())
+                for name in w_stats:
+                    assert w_stats[name].null_count == r_stats[name].null_count
+                    assert w_stats[name].has_min_max == r_stats[name].has_min_max
+                    assert w_stats[name].min == r_stats[name].min
+                    assert w_stats[name].max == r_stats[name].max
 
     def test_row_group_num_rows(self):
         pa_schema = pa.schema(

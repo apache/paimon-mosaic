@@ -39,6 +39,8 @@ pub struct MosaicSchema {
     pub columns: Vec<ColumnMeta>,
     /// bucket_to_global[bucket_id] = [global_col_indices...] in name-sorted order
     pub bucket_to_global: Vec<Vec<usize>>,
+    /// original_order[orig_pos] = sorted_pos. Used as default output order when no projection is set.
+    pub original_order: Vec<usize>,
 }
 
 impl MosaicSchema {
@@ -71,26 +73,29 @@ impl MosaicSchema {
         sorted_indices.sort_by(|&a, &b| columns[a].0.cmp(&columns[b].0));
 
         let mut bucket_to_global = vec![Vec::new(); actual_buckets];
-        let mut cols: Vec<ColumnMeta> = columns
-            .into_iter()
-            .map(|(name, data_type, nullable)| ColumnMeta {
-                name,
-                data_type,
-                nullable,
-                bucket_id: 0,
-            })
-            .collect();
+        let mut cols: Vec<ColumnMeta> = Vec::with_capacity(num_columns);
 
-        for (sorted_pos, &global_idx) in sorted_indices.iter().enumerate() {
+        for (sorted_pos, &input_idx) in sorted_indices.iter().enumerate() {
             let bucket_id = spec::assign_bucket(sorted_pos, num_columns, actual_buckets);
-            cols[global_idx].bucket_id = bucket_id;
-            bucket_to_global[bucket_id].push(global_idx);
+            cols.push(ColumnMeta {
+                name: columns[input_idx].0.clone(),
+                data_type: columns[input_idx].1.clone(),
+                nullable: columns[input_idx].2,
+                bucket_id,
+            });
+            bucket_to_global[bucket_id].push(sorted_pos);
+        }
+
+        let mut original_order = vec![0usize; num_columns];
+        for (sorted_pos, &input_idx) in sorted_indices.iter().enumerate() {
+            original_order[input_idx] = sorted_pos;
         }
 
         MosaicSchema {
             num_buckets: actual_buckets,
             columns: cols,
             bucket_to_global,
+            original_order,
         }
     }
 
@@ -135,16 +140,10 @@ impl MosaicSchema {
             None
         };
 
-        struct SortedEntry {
-            logical_index: usize,
-            name: String,
-            data_type: DataType,
-            nullable: bool,
-            sorted_pos: usize,
-        }
-
-        let mut entries = Vec::with_capacity(num_columns);
+        let mut columns = Vec::with_capacity(num_columns);
+        let mut bucket_to_global = vec![Vec::new(); num_buckets];
         let mut prev_encoded: Vec<u8> = Vec::new();
+        let mut seen_names = std::collections::HashSet::with_capacity(num_columns);
 
         for sorted_pos in 0..num_columns {
             let shared = varint::decode(data, &mut pos)? as usize;
@@ -173,89 +172,64 @@ impl MosaicSchema {
                 )
             })?;
 
-            let logical_index = varint::decode(data, &mut pos)? as usize;
-
-            let field = types::deserialize_field(&name, data, &mut pos)?;
-
-            entries.push(SortedEntry {
-                logical_index,
-                name,
-                data_type: field.data_type().clone(),
-                nullable: field.is_nullable(),
-                sorted_pos,
-            });
-        }
-
-        let mut columns = Vec::with_capacity(num_columns);
-        columns.resize_with(num_columns, || ColumnMeta {
-            name: String::new(),
-            data_type: DataType::Int32,
-            nullable: false,
-            bucket_id: 0,
-        });
-        let mut bucket_to_global = vec![Vec::new(); num_buckets];
-        let mut seen = vec![false; num_columns];
-
-        for entry in entries {
-            if entry.logical_index >= num_columns {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "schema: logical_index out of range",
-                ));
-            }
-            if seen[entry.logical_index] {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "schema: duplicate logical_index",
-                ));
-            }
-            seen[entry.logical_index] = true;
-            let bucket_id = spec::assign_bucket(entry.sorted_pos, num_columns, num_buckets);
-            columns[entry.logical_index] = ColumnMeta {
-                name: entry.name,
-                data_type: entry.data_type,
-                nullable: entry.nullable,
-                bucket_id,
-            };
-            bucket_to_global[bucket_id].push(entry.logical_index);
-        }
-
-        let mut seen_names = std::collections::HashSet::with_capacity(num_columns);
-        for col in &columns {
-            if col.name.is_empty() {
+            if name.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "schema: empty column name",
                 ));
             }
-            if !seen_names.insert(&col.name) {
+            if !seen_names.insert(name.clone()) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("schema: duplicate column name '{}'", col.name),
+                    format!("schema: duplicate column name '{}'", name),
                 ));
             }
+
+            let field = types::deserialize_field(&name, data, &mut pos)?;
+
+            let bucket_id = spec::assign_bucket(sorted_pos, num_columns, num_buckets);
+            columns.push(ColumnMeta {
+                name,
+                data_type: field.data_type().clone(),
+                nullable: field.is_nullable(),
+                bucket_id,
+            });
+            bucket_to_global[bucket_id].push(sorted_pos);
         }
+
+        // Read original column order (delta + zigzag encoded)
+        let original_order = if pos < data.len() {
+            let mut order = Vec::with_capacity(num_columns);
+            let mut prev = 0i64;
+            for _ in 0..num_columns {
+                let delta = varint::decode_zigzag(data, &mut pos)?;
+                prev += delta;
+                order.push(prev as usize);
+            }
+            order
+        } else {
+            (0..num_columns).collect()
+        };
 
         Ok(MosaicSchema {
             num_buckets,
             columns,
             bucket_to_global,
+            original_order,
         })
     }
 
     pub fn serialize(&self) -> Vec<u8> {
         let num_columns = self.columns.len();
 
-        let mut sorted_indices: Vec<usize> = (0..num_columns).collect();
-        sorted_indices.sort_by(|&a, &b| self.columns[a].name.cmp(&self.columns[b].name));
-
-        let raw_names: Vec<Vec<u8>> = sorted_indices
+        let raw_names: Vec<Vec<u8>> = self
+            .columns
             .iter()
-            .map(|&i| self.columns[i].name.as_bytes().to_vec())
+            .map(|c| c.name.as_bytes().to_vec())
             .collect();
         let raw_refs: Vec<&[u8]> = raw_names.iter().map(|v| v.as_slice()).collect();
 
-        let plain_size = front_coded_size(&raw_refs, &sorted_indices);
+        let plain_size = front_coded_size(&raw_refs);
 
         let mut bpe_rules = Vec::new();
         let mut bpe_names = Vec::new();
@@ -269,7 +243,7 @@ impl MosaicSchema {
                     .map(|name| bpe::encode(name, &rules))
                     .collect();
                 let name_refs: Vec<&[u8]> = names.iter().map(|v| v.as_slice()).collect();
-                bpe_size = 1 + rules.len() * 2 + front_coded_size(&name_refs, &sorted_indices);
+                bpe_size = 1 + rules.len() * 2 + front_coded_size(&name_refs);
                 bpe_rules = rules;
                 bpe_names = names;
             }
@@ -287,26 +261,27 @@ impl MosaicSchema {
                 buf.push(rule[1]);
             }
             let bpe_refs: Vec<&[u8]> = bpe_names.iter().map(|v| v.as_slice()).collect();
-            write_front_coded(&mut buf, &bpe_refs, &sorted_indices, &self.columns);
+            write_front_coded(&mut buf, &bpe_refs, &self.columns);
         } else {
             buf.push(0); // NAME_ENCODING_FRONT_CODE
-            write_front_coded(&mut buf, &raw_refs, &sorted_indices, &self.columns);
+            write_front_coded(&mut buf, &raw_refs, &self.columns);
+        }
+
+        // Append original column order as delta + zigzag encoded permutation
+        let mut prev = 0i64;
+        for &pos in &self.original_order {
+            let delta = pos as i64 - prev;
+            varint::encode_zigzag(&mut buf, delta);
+            prev = pos as i64;
         }
 
         buf
     }
 }
 
-fn write_front_coded(
-    buf: &mut Vec<u8>,
-    name_bytes: &[&[u8]],
-    sorted_indices: &[usize],
-    columns: &[ColumnMeta],
-) {
+fn write_front_coded(buf: &mut Vec<u8>, name_bytes: &[&[u8]], columns: &[ColumnMeta]) {
     let mut prev: &[u8] = &[];
-    for (i, &global_idx) in sorted_indices.iter().enumerate() {
-        let col = &columns[global_idx];
-
+    for (i, col) in columns.iter().enumerate() {
         let cur = name_bytes[i];
         let shared = common_prefix_length(prev, cur);
         varint::encode(buf, shared as u32);
@@ -314,22 +289,20 @@ fn write_front_coded(
         buf.extend_from_slice(&cur[shared..]);
         prev = cur;
 
-        varint::encode(buf, global_idx as u32);
         let field = Field::new(&col.name, col.data_type.clone(), col.nullable);
         types::serialize_field(&field, buf);
     }
 }
 
-fn front_coded_size(names: &[&[u8]], sorted_indices: &[usize]) -> usize {
+fn front_coded_size(names: &[&[u8]]) -> usize {
     let mut size = 0;
     let mut prev: &[u8] = &[];
-    for (i, name) in names.iter().enumerate() {
+    for name in names {
         let shared = common_prefix_length(prev, name);
         let suffix_len = name.len() - shared;
         size += varint::encoded_size(shared as u32)
             + varint::encoded_size(suffix_len as u32)
-            + suffix_len
-            + varint::encoded_size(sorted_indices[i] as u32);
+            + suffix_len;
         prev = name;
     }
     size
@@ -366,29 +339,47 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_deserialize_preserves_column_order() {
+    fn test_serialize_deserialize_sorted_order() {
         let columns = vec![
             ("name".to_string(), DataType::Utf8, true),
             ("age".to_string(), DataType::Int32, true),
             ("score".to_string(), DataType::Float64, true),
         ];
         let schema = MosaicSchema::new(columns, 2);
-        assert_eq!(schema.columns[0].name, "name");
-        assert_eq!(schema.columns[1].name, "age");
+        assert_eq!(schema.columns[0].name, "age");
+        assert_eq!(schema.columns[1].name, "name");
         assert_eq!(schema.columns[2].name, "score");
+        // original_order: "name"(orig 0)→sorted 1, "age"(orig 1)→sorted 0, "score"(orig 2)→sorted 2
+        assert_eq!(schema.original_order, vec![1, 0, 2]);
 
         let data = schema.serialize();
         let restored = MosaicSchema::deserialize(&data).unwrap();
 
         assert_eq!(restored.columns.len(), 3);
-        assert_eq!(restored.columns[0].name, "name");
-        assert_eq!(restored.columns[1].name, "age");
+        assert_eq!(restored.columns[0].name, "age");
+        assert_eq!(restored.columns[1].name, "name");
         assert_eq!(restored.columns[2].name, "score");
         assert_eq!(restored.num_buckets, schema.num_buckets);
+        assert_eq!(restored.original_order, vec![1, 0, 2]);
 
         for i in 0..3 {
             assert_eq!(restored.columns[i].bucket_id, schema.columns[i].bucket_id);
         }
         assert_eq!(restored.bucket_to_global, schema.bucket_to_global);
+    }
+
+    #[test]
+    fn test_original_order_identity() {
+        let columns = vec![
+            ("a".to_string(), DataType::Int32, false),
+            ("b".to_string(), DataType::Utf8, true),
+            ("c".to_string(), DataType::Float64, true),
+        ];
+        let schema = MosaicSchema::new(columns, 1);
+        assert_eq!(schema.original_order, vec![0, 1, 2]);
+
+        let data = schema.serialize();
+        let restored = MosaicSchema::deserialize(&data).unwrap();
+        assert_eq!(restored.original_order, vec![0, 1, 2]);
     }
 }

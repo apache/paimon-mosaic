@@ -19,8 +19,9 @@
 
 package org.apache.paimon.mosaic;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
@@ -29,6 +30,10 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+/**
+ * The reader returns columns in the original input order by default.
+ * Use {@link #project} to select and reorder output columns.
+ */
 public class MosaicReader implements AutoCloseable {
 
     private long handle;
@@ -66,20 +71,12 @@ public class MosaicReader implements AutoCloseable {
         return NativeLib.nativeReaderNumRowGroups(handle);
     }
 
-    public VectorSchemaRoot readRowGroup(int rgIndex, BufferAllocator allocator) {
-        long rgHandle = NativeLib.nativeReaderOpenRowGroup(handle, rgIndex);
-        if (rgHandle == 0) {
-            throw new RuntimeException("failed to open row group " + rgIndex);
-        }
-        try {
-            return readRowGroupHandle(rgHandle, allocator);
-        } finally {
-            NativeLib.nativeRowGroupReaderFree(rgHandle);
-        }
+    public void project(String[] columns) {
+        NativeLib.nativeReaderSetProjection(handle, columns);
     }
 
-    public VectorSchemaRoot readRowGroup(int rgIndex, int[] columns, BufferAllocator allocator) {
-        long rgHandle = NativeLib.nativeReaderOpenRowGroupProjected(handle, rgIndex, columns);
+    public VectorSchemaRoot readRowGroup(int rgIndex, BufferAllocator allocator) {
+        long rgHandle = NativeLib.nativeReaderOpenRowGroup(handle, rgIndex);
         if (rgHandle == 0) {
             throw new RuntimeException("failed to open row group " + rgIndex);
         }
@@ -111,23 +108,21 @@ public class MosaicReader implements AutoCloseable {
     }
 
     /**
-     * Returns column statistics for the given row group. The returned list follows the same order
-     * as the {@code statsColumns} specified in {@link WriterOptions} when the file was written.
+     * Returns column statistics for the given row group, keyed by column name.
      */
-    public List<ColumnStatistics> getRowGroupStatistics(int rgIndex) {
-        int n = NativeLib.nativeReaderRowGroupNumStats(handle, rgIndex);
-        if (n < 0) {
-            throw new RuntimeException("failed to get row group statistics for index " + rgIndex);
+    public Map<String, ColumnStatistics> getRowGroupStatistics(int rgIndex) {
+        String[] names = NativeLib.nativeReaderRowGroupStatNames(handle, rgIndex);
+        if (names == null || names.length == 0) {
+            return Collections.emptyMap();
         }
-        List<ColumnStatistics> result = new ArrayList<>(n);
-        for (int i = 0; i < n; i++) {
-            result.add(new ColumnStatistics(
-                    NativeLib.nativeReaderRowGroupStatColumnIndex(handle, rgIndex, i),
-                    NativeLib.nativeReaderRowGroupStatNullCount(handle, rgIndex, i),
-                    NativeLib.nativeReaderRowGroupStatMin(handle, rgIndex, i),
-                    NativeLib.nativeReaderRowGroupStatMax(handle, rgIndex, i)));
+        long[] nullCounts = NativeLib.nativeReaderRowGroupStatNullCounts(handle, rgIndex);
+        byte[][] mins = NativeLib.nativeReaderRowGroupStatMins(handle, rgIndex);
+        byte[][] maxs = NativeLib.nativeReaderRowGroupStatMaxs(handle, rgIndex);
+        Map<String, ColumnStatistics> result = new LinkedHashMap<>(names.length);
+        for (int i = 0; i < names.length; i++) {
+            result.put(names[i], new ColumnStatistics(nullCounts[i], mins[i], maxs[i]));
         }
-        return result;
+        return Collections.unmodifiableMap(result);
     }
 
     @Override

@@ -20,8 +20,10 @@ use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
 
-use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JMethodID, JObject, JValue};
-use jni::sys::{jint, jlong};
+use jni::objects::{
+    GlobalRef, JByteArray, JClass, JMethodID, JObject, JObjectArray, JString, JValue,
+};
+use jni::sys::{jint, jlong, jlongArray};
 use jni::JNIEnv;
 use jni::JavaVM;
 
@@ -205,7 +207,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
     row_group_max_size: jlong,
     max_dict_total_bytes: jint,
     max_dict_entries: jint,
-    stats_columns: jni::objects::JIntArray,
+    stats_columns: JObjectArray<'_>,
     page_size_threshold: jint,
 ) -> jlong {
     let raw_env = env.get_raw();
@@ -266,17 +268,31 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
             cached_array_len: 0,
         };
 
-        let stats_cols: Vec<usize> = match env.get_array_length(&stats_columns) {
+        let stats_cols: Vec<String> = match env.get_array_length(&stats_columns) {
             Ok(len) if len > 0 => {
-                let mut buf = vec![0i32; len as usize];
-                if env
-                    .get_int_array_region(&stats_columns, 0, &mut buf)
-                    .is_ok()
-                {
-                    buf.iter().map(|&v| v as usize).collect()
-                } else {
-                    Vec::new()
+                let mut names = Vec::with_capacity(len as usize);
+                for i in 0..len {
+                    let obj = match env.get_object_array_element(&stats_columns, i) {
+                        Ok(o) => o,
+                        Err(_) => {
+                            throw(&mut env, "failed to read stats_columns element");
+                            return 0;
+                        }
+                    };
+                    let jstr = JString::from(obj);
+                    let s: String = match env.get_string(&jstr) {
+                        Ok(s) => s.into(),
+                        Err(_) => {
+                            throw(
+                                &mut env,
+                                "failed to convert stats_columns element to string",
+                            );
+                            return 0;
+                        }
+                    };
+                    names.push(s);
                 }
+                names
             }
             _ => Vec::new(),
         };
@@ -385,131 +401,130 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterNumRo
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupNumStats(
-    _env: JNIEnv,
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatNames<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
     rg_index: jint,
-) -> jint {
+) -> JObjectArray<'local> {
+    let null = JObjectArray::default();
     if handle == 0 {
-        return 0;
+        return null;
     }
     let writer = unsafe { &*(handle as *const WriterHandle) };
     let rg = rg_index as usize;
     if rg >= writer.inner.num_row_groups() {
-        return -1;
-    }
-    writer.inner.row_group_stats(rg).len() as jint
-}
-
-#[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatColumnIndex(
-    _env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-    rg_index: jint,
-    stat_index: jint,
-) -> jint {
-    if handle == 0 {
-        return -1;
-    }
-    let writer = unsafe { &*(handle as *const WriterHandle) };
-    let rg = rg_index as usize;
-    if rg >= writer.inner.num_row_groups() {
-        return -1;
+        return null;
     }
     let stats = writer.inner.row_group_stats(rg);
-    let idx = stat_index as usize;
-    if idx >= stats.len() {
-        return -1;
-    }
-    stats[idx].column_index as jint
-}
-
-#[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatNullCount(
-    _env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-    rg_index: jint,
-    stat_index: jint,
-) -> jlong {
-    if handle == 0 {
-        return 0;
-    }
-    let writer = unsafe { &*(handle as *const WriterHandle) };
-    let rg = rg_index as usize;
-    if rg >= writer.inner.num_row_groups() {
-        return 0;
-    }
-    let stats = writer.inner.row_group_stats(rg);
-    let idx = stat_index as usize;
-    if idx >= stats.len() {
-        return 0;
-    }
-    stats[idx].null_count as jlong
-}
-
-#[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatMin<'a>(
-    env: JNIEnv<'a>,
-    _class: JClass<'a>,
-    handle: jlong,
-    rg_index: jint,
-    stat_index: jint,
-) -> JByteArray<'a> {
-    if handle == 0 {
-        return JByteArray::default();
-    }
-    let writer = unsafe { &*(handle as *const WriterHandle) };
-    let rg = rg_index as usize;
-    if rg >= writer.inner.num_row_groups() {
-        return JByteArray::default();
-    }
-    let stats = writer.inner.row_group_stats(rg);
-    let idx = stat_index as usize;
-    if idx >= stats.len() {
-        return JByteArray::default();
-    }
-    let buf = match &stats[idx].min {
-        Some(v) => v.to_be_bytes(),
-        None => return JByteArray::default(),
+    let schema = writer.inner.schema();
+    let arr = match env.new_object_array(stats.len() as i32, "java/lang/String", JObject::null()) {
+        Ok(a) => a,
+        Err(_) => return null,
     };
-    if buf.is_empty() {
-        return JByteArray::default();
+    for (i, st) in stats.iter().enumerate() {
+        let name = &schema.columns[st.column_index].name;
+        if let Ok(s) = env.new_string(name) {
+            let _ = env.set_object_array_element(&arr, i as i32, &s);
+        }
     }
-    env.byte_array_from_slice(&buf).unwrap_or_default()
+    arr
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatMax<'a>(
-    env: JNIEnv<'a>,
-    _class: JClass<'a>,
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatNullCounts(
+    env: JNIEnv,
+    _class: JClass,
     handle: jlong,
     rg_index: jint,
-    stat_index: jint,
-) -> JByteArray<'a> {
+) -> jlongArray {
     if handle == 0 {
-        return JByteArray::default();
+        return std::ptr::null_mut();
     }
     let writer = unsafe { &*(handle as *const WriterHandle) };
     let rg = rg_index as usize;
     if rg >= writer.inner.num_row_groups() {
-        return JByteArray::default();
+        return std::ptr::null_mut();
     }
     let stats = writer.inner.row_group_stats(rg);
-    let idx = stat_index as usize;
-    if idx >= stats.len() {
-        return JByteArray::default();
+    let counts: Vec<jlong> = stats.iter().map(|s| s.null_count as jlong).collect();
+    match env.new_long_array(counts.len() as i32) {
+        Ok(arr) => {
+            let _ = env.set_long_array_region(&arr, 0, &counts);
+            arr.into_raw()
+        }
+        Err(_) => std::ptr::null_mut(),
     }
-    let buf = match &stats[idx].max {
-        Some(v) => v.to_be_bytes(),
-        None => return JByteArray::default(),
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatMins<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+    rg_index: jint,
+) -> JObjectArray<'local> {
+    let null = JObjectArray::default();
+    if handle == 0 {
+        return null;
+    }
+    let writer = unsafe { &*(handle as *const WriterHandle) };
+    let rg = rg_index as usize;
+    if rg >= writer.inner.num_row_groups() {
+        return null;
+    }
+    let stats = writer.inner.row_group_stats(rg);
+    let arr = match env.new_object_array(stats.len() as i32, "[B", JObject::null()) {
+        Ok(a) => a,
+        Err(_) => return null,
     };
-    if buf.is_empty() {
-        return JByteArray::default();
+    for (i, st) in stats.iter().enumerate() {
+        if let Some(v) = &st.min {
+            let bytes = v.to_be_bytes();
+            if let Ok(ba) = env.byte_array_from_slice(&bytes) {
+                let _ = env.set_object_array_element(&arr, i as i32, &ba);
+            }
+        }
     }
-    env.byte_array_from_slice(&buf).unwrap_or_default()
+    arr
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatMaxs<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+    rg_index: jint,
+) -> JObjectArray<'local> {
+    let null = JObjectArray::default();
+    if handle == 0 {
+        return null;
+    }
+    let writer = unsafe { &*(handle as *const WriterHandle) };
+    let rg = rg_index as usize;
+    if rg >= writer.inner.num_row_groups() {
+        return null;
+    }
+    let stats = writer.inner.row_group_stats(rg);
+    let arr = match env.new_object_array(stats.len() as i32, "[B", JObject::null()) {
+        Ok(a) => a,
+        Err(_) => return null,
+    };
+    for (i, st) in stats.iter().enumerate() {
+        if let Some(v) = &st.max {
+            let bytes = v.to_be_bytes();
+            if let Ok(ba) = env.byte_array_from_slice(&bytes) {
+                let _ = env.set_object_array_element(&arr, i as i32, &ba);
+            }
+        }
+    }
+    arr
 }
 
 // ======================== Writer.writeBatch (Arrow C Data Interface) ========================
@@ -647,9 +662,12 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderExpor
         let reader = &*rh.reader;
         let schema = reader.schema();
         let fields: Vec<arrow_schema::Field> = schema
-            .columns
+            .original_order
             .iter()
-            .map(|c| arrow_schema::Field::new(&c.name, c.data_type.clone(), c.nullable))
+            .map(|&i| {
+                let c = &schema.columns[i];
+                arrow_schema::Field::new(&c.name, c.data_type.clone(), c.nullable)
+            })
             .collect();
         let arrow_schema = Schema::new(fields);
         match FFI_ArrowSchema::try_from(&arrow_schema) {
@@ -715,53 +733,52 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpenR
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpenRowGroupProjected(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderSetProjection(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
-    rg_index: jint,
-    columns: JIntArray,
-) -> jlong {
+    columns: JObjectArray,
+) {
     let raw_env = env.get_raw();
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         if handle == 0 {
             throw(&mut env, "null reader handle");
-            return 0;
+            return;
         }
-        let rh = unsafe { &*(handle as *const ReaderHandle) };
-        let col_indices: Vec<usize> = match env.get_array_length(&columns) {
+        let rh = unsafe { &mut *(handle as *mut ReaderHandle) };
+        let col_names: Vec<String> = match env.get_array_length(&columns) {
             Ok(len) if len > 0 => {
-                let mut buf = vec![0i32; len as usize];
-                if env.get_int_array_region(&columns, 0, &mut buf).is_ok() {
-                    buf.iter().map(|&v| v as usize).collect()
-                } else {
-                    throw(&mut env, "failed to read columns array");
-                    return 0;
+                let mut names = Vec::with_capacity(len as usize);
+                for i in 0..len {
+                    let obj = match env.get_object_array_element(&columns, i) {
+                        Ok(o) => o,
+                        Err(_) => {
+                            throw(&mut env, "failed to read columns array element");
+                            return;
+                        }
+                    };
+                    let jstr = JString::from(obj);
+                    let s: String = match env.get_string(&jstr) {
+                        Ok(js) => js.into(),
+                        Err(_) => {
+                            throw(&mut env, "failed to convert column name to string");
+                            return;
+                        }
+                    };
+                    names.push(s);
                 }
+                names
             }
             _ => Vec::new(),
         };
-        match rh
-            .reader
-            .row_group_reader_projected(rg_index as usize, &col_indices)
-        {
-            Ok(rg) => {
-                let rg_handle = Box::new(RowGroupReaderHandle { inner: rg });
-                Box::into_raw(rg_handle) as jlong
-            }
-            Err(e) => {
-                throw(&mut env, &format!("open row group projected failed: {}", e));
-                0
-            }
+        let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+        if let Err(e) = rh.reader.project(&col_refs) {
+            throw(&mut env, &format!("set projection failed: {}", e));
         }
     }));
-    match result {
-        Ok(val) => val,
-        Err(e) => {
-            let mut env = unsafe { JNIEnv::from_raw(raw_env).unwrap() };
-            throw(&mut env, &panic_message(&e));
-            0
-        }
+    if let Err(e) = result {
+        let mut env = unsafe { JNIEnv::from_raw(raw_env).unwrap() };
+        throw(&mut env, &panic_message(&e));
     }
 }
 
@@ -813,126 +830,126 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGr
 // ======================== Row Group Stats ========================
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupNumStats(
-    _env: JNIEnv,
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatNames<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
     rg_index: jint,
-) -> jint {
+) -> JObjectArray<'local> {
+    let null = JObjectArray::default();
     if handle == 0 {
-        return 0;
+        return null;
     }
     let rh = unsafe { &*(handle as *const ReaderHandle) };
-    match rh.reader.row_group_stats(rg_index as usize) {
-        Ok(s) => s.len() as jint,
-        Err(_) => -1,
+    let stats = match rh.reader.row_group_stats(rg_index as usize) {
+        Ok(s) => s,
+        Err(_) => return null,
+    };
+    let schema = rh.reader.schema();
+    let arr = match env.new_object_array(stats.len() as i32, "java/lang/String", JObject::null()) {
+        Ok(a) => a,
+        Err(_) => return null,
+    };
+    for (i, st) in stats.iter().enumerate() {
+        let name = &schema.columns[st.column_index].name;
+        if let Ok(s) = env.new_string(name) {
+            let _ = env.set_object_array_element(&arr, i as i32, &s);
+        }
     }
+    arr
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatColumnIndex(
-    _env: JNIEnv,
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatNullCounts(
+    env: JNIEnv,
     _class: JClass,
     handle: jlong,
     rg_index: jint,
-    stat_index: jint,
-) -> jint {
+) -> jlongArray {
     if handle == 0 {
-        return -1;
+        return std::ptr::null_mut();
     }
     let rh = unsafe { &*(handle as *const ReaderHandle) };
     let stats = match rh.reader.row_group_stats(rg_index as usize) {
         Ok(s) => s,
-        Err(_) => return -1,
+        Err(_) => return std::ptr::null_mut(),
     };
-    let idx = stat_index as usize;
-    if idx >= stats.len() {
-        return -1;
+    let counts: Vec<jlong> = stats.iter().map(|s| s.null_count as jlong).collect();
+    match env.new_long_array(counts.len() as i32) {
+        Ok(arr) => {
+            let _ = env.set_long_array_region(&arr, 0, &counts);
+            arr.into_raw()
+        }
+        Err(_) => std::ptr::null_mut(),
     }
-    stats[idx].column_index as jint
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatNullCount(
-    _env: JNIEnv,
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatMins<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
     rg_index: jint,
-    stat_index: jint,
-) -> jlong {
+) -> JObjectArray<'local> {
+    let null = JObjectArray::default();
     if handle == 0 {
-        return 0;
+        return null;
     }
     let rh = unsafe { &*(handle as *const ReaderHandle) };
     let stats = match rh.reader.row_group_stats(rg_index as usize) {
         Ok(s) => s,
-        Err(_) => return -1,
+        Err(_) => return null,
     };
-    let idx = stat_index as usize;
-    if idx >= stats.len() {
-        return 0;
+    let arr = match env.new_object_array(stats.len() as i32, "[B", JObject::null()) {
+        Ok(a) => a,
+        Err(_) => return null,
+    };
+    for (i, st) in stats.iter().enumerate() {
+        if let Some(v) = &st.min {
+            let bytes = v.to_be_bytes();
+            if let Ok(ba) = env.byte_array_from_slice(&bytes) {
+                let _ = env.set_object_array_element(&arr, i as i32, &ba);
+            }
+        }
     }
-    stats[idx].null_count as jlong
+    arr
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatMin<'a>(
-    env: JNIEnv<'a>,
-    _class: JClass<'a>,
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatMaxs<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
     handle: jlong,
     rg_index: jint,
-    stat_index: jint,
-) -> JByteArray<'a> {
+) -> JObjectArray<'local> {
+    let null = JObjectArray::default();
     if handle == 0 {
-        return JByteArray::default();
+        return null;
     }
     let rh = unsafe { &*(handle as *const ReaderHandle) };
     let stats = match rh.reader.row_group_stats(rg_index as usize) {
         Ok(s) => s,
-        Err(_) => return JByteArray::default(),
+        Err(_) => return null,
     };
-    let idx = stat_index as usize;
-    if idx >= stats.len() {
-        return JByteArray::default();
-    }
-    let buf = match &stats[idx].min {
-        Some(v) => v.to_be_bytes(),
-        None => return JByteArray::default(),
+    let arr = match env.new_object_array(stats.len() as i32, "[B", JObject::null()) {
+        Ok(a) => a,
+        Err(_) => return null,
     };
-    if buf.is_empty() {
-        return JByteArray::default();
+    for (i, st) in stats.iter().enumerate() {
+        if let Some(v) = &st.max {
+            let bytes = v.to_be_bytes();
+            if let Ok(ba) = env.byte_array_from_slice(&bytes) {
+                let _ = env.set_object_array_element(&arr, i as i32, &ba);
+            }
+        }
     }
-    env.byte_array_from_slice(&buf).unwrap_or_default()
-}
-
-#[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatMax<'a>(
-    env: JNIEnv<'a>,
-    _class: JClass<'a>,
-    handle: jlong,
-    rg_index: jint,
-    stat_index: jint,
-) -> JByteArray<'a> {
-    if handle == 0 {
-        return JByteArray::default();
-    }
-    let rh = unsafe { &*(handle as *const ReaderHandle) };
-    let stats = match rh.reader.row_group_stats(rg_index as usize) {
-        Ok(s) => s,
-        Err(_) => return JByteArray::default(),
-    };
-    let idx = stat_index as usize;
-    if idx >= stats.len() {
-        return JByteArray::default();
-    }
-    let buf = match &stats[idx].max {
-        Some(v) => v.to_be_bytes(),
-        None => return JByteArray::default(),
-    };
-    if buf.is_empty() {
-        return JByteArray::default();
-    }
-    env.byte_array_from_slice(&buf).unwrap_or_default()
+    arr
 }
 
 // ======================== Columnar Read (Arrow C Data Interface) ========================

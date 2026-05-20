@@ -118,7 +118,7 @@ class MosaicWriterOptions(Structure):
         ("row_group_max_size", c_uint64),
         ("max_dict_total_bytes", c_uint32),
         ("max_dict_entries", c_uint32),
-        ("stats_columns", POINTER(c_uint32)),
+        ("stats_columns", POINTER(c_char_p)),
         ("num_stats_columns", c_uint32),
         ("page_size_threshold", c_uint32),
     ]
@@ -154,17 +154,13 @@ lib.mosaic_writer_num_row_groups.restype = c_int
 lib.mosaic_writer_row_group_num_stats.argtypes = [c_void_p, c_uint32, POINTER(c_uint32)]
 lib.mosaic_writer_row_group_num_stats.restype = c_int
 
-lib.mosaic_writer_row_group_stat_column_index.argtypes = [c_void_p, c_uint32, c_uint32, POINTER(c_uint32)]
-lib.mosaic_writer_row_group_stat_column_index.restype = c_int
-
-lib.mosaic_writer_row_group_stat_null_count.argtypes = [c_void_p, c_uint32, c_uint32, POINTER(c_uint64)]
-lib.mosaic_writer_row_group_stat_null_count.restype = c_int
-
-lib.mosaic_writer_row_group_stat_min.argtypes = [c_void_p, c_uint32, c_uint32, POINTER(c_size_t)]
-lib.mosaic_writer_row_group_stat_min.restype = POINTER(c_uint8)
-
-lib.mosaic_writer_row_group_stat_max.argtypes = [c_void_p, c_uint32, c_uint32, POINTER(c_size_t)]
-lib.mosaic_writer_row_group_stat_max.restype = POINTER(c_uint8)
+lib.mosaic_writer_row_group_stats.argtypes = [
+    c_void_p, c_uint32,
+    POINTER(c_char_p), POINTER(c_uint64),
+    POINTER(POINTER(c_uint8)), POINTER(c_size_t),
+    POINTER(POINTER(c_uint8)), POINTER(c_size_t),
+]
+lib.mosaic_writer_row_group_stats.restype = c_int
 
 # ======================== Reader ========================
 
@@ -185,10 +181,10 @@ lib.mosaic_reader_num_row_groups.restype = c_int
 lib.mosaic_reader_open_row_group.argtypes = [c_void_p, c_uint32]
 lib.mosaic_reader_open_row_group.restype = c_void_p
 
-lib.mosaic_reader_open_row_group_projected.argtypes = [
-    c_void_p, c_uint32, POINTER(c_uint32), c_uint32,
+lib.mosaic_reader_set_projection.argtypes = [
+    c_void_p, POINTER(c_char_p), c_uint32,
 ]
-lib.mosaic_reader_open_row_group_projected.restype = c_void_p
+lib.mosaic_reader_set_projection.restype = c_int32
 
 lib.mosaic_row_group_reader_free.argtypes = [c_void_p]
 lib.mosaic_row_group_reader_free.restype = None
@@ -223,17 +219,13 @@ lib.mosaic_reader_row_group_num_rows.restype = c_int
 lib.mosaic_reader_row_group_num_stats.argtypes = [c_void_p, c_uint32, POINTER(c_uint32)]
 lib.mosaic_reader_row_group_num_stats.restype = c_int
 
-lib.mosaic_reader_row_group_stat_column_index.argtypes = [c_void_p, c_uint32, c_uint32, POINTER(c_uint32)]
-lib.mosaic_reader_row_group_stat_column_index.restype = c_int
-
-lib.mosaic_reader_row_group_stat_null_count.argtypes = [c_void_p, c_uint32, c_uint32, POINTER(c_uint64)]
-lib.mosaic_reader_row_group_stat_null_count.restype = c_int
-
-lib.mosaic_reader_row_group_stat_min.argtypes = [c_void_p, c_uint32, c_uint32, POINTER(c_size_t)]
-lib.mosaic_reader_row_group_stat_min.restype = POINTER(c_uint8)
-
-lib.mosaic_reader_row_group_stat_max.argtypes = [c_void_p, c_uint32, c_uint32, POINTER(c_size_t)]
-lib.mosaic_reader_row_group_stat_max.restype = POINTER(c_uint8)
+lib.mosaic_reader_row_group_stats.argtypes = [
+    c_void_p, c_uint32,
+    POINTER(c_char_p), POINTER(c_uint64),
+    POINTER(POINTER(c_uint8)), POINTER(c_size_t),
+    POINTER(POINTER(c_uint8)), POINTER(c_size_t),
+]
+lib.mosaic_reader_row_group_stats.restype = c_int
 
 # ======================== Error ========================
 

@@ -112,6 +112,16 @@ pub fn decode_u64(buf: &[u8], pos: &mut usize) -> Result<u64, std::io::Error> {
     }
 }
 
+pub fn encode_zigzag(buf: &mut Vec<u8>, value: i64) {
+    let encoded = ((value << 1) ^ (value >> 63)) as u64;
+    encode_u64(buf, encoded);
+}
+
+pub fn decode_zigzag(buf: &[u8], pos: &mut usize) -> Result<i64, std::io::Error> {
+    let encoded = decode_u64(buf, pos)?;
+    Ok(((encoded >> 1) as i64) ^ -((encoded & 1) as i64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +155,29 @@ mod tests {
             encode_u64(&mut buf, v);
             let mut pos = 0;
             assert_eq!(decode_u64(&buf, &mut pos).unwrap(), v);
+            assert_eq!(pos, buf.len());
+        }
+    }
+
+    #[test]
+    fn test_zigzag_roundtrip() {
+        for &v in &[
+            0i64,
+            1,
+            -1,
+            2,
+            -2,
+            127,
+            -128,
+            10000,
+            -10000,
+            i64::MAX,
+            i64::MIN,
+        ] {
+            let mut buf = Vec::new();
+            encode_zigzag(&mut buf, v);
+            let mut pos = 0;
+            assert_eq!(decode_zigzag(&buf, &mut pos).unwrap(), v);
             assert_eq!(pos, buf.len());
         }
     }

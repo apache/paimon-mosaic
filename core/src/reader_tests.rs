@@ -652,15 +652,6 @@ fn test_roundtrip_all_types() {
     let len = data.len() as u64;
     let reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
 
-    let col = |name: &str| -> usize {
-        reader
-            .schema()
-            .columns
-            .iter()
-            .position(|c| c.name == name)
-            .unwrap()
-    };
-
     let mut rg = reader.row_group_reader(0).unwrap();
     let batch = rg.read_columns().unwrap();
     assert_eq!(batch.num_rows(), 1);
@@ -680,6 +671,8 @@ fn test_roundtrip_all_types() {
         batch_col_binary(&batch, "f_bytes").value(0),
         &[1u8, 2, 3, 4, 5]
     );
+
+    let col = |name: &str| -> usize { batch.schema().index_of(name).unwrap() };
 
     let c_dec = batch
         .column(col("f_decimal_compact"))
@@ -869,7 +862,7 @@ fn test_stats_roundtrip() {
         &columns_to_arrow_schema(&columns),
         WriterOptions {
             compression: COMPRESSION_NONE,
-            stats_columns: vec![0, 2],
+            stats_columns: vec!["id".to_string(), "score".to_string()],
             num_buckets: 2,
             ..Default::default()
         },
@@ -924,7 +917,7 @@ fn test_stats_with_nulls() {
         &columns_to_arrow_schema(&columns),
         WriterOptions {
             compression: COMPRESSION_NONE,
-            stats_columns: vec![0, 1],
+            stats_columns: vec!["a".to_string(), "b".to_string()],
             num_buckets: 1,
             ..Default::default()
         },
@@ -965,7 +958,7 @@ fn test_stats_all_null_column() {
         &columns_to_arrow_schema(&columns),
         WriterOptions {
             compression: COMPRESSION_NONE,
-            stats_columns: vec![0],
+            stats_columns: vec!["x".to_string()],
             num_buckets: 1,
             ..Default::default()
         },
@@ -1013,14 +1006,14 @@ fn test_no_stats_minimal_overhead() {
     writer.close().unwrap();
     let no_stats_size = writer.output().buf.len();
 
-    // Write with stats on column 0
+    // Write with stats on column "a"
     let out2 = MemOutputFile::new();
     let mut writer2 = MosaicWriter::new(
         out2,
         &columns_to_arrow_schema(&columns),
         WriterOptions {
             compression: COMPRESSION_NONE,
-            stats_columns: vec![0],
+            stats_columns: vec!["a".to_string()],
             num_buckets: 1,
             ..Default::default()
         },
@@ -1061,7 +1054,7 @@ fn test_stats_string_column() {
         &columns_to_arrow_schema(&columns),
         WriterOptions {
             compression: COMPRESSION_NONE,
-            stats_columns: vec![0],
+            stats_columns: vec!["s".to_string()],
             num_buckets: 1,
             ..Default::default()
         },
@@ -1307,6 +1300,113 @@ fn test_projection_single_column() {
     for i in 0..20usize {
         assert_eq!(cy.value(i), i as i32 * 10);
     }
+}
+
+#[test]
+fn test_projection_preserves_requested_order() {
+    let columns = vec![
+        ("a".to_string(), DataType::Int32, true),
+        ("b".to_string(), DataType::Utf8, true),
+        ("c".to_string(), DataType::Float64, true),
+    ];
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            compression: COMPRESSION_ZSTD,
+            num_buckets: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let rows: Vec<Vec<Value>> = (0..10)
+        .map(|i| {
+            vec![
+                Value::Integer(i),
+                Value::String(format!("s{}", i).into_bytes()),
+                Value::Double(i as f64 * 0.5),
+            ]
+        })
+        .collect();
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    let mut reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
+
+    reader.project(&["c", "a", "b"]).unwrap();
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+
+    assert_eq!(batch.num_columns(), 3);
+    let schema = batch.schema();
+    let fields: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(fields, vec!["c", "a", "b"]);
+
+    let col_c = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let col_a = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let col_b = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for i in 0..10usize {
+        assert_eq!(col_a.value(i), i as i32);
+        assert_eq!(col_b.value(i), format!("s{}", i));
+        assert!((col_c.value(i) - i as f64 * 0.5).abs() < 1e-10);
+    }
+}
+
+#[test]
+fn test_projection_empty_via_project_method() {
+    let columns = vec![
+        ("a".to_string(), DataType::Int32, true),
+        ("b".to_string(), DataType::Utf8, true),
+        ("c".to_string(), DataType::Float64, true),
+    ];
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            compression: COMPRESSION_ZSTD,
+            num_buckets: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let rows: Vec<Vec<Value>> = (0..5)
+        .map(|i| {
+            vec![
+                Value::Integer(i),
+                Value::String(format!("v{}", i).into_bytes()),
+                Value::Double(i as f64),
+            ]
+        })
+        .collect();
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    let mut reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
+
+    reader.project(&[]).unwrap();
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+
+    assert_eq!(batch.num_columns(), 0);
+    assert_eq!(batch.num_rows(), 5);
 }
 
 #[test]
@@ -1762,24 +1862,15 @@ fn test_timestamp_ltz_roundtrip() {
     ];
     let (reader, _) = write_and_read(columns, &rows);
 
-    let schema = reader.schema();
-    let dt0 = &schema.columns[0].data_type;
-    let dt1 = &schema.columns[1].data_type;
-    assert_eq!(
-        *dt0,
-        DataType::Timestamp(TimeUnit::Millisecond, Some("Asia/Shanghai".into()))
-    );
-    assert_eq!(
-        *dt1,
-        DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into()))
-    );
-
     let mut rg = reader.row_group_reader(0).unwrap();
     let batch = rg.read_columns().unwrap();
     assert_eq!(batch.num_rows(), 3);
 
+    let millis_idx = batch.schema().index_of("ts_millis").unwrap();
+    let micros_idx = batch.schema().index_of("ts_micros").unwrap();
+
     let ts0 = batch
-        .column(0)
+        .column(millis_idx)
         .as_any()
         .downcast_ref::<TimestampMillisecondArray>()
         .unwrap();
@@ -1789,7 +1880,7 @@ fn test_timestamp_ltz_roundtrip() {
     assert_eq!(ts0.timezone().unwrap(), "Asia/Shanghai");
 
     let ts1 = batch
-        .column(1)
+        .column(micros_idx)
         .as_any()
         .downcast_ref::<TimestampMicrosecondArray>()
         .unwrap();
@@ -1848,18 +1939,22 @@ fn test_timestamp_micros_roundtrip() {
     let batch = rg.read_columns().unwrap();
     assert_eq!(batch.num_rows(), 3);
 
+    let millis_pos = batch.schema().index_of("ts_millis").unwrap();
+    let micros_pos = batch.schema().index_of("ts_micros").unwrap();
+    let nanos_pos = batch.schema().index_of("ts_nanos").unwrap();
+
     let ts_millis = batch
-        .column(0)
+        .column(millis_pos)
         .as_any()
         .downcast_ref::<TimestampMillisecondArray>()
         .unwrap();
     let ts_micros = batch
-        .column(1)
+        .column(micros_pos)
         .as_any()
         .downcast_ref::<TimestampMicrosecondArray>()
         .unwrap();
     let ts_nanos = batch
-        .column(2)
+        .column(nanos_pos)
         .as_any()
         .downcast_ref::<StructArray>()
         .unwrap();
@@ -2136,7 +2231,7 @@ fn test_stats_across_multiple_row_groups() {
         WriterOptions {
             compression: COMPRESSION_NONE,
             row_group_max_size: 100,
-            stats_columns: vec![0],
+            stats_columns: vec!["v".to_string()],
             num_buckets: 1,
             ..Default::default()
         },
@@ -2182,7 +2277,7 @@ fn test_schema_order_preserved_after_roundtrip() {
         &columns_to_arrow_schema(&columns),
         WriterOptions {
             compression: COMPRESSION_NONE,
-            stats_columns: vec![1],
+            stats_columns: vec!["age".to_string()],
             num_buckets: 2,
             ..Default::default()
         },
@@ -2204,18 +2299,25 @@ fn test_schema_order_preserved_after_roundtrip() {
     let len = data.len() as u64;
     let reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
 
-    assert_eq!(reader.schema().columns[0].name, "name");
-    assert_eq!(reader.schema().columns[1].name, "age");
+    // Internal storage is name-sorted
+    assert_eq!(reader.schema().columns[0].name, "age");
+    assert_eq!(reader.schema().columns[1].name, "name");
     assert_eq!(reader.schema().columns[2].name, "score");
+    // original_order preserves input order: name=1, age=0, score=2
+    assert_eq!(reader.schema().original_order, vec![1, 0, 2]);
 
     let stats = reader.row_group_stats(0).unwrap();
     assert_eq!(stats.len(), 1);
-    assert_eq!(stats[0].column_index, 1);
+    assert_eq!(stats[0].column_index, 0);
     assert!(matches!(&stats[0].min, Some(Value::Integer(20))));
     assert!(matches!(&stats[0].max, Some(Value::Integer(69))));
 
     let mut rg = reader.row_group_reader(0).unwrap();
     let batch = rg.read_columns().unwrap();
+    // Output batch is in original input order (name, age, score)
+    assert_eq!(batch.schema().field(0).name(), "name");
+    assert_eq!(batch.schema().field(1).name(), "age");
+    assert_eq!(batch.schema().field(2).name(), "score");
     assert_eq!(batch_col_string(&batch, "name").value(0), "user_0");
     assert_eq!(batch_col_i32(&batch, "age").value(0), 20);
 }
@@ -3563,7 +3665,7 @@ fn test_writer_stats_basic() {
         &columns_to_arrow_schema(&columns),
         WriterOptions {
             compression: COMPRESSION_NONE,
-            stats_columns: vec![0, 2],
+            stats_columns: vec!["id".to_string(), "score".to_string()],
             num_buckets: 2,
             ..Default::default()
         },
@@ -3615,7 +3717,7 @@ fn test_writer_stats_with_nulls() {
         &columns_to_arrow_schema(&columns),
         WriterOptions {
             compression: COMPRESSION_NONE,
-            stats_columns: vec![0, 1],
+            stats_columns: vec!["a".to_string(), "b".to_string()],
             num_buckets: 1,
             ..Default::default()
         },
@@ -3655,7 +3757,7 @@ fn test_writer_stats_all_null() {
         &columns_to_arrow_schema(&columns),
         WriterOptions {
             compression: COMPRESSION_NONE,
-            stats_columns: vec![0],
+            stats_columns: vec!["x".to_string()],
             num_buckets: 1,
             ..Default::default()
         },
@@ -3686,7 +3788,7 @@ fn test_writer_stats_matches_reader_stats() {
         &columns_to_arrow_schema(&columns),
         WriterOptions {
             compression: COMPRESSION_NONE,
-            stats_columns: vec![0, 1],
+            stats_columns: vec!["id".to_string(), "score".to_string()],
             num_buckets: 1,
             ..Default::default()
         },
@@ -3756,6 +3858,43 @@ fn test_row_group_num_rows() {
         total += num_rows;
     }
     assert_eq!(total, total_rows as usize);
+}
+
+#[test]
+fn test_stats_empty_string_min() {
+    let columns = vec![("s".to_string(), DataType::Utf8, true)];
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            stats_columns: vec!["s".to_string()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let rows: Vec<Vec<Value>> = vec![
+        vec![Value::String(b"".to_vec())],
+        vec![Value::String(b"b".to_vec())],
+    ];
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+
+    let stats = writer.row_group_stats(0);
+    assert_eq!(stats.len(), 1);
+    assert!(stats[0].min.is_some());
+    assert!(stats[0].max.is_some());
+    assert_eq!(stats[0].min.as_ref().unwrap().to_be_bytes(), b"");
+    assert_eq!(stats[0].max.as_ref().unwrap().to_be_bytes(), b"b");
+    assert_eq!(stats[0].null_count, 0);
+
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    let reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
+    let reader_stats = reader.row_group_stats(0).unwrap();
+    assert_eq!(reader_stats.len(), 1);
+    assert!(reader_stats[0].min.is_some());
+    assert!(reader_stats[0].max.is_some());
 }
 
 #[test]

@@ -89,7 +89,7 @@ struct WriterOptions {
     uint64_t row_group_max_size = 256ULL * 1024 * 1024;
     uint32_t max_dict_total_bytes = 32 * 1024;
     uint32_t max_dict_entries = 255;
-    const uint32_t* stats_columns = nullptr;
+    const char* const* stats_columns = nullptr;
     uint32_t num_stats_columns = 0;
     uint32_t page_size_threshold = 32 * 1024;
 };
@@ -97,13 +97,17 @@ struct WriterOptions {
 // ======================== Statistics ========================
 
 struct ColumnStatistics {
-    uint32_t column_index;
+    std::string column_name;
     uint64_t null_count;
+    bool has_min_max_ = false;
     std::vector<uint8_t> min_value;
     std::vector<uint8_t> max_value;
-    bool has_min_max() const { return !min_value.empty(); }
+    bool has_min_max() const { return has_min_max_; }
 };
 
+/// Columns are stored on disk in name-sorted order for compression.
+/// The reader returns columns in the original input order by default;
+/// use Reader::set_projection() to select and reorder output columns.
 class Writer {
 public:
     /// Construct a writer. `arrow_schema` is a pointer to an ArrowSchema (Arrow C Data Interface).
@@ -183,22 +187,32 @@ public:
         return out;
     }
 
-    std::vector<ColumnStatistics> get_row_group_statistics(uint32_t rg_index) const {
+    std::vector<ColumnStatistics> get_row_group_statistics(uint32_t rg_index) {
         uint32_t n = 0;
         check(mosaic_writer_row_group_num_stats(handle_, rg_index, &n));
+        if (n == 0) return {};
+        std::vector<const char*> names(n);
+        std::vector<uint64_t> null_counts(n);
+        std::vector<const uint8_t*> min_ptrs(n);
+        std::vector<size_t> min_lens(n);
+        std::vector<const uint8_t*> max_ptrs(n);
+        std::vector<size_t> max_lens(n);
+        check(mosaic_writer_row_group_stats(handle_, rg_index,
+            names.data(), null_counts.data(),
+            min_ptrs.data(), min_lens.data(),
+            max_ptrs.data(), max_lens.data()));
         std::vector<ColumnStatistics> result;
         result.reserve(n);
         for (uint32_t i = 0; i < n; i++) {
             ColumnStatistics s;
-            check(mosaic_writer_row_group_stat_column_index(handle_, rg_index, i, &s.column_index));
-            check(mosaic_writer_row_group_stat_null_count(handle_, rg_index, i, &s.null_count));
-            size_t min_len = 0, max_len = 0;
-            const uint8_t* min_ptr = mosaic_writer_row_group_stat_min(handle_, rg_index, i, &min_len);
-            const uint8_t* max_ptr = mosaic_writer_row_group_stat_max(handle_, rg_index, i, &max_len);
-            if (min_ptr && min_len > 0)
-                s.min_value.assign(min_ptr, min_ptr + min_len);
-            if (max_ptr && max_len > 0)
-                s.max_value.assign(max_ptr, max_ptr + max_len);
+            s.column_name = names[i] ? names[i] : "";
+            s.null_count = null_counts[i];
+            if (min_ptrs[i]) {
+                s.has_min_max_ = true;
+                s.min_value.assign(min_ptrs[i], min_ptrs[i] + min_lens[i]);
+            }
+            if (max_ptrs[i])
+                s.max_value.assign(max_ptrs[i], max_ptrs[i] + max_lens[i]);
             result.push_back(std::move(s));
         }
         return result;
@@ -239,6 +253,8 @@ inline uint64_t input_length(void* ctx) noexcept {
 
 } // namespace detail
 
+/// The reader returns columns in the original input order by default.
+/// Use set_projection() to select and reorder output columns.
 class Reader {
 public:
     Reader(const Reader&) = delete;
@@ -275,18 +291,8 @@ public:
         if (rc != 0) throw Error("record_batch_export failed");
     }
 
-    void read_row_group(uint32_t rg_index, const uint32_t* cols, uint32_t num_cols,
-                        void* out_array, void* out_schema) {
-        auto* rg = mosaic_reader_open_row_group_projected(handle_, rg_index, cols, num_cols);
-        if (!rg) throw Error("failed to open row group");
-        auto* rb = mosaic_row_group_reader_read_columns(rg);
-        mosaic_row_group_reader_free(rg);
-        if (!rb) throw Error("read_columns failed");
-        int rc = mosaic_record_batch_export(rb,
-            static_cast<ArrowArray*>(out_array),
-            static_cast<ArrowSchema*>(out_schema));
-        mosaic_record_batch_free(rb);
-        if (rc != 0) throw Error("record_batch_export failed");
+    void set_projection(const char* const* cols, uint32_t num_cols) {
+        check(mosaic_reader_set_projection(handle_, cols, num_cols));
     }
 
     uint32_t row_group_num_rows(uint32_t rg_index) const {
@@ -295,22 +301,32 @@ public:
         return out;
     }
 
-    std::vector<ColumnStatistics> get_row_group_statistics(uint32_t rg_index) const {
+    std::vector<ColumnStatistics> get_row_group_statistics(uint32_t rg_index) {
         uint32_t n = 0;
         check(mosaic_reader_row_group_num_stats(handle_, rg_index, &n));
+        if (n == 0) return {};
+        std::vector<const char*> names(n);
+        std::vector<uint64_t> null_counts(n);
+        std::vector<const uint8_t*> min_ptrs(n);
+        std::vector<size_t> min_lens(n);
+        std::vector<const uint8_t*> max_ptrs(n);
+        std::vector<size_t> max_lens(n);
+        check(mosaic_reader_row_group_stats(handle_, rg_index,
+            names.data(), null_counts.data(),
+            min_ptrs.data(), min_lens.data(),
+            max_ptrs.data(), max_lens.data()));
         std::vector<ColumnStatistics> result;
         result.reserve(n);
         for (uint32_t i = 0; i < n; i++) {
             ColumnStatistics s;
-            check(mosaic_reader_row_group_stat_column_index(handle_, rg_index, i, &s.column_index));
-            check(mosaic_reader_row_group_stat_null_count(handle_, rg_index, i, &s.null_count));
-            size_t min_len = 0, max_len = 0;
-            const uint8_t* min_ptr = mosaic_reader_row_group_stat_min(handle_, rg_index, i, &min_len);
-            const uint8_t* max_ptr = mosaic_reader_row_group_stat_max(handle_, rg_index, i, &max_len);
-            if (min_ptr && min_len > 0)
-                s.min_value.assign(min_ptr, min_ptr + min_len);
-            if (max_ptr && max_len > 0)
-                s.max_value.assign(max_ptr, max_ptr + max_len);
+            s.column_name = names[i] ? names[i] : "";
+            s.null_count = null_counts[i];
+            if (min_ptrs[i]) {
+                s.has_min_max_ = true;
+                s.min_value.assign(min_ptrs[i], min_ptrs[i] + min_lens[i]);
+            }
+            if (max_ptrs[i])
+                s.max_value.assign(max_ptrs[i], max_ptrs[i] + max_lens[i]);
             result.push_back(std::move(s));
         }
         return result;
