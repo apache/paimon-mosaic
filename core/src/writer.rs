@@ -102,7 +102,11 @@ impl<S: OutputFile> MosaicWriter<S> {
         Self::from_mosaic_schema(out, mosaic_schema, options)
     }
 
-    pub fn from_mosaic_schema(out: S, schema: MosaicSchema, options: WriterOptions) -> io::Result<Self> {
+    pub fn from_mosaic_schema(
+        out: S,
+        schema: MosaicSchema,
+        options: WriterOptions,
+    ) -> io::Result<Self> {
         let num_buckets = schema.num_buckets;
         let mut bucket_writers = Vec::with_capacity(num_buckets);
 
@@ -132,14 +136,21 @@ impl<S: OutputFile> MosaicWriter<S> {
                 if idx >= schema.columns.len() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("stats_columns index {} is out of range (schema has {} columns)", idx, schema.columns.len()),
+                        format!(
+                            "stats_columns index {} is out of range (schema has {} columns)",
+                            idx,
+                            schema.columns.len()
+                        ),
                     ));
                 }
                 let dt = &schema.columns[idx].data_type;
                 if !stats::supports_stats(dt) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("stats_columns index {} has unsupported type {:?} for statistics", idx, dt),
+                        format!(
+                            "stats_columns index {} has unsupported type {:?} for statistics",
+                            idx, dt
+                        ),
                     ));
                 }
                 cols.push((idx, dt.clone()));
