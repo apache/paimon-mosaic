@@ -3457,3 +3457,168 @@ fn test_file_open_single_io() {
         "file open should use only 1 IO when metadata fits in tail prefetch"
     );
 }
+
+#[test]
+fn test_writer_stats_basic() {
+    let columns = vec![
+        ("id".to_string(), DataType::Int32, true),
+        ("name".to_string(), DataType::Utf8, true),
+        ("score".to_string(), DataType::Float64, true),
+    ];
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            compression: COMPRESSION_NONE,
+            stats_columns: vec![0, 2],
+            num_buckets: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let rows: Vec<Vec<Value>> = (0..100)
+        .map(|i| {
+            vec![
+                Value::Integer(i * 2),
+                Value::String(format!("row_{}", i).into_bytes()),
+                Value::Double(i as f64 * 0.5),
+            ]
+        })
+        .collect();
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+
+    assert_eq!(writer.num_row_groups(), 1);
+    let stats = writer.row_group_stats(0);
+    assert_eq!(stats.len(), 2);
+
+    assert_eq!(stats[0].column_index, 0);
+    assert_eq!(stats[0].null_count, 0);
+    assert!(matches!(&stats[0].min, Some(Value::Integer(0))));
+    assert!(matches!(&stats[0].max, Some(Value::Integer(198))));
+
+    assert_eq!(stats[1].column_index, 2);
+    assert_eq!(stats[1].null_count, 0);
+    match &stats[1].min {
+        Some(Value::Double(v)) => assert!(v.abs() < 1e-10),
+        other => panic!("expected Double(0.0), got {:?}", other),
+    }
+    match &stats[1].max {
+        Some(Value::Double(v)) => assert!((*v - 49.5).abs() < 1e-10),
+        other => panic!("expected Double(49.5), got {:?}", other),
+    }
+}
+
+#[test]
+fn test_writer_stats_with_nulls() {
+    let columns = vec![
+        ("a".to_string(), DataType::Int32, true),
+        ("b".to_string(), DataType::Int64, true),
+    ];
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            compression: COMPRESSION_NONE,
+            stats_columns: vec![0, 1],
+            num_buckets: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let rows = vec![
+        vec![Value::Integer(10), Value::Null],
+        vec![Value::Null, Value::Null],
+        vec![Value::Integer(5), Value::BigInt(100)],
+        vec![Value::Integer(20), Value::BigInt(50)],
+    ];
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+
+    assert_eq!(writer.num_row_groups(), 1);
+    let stats = writer.row_group_stats(0);
+    assert_eq!(stats.len(), 2);
+
+    assert_eq!(stats[0].column_index, 0);
+    assert_eq!(stats[0].null_count, 1);
+    assert!(matches!(&stats[0].min, Some(Value::Integer(5))));
+    assert!(matches!(&stats[0].max, Some(Value::Integer(20))));
+
+    assert_eq!(stats[1].column_index, 1);
+    assert_eq!(stats[1].null_count, 2);
+    assert!(matches!(&stats[1].min, Some(Value::BigInt(50))));
+    assert!(matches!(&stats[1].max, Some(Value::BigInt(100))));
+}
+
+#[test]
+fn test_writer_stats_all_null() {
+    let columns = vec![("x".to_string(), DataType::Int32, true)];
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            compression: COMPRESSION_NONE,
+            stats_columns: vec![0],
+            num_buckets: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let rows: Vec<Vec<Value>> = (0..10).map(|_| vec![Value::Null]).collect();
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+
+    assert_eq!(writer.num_row_groups(), 1);
+    let stats = writer.row_group_stats(0);
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].null_count, 10);
+    assert!(stats[0].min.is_none());
+    assert!(stats[0].max.is_none());
+}
+
+#[test]
+fn test_writer_stats_matches_reader_stats() {
+    let columns = vec![
+        ("id".to_string(), DataType::Int32, true),
+        ("score".to_string(), DataType::Float64, true),
+    ];
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            compression: COMPRESSION_NONE,
+            stats_columns: vec![0, 1],
+            num_buckets: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let rows: Vec<Vec<Value>> = (0..50)
+        .map(|i| vec![Value::Integer(i), Value::Double(i as f64 * 2.0)])
+        .collect();
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+
+    let writer_stats = writer.row_group_stats(0);
+
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    let reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
+    let reader_stats = reader.row_group_stats(0).unwrap();
+
+    assert_eq!(writer_stats.len(), reader_stats.len());
+    for (ws, rs) in writer_stats.iter().zip(reader_stats.iter()) {
+        assert_eq!(ws.column_index, rs.column_index);
+        assert_eq!(ws.null_count, rs.null_count);
+        assert_eq!(format!("{:?}", ws.min), format!("{:?}", rs.min));
+        assert_eq!(format!("{:?}", ws.max), format!("{:?}", rs.max));
+    }
+}
