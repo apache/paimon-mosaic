@@ -20,6 +20,7 @@
 package org.apache.paimon.mosaic;
 
 import java.io.ByteArrayOutputStream;
+import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
@@ -79,6 +80,31 @@ public class MosaicRoundtripTest {
             System.arraycopy(data, (int) position, buffer, offset, length);
         };
         return MosaicReader.open(inputFile, data.length, allocator);
+    }
+
+    private static void awaitGarbageCollection(WeakReference<?> reference) throws InterruptedException {
+        for (int i = 0; i < 20 && reference.get() != null; i++) {
+            System.gc();
+            System.runFinalization();
+            Thread.sleep(50L);
+        }
+        assertNull("expected input file to be released after failed open", reference.get());
+    }
+
+    private WeakReference<InputFile> openReaderWithClosedAllocator(byte[] data) {
+        BufferAllocator failingAllocator = new RootAllocator();
+        failingAllocator.close();
+
+        InputFile inputFile = new InputFile() {
+            @Override
+            public void readFully(long position, byte[] buffer, int offset, int length) {
+                System.arraycopy(data, (int) position, buffer, offset, length);
+            }
+        };
+        WeakReference<InputFile> reference = new WeakReference<>(inputFile);
+
+        assertThrows(RuntimeException.class, () -> MosaicReader.open(inputFile, data.length, failingAllocator));
+        return reference;
     }
 
     @Test
@@ -505,6 +531,25 @@ public class MosaicRoundtripTest {
         try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
             assertThrows(IllegalStateException.class, () -> writer.write(root));
         }
+    }
+
+    @Test
+    public void testReaderOpenFreesNativeHandleWhenConstructorFails() throws Exception {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.nullable("x", new ArrowType.Int(32, true))
+        ));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            IntVector xVec = (IntVector) root.getVector("x");
+            xVec.allocateNew(1);
+            xVec.set(0, 1);
+            root.setRowCount(1);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        WeakReference<InputFile> reference = openReaderWithClosedAllocator(data);
+        awaitGarbageCollection(reference);
     }
 
     @Test
