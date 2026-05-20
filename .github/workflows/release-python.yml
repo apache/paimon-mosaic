@@ -39,29 +39,6 @@ permissions:
   contents: read
 
 jobs:
-  sdist:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install build tools
-        run: pip install build
-
-      - name: Build sdist
-        working-directory: python
-        run: python -m build --sdist
-
-      - name: Upload sdist
-        uses: actions/upload-artifact@v7
-        with:
-          name: wheels-sdist
-          path: python/dist/*.tar.gz
-
   wheels:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -84,7 +61,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             lib_name: mosaic_ffi.dll
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
         run: |
@@ -110,8 +87,24 @@ jobs:
         working-directory: python
         run: python -m build --wheel
 
+      - name: Repair wheel (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pip install auditwheel patchelf
+          auditwheel repair python/dist/*.whl --wheel-dir python/dist/repaired
+          rm python/dist/*.whl
+          mv python/dist/repaired/*.whl python/dist/
+
+      - name: Repair wheel (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pip install delocate
+          delocate-wheel -w python/dist/repaired python/dist/*.whl
+          rm python/dist/*.whl
+          mv python/dist/repaired/*.whl python/dist/
+
       - name: Upload wheel
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: python/dist/*.whl
@@ -121,10 +114,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    needs: [sdist, wheels]
+    needs: [wheels]
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
           merge-multiple: true

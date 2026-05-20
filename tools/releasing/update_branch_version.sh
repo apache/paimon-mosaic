@@ -55,6 +55,12 @@ cd ..
 #change version in all pom files
 find . -name 'pom.xml' -type f -exec perl -pi -e 's#<version>'$OLD_VERSION'</version>#<version>'$NEW_VERSION'</version>#' {} \;
 
+#change version in Cargo.toml files
+find . -name 'Cargo.toml' -not -path '*/target/*' -type f -exec perl -pi -e 's#^version = "'$OLD_VERSION'"#version = "'$NEW_VERSION'"#' {} \;
+
+#change version in pyproject.toml
+perl -pi -e 's#^version = "'$OLD_VERSION'"#version = "'$NEW_VERSION'"#' python/pyproject.toml
+
 git commit -am "Update version to $NEW_VERSION"
 
 echo "Don't forget to push the change."
