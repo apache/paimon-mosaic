@@ -102,6 +102,14 @@ public class MosaicReader implements AutoCloseable {
         }
     }
 
+    public int rowGroupNumRows(int rgIndex) {
+        int result = NativeLib.nativeReaderRowGroupNumRows(handle, rgIndex);
+        if (result < 0) {
+            throw new RuntimeException("failed to get row group num rows for index " + rgIndex);
+        }
+        return result;
+    }
+
     public List<ColumnStatistics> getRowGroupStatistics(int rgIndex) {
         int n = NativeLib.nativeReaderRowGroupNumStats(handle, rgIndex);
         if (n < 0) {

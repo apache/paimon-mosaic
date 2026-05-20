@@ -213,6 +213,7 @@ reader.export_schema(&amp;ffi_schema);
                 </thead>
                 <tbody>
                     <tr><td><code>num_row_groups()</code></td><td><code>uint32_t</code></td><td>Row group count</td></tr>
+                    <tr><td><code>row_group_num_rows(rg)</code></td><td><code>uint32_t</code></td><td>Number of rows in a specific row group</td></tr>
                     <tr><td><code>export_schema(&amp;ffi_schema)</code></td><td><code>void</code></td><td>Export schema via Arrow C Data Interface</td></tr>
                     <tr><td><code>read_row_group(rg, &amp;array, &amp;schema)</code></td><td><code>void</code></td><td>Read all columns of a row group</td></tr>
                     <tr><td><code>read_row_group(rg, cols, n, &amp;array, &amp;schema)</code></td><td><code>void</code></td><td>Read projected columns of a row group</td></tr>

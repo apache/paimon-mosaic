@@ -197,6 +197,7 @@ pub trait ReaderAccess {
         columns: &[usize],
     ) -> io::Result<RowGroupReader>;
     fn row_group_stats(&self, rg_index: usize) -> io::Result<&[ColumnStats]>;
+    fn row_group_num_rows(&self, rg_index: usize) -> io::Result<usize>;
 }
 
 pub struct MosaicReader<I: InputFile> {
@@ -476,6 +477,20 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
             ));
         }
         Ok(&self.row_group_metas[rg_index].stats)
+    }
+
+    fn row_group_num_rows(&self, rg_index: usize) -> io::Result<usize> {
+        if rg_index >= self.row_group_metas.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "row group index {} out of range (num_row_groups={})",
+                    rg_index,
+                    self.row_group_metas.len()
+                ),
+            ));
+        }
+        Ok(self.row_group_metas[rg_index].num_rows)
     }
 
     fn row_group_reader(&self, rg_index: usize) -> io::Result<RowGroupReader> {

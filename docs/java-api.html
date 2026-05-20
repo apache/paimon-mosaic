@@ -222,6 +222,7 @@
                 <tbody>
                     <tr><td><code>getSchema()</code></td><td><code>Schema</code></td><td>Arrow Schema for the file</td></tr>
                     <tr><td><code>numRowGroups()</code></td><td><code>int</code></td><td>Row group count</td></tr>
+                    <tr><td><code>rowGroupNumRows(rg)</code></td><td><code>int</code></td><td>Number of rows in a specific row group</td></tr>
                     <tr><td><code>readRowGroup(rg, allocator)</code></td><td><code>VectorSchemaRoot</code></td><td>Read all columns of a row group</td></tr>
                     <tr><td><code>readRowGroup(rg, cols, allocator)</code></td><td><code>VectorSchemaRoot</code></td><td>Read projected columns of a row group</td></tr>
                     <tr><td><code>getRowGroupStatistics(rg)</code></td><td><code>List&lt;ColumnStatistics&gt;</code></td><td>Column statistics for a row group</td></tr>

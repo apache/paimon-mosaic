@@ -357,6 +357,13 @@ class MosaicReader:
             schema = pa.schema([self._schema.field(i) for i in columns])
         return pa.Table.from_batches([], schema=schema)
 
+    def row_group_num_rows(self, rg_index):
+        out = ctypes.c_uint32(0)
+        rc = lib.mosaic_reader_row_group_num_rows(self._handle, rg_index, ctypes.byref(out))
+        if rc != 0:
+            _check_error("row_group_num_rows failed")
+        return out.value
+
     def get_row_group_statistics(self, rg_index):
         n_out = ctypes.c_uint32(0)
         rc = lib.mosaic_reader_row_group_num_stats(self._handle, rg_index, ctypes.byref(n_out))

@@ -189,6 +189,7 @@ score_col = reader.schema.get_field_index(<span class="str">"score"</span>)</cod
                 <tbody>
                     <tr><td><code>schema</code></td><td><code>pa.Schema</code></td><td>Arrow Schema for the file</td></tr>
                     <tr><td><code>num_row_groups</code></td><td><code>int</code></td><td>Row group count</td></tr>
+                    <tr><td><code>row_group_num_rows(rg)</code></td><td><code>int</code></td><td>Number of rows in a specific row group</td></tr>
                     <tr><td><code>read_row_group(rg, columns=None)</code></td><td><code>pa.RecordBatch</code></td><td>Read a row group (optionally with projection)</td></tr>
                     <tr><td><code>read_all(columns=None)</code></td><td><code>pa.Table</code></td><td>Read entire file as a Table</td></tr>
                     <tr><td><code>get_row_group_statistics(rg)</code></td><td><code>list[ColumnStatistics]</code></td><td>Column statistics for a row group</td></tr>

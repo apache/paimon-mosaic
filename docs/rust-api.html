@@ -238,6 +238,12 @@ writer.close().unwrap();
     }
 }</code></pre>
 
+            <h3>Getting Row Group Row Count</h3>
+<pre><code><span class="kw">for</span> rg_idx <span class="kw">in</span> <span class="num">0</span>..reader.num_row_groups() {
+    <span class="kw">let</span> num_rows = reader.row_group_num_rows(rg_idx)?;
+    println!(<span class="str">"row group {} has {} rows"</span>, rg_idx, num_rows);
+}</code></pre>
+
             <h3>Reading Stats from Reader</h3>
 <pre><code><span class="kw">for</span> rg_idx <span class="kw">in</span> <span class="num">0</span>..reader.num_row_groups() {
     <span class="kw">let</span> stats = reader.row_group_stats(rg_idx)?;

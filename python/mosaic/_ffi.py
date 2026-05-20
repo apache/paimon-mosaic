@@ -213,6 +213,11 @@ lib.mosaic_record_batch_export.restype = c_int
 lib.mosaic_record_batch_free.argtypes = [c_void_p]
 lib.mosaic_record_batch_free.restype = None
 
+# ======================== Row Group Num Rows ========================
+
+lib.mosaic_reader_row_group_num_rows.argtypes = [c_void_p, c_uint32, POINTER(c_uint32)]
+lib.mosaic_reader_row_group_num_rows.restype = c_int
+
 # ======================== Row Group Stats ========================
 
 lib.mosaic_reader_row_group_num_stats.argtypes = [c_void_p, c_uint32, POINTER(c_uint32)]

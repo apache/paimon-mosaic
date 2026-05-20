@@ -703,6 +703,31 @@ pub unsafe extern "C" fn mosaic_row_group_reader_num_rows(
 
 // ======================== Row Group Stats ========================
 
+/// Get number of rows in a row group.
+/// Returns 0 on success, -1 on error. Writes result to `out`.
+#[no_mangle]
+pub unsafe extern "C" fn mosaic_reader_row_group_num_rows(
+    handle: *const MosaicReaderHandle,
+    rg_index: u32,
+    out: *mut u32,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        set_error("null pointer".into());
+        return -1;
+    }
+    let h = &*handle;
+    match h.reader.row_group_num_rows(rg_index as usize) {
+        Ok(n) => {
+            *out = n as u32;
+            0
+        }
+        Err(e) => {
+            set_error(e.to_string());
+            -1
+        }
+    }
+}
+
 /// Get number of stats entries for a row group.
 /// Returns 0 on success, -1 on error. Writes result to `out`.
 #[no_mangle]

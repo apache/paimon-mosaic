@@ -289,6 +289,12 @@ public:
         if (rc != 0) throw Error("record_batch_export failed");
     }
 
+    uint32_t row_group_num_rows(uint32_t rg_index) const {
+        uint32_t out = 0;
+        check(mosaic_reader_row_group_num_rows(handle_, rg_index, &out));
+        return out;
+    }
+
     std::vector<ColumnStatistics> get_row_group_statistics(uint32_t rg_index) const {
         uint32_t n = 0;
         check(mosaic_reader_row_group_num_stats(handle_, rg_index, &n));

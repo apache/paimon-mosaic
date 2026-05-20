@@ -130,6 +130,9 @@ final class NativeLib {
     static native int nativeRowGroupReaderReadColumns(long handle, long arrayAddr, long schemaAddr);
     static native void nativeRowGroupReaderFree(long handle);
 
+    // Row group num rows
+    static native int nativeReaderRowGroupNumRows(long handle, int rgIndex);
+
     // Row group stats
     static native int nativeReaderRowGroupNumStats(long handle, int rgIndex);
     static native int nativeReaderRowGroupStatColumnIndex(long handle, int rgIndex, int statIndex);

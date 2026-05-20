@@ -791,6 +791,25 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
     }
 }
 
+// ======================== Row Group Num Rows ========================
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupNumRows(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    rg_index: jint,
+) -> jint {
+    if handle == 0 {
+        return -1;
+    }
+    let rh = unsafe { &*(handle as *const ReaderHandle) };
+    match rh.reader.row_group_num_rows(rg_index as usize) {
+        Ok(n) => n as jint,
+        Err(_) => -1,
+    }
+}
+
 // ======================== Row Group Stats ========================
 
 #[no_mangle]
