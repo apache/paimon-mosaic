@@ -133,11 +133,6 @@ class WriterOptions:
 
 
 class MosaicWriter:
-    """Columns are stored on disk in name-sorted order for compression.
-
-    The reader returns columns in the original input order by default;
-    use :meth:`MosaicReader.project` to select and reorder output columns.
-    """
 
     def __init__(self, stream, schema, options=None):
         if not isinstance(schema, pa.Schema):
@@ -279,10 +274,6 @@ class ColumnStatistics:
 
 
 class MosaicReader:
-    """The reader returns columns in the original input order by default.
-
-    Use :meth:`project` to select and reorder output columns.
-    """
 
     def __init__(self, handle, refs=None):
         self._handle = handle

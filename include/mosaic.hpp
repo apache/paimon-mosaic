@@ -105,9 +105,6 @@ struct ColumnStatistics {
     bool has_min_max() const { return has_min_max_; }
 };
 
-/// Columns are stored on disk in name-sorted order for compression.
-/// The reader returns columns in the original input order by default;
-/// use Reader::set_projection() to select and reorder output columns.
 class Writer {
 public:
     /// Construct a writer. `arrow_schema` is a pointer to an ArrowSchema (Arrow C Data Interface).
@@ -253,8 +250,6 @@ inline uint64_t input_length(void* ctx) noexcept {
 
 } // namespace detail
 
-/// The reader returns columns in the original input order by default.
-/// Use set_projection() to select and reorder output columns.
 class Reader {
 public:
     Reader(const Reader&) = delete;

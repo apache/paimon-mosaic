@@ -33,11 +33,6 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 
-/**
- * Columns are stored on disk in name-sorted order for compression.
- * The reader returns columns in the original input order by default;
- * use {@link MosaicReader#project} to select and reorder output columns.
- */
 public class MosaicWriter implements AutoCloseable {
 
     private long handle;

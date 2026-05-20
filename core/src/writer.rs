@@ -74,9 +74,6 @@ struct RowGroupMeta {
     stats: Vec<ColumnStats>,
 }
 
-/// Columns are stored on disk in name-sorted order for compression.
-/// The reader returns columns in the original input order by default;
-/// use `project()` on the reader to select and reorder output columns.
 pub struct MosaicWriter<S: OutputFile> {
     out: S,
     schema: MosaicSchema,

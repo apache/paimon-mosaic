@@ -222,8 +222,6 @@ pub trait ReaderAccess {
     fn row_group_num_rows(&self, rg_index: usize) -> io::Result<usize>;
 }
 
-/// The reader returns columns in the original input order by default.
-/// Use `project()` to select and reorder output columns.
 pub struct MosaicReader<I: InputFile> {
     input: I,
     schema: MosaicSchema,

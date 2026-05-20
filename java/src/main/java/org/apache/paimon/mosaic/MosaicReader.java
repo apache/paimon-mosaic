@@ -30,10 +30,6 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 
-/**
- * The reader returns columns in the original input order by default.
- * Use {@link #project} to select and reorder output columns.
- */
 public class MosaicReader implements AutoCloseable {
 
     private long handle;
