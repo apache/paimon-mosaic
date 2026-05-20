@@ -46,11 +46,16 @@ public class MosaicReader implements AutoCloseable {
     }
 
     public static MosaicReader open(InputFile inputFile, long fileLength, BufferAllocator allocator) {
-        long h = NativeLib.nativeReaderOpen(inputFile, fileLength);
-        if (h == 0) {
+        long handle = NativeLib.nativeReaderOpen(inputFile, fileLength);
+        if (handle == 0) {
             throw new RuntimeException("failed to open reader");
         }
-        return new MosaicReader(h, allocator);
+        try {
+            return new MosaicReader(handle, allocator);
+        } catch (RuntimeException | Error e) {
+            NativeLib.nativeReaderFree(handle);
+            throw e;
+        }
     }
 
     public Schema getSchema() {
