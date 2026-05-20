@@ -18,8 +18,7 @@
 use std::io;
 use std::sync::Arc;
 
-use arrow_array::ArrayRef;
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema};
 
 use crate::bucket_reader::{read_typed_value, read_variable_value, BucketReader, ColumnPageReader};
@@ -947,8 +946,16 @@ impl RowGroupReader {
         }
 
         let arrow_schema = std::sync::Arc::new(Schema::new(fields));
-        RecordBatch::try_new(arrow_schema, batch_arrays)
-            .map_err(|e| io::Error::other(e.to_string()))
+        let batch = if batch_arrays.is_empty() {
+            RecordBatch::try_new_with_options(
+                arrow_schema,
+                batch_arrays,
+                &RecordBatchOptions::new().with_row_count(Some(self.num_rows)),
+            )
+        } else {
+            RecordBatch::try_new(arrow_schema, batch_arrays)
+        };
+        batch.map_err(|e| io::Error::other(e.to_string()))
     }
 }
 
