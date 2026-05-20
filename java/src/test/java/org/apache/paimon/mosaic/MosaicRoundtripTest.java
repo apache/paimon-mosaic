@@ -780,18 +780,18 @@ public class MosaicRoundtripTest {
     @Test
     public void testSchemaRoundtrip() {
         Schema arrowSchema = new Schema(Arrays.asList(
-                Field.notNullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("name", ArrowType.Utf8.INSTANCE),
+                Field.notNullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("score", new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE))
         ));
 
         byte[] data;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
-            IntVector ids = (IntVector) root.getVector("id");
             VarCharVector names = (VarCharVector) root.getVector("name");
+            IntVector ids = (IntVector) root.getVector("id");
             Float8Vector scores = (Float8Vector) root.getVector("score");
-            ids.allocateNew(1); names.allocateNew(1); scores.allocateNew(1);
-            ids.set(0, 1); names.setSafe(0, "x".getBytes()); scores.set(0, 1.0);
+            names.allocateNew(1); ids.allocateNew(1); scores.allocateNew(1);
+            names.setSafe(0, "x".getBytes()); ids.set(0, 1); scores.set(0, 1.0);
             root.setRowCount(1);
             data = writeToBytes(arrowSchema, writer -> writer.write(root));
         }
@@ -799,11 +799,11 @@ public class MosaicRoundtripTest {
         try (MosaicReader reader = readerFromBytes(data)) {
             Schema readSchema = reader.getSchema();
             assertEquals(3, readSchema.getFields().size());
-            assertEquals("id", readSchema.getFields().get(0).getName());
-            assertEquals("name", readSchema.getFields().get(1).getName());
+            assertEquals("name", readSchema.getFields().get(0).getName());
+            assertEquals("id", readSchema.getFields().get(1).getName());
             assertEquals("score", readSchema.getFields().get(2).getName());
-            assertFalse(readSchema.getFields().get(0).isNullable());
-            assertTrue(readSchema.getFields().get(1).isNullable());
+            assertFalse(readSchema.getFields().get(1).isNullable());
+            assertTrue(readSchema.getFields().get(0).isNullable());
         }
     }
 

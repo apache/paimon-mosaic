@@ -393,21 +393,21 @@ static void test_compression_zstd() {
 
 static void test_schema_roundtrip() {
     auto schema = arrow::schema({
-        arrow::field("id", arrow::int32(), false),
         arrow::field("name", arrow::utf8(), true),
+        arrow::field("id", arrow::int32(), false),
         arrow::field("score", arrow::float64(), true),
     });
 
-    arrow::Int32Builder sr_id_b;
-    assert(sr_id_b.Append(1).ok());
     arrow::StringBuilder sr_name_b;
     assert(sr_name_b.Append("x").ok());
+    arrow::Int32Builder sr_id_b;
+    assert(sr_id_b.Append(1).ok());
     arrow::DoubleBuilder sr_score_b;
     assert(sr_score_b.Append(1.0).ok());
 
     auto batch = arrow::RecordBatch::Make(schema, 1, {
-        sr_id_b.Finish().ValueUnsafe(),
         sr_name_b.Finish().ValueUnsafe(),
+        sr_id_b.Finish().ValueUnsafe(),
         sr_score_b.Finish().ValueUnsafe(),
     });
 
@@ -424,11 +424,11 @@ static void test_schema_roundtrip() {
     auto read_schema = imported.ValueUnsafe();
 
     ASSERT_EQ(read_schema->num_fields(), 3);
-    ASSERT_EQ(read_schema->field(0)->name(), "id");
-    ASSERT_EQ(read_schema->field(1)->name(), "name");
+    ASSERT_EQ(read_schema->field(0)->name(), "name");
+    ASSERT_EQ(read_schema->field(1)->name(), "id");
     ASSERT_EQ(read_schema->field(2)->name(), "score");
-    ASSERT_TRUE(!read_schema->field(0)->nullable());
-    ASSERT_TRUE(read_schema->field(1)->nullable());
+    ASSERT_TRUE(read_schema->field(0)->nullable());
+    ASSERT_TRUE(!read_schema->field(1)->nullable());
     printf("  PASS test_schema_roundtrip\n");
 }
 

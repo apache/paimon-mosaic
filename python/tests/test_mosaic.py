@@ -443,19 +443,19 @@ class TestSchema:
     def test_schema_roundtrip(self):
         pa_schema = pa.schema(
             [
-                pa.field("id", pa.int32(), nullable=False),
                 pa.field("name", pa.utf8(), nullable=True),
+                pa.field("id", pa.int32(), nullable=False),
                 pa.field("score", pa.float64(), nullable=True),
             ]
         )
 
         batch = pa.record_batch(
             [
-                pa.array([1], type=pa.int32()),
                 pa.array(["x"]),
+                pa.array([1], type=pa.int32()),
                 pa.array([1.0]),
             ],
-            names=["id", "name", "score"],
+            names=["name", "id", "score"],
         )
 
         data = _write_to_bytes(pa_schema, batch)
@@ -463,6 +463,7 @@ class TestSchema:
         with _reader_from_bytes(data) as reader:
             s = reader.schema
             assert len(s) == 3
+            assert s.names == ["name", "id", "score"]
             assert s.field("id").type == pa.int32()
             assert s.field("name").type == pa.utf8()
             assert s.field("score").type == pa.float64()
