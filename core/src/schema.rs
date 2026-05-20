@@ -211,6 +211,24 @@ impl MosaicSchema {
             (0..num_columns).collect()
         };
 
+        // Validate that original_order is a permutation of 0..num_columns
+        if original_order.len() != num_columns {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "original_order length mismatch",
+            ));
+        }
+        let mut seen = vec![false; num_columns];
+        for &idx in &original_order {
+            if idx >= num_columns || seen[idx] {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "original_order is not a valid permutation",
+                ));
+            }
+            seen[idx] = true;
+        }
+
         Ok(MosaicSchema {
             num_buckets,
             columns,
@@ -381,5 +399,35 @@ mod tests {
         let data = schema.serialize();
         let restored = MosaicSchema::deserialize(&data).unwrap();
         assert_eq!(restored.original_order, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_original_order_duplicate_rejected() {
+        let columns = vec![
+            ("name".to_string(), DataType::Utf8, true),
+            ("age".to_string(), DataType::Int32, false),
+            ("score".to_string(), DataType::Float64, true),
+        ];
+        let mut schema = MosaicSchema::new(columns, 1);
+        // Corrupt: duplicate index
+        schema.original_order = vec![1, 1, 2];
+        let data = schema.serialize();
+        let err = MosaicSchema::deserialize(&data).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_original_order_out_of_range_rejected() {
+        let columns = vec![
+            ("name".to_string(), DataType::Utf8, true),
+            ("age".to_string(), DataType::Int32, false),
+            ("score".to_string(), DataType::Float64, true),
+        ];
+        let mut schema = MosaicSchema::new(columns, 1);
+        // Corrupt: index out of range
+        schema.original_order = vec![0, 1, 5];
+        let data = schema.serialize();
+        let err = MosaicSchema::deserialize(&data).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
