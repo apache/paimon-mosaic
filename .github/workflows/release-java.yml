@@ -16,11 +16,14 @@
 # limitations under the License.
 ################################################################################
 
-name: Publish Snapshot
+name: Release Java
 
 on:
   push:
-    branches: [main]
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"
+  workflow_dispatch:
 
 env:
   JDK_VERSION: 8
@@ -69,17 +72,6 @@ jobs:
           rustup update stable
           rustup default stable
 
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-
-
       - name: Build JNI library
         run: cargo build --release -p mosaic-jni
 
@@ -89,7 +81,7 @@ jobs:
           name: native-${{ matrix.os_name }}-${{ matrix.arch }}
           path: target/release/${{ matrix.lib_name }}
 
-  publish-snapshot:
+  deploy-staging:
     if: github.repository == 'apache/paimon-mosaic'
     runs-on: ubuntu-latest
     needs: [build-native]
@@ -134,28 +126,20 @@ jobs:
         with:
           java-version: ${{ env.JDK_VERSION }}
           distribution: 'temurin'
+          server-id: apache.releases.https
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_SECRET_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
 
-      - name: Cache local Maven repository
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: snapshot-maven-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            snapshot-maven-
-
-      - name: Publish snapshot
-        env:
-          ASF_USERNAME: ${{ secrets.NEXUS_USER }}
-          ASF_PASSWORD: ${{ secrets.NEXUS_PW }}
-          MAVEN_OPTS: -Xmx4096m
+      - name: Deploy to Apache Nexus staging
         working-directory: java
         run: |
-          tmp_settings="tmp-settings.xml"
-          echo "<settings><servers><server>" > $tmp_settings
-          echo "<id>apache.snapshots.https</id><username>$ASF_USERNAME</username>" >> $tmp_settings
-          echo "<password>$ASF_PASSWORD</password>" >> $tmp_settings
-          echo "</server></servers></settings>" >> $tmp_settings
-
-          mvn --settings $tmp_settings clean deploy -Dgpg.skip -Drat.skip -DskipTests
-
-          rm $tmp_settings
+          mvn clean deploy \
+            -Prelease \
+            -DskipTests \
+            -DretryFailedDeploymentCount=10
+        env:
+          MAVEN_USERNAME: ${{ secrets.NEXUS_STAGE_DEPLOYER_USER }}
+          MAVEN_PASSWORD: ${{ secrets.NEXUS_STAGE_DEPLOYER_PW }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}

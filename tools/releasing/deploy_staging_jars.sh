@@ -18,6 +18,10 @@
 #
 
 ##
+## This script is for local testing only.
+## For official releases, use the GitHub Actions workflow: .github/workflows/release-java.yml
+## which builds native libraries for all platforms (linux, macOS, windows) before deploying.
+##
 ## Variables with defaults (if not overwritten by environment)
 ##
 MVN=${MVN:-mvn}
