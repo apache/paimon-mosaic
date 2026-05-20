@@ -1632,7 +1632,7 @@ fn test_decimal128_extreme_values() {
     }
 }
 
-// ======================== TimestampNanos (Struct) Tests ========================
+// ======================== TimestampNanos Tests ========================
 
 #[test]
 fn test_timestamp_nanos_basic_roundtrip() {
@@ -1686,19 +1686,22 @@ fn test_timestamp_nanos_basic_roundtrip() {
     let col = result[0]
         .column(0)
         .as_any()
-        .downcast_ref::<StructArray>()
+        .downcast_ref::<TimestampNanosecondArray>()
         .unwrap();
-
-    let millis_col = col.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let nanos_col = col.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
 
     for i in 0..num_rows {
         if i % 11 == 0 {
             assert!(col.is_null(i), "expected null at row {}", i);
         } else {
             assert!(!col.is_null(i));
-            assert_eq!(millis_col.value(i), 1_700_000_000_000i64 + i as i64);
-            assert_eq!(nanos_col.value(i), (i % 1_000_000) as i32);
+            assert_eq!(
+                col.value(i),
+                mosaic_core::types::millis_nanos_to_ns(
+                    1_700_000_000_000i64 + i as i64,
+                    (i % 1_000_000) as i32,
+                )
+                .unwrap()
+            );
         }
     }
 }
@@ -1717,20 +1720,19 @@ fn test_timestamp_nanos_extreme_values() {
         false,
     )]);
 
-    // Extreme millisecond values and nanos boundary values
-    let millis_data: Vec<i64> = vec![
+    let ns_data: Vec<i64> = vec![
         0,
         i64::MAX,
         i64::MIN,
-        1_700_000_000_000,
-        -1_700_000_000_000,
+        mosaic_core::types::millis_nanos_to_ns(1_700_000_000_000, 999_999).unwrap(),
+        mosaic_core::types::millis_nanos_to_ns(-1_700_000_000_000, 1).unwrap(),
         1,
         -1,
     ];
-    let nanos_data: Vec<i32> = vec![
-        0, 999_999, // max valid nanos_of_milli
-        0, 500_000, 999_999, 1, 0,
-    ];
+    let (millis_data, nanos_data): (Vec<i64>, Vec<i32>) = ns_data
+        .iter()
+        .map(|&ns| mosaic_core::types::ns_to_millis_nanos(ns))
+        .unzip();
 
     let millis_arr = Int64Array::from(millis_data.clone());
     let nanos_arr = Int32Array::from(nanos_data.clone());
@@ -1747,20 +1749,11 @@ fn test_timestamp_nanos_extreme_values() {
     let col = result[0]
         .column(0)
         .as_any()
-        .downcast_ref::<StructArray>()
+        .downcast_ref::<TimestampNanosecondArray>()
         .unwrap();
 
-    let millis_col = col.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let nanos_col = col.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
-
-    for i in 0..millis_data.len() {
-        assert_eq!(
-            millis_col.value(i),
-            millis_data[i],
-            "millis mismatch at {}",
-            i
-        );
-        assert_eq!(nanos_col.value(i), nanos_data[i], "nanos mismatch at {}", i);
+    for (i, expected) in ns_data.iter().enumerate() {
+        assert_eq!(col.value(i), *expected, "timestamp ns mismatch at {}", i);
     }
 }
 

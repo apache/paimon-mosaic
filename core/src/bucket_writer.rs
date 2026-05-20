@@ -144,7 +144,8 @@ impl BucketWriter {
         let typed = downcast_array(array, dt)?;
 
         if array.null_count() == 0 {
-            if let Some(col_size) = self.append_no_null_batch(col, &typed, start_row, num_new_rows)
+            if let Some(col_size) =
+                self.append_no_null_batch(col, &typed, start_row, num_new_rows)?
             {
                 return Ok(col_size);
             }
@@ -158,7 +159,7 @@ impl BucketWriter {
             } else {
                 self.non_null_counts[col] += 1;
                 let before = self.value_buffers[col].len();
-                write_typed_value(&mut self.value_buffers[col], &typed, row);
+                write_typed_value(&mut self.value_buffers[col], &typed, row)?;
                 let written = self.value_buffers[col].len() - before;
                 col_size += written;
 
@@ -207,7 +208,7 @@ impl BucketWriter {
         typed: &TypedArrayRef,
         start_row: usize,
         num_rows: usize,
-    ) -> Option<usize> {
+    ) -> io::Result<Option<usize>> {
         let buf = &mut self.value_buffers[col];
         let before_all = buf.len();
 
@@ -295,16 +296,22 @@ impl BucketWriter {
                     buf.extend_from_slice(&v.to_be_bytes());
                 }
             }
-            TypedArrayRef::TimestampNanos { millis, nanos } => {
+            TypedArrayRef::TimestampNanos(a) => {
+                let vals = a.values();
+                buf.reserve(num_rows * 12);
+                for &v in vals.iter() {
+                    write_timestamp_nanos_value(buf, v);
+                }
+            }
+            TypedArrayRef::LegacyTimestampNanos { millis, nanos } => {
                 let m_vals = millis.values();
                 let n_vals = nanos.values();
                 buf.reserve(num_rows * 12);
                 for i in 0..num_rows {
-                    buf.extend_from_slice(&m_vals[i].to_be_bytes());
-                    buf.extend_from_slice(&n_vals[i].to_be_bytes());
+                    write_legacy_timestamp_nanos_value(buf, m_vals[i], n_vals[i])?;
                 }
             }
-            _ => return None,
+            _ => return Ok(None),
         }
 
         let col_size = buf.len() - before_all;
@@ -342,12 +349,28 @@ impl BucketWriter {
                     break;
                 }
             }
+        } else if let Some(ref mut dict) = self.byte_dict_maps[col] {
+            for i in 0..num_rows {
+                let start = before_all + i * fw;
+                let slice = &buf[start..start + fw];
+                if !dict.contains_key(slice) {
+                    let len = dict.len();
+                    dict.insert(slice.to_vec(), len);
+                    self.dict_total_bytes[col] += fw;
+                }
+                if dict.len() > self.max_dict_entries
+                    || self.dict_total_bytes[col] > self.max_dict_total_bytes
+                {
+                    self.byte_dict_maps[col] = None;
+                    break;
+                }
+            }
         }
 
         // null_bitmap stays all-zero (no nulls), start_row offsets are fine
         let _ = start_row;
 
-        Some(col_size)
+        Ok(Some(col_size))
     }
 
     fn compute_encodings(&self) -> (Vec<u8>, Vec<bool>) {
@@ -688,7 +711,8 @@ enum TypedArrayRef<'a> {
     Decimal128Large(&'a Decimal128Array),
     TimestampMillis(&'a TimestampMillisecondArray),
     TimestampMicros(&'a TimestampMicrosecondArray),
-    TimestampNanos {
+    TimestampNanos(&'a TimestampNanosecondArray),
+    LegacyTimestampNanos {
         millis: &'a Int64Array,
         nanos: &'a Int32Array,
     },
@@ -768,24 +792,30 @@ fn downcast_array<'a>(array: &'a dyn Array, dt: &DataType) -> io::Result<TypedAr
                     .ok_or_else(|| cast_err(dt))?,
             ))
         }
+        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, _) => {
+            Ok(TypedArrayRef::TimestampNanos(
+                any.downcast_ref::<TimestampNanosecondArray>()
+                    .ok_or_else(|| cast_err(dt))?,
+            ))
+        }
         DataType::Struct(fields) if types::is_timestamp_nanos_struct(fields) => {
             let s = any
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| cast_err(dt))?;
             let ts_dt = DataType::Int64;
             let ns_dt = DataType::Int32;
-            Ok(TypedArrayRef::TimestampNanos {
-                millis: s
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| cast_err(&ts_dt))?,
-                nanos: s
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| cast_err(&ns_dt))?,
-            })
+            let millis = s
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| cast_err(&ts_dt))?;
+            let nanos = s
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| cast_err(&ns_dt))?;
+            validate_legacy_timestamp_nanos(s, millis, nanos)?;
+            Ok(TypedArrayRef::LegacyTimestampNanos { millis, nanos })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -795,7 +825,7 @@ fn downcast_array<'a>(array: &'a dyn Array, dt: &DataType) -> io::Result<TypedAr
 }
 
 #[inline]
-fn write_typed_value(buf: &mut Vec<u8>, typed: &TypedArrayRef, row: usize) {
+fn write_typed_value(buf: &mut Vec<u8>, typed: &TypedArrayRef, row: usize) -> io::Result<()> {
     match typed {
         TypedArrayRef::Boolean(a) => buf.push(if a.value(row) { 1 } else { 0 }),
         TypedArrayRef::Int8(a) => buf.push(a.value(row) as u8),
@@ -826,11 +856,57 @@ fn write_typed_value(buf: &mut Vec<u8>, typed: &TypedArrayRef, row: usize) {
         }
         TypedArrayRef::TimestampMillis(a) => buf.extend_from_slice(&a.value(row).to_be_bytes()),
         TypedArrayRef::TimestampMicros(a) => buf.extend_from_slice(&a.value(row).to_be_bytes()),
-        TypedArrayRef::TimestampNanos { millis, nanos } => {
-            buf.extend_from_slice(&millis.value(row).to_be_bytes());
-            buf.extend_from_slice(&nanos.value(row).to_be_bytes());
+        TypedArrayRef::TimestampNanos(a) => write_timestamp_nanos_value(buf, a.value(row)),
+        TypedArrayRef::LegacyTimestampNanos { millis, nanos } => {
+            write_legacy_timestamp_nanos_value(buf, millis.value(row), nanos.value(row))?;
         }
     }
+    Ok(())
+}
+
+fn validate_legacy_timestamp_nanos(
+    parent: &StructArray,
+    millis: &Int64Array,
+    nanos: &Int32Array,
+) -> io::Result<()> {
+    for row in 0..parent.len() {
+        if parent.is_null(row) {
+            continue;
+        }
+        if millis.is_null(row) || nanos.is_null(row) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "legacy timestamp nanos has null child for a non-null parent row",
+            ));
+        }
+        validate_timestamp_nanos_pair(millis.value(row), nanos.value(row))?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn write_timestamp_nanos_value(buf: &mut Vec<u8>, ns: i64) {
+    let (millis, nanos) = types::ns_to_millis_nanos(ns);
+    buf.extend_from_slice(&millis.to_be_bytes());
+    buf.extend_from_slice(&nanos.to_be_bytes());
+}
+
+#[inline]
+fn write_legacy_timestamp_nanos_value(
+    buf: &mut Vec<u8>,
+    millis: i64,
+    nanos: i32,
+) -> io::Result<()> {
+    validate_timestamp_nanos_pair(millis, nanos)?;
+    buf.extend_from_slice(&millis.to_be_bytes());
+    buf.extend_from_slice(&nanos.to_be_bytes());
+    Ok(())
+}
+
+fn validate_timestamp_nanos_pair(millis: i64, nanos: i32) -> io::Result<()> {
+    types::millis_nanos_to_ns(millis, nanos)
+        .map(|_| ())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))
 }
 
 fn i128_to_biginteger_bytes(val: i128) -> Vec<u8> {
@@ -1028,6 +1104,26 @@ mod tests {
             .collect();
         let arr = Int32Array::from(vals);
         writer.write_columns(&[&arr], &[&DataType::Int32]).unwrap();
+
+        let data = writer.finish();
+        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+    }
+
+    #[test]
+    fn test_timestamp_nanos_byte_dict_after_no_null_batch() {
+        let types = [DataType::Timestamp(
+            arrow_schema::TimeUnit::Nanosecond,
+            None,
+        )];
+        let type_refs: Vec<&DataType> = types.iter().collect();
+        let mut writer = BucketWriter::new(&type_refs, 32768, 255);
+
+        let first = TimestampNanosecondArray::from(vec![Some(1), None, Some(2)]);
+        writer.write_columns(&[&first], &[&types[0]]).unwrap();
+
+        let second_values: Vec<i64> = (0..120).map(|i| 3 + (i % 3) as i64).collect();
+        let second = TimestampNanosecondArray::from(second_values);
+        writer.write_columns(&[&second], &[&types[0]]).unwrap();
 
         let data = writer.finish();
         assert_eq!(data[0] & 0x03, ENCODING_DICT);

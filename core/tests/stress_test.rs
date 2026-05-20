@@ -27,7 +27,7 @@ use std::io;
 use std::sync::Arc;
 
 use arrow_array::*;
-use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess};
 use mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
 
@@ -286,10 +286,6 @@ fn test_wide_table_200_columns() {
 #[test]
 fn test_all_types_at_scale() {
     let num_rows = 500_000;
-    let ts_nanos_fields = Fields::from(vec![
-        Field::new("millis", DataType::Int64, false),
-        Field::new("nanos_of_milli", DataType::Int32, false),
-    ]);
     let schema = Schema::new(vec![
         Field::new("bool_col", DataType::Boolean, true),
         Field::new("i8_col", DataType::Int8, true),
@@ -313,7 +309,11 @@ fn test_all_types_at_scale() {
             DataType::Timestamp(TimeUnit::Microsecond, None),
             true,
         ),
-        Field::new("ts_ns_col", DataType::Struct(ts_nanos_fields.clone()), true),
+        Field::new(
+            "ts_ns_col",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
     ]);
 
     let batch_size = 50_000;
@@ -473,34 +473,17 @@ fn test_all_types_at_scale() {
             })
             .collect();
 
-        // Timestamp nanos as struct
-        let millis_vals: Vec<Option<i64>> = (0..count)
+        let ts_ns: Vec<Option<i64>> = (0..count)
             .map(|i| {
                 if (batch_start + i) % 21 == 0 {
                     None
                 } else {
-                    Some(1_700_000_000_000i64 + (batch_start + i) as i64)
+                    let millis = 1_700_000_000_000i64 + (batch_start + i) as i64;
+                    let nanos = ((batch_start + i) % 1_000_000) as i32;
+                    Some(mosaic_core::types::millis_nanos_to_ns(millis, nanos).unwrap())
                 }
             })
             .collect();
-        let nanos_vals: Vec<Option<i32>> = (0..count)
-            .map(|i| {
-                if (batch_start + i) % 21 == 0 {
-                    None
-                } else {
-                    Some(((batch_start + i) % 1_000_000) as i32)
-                }
-            })
-            .collect();
-
-        let millis_arr = Int64Array::from(millis_vals);
-        let nanos_arr = Int32Array::from(nanos_vals);
-        let null_buf = millis_arr.nulls().cloned();
-        let ts_ns_struct = StructArray::new(
-            ts_nanos_fields.clone(),
-            vec![Arc::new(millis_arr), Arc::new(nanos_arr)],
-            null_buf,
-        );
 
         let batch = RecordBatch::try_new(
             Arc::new(schema.clone()),
@@ -523,7 +506,7 @@ fn test_all_types_at_scale() {
                 ),
                 Arc::new(TimestampMillisecondArray::from(ts_ms)),
                 Arc::new(TimestampMicrosecondArray::from(ts_us)),
-                Arc::new(ts_ns_struct),
+                Arc::new(TimestampNanosecondArray::from(ts_ns)),
             ],
         )
         .unwrap();

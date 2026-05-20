@@ -30,6 +30,18 @@ fn columns_to_arrow_schema(columns: &[(String, DataType, bool)]) -> Schema {
     )
 }
 
+fn legacy_timestamp_nanos_fields() -> arrow_schema::Fields {
+    vec![
+        Field::new("millis", DataType::Int64, false),
+        Field::new("nanos_of_milli", DataType::Int32, false),
+    ]
+    .into()
+}
+
+fn legacy_timestamp_nanos_type() -> DataType {
+    DataType::Struct(legacy_timestamp_nanos_fields())
+}
+
 struct ByteArrayInputFile {
     data: Vec<u8>,
 }
@@ -257,6 +269,25 @@ fn build_array_from_values(rows: &[Vec<Value>], col: usize, dt: &DataType) -> Ar
                 })
                 .collect();
             let arr = TimestampMicrosecondArray::from(vals);
+            Arc::new(if let Some(tz) = tz {
+                arr.with_timezone(tz.clone())
+            } else {
+                arr
+            })
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            let vals: Vec<Option<i64>> = rows
+                .iter()
+                .map(|row| match &row[col] {
+                    Value::TimestampNanos {
+                        millis,
+                        nanos_of_milli,
+                    } => Some(crate::types::millis_nanos_to_ns(*millis, *nanos_of_milli).unwrap()),
+                    Value::Null => None,
+                    _ => panic!("type mismatch"),
+                })
+                .collect();
+            let arr = TimestampNanosecondArray::from(vals);
             Arc::new(if let Some(tz) = tz {
                 arr.with_timezone(tz.clone())
             } else {
@@ -705,20 +736,12 @@ fn test_roundtrip_all_types() {
     let c_ts_high = batch
         .column(col("f_timestamp_high"))
         .as_any()
-        .downcast_ref::<StructArray>()
+        .downcast_ref::<TimestampNanosecondArray>()
         .unwrap();
-    let millis_arr = c_ts_high
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
-    let nanos_arr = c_ts_high
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
-    assert_eq!(millis_arr.value(0), 1700000000000i64);
-    assert_eq!(nanos_arr.value(0), 123456);
+    assert_eq!(
+        c_ts_high.value(0),
+        crate::types::millis_nanos_to_ns(1700000000000, 123456).unwrap()
+    );
 }
 
 fn write_and_read(
@@ -1800,6 +1823,251 @@ fn test_timestamp_ltz_roundtrip() {
 }
 
 #[test]
+fn test_timestamp_nanos_roundtrip() {
+    let columns = vec![(
+        "ts_nanos".to_string(),
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        true,
+    )];
+    let rows = vec![
+        vec![Value::TimestampNanos {
+            millis: 1700000000000,
+            nanos_of_milli: 123456,
+        }],
+        vec![Value::Null],
+        vec![Value::TimestampNanos {
+            millis: -1,
+            nanos_of_milli: 999999,
+        }],
+        vec![Value::TimestampNanos {
+            millis: 0,
+            nanos_of_milli: 0,
+        }],
+    ];
+    let (reader, _) = write_and_read(columns, &rows);
+
+    assert_eq!(
+        reader.schema().columns[0].data_type,
+        DataType::Timestamp(TimeUnit::Nanosecond, None)
+    );
+
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+    let ts = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    assert_eq!(
+        ts.value(0),
+        crate::types::millis_nanos_to_ns(1700000000000, 123456).unwrap()
+    );
+    assert!(ts.is_null(1));
+    assert_eq!(ts.value(2), -1);
+    assert_eq!(ts.value(3), 0);
+}
+
+#[test]
+fn test_timestamp_ltz_nanos_roundtrip() {
+    let columns = vec![(
+        "ts_ltz_nanos".to_string(),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("Asia/Shanghai".into())),
+        true,
+    )];
+    let rows = vec![
+        vec![Value::TimestampNanos {
+            millis: 1700000000000,
+            nanos_of_milli: 42,
+        }],
+        vec![Value::Null],
+    ];
+    let (reader, _) = write_and_read(columns, &rows);
+
+    assert_eq!(
+        reader.schema().columns[0].data_type,
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("Asia/Shanghai".into()))
+    );
+
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+    let ts = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    assert_eq!(ts.timezone().unwrap(), "Asia/Shanghai");
+    assert_eq!(
+        ts.value(0),
+        crate::types::millis_nanos_to_ns(1700000000000, 42).unwrap()
+    );
+    assert!(ts.is_null(1));
+}
+
+#[test]
+fn test_legacy_timestamp_nanos_struct_writes_as_arrow_nanos() {
+    let columns = vec![("ts".to_string(), legacy_timestamp_nanos_type(), true)];
+    let rows = vec![vec![Value::TimestampNanos {
+        millis: 1700000000000,
+        nanos_of_milli: 123456,
+    }]];
+    let (reader, _) = write_and_read(columns, &rows);
+
+    assert_eq!(
+        reader.schema().columns[0].data_type,
+        DataType::Timestamp(TimeUnit::Nanosecond, None)
+    );
+
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+    let ts = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    assert_eq!(
+        ts.value(0),
+        crate::types::millis_nanos_to_ns(1700000000000, 123456).unwrap()
+    );
+}
+
+#[test]
+fn test_legacy_timestamp_nanos_struct_rejects_child_null() {
+    let legacy_fields: arrow_schema::Fields = vec![
+        Field::new("millis", DataType::Int64, true),
+        Field::new("nanos_of_milli", DataType::Int32, true),
+    ]
+    .into();
+    let legacy_dt = DataType::Struct(legacy_fields.clone());
+    let schema = Schema::new(vec![Field::new("ts", legacy_dt.clone(), true)]);
+    let struct_array = StructArray::new(
+        legacy_fields,
+        vec![
+            Arc::new(Int64Array::from(vec![Some(0)])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![None])) as ArrayRef,
+        ],
+        Some(arrow_buffer::NullBuffer::from(vec![true])),
+    );
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(struct_array)]).unwrap();
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &Schema::new(vec![Field::new("ts", legacy_dt, true)]),
+        WriterOptions::default(),
+    )
+    .unwrap();
+
+    let err = writer.write_batch(&batch).unwrap_err();
+    assert!(err.to_string().contains("null child"));
+}
+
+#[test]
+fn test_legacy_timestamp_nanos_struct_rejects_invalid_nanos() {
+    let legacy_dt = legacy_timestamp_nanos_type();
+    let schema = Schema::new(vec![Field::new("ts", legacy_dt.clone(), true)]);
+    let fields = legacy_timestamp_nanos_fields();
+    let struct_array = StructArray::new(
+        fields,
+        vec![
+            Arc::new(Int64Array::from(vec![Some(0)])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![Some(1_000_000)])) as ArrayRef,
+        ],
+        Some(arrow_buffer::NullBuffer::from(vec![true])),
+    );
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(struct_array)]).unwrap();
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &Schema::new(vec![Field::new("ts", legacy_dt, true)]),
+        WriterOptions::default(),
+    )
+    .unwrap();
+
+    let err = writer.write_batch(&batch).unwrap_err();
+    assert!(err.to_string().contains("invalid nanos_of_milli"));
+}
+
+#[test]
+fn test_legacy_timestamp_nanos_struct_rejects_overflow() {
+    let legacy_dt = legacy_timestamp_nanos_type();
+    let schema = Schema::new(vec![Field::new("ts", legacy_dt.clone(), true)]);
+    let fields = legacy_timestamp_nanos_fields();
+    let struct_array = StructArray::new(
+        fields,
+        vec![
+            Arc::new(Int64Array::from(vec![Some(i64::MAX)])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![Some(0)])) as ArrayRef,
+        ],
+        Some(arrow_buffer::NullBuffer::from(vec![true])),
+    );
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(struct_array)]).unwrap();
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &Schema::new(vec![Field::new("ts", legacy_dt, true)]),
+        WriterOptions::default(),
+    )
+    .unwrap();
+
+    let err = writer.write_batch(&batch).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("overflow"));
+}
+
+#[test]
+fn test_timestamp_nanos_stats_min_max() {
+    let columns = vec![(
+        "ts".to_string(),
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        true,
+    )];
+    let rows = vec![
+        vec![Value::TimestampNanos {
+            millis: -1,
+            nanos_of_milli: 999999,
+        }],
+        vec![Value::Null],
+        vec![Value::TimestampNanos {
+            millis: 0,
+            nanos_of_milli: 42,
+        }],
+        vec![Value::TimestampNanos {
+            millis: -1,
+            nanos_of_milli: 999998,
+        }],
+    ];
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            stats_columns: vec![0],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+
+    let stats = writer.row_group_stats(0);
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].null_count, 1);
+    assert!(matches!(
+        stats[0].min,
+        Some(Value::TimestampNanos {
+            millis: -1,
+            nanos_of_milli: 999998
+        })
+    ));
+    assert!(matches!(
+        stats[0].max,
+        Some(Value::TimestampNanos {
+            millis: 0,
+            nanos_of_milli: 42
+        })
+    ));
+}
+
+#[test]
 fn test_timestamp_micros_roundtrip() {
     let columns = vec![
         (
@@ -1861,23 +2129,15 @@ fn test_timestamp_micros_roundtrip() {
     let ts_nanos = batch
         .column(2)
         .as_any()
-        .downcast_ref::<StructArray>()
-        .unwrap();
-    let millis = ts_nanos
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
-    let nanos = ts_nanos
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int32Array>()
+        .downcast_ref::<TimestampNanosecondArray>()
         .unwrap();
 
     assert_eq!(ts_millis.value(0), 1700000000000i64);
     assert_eq!(ts_micros.value(0), 1_700_000_000_000_000i64);
-    assert_eq!(millis.value(0), 1700000000000i64);
-    assert_eq!(nanos.value(0), 123456);
+    assert_eq!(
+        ts_nanos.value(0),
+        crate::types::millis_nanos_to_ns(1700000000000, 123456).unwrap()
+    );
 
     assert!(ts_millis.is_null(1));
     assert!(ts_micros.is_null(1));
@@ -1885,6 +2145,7 @@ fn test_timestamp_micros_roundtrip() {
 
     assert_eq!(ts_millis.value(2), 0);
     assert_eq!(ts_micros.value(2), 0);
+    assert_eq!(ts_nanos.value(2), 0);
 }
 
 #[test]

@@ -760,6 +760,15 @@ TypeDescriptor</code></pre>
                     <tr><td>BINARY / VARBINARY / BYTES</td><td>varint length + raw bytes</td></tr>
                 </tbody>
             </table>
+            <p>
+                Readers expose TIMESTAMP precision &gt; 6 as Arrow Timestamp(Nanosecond, timezone).
+                This keeps the 12-byte physical encoding unchanged, but precisions 7 and 8 are
+                normalized to Arrow nanosecond units in the external schema because Arrow timestamp
+                units do not preserve decimal timestamp precision separately.
+                Existing 12-byte timestamp values outside Arrow's signed 64-bit epoch-nanosecond
+                range cannot be represented through this Arrow API; readers return InvalidData for
+                those values, and legacy Struct timestamp writes reject them before writing.
+            </p>
 
             <!-- ============================================================ -->
             <h2>Varint Encoding</h2>

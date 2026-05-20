@@ -253,6 +253,52 @@ static void test_all_types() {
     printf("  PASS test_all_types\n");
 }
 
+static void test_timestamp_ns_roundtrip() {
+    auto ts_ns_type = arrow::timestamp(arrow::TimeUnit::NANO);
+    auto ts_ns_tz_type = arrow::timestamp(arrow::TimeUnit::NANO, "Asia/Shanghai");
+    auto schema = arrow::schema({
+        arrow::field("ts_ns", ts_ns_type),
+        arrow::field("ts_ns_tz", ts_ns_tz_type),
+    });
+
+    const int64_t values[] = {1700000000000000123LL, -1LL};
+
+    arrow::TimestampBuilder ts_ns_b(ts_ns_type, arrow::default_memory_pool());
+    assert(ts_ns_b.Append(values[0]).ok());
+    assert(ts_ns_b.AppendNull().ok());
+    assert(ts_ns_b.Append(values[1]).ok());
+
+    arrow::TimestampBuilder ts_ns_tz_b(ts_ns_tz_type, arrow::default_memory_pool());
+    assert(ts_ns_tz_b.Append(values[0]).ok());
+    assert(ts_ns_tz_b.AppendNull().ok());
+    assert(ts_ns_tz_b.Append(values[1]).ok());
+
+    auto batch = arrow::RecordBatch::Make(schema, 3, {
+        ts_ns_b.Finish().ValueUnsafe(),
+        ts_ns_tz_b.Finish().ValueUnsafe(),
+    });
+
+    auto data_vec = write_and_get(schema, batch);
+
+    MemBuffer buf;
+    buf.data = data_vec;
+    auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
+    auto rb = read_row_group(reader, 0);
+
+    ASSERT_TRUE(rb->schema()->field(0)->type()->Equals(ts_ns_type));
+    ASSERT_TRUE(rb->schema()->field(1)->type()->Equals(ts_ns_tz_type));
+
+    auto ts_ns = std::static_pointer_cast<arrow::TimestampArray>(rb->column(0));
+    auto ts_ns_tz = std::static_pointer_cast<arrow::TimestampArray>(rb->column(1));
+    ASSERT_EQ(ts_ns->Value(0), values[0]);
+    ASSERT_TRUE(ts_ns->IsNull(1));
+    ASSERT_EQ(ts_ns->Value(2), values[1]);
+    ASSERT_EQ(ts_ns_tz->Value(0), values[0]);
+    ASSERT_TRUE(ts_ns_tz->IsNull(1));
+    ASSERT_EQ(ts_ns_tz->Value(2), values[1]);
+    printf("  PASS test_timestamp_ns_roundtrip\n");
+}
+
 static void test_projection() {
     auto schema = arrow::schema({
         arrow::field("a", arrow::int32()),
@@ -700,6 +746,7 @@ int main() {
     test_basic_roundtrip();
     test_null_values();
     test_all_types();
+    test_timestamp_ns_roundtrip();
     test_projection();
     test_statistics();
     test_compression_zstd();
@@ -709,6 +756,6 @@ int main() {
     test_writer_stats_with_nulls();
     test_writer_stats_all_null();
     test_writer_stats_matches_reader();
-    printf("All %d tests passed.\n", 12);
+    printf("All %d tests passed.\n", 13);
     return 0;
 }

@@ -56,10 +56,8 @@ fn data_variant_for_type(dt: &DataType) -> DataVariant {
                 DataVariant::Binary
             }
         }
+        dt if types::is_timestamp_nanos(dt) => DataVariant::TimestampNanos,
         DataType::Timestamp(_, _) => DataVariant::Int64,
-        DataType::Struct(fields) if types::is_timestamp_nanos_struct(fields) => {
-            DataVariant::TimestampNanos
-        }
         _ => DataVariant::Binary,
     }
 }
@@ -104,13 +102,11 @@ fn empty_raw_data_for_type(dt: &DataType) -> RawColumnData {
                 }
             }
         }
+        dt if types::is_timestamp_nanos(dt) => RawColumnData::TimestampNanos {
+            millis: Vec::new(),
+            nanos_of_milli: Vec::new(),
+        },
         DataType::Timestamp(_, _) => RawColumnData::Int64(Vec::new()),
-        DataType::Struct(fields) if types::is_timestamp_nanos_struct(fields) => {
-            RawColumnData::TimestampNanos {
-                millis: Vec::new(),
-                nanos_of_milli: Vec::new(),
-            }
-        }
         _ => RawColumnData::Binary {
             offsets: vec![0],
             data: Vec::new(),
@@ -191,10 +187,10 @@ fn build_array(
     dt: &DataType,
     null_bitmap: Option<Vec<u8>>,
     num_rows: usize,
-) -> ArrayRef {
+) -> io::Result<ArrayRef> {
     let null_buf = make_null_buffer(null_bitmap.clone(), num_rows);
 
-    match data {
+    Ok(match data {
         RawColumnData::Boolean(values) => {
             let bool_buf = BooleanBuffer::new(Buffer::from_vec(values), 0, num_rows);
             Arc::new(BooleanArray::new(bool_buf, null_buf))
@@ -307,19 +303,43 @@ fn build_array(
         } => {
             let millis_scattered = scatter_fixed(millis, &null_bitmap, num_rows);
             let nanos_scattered = scatter_fixed(nanos_of_milli, &null_bitmap, num_rows);
-            let millis_array = Arc::new(Int64Array::from(millis_scattered)) as ArrayRef;
-            let nanos_array = Arc::new(Int32Array::from(nanos_scattered)) as ArrayRef;
-            let fields = vec![
-                Field::new("millis", DataType::Int64, false),
-                Field::new("nanos_of_milli", DataType::Int32, false),
-            ];
-            Arc::new(StructArray::new(
-                fields.into(),
-                vec![millis_array, nanos_array],
-                null_buf,
-            ))
+
+            match dt {
+                DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+                    let values = millis_scattered
+                        .into_iter()
+                        .zip(nanos_scattered)
+                        .map(|(millis, nanos)| types::millis_nanos_to_ns(millis, nanos))
+                        .collect::<io::Result<Vec<_>>>()?;
+                    let arr = TimestampNanosecondArray::new(ScalarBuffer::from(values), null_buf);
+                    Arc::new(if let Some(tz) = tz {
+                        arr.with_timezone(tz.clone())
+                    } else {
+                        arr
+                    })
+                }
+                DataType::Struct(fields) if types::is_timestamp_nanos_struct(fields) => {
+                    let millis_array = Arc::new(Int64Array::from(millis_scattered)) as ArrayRef;
+                    let nanos_array = Arc::new(Int32Array::from(nanos_scattered)) as ArrayRef;
+                    let fields = vec![
+                        Field::new("millis", DataType::Int64, false),
+                        Field::new("nanos_of_milli", DataType::Int32, false),
+                    ];
+                    Arc::new(StructArray::new(
+                        fields.into(),
+                        vec![millis_array, nanos_array],
+                        null_buf,
+                    ))
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("timestamp nanos data for non-nanos type: {:?}", dt),
+                    ));
+                }
+            }
         }
-    }
+    })
 }
 
 pub struct BucketReader {
@@ -536,7 +556,12 @@ impl BucketReader {
                 _ => empty_raw_data_for_type(&self.col_types[i]),
             };
 
-            result.push(build_array(data, &self.col_types[i], null_bitmap, num_rows));
+            result.push(build_array(
+                data,
+                &self.col_types[i],
+                null_bitmap,
+                num_rows,
+            )?);
         }
 
         Ok(result)
@@ -788,7 +813,7 @@ impl ColumnPageReader {
             _ => empty_raw_data_for_type(&self.col_type),
         };
 
-        Ok(build_array(data, &self.col_type, null_bitmap, num_rows))
+        build_array(data, &self.col_type, null_bitmap, num_rows)
     }
 }
 
@@ -824,6 +849,16 @@ pub(crate) fn read_typed_value(dt: &DataType, buf: &[u8], pos: usize, width: i32
         DataType::Decimal128(_, _) => Value::DecimalCompact(read_i64(buf, pos)),
         DataType::Timestamp(TimeUnit::Millisecond, _) => Value::TimestampMillis(read_i64(buf, pos)),
         DataType::Timestamp(TimeUnit::Microsecond, _) => Value::TimestampMicros(read_i64(buf, pos)),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            debug_assert_eq!(width, 12);
+            let millis = read_i64(buf, pos);
+            let nanos =
+                i32::from_be_bytes([buf[pos + 8], buf[pos + 9], buf[pos + 10], buf[pos + 11]]);
+            Value::TimestampNanos {
+                millis,
+                nanos_of_milli: nanos,
+            }
+        }
         DataType::Struct(fields) if types::is_timestamp_nanos_struct(fields) => {
             debug_assert_eq!(width, 12);
             let millis = read_i64(buf, pos);

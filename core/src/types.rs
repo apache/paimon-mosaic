@@ -15,9 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::io;
+
 use arrow_schema::{DataType, Field, Fields, TimeUnit};
 
 use crate::varint;
+
+pub const NANOS_PER_MILLI: i64 = 1_000_000;
 
 pub fn fixed_width(dt: &DataType) -> i32 {
     match dt {
@@ -26,10 +30,16 @@ pub fn fixed_width(dt: &DataType) -> i32 {
         DataType::Int32 | DataType::Date32 | DataType::Time32(_) | DataType::Float32 => 4,
         DataType::Int64 | DataType::Float64 => 8,
         DataType::Decimal128(p, _) if *p <= 18 => 8,
-        DataType::Timestamp(_, _) => 8,
+        DataType::Timestamp(TimeUnit::Millisecond | TimeUnit::Microsecond, _) => 8,
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => 12,
         DataType::Struct(fields) if is_timestamp_nanos_struct(fields) => 12,
         _ => -1,
     }
+}
+
+pub fn is_timestamp_nanos(dt: &DataType) -> bool {
+    matches!(dt, DataType::Timestamp(TimeUnit::Nanosecond, _))
+        || matches!(dt, DataType::Struct(fields) if is_timestamp_nanos_struct(fields))
 }
 
 pub fn is_timestamp_nanos_struct(fields: &Fields) -> bool {
@@ -38,6 +48,34 @@ pub fn is_timestamp_nanos_struct(fields: &Fields) -> bool {
         && *fields[0].data_type() == DataType::Int64
         && fields[1].name() == "nanos_of_milli"
         && *fields[1].data_type() == DataType::Int32
+}
+
+pub fn is_valid_nanos_of_milli(nanos: i32) -> bool {
+    (0..NANOS_PER_MILLI as i32).contains(&nanos)
+}
+
+pub fn ns_to_millis_nanos(ns: i64) -> (i64, i32) {
+    (
+        ns.div_euclid(NANOS_PER_MILLI),
+        ns.rem_euclid(NANOS_PER_MILLI) as i32,
+    )
+}
+
+pub fn millis_nanos_to_ns(millis: i64, nanos: i32) -> io::Result<i64> {
+    if !is_valid_nanos_of_milli(nanos) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid nanos_of_milli: {}", nanos),
+        ));
+    }
+    let ns = millis as i128 * NANOS_PER_MILLI as i128 + nanos as i128;
+    if ns < i64::MIN as i128 || ns > i64::MAX as i128 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "timestamp ns overflow",
+        ));
+    }
+    Ok(ns as i64)
 }
 
 pub fn validate_data_type(dt: &DataType) -> Result<(), String> {
@@ -61,7 +99,7 @@ pub fn validate_data_type(dt: &DataType) -> Result<(), String> {
             }
         }
         DataType::Timestamp(unit, _) => match unit {
-            TimeUnit::Millisecond | TimeUnit::Microsecond => Ok(()),
+            TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond => Ok(()),
             _ => Err(format!("unsupported Timestamp unit: {:?}", unit)),
         },
         DataType::Struct(fields) if is_timestamp_nanos_struct(fields) => Ok(()),
@@ -95,6 +133,7 @@ pub fn precision_of(dt: &DataType) -> u32 {
         DataType::Decimal128(p, _) => *p as u32,
         DataType::Timestamp(TimeUnit::Millisecond, _) => 3,
         DataType::Timestamp(TimeUnit::Microsecond, _) => 6,
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => 9,
         DataType::Struct(fields) if is_timestamp_nanos_struct(fields) => 9,
         DataType::Time32(TimeUnit::Millisecond) => 3,
         _ => 0,
@@ -125,6 +164,7 @@ pub fn serialize_field(field: &Field, buf: &mut Vec<u8>) {
             let p = match unit {
                 TimeUnit::Millisecond => 3u32,
                 TimeUnit::Microsecond => 6u32,
+                TimeUnit::Nanosecond => 9u32,
                 _ => 0,
             };
             varint::encode(buf, p);
@@ -190,13 +230,7 @@ pub fn deserialize_field(name: &str, buf: &[u8], pos: &mut usize) -> Result<Fiel
             } else if precision <= 6 {
                 DataType::Timestamp(TimeUnit::Microsecond, None)
             } else {
-                DataType::Struct(
-                    vec![
-                        Field::new("millis", DataType::Int64, false),
-                        Field::new("nanos_of_milli", DataType::Int32, false),
-                    ]
-                    .into(),
-                )
+                DataType::Timestamp(TimeUnit::Nanosecond, None)
             }
         }
         17 => {
@@ -221,13 +255,7 @@ pub fn deserialize_field(name: &str, buf: &[u8], pos: &mut usize) -> Result<Fiel
             } else if precision <= 6 {
                 DataType::Timestamp(TimeUnit::Microsecond, Some(tz))
             } else {
-                DataType::Struct(
-                    vec![
-                        Field::new("millis", DataType::Int64, false),
-                        Field::new("nanos_of_milli", DataType::Int32, false),
-                    ]
-                    .into(),
-                )
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(tz))
             }
         }
         _ => {

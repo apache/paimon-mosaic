@@ -243,6 +243,14 @@ fn extract_value_for_stats(array: &dyn Array, row: usize, dt: &DataType) -> Opti
             let a = array.as_any().downcast_ref::<TimestampMicrosecondArray>()?;
             Some(Value::TimestampMicros(a.value(row)))
         }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let a = array.as_any().downcast_ref::<TimestampNanosecondArray>()?;
+            let (millis, nanos) = types::ns_to_millis_nanos(a.value(row));
+            Some(Value::TimestampNanos {
+                millis,
+                nanos_of_milli: nanos,
+            })
+        }
         DataType::Struct(fields) if types::is_timestamp_nanos_struct(fields) => {
             let s = array.as_any().downcast_ref::<StructArray>()?;
             let millis = s
@@ -435,6 +443,25 @@ fn read_fixed_value(buf: &[u8], pos: usize, dt: &DataType, width: i32) -> Value 
                 buf[pos + 6],
                 buf[pos + 7],
             ]))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            debug_assert_eq!(width, 12);
+            let millis = i64::from_be_bytes([
+                buf[pos],
+                buf[pos + 1],
+                buf[pos + 2],
+                buf[pos + 3],
+                buf[pos + 4],
+                buf[pos + 5],
+                buf[pos + 6],
+                buf[pos + 7],
+            ]);
+            let nanos =
+                i32::from_be_bytes([buf[pos + 8], buf[pos + 9], buf[pos + 10], buf[pos + 11]]);
+            Value::TimestampNanos {
+                millis,
+                nanos_of_milli: nanos,
+            }
         }
         DataType::Struct(fields) if types::is_timestamp_nanos_struct(fields) => {
             debug_assert_eq!(width, 12);

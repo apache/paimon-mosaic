@@ -49,14 +49,14 @@ def _load_library():
     else:
         lib_name = "libmosaic_ffi.so"
 
+    env_path = os.environ.get("MOSAIC_LIB_PATH")
     search_paths = []
+    if env_path:
+        search_paths.append(env_path)
+
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     search_paths.append(pkg_dir)
     search_paths.append(os.path.join(pkg_dir, "..", ".."))
-
-    env_path = os.environ.get("MOSAIC_LIB_PATH")
-    if env_path:
-        search_paths.append(env_path)
 
     for rel in [
         os.path.join("..", "target", "release"),

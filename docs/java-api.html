@@ -109,8 +109,14 @@
     <span class="ty">Field</span>.nullable(<span class="str">"name"</span>, <span class="ty">ArrowType.Utf8</span>.INSTANCE),
     <span class="ty">Field</span>.nullable(<span class="str">"score"</span>, <span class="kw">new</span> <span class="ty">ArrowType.FloatingPoint</span>(FloatingPointPrecision.DOUBLE)),
     <span class="ty">Field</span>.nullable(<span class="str">"amount"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Decimal</span>(<span class="num">10</span>, <span class="num">2</span>, <span class="num">128</span>)),
-    <span class="ty">Field</span>.nullable(<span class="str">"ts"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Timestamp</span>(TimeUnit.MILLISECOND, <span class="kw">null</span>))
+    <span class="ty">Field</span>.nullable(<span class="str">"ts"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Timestamp</span>(TimeUnit.MILLISECOND, <span class="kw">null</span>)),
+    <span class="ty">Field</span>.nullable(<span class="str">"ts_ns"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Timestamp</span>(TimeUnit.NANOSECOND, <span class="str">"Asia/Shanghai"</span>))
 ));</code></pre>
+            <p>
+                Timestamp fields support Arrow millisecond, microsecond, and nanosecond units.
+                Nanosecond timestamps are exposed as standard Arrow <code>TimeUnit.NANOSECOND</code>
+                vectors while Mosaic keeps its 12-byte physical encoding internally.
+            </p>
 
             <h3>2. Create Writer and Write Batches</h3>
             <p>

@@ -34,11 +34,14 @@ import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TimeStampNanoTZVector;
+import org.apache.arrow.vector.TimeStampNanoVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -402,6 +405,52 @@ public class MosaicRoundtripTest {
                 assertEquals("world", new String(((VarCharVector) batch.getVector("f_utf8")).get(1)));
                 assertArrayEquals(new byte[]{1, 2, 3}, ((VarBinaryVector) batch.getVector("f_binary")).get(0));
                 assertArrayEquals(new byte[]{(byte) 0xff, 0}, ((VarBinaryVector) batch.getVector("f_binary")).get(1));
+            }
+        }
+    }
+
+    @Test
+    public void testTimestampNsRoundtrip() {
+        ArrowType.Timestamp tsNsType = new ArrowType.Timestamp(TimeUnit.NANOSECOND, null);
+        ArrowType.Timestamp tsNsTzType = new ArrowType.Timestamp(TimeUnit.NANOSECOND, "Asia/Shanghai");
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.nullable("ts_ns", tsNsType),
+                Field.nullable("ts_ns_tz", tsNsTzType)
+        ));
+
+        long[] values = {1700000000000000123L, -1L};
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            TimeStampNanoVector tsNsVec = (TimeStampNanoVector) root.getVector("ts_ns");
+            TimeStampNanoTZVector tsNsTzVec = (TimeStampNanoTZVector) root.getVector("ts_ns_tz");
+            int n = 3;
+            tsNsVec.allocateNew(n);
+            tsNsTzVec.allocateNew(n);
+
+            tsNsVec.set(0, values[0]);
+            tsNsVec.setNull(1);
+            tsNsVec.set(2, values[1]);
+            tsNsTzVec.set(0, values[0]);
+            tsNsTzVec.setNull(1);
+            tsNsTzVec.set(2, values[1]);
+
+            root.setRowCount(n);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            assertEquals(tsNsType, reader.getSchema().findField("ts_ns").getType());
+            assertEquals(tsNsTzType, reader.getSchema().findField("ts_ns_tz").getType());
+            try (VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+                TimeStampNanoVector tsNs = (TimeStampNanoVector) batch.getVector("ts_ns");
+                TimeStampNanoTZVector tsNsTz = (TimeStampNanoTZVector) batch.getVector("ts_ns_tz");
+
+                assertEquals(values[0], tsNs.get(0));
+                assertTrue(tsNs.isNull(1));
+                assertEquals(values[1], tsNs.get(2));
+                assertEquals(values[0], tsNsTz.get(0));
+                assertTrue(tsNsTz.isNull(1));
+                assertEquals(values[1], tsNsTz.get(2));
             }
         }
     }

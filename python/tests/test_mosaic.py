@@ -176,9 +176,12 @@ class TestRoundtrip:
                 pa.field("f_decimal", pa.decimal128(10, 2)),
                 pa.field("f_date", pa.date32()),
                 pa.field("f_timestamp", pa.timestamp("ms")),
+                pa.field("f_timestamp_ns", pa.timestamp("ns")),
+                pa.field("f_timestamp_ns_tz", pa.timestamp("ns", tz="Asia/Shanghai")),
             ]
         )
 
+        ts_ns_values = [1700000000000000123, -1]
         batch = pa.record_batch(
             [
                 pa.array([True, False]),
@@ -193,11 +196,14 @@ class TestRoundtrip:
                 pa.array([1234567, -9876543], type=pa.decimal128(10, 2)),
                 pa.array([19000, 0], type=pa.date32()),
                 pa.array([1700000000000, 0], type=pa.timestamp("ms")),
+                pa.array(ts_ns_values, type=pa.timestamp("ns")),
+                pa.array(ts_ns_values, type=pa.timestamp("ns", tz="Asia/Shanghai")),
             ],
             names=[
                 "f_bool", "f_int8", "f_int16", "f_int32", "f_int64",
                 "f_float32", "f_float64", "f_utf8", "f_binary",
                 "f_decimal", "f_date", "f_timestamp",
+                "f_timestamp_ns", "f_timestamp_ns_tz",
             ],
         )
 
@@ -222,6 +228,39 @@ class TestRoundtrip:
             f64 = rb.column("f_float64").to_pylist()
             assert abs(f64[0] - 2.718281828) < 1e-9
             assert abs(f64[1] - (-3.141592653)) < 1e-9
+
+            assert rb.schema.field("f_timestamp_ns").type == pa.timestamp("ns")
+            assert rb.column("f_timestamp_ns").cast(pa.int64()).to_pylist() == ts_ns_values
+            assert rb.schema.field("f_timestamp_ns_tz").type == pa.timestamp(
+                "ns", tz="Asia/Shanghai"
+            )
+            assert rb.column("f_timestamp_ns_tz").cast(pa.int64()).to_pylist() == ts_ns_values
+
+    def test_timestamp_nanos_mixed_batches_updates_dictionary(self):
+        pa_schema = pa.schema([pa.field("ts", pa.timestamp("ns"))])
+        first_values = [1, None, 2]
+        second_values = [3 + (i % 3) for i in range(120)]
+
+        buf = io.BytesIO()
+        with MosaicWriter(buf, pa_schema) as writer:
+            writer.write(
+                pa.record_batch(
+                    [pa.array(first_values, type=pa.timestamp("ns"))],
+                    names=["ts"],
+                )
+            )
+            writer.write(
+                pa.record_batch(
+                    [pa.array(second_values, type=pa.timestamp("ns"))],
+                    names=["ts"],
+                )
+            )
+
+        with _reader_from_bytes(buf.getvalue()) as reader:
+            rb = reader.read_row_group(0)
+            assert rb.column("ts").cast(pa.int64()).to_pylist() == (
+                first_values + second_values
+            )
 
     def test_multiple_row_groups(self):
         pa_schema = pa.schema(
