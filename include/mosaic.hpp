@@ -94,6 +94,16 @@ struct WriterOptions {
     uint32_t page_size_threshold = 32 * 1024;
 };
 
+// ======================== Statistics ========================
+
+struct ColumnStatistics {
+    uint32_t column_index;
+    uint64_t null_count;
+    std::vector<uint8_t> min_value;
+    std::vector<uint8_t> max_value;
+    bool has_min_max() const { return !min_value.empty(); }
+};
+
 class Writer {
 public:
     /// Construct a writer. `arrow_schema` is a pointer to an ArrowSchema (Arrow C Data Interface).
@@ -123,17 +133,18 @@ public:
     Writer(const Writer&) = delete;
     Writer& operator=(const Writer&) = delete;
     Writer(Writer&& other) noexcept
-        : callbacks_(std::move(other.callbacks_)), handle_(other.handle_) {
+        : callbacks_(std::move(other.callbacks_)), handle_(other.handle_), closed_(other.closed_) {
         other.handle_ = nullptr;
     }
     Writer& operator=(Writer&& other) noexcept {
         if (this != &other) {
             if (handle_) {
-                mosaic_writer_close(handle_);
+                if (!closed_) mosaic_writer_close(handle_);
                 mosaic_writer_free(handle_);
             }
             callbacks_ = std::move(other.callbacks_);
             handle_ = other.handle_;
+            closed_ = other.closed_;
             other.handle_ = nullptr;
         }
         return *this;
@@ -141,7 +152,7 @@ public:
 
     ~Writer() {
         if (handle_) {
-            mosaic_writer_close(handle_);
+            if (!closed_) mosaic_writer_close(handle_);
             mosaic_writer_free(handle_);
         }
     }
@@ -160,22 +171,43 @@ public:
     }
 
     void close() {
-        check(mosaic_writer_close(handle_));
+        if (!closed_) {
+            check(mosaic_writer_close(handle_));
+            closed_ = true;
+        }
+    }
+
+    uint32_t num_row_groups() const {
+        uint32_t out = 0;
+        check(mosaic_writer_num_row_groups(handle_, &out));
+        return out;
+    }
+
+    std::vector<ColumnStatistics> get_row_group_statistics(uint32_t rg_index) const {
+        uint32_t n = 0;
+        check(mosaic_writer_row_group_num_stats(handle_, rg_index, &n));
+        std::vector<ColumnStatistics> result;
+        result.reserve(n);
+        for (uint32_t i = 0; i < n; i++) {
+            ColumnStatistics s;
+            check(mosaic_writer_row_group_stat_column_index(handle_, rg_index, i, &s.column_index));
+            check(mosaic_writer_row_group_stat_null_count(handle_, rg_index, i, &s.null_count));
+            size_t min_len = 0, max_len = 0;
+            const uint8_t* min_ptr = mosaic_writer_row_group_stat_min(handle_, rg_index, i, &min_len);
+            const uint8_t* max_ptr = mosaic_writer_row_group_stat_max(handle_, rg_index, i, &max_len);
+            if (min_ptr && min_len > 0)
+                s.min_value.assign(min_ptr, min_ptr + min_len);
+            if (max_ptr && max_len > 0)
+                s.max_value.assign(max_ptr, max_ptr + max_len);
+            result.push_back(std::move(s));
+        }
+        return result;
     }
 
 private:
     std::shared_ptr<OutputFile> callbacks_;
     MosaicWriterHandle* handle_ = nullptr;
-};
-
-// ======================== Statistics ========================
-
-struct ColumnStatistics {
-    uint32_t column_index;
-    uint64_t null_count;
-    std::vector<uint8_t> min_value;
-    std::vector<uint8_t> max_value;
-    bool has_min_max() const { return !min_value.empty(); }
+    bool closed_ = false;
 };
 
 // ======================== Reader ========================

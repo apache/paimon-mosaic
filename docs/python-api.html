@@ -145,12 +145,14 @@ data = buf.getvalue()</code></pre>
             <h3>Writer Methods</h3>
             <table>
                 <thead>
-                    <tr><th>Method</th><th>Return</th><th>Description</th></tr>
+                    <tr><th>Method / Property</th><th>Return</th><th>Description</th></tr>
                 </thead>
                 <tbody>
                     <tr><td><code>write(batch)</code></td><td><code>None</code></td><td>Write a <code>pyarrow.RecordBatch</code> or <code>pyarrow.Table</code></td></tr>
                     <tr><td><code>estimated_file_size()</code></td><td><code>int</code></td><td>Estimated output file size in bytes (for file rolling)</td></tr>
                     <tr><td><code>close()</code></td><td><code>None</code></td><td>Flush remaining data and write footer</td></tr>
+                    <tr><td><code>num_row_groups</code></td><td><code>int</code></td><td>Number of row groups written (available after close)</td></tr>
+                    <tr><td><code>get_row_group_statistics(rg)</code></td><td><code>list[ColumnStatistics]</code></td><td>Column statistics for a row group (available after close)</td></tr>
                 </tbody>
             </table>
 
@@ -216,11 +218,19 @@ batch = reader.read_row_group(rg, columns=projected)
 
             <h3>Column Statistics (Filter Pushdown)</h3>
             <p>
-                When stats columns are configured during writing, the reader can access per-row-group
-                min/max statistics to skip row groups that don't match a filter predicate:
+                When stats columns are configured during writing, statistics are available both
+                from the writer (after close) and from the reader:
             </p>
 <pre><code>opts = WriterOptions(stats_columns=[<span class="num">0</span>, <span class="num">2</span>])  <span class="cmt"># build stats for columns 0 and 2</span></code></pre>
-<pre><code><span class="cmt"># Reading stats</span>
+<pre><code><span class="cmt"># Get stats directly from the writer after close</span>
+<span class="kw">with</span> MosaicWriter(buf, pa_schema, opts) <span class="kw">as</span> writer:
+    writer.write(batch)
+
+<span class="kw">for</span> rg <span class="kw">in</span> range(writer.num_row_groups):
+    <span class="kw">for</span> stat <span class="kw">in</span> writer.get_row_group_statistics(rg):
+        col_idx = stat.column_index
+        null_count = stat.null_count</code></pre>
+<pre><code><span class="cmt"># Or read stats from the reader</span>
 <span class="kw">for</span> rg <span class="kw">in</span> range(reader.num_row_groups):
     <span class="kw">for</span> stat <span class="kw">in</span> reader.get_row_group_statistics(rg):
         col_idx = stat.column_index

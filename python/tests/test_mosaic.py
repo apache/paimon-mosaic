@@ -588,3 +588,139 @@ class TestWriter:
 
         with pytest.raises(RuntimeError, match="writer is closed"):
             writer.write(batch)
+
+    def test_writer_stats_basic(self):
+        pa_schema = pa.schema(
+            [
+                pa.field("id", pa.int32()),
+                pa.field("name", pa.utf8()),
+                pa.field("score", pa.float64()),
+            ]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array([i * 10 for i in range(10)], type=pa.int32()),
+                pa.array([f"item_{i}" for i in range(10)]),
+                pa.array([i * 1.1 for i in range(10)]),
+            ],
+            names=["id", "name", "score"],
+        )
+
+        opts = WriterOptions(stats_columns=[0, 2])
+        buf = io.BytesIO()
+        writer = MosaicWriter(buf, pa_schema, opts)
+        writer.write(batch)
+        writer.close()
+
+        assert writer.num_row_groups >= 1
+        stats = writer.get_row_group_statistics(0)
+        assert len(stats) > 0
+        for stat in stats:
+            assert isinstance(stat, ColumnStatistics)
+            assert stat.column_index in (0, 2)
+            assert stat.null_count == 0
+            assert stat.has_min_max
+            assert stat.min is not None
+            assert stat.max is not None
+
+        id_stat = next(s for s in stats if s.column_index == 0)
+        min_id = struct.unpack(">i", id_stat.min)[0]
+        max_id = struct.unpack(">i", id_stat.max)[0]
+        assert min_id == 0
+        assert max_id == 90
+
+    def test_writer_stats_with_nulls(self):
+        pa_schema = pa.schema(
+            [pa.field("a", pa.int32()), pa.field("b", pa.int64())]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array([10, None, 5, 20], type=pa.int32()),
+                pa.array([None, None, 100, 50], type=pa.int64()),
+            ],
+            names=["a", "b"],
+        )
+
+        opts = WriterOptions(stats_columns=[0, 1], num_buckets=1)
+        buf = io.BytesIO()
+        writer = MosaicWriter(buf, pa_schema, opts)
+        writer.write(batch)
+        writer.close()
+
+        assert writer.num_row_groups == 1
+        stats = writer.get_row_group_statistics(0)
+        assert len(stats) == 2
+
+        a_stat = next(s for s in stats if s.column_index == 0)
+        assert a_stat.null_count == 1
+        assert a_stat.has_min_max
+        min_a = struct.unpack(">i", a_stat.min)[0]
+        max_a = struct.unpack(">i", a_stat.max)[0]
+        assert min_a == 5
+        assert max_a == 20
+
+        b_stat = next(s for s in stats if s.column_index == 1)
+        assert b_stat.null_count == 2
+        assert b_stat.has_min_max
+        min_b = struct.unpack(">q", b_stat.min)[0]
+        max_b = struct.unpack(">q", b_stat.max)[0]
+        assert min_b == 50
+        assert max_b == 100
+
+    def test_writer_stats_all_null(self):
+        pa_schema = pa.schema([pa.field("x", pa.int32())])
+
+        batch = pa.record_batch(
+            [pa.array([None, None, None], type=pa.int32())], names=["x"]
+        )
+
+        opts = WriterOptions(stats_columns=[0], num_buckets=1)
+        buf = io.BytesIO()
+        writer = MosaicWriter(buf, pa_schema, opts)
+        writer.write(batch)
+        writer.close()
+
+        assert writer.num_row_groups == 1
+        stats = writer.get_row_group_statistics(0)
+        assert len(stats) == 1
+        assert stats[0].null_count == 3
+        assert not stats[0].has_min_max
+        assert stats[0].min is None
+        assert stats[0].max is None
+
+    def test_writer_stats_matches_reader_stats(self):
+        pa_schema = pa.schema(
+            [
+                pa.field("id", pa.int32()),
+                pa.field("score", pa.float64()),
+            ]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array(list(range(50)), type=pa.int32()),
+                pa.array([i * 2.0 for i in range(50)]),
+            ],
+            names=["id", "score"],
+        )
+
+        opts = WriterOptions(stats_columns=[0, 1], num_buckets=1)
+        buf = io.BytesIO()
+        writer = MosaicWriter(buf, pa_schema, opts)
+        writer.write(batch)
+        writer.close()
+
+        data = buf.getvalue()
+        with _reader_from_bytes(data) as reader:
+            for rg in range(writer.num_row_groups):
+                w_stats = writer.get_row_group_statistics(rg)
+                r_stats = reader.get_row_group_statistics(rg)
+                assert len(w_stats) == len(r_stats)
+                for ws, rs in zip(w_stats, r_stats):
+                    assert ws.column_index == rs.column_index
+                    assert ws.null_count == rs.null_count
+                    assert ws.has_min_max == rs.has_min_max
+                    assert ws.min == rs.min
+                    assert ws.max == rs.max

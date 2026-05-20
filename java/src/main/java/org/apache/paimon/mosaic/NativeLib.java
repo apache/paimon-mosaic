@@ -110,6 +110,12 @@ final class NativeLib {
     static native void nativeWriterFree(long handle);
     static native long nativeWriterEstimatedSize(long handle);
     static native void nativeWriterWriteBatch(long writerHandle, long arrayAddr, long schemaAddr);
+    static native int nativeWriterNumRowGroups(long handle);
+    static native int nativeWriterRowGroupNumStats(long handle, int rgIndex);
+    static native int nativeWriterRowGroupStatColumnIndex(long handle, int rgIndex, int statIndex);
+    static native long nativeWriterRowGroupStatNullCount(long handle, int rgIndex, int statIndex);
+    static native byte[] nativeWriterRowGroupStatMin(long handle, int rgIndex, int statIndex);
+    static native byte[] nativeWriterRowGroupStatMax(long handle, int rgIndex, int statIndex);
 
     // Reader
     static native long nativeReaderOpen(Object inputFile, long fileLength);

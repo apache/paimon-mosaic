@@ -21,7 +21,11 @@ Cargo.lock
 
 # Java
 java/target/
+java/src/main/resources/native/
 *.class
+
+# C++
+cpp/build/
 
 # Python
 __pycache__/

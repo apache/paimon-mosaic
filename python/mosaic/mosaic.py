@@ -111,6 +111,7 @@ class MosaicWriter:
 
         self._stream = stream
         self._closed = False
+        self._row_group_stats = None
 
         self._write_callback = _ffi.WRITE_FN(self._on_write)
         self._flush_callback = _ffi.FLUSH_FN(self._on_flush)
@@ -187,14 +188,55 @@ class MosaicWriter:
             _check_error("estimated_file_size failed")
         return out.value
 
+    @property
+    def num_row_groups(self):
+        if self._row_group_stats is None:
+            raise RuntimeError("writer is not closed yet")
+        return len(self._row_group_stats)
+
+    def get_row_group_statistics(self, rg_index):
+        if self._row_group_stats is None:
+            raise RuntimeError("writer is not closed yet")
+        return self._row_group_stats[rg_index]
+
     def close(self):
         if not self._closed and self._handle:
             self._closed = True
             rc = lib.mosaic_writer_close(self._handle)
+            if rc != 0:
+                lib.mosaic_writer_free(self._handle)
+                self._handle = None
+                _check_error("close failed")
+            self._collect_statistics()
             lib.mosaic_writer_free(self._handle)
             self._handle = None
-            if rc != 0:
-                _check_error("close failed")
+
+    def _collect_statistics(self):
+        n_rg = ctypes.c_uint32(0)
+        lib.mosaic_writer_num_row_groups(self._handle, ctypes.byref(n_rg))
+        all_stats = []
+        for rg in range(n_rg.value):
+            n_stats = ctypes.c_uint32(0)
+            lib.mosaic_writer_row_group_num_stats(self._handle, rg, ctypes.byref(n_stats))
+            rg_stats = []
+            for i in range(n_stats.value):
+                col_idx = ctypes.c_uint32(0)
+                null_count = ctypes.c_uint64(0)
+                lib.mosaic_writer_row_group_stat_column_index(
+                    self._handle, rg, i, ctypes.byref(col_idx))
+                lib.mosaic_writer_row_group_stat_null_count(
+                    self._handle, rg, i, ctypes.byref(null_count))
+                min_len = ctypes.c_size_t(0)
+                max_len = ctypes.c_size_t(0)
+                min_ptr = lib.mosaic_writer_row_group_stat_min(
+                    self._handle, rg, i, ctypes.byref(min_len))
+                max_ptr = lib.mosaic_writer_row_group_stat_max(
+                    self._handle, rg, i, ctypes.byref(max_len))
+                min_val = bytes(min_ptr[:min_len.value]) if min_ptr and min_len.value > 0 else None
+                max_val = bytes(max_ptr[:max_len.value]) if max_ptr and max_len.value > 0 else None
+                rg_stats.append(ColumnStatistics(col_idx.value, null_count.value, min_val, max_val))
+            all_stats.append(rg_stats)
+        self._row_group_stats = all_stats
 
     def __enter__(self):
         return self
