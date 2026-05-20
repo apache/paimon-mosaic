@@ -405,7 +405,11 @@ unsafe fn writer_stat_value_ptr(
     match value {
         Some(v) => {
             let bytes = v.to_be_bytes();
-            let buf_ref = if is_min { &WRITER_STAT_MIN_BUF } else { &WRITER_STAT_MAX_BUF };
+            let buf_ref = if is_min {
+                &WRITER_STAT_MIN_BUF
+            } else {
+                &WRITER_STAT_MAX_BUF
+            };
             buf_ref.with(|buf| {
                 let mut b = buf.borrow_mut();
                 *b = bytes;
