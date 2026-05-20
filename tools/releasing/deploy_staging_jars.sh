@@ -35,9 +35,43 @@ if [[ `basename $CURR_DIR` != "tools" ]] ; then
 fi
 
 ###########################
+
+cd ..
+
+# Detect OS
+case "$(uname -s)" in
+  Linux*)  OS_NAME="linux";;
+  Darwin*) OS_NAME="macos";;
+  *)       echo "Unsupported OS: $(uname -s)"; exit 1;;
+esac
+
+# Detect architecture
+case "$(uname -m)" in
+  x86_64|amd64)   ARCH="x86_64";;
+  aarch64|arm64)   ARCH="aarch64";;
+  *)               echo "Unsupported arch: $(uname -m)"; exit 1;;
+esac
+
+# Determine library file name
+if [ "$OS_NAME" = "linux" ]; then
+  LIB_FILE="libmosaic_jni.so"
+elif [ "$OS_NAME" = "macos" ]; then
+  LIB_FILE="libmosaic_jni.dylib"
+fi
+
+echo "Building native JNI library for ${OS_NAME}/${ARCH}"
+cargo build --release -p mosaic-jni
+
+RESOURCE_DIR="java/src/main/resources/native/${OS_NAME}/${ARCH}"
+mkdir -p "$RESOURCE_DIR"
+cp "target/release/${LIB_FILE}" "$RESOURCE_DIR/"
+
+echo "Native library copied to ${RESOURCE_DIR}/${LIB_FILE}"
+
+###########################
 COMMON_OPTIONS="-Prelease -DskipTests -DretryFailedDeploymentCount=10 "
 
-cd ../java
+cd java
 
 echo "Deploying to repository.apache.org"
 $MVN clean deploy $COMMON_OPTIONS
