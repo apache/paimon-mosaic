@@ -369,6 +369,149 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterEstim
     writer.inner.estimated_file_size() as jlong
 }
 
+// ======================== Writer Stats ========================
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterNumRowGroups(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jint {
+    if handle == 0 {
+        return 0;
+    }
+    let writer = unsafe { &*(handle as *const WriterHandle) };
+    writer.inner.num_row_groups() as jint
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupNumStats(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    rg_index: jint,
+) -> jint {
+    if handle == 0 {
+        return 0;
+    }
+    let writer = unsafe { &*(handle as *const WriterHandle) };
+    let rg = rg_index as usize;
+    if rg >= writer.inner.num_row_groups() {
+        return -1;
+    }
+    writer.inner.row_group_stats(rg).len() as jint
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatColumnIndex(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    rg_index: jint,
+    stat_index: jint,
+) -> jint {
+    if handle == 0 {
+        return -1;
+    }
+    let writer = unsafe { &*(handle as *const WriterHandle) };
+    let rg = rg_index as usize;
+    if rg >= writer.inner.num_row_groups() {
+        return -1;
+    }
+    let stats = writer.inner.row_group_stats(rg);
+    let idx = stat_index as usize;
+    if idx >= stats.len() {
+        return -1;
+    }
+    stats[idx].column_index as jint
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatNullCount(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    rg_index: jint,
+    stat_index: jint,
+) -> jlong {
+    if handle == 0 {
+        return 0;
+    }
+    let writer = unsafe { &*(handle as *const WriterHandle) };
+    let rg = rg_index as usize;
+    if rg >= writer.inner.num_row_groups() {
+        return 0;
+    }
+    let stats = writer.inner.row_group_stats(rg);
+    let idx = stat_index as usize;
+    if idx >= stats.len() {
+        return 0;
+    }
+    stats[idx].null_count as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatMin<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    handle: jlong,
+    rg_index: jint,
+    stat_index: jint,
+) -> JByteArray<'a> {
+    if handle == 0 {
+        return JByteArray::default();
+    }
+    let writer = unsafe { &*(handle as *const WriterHandle) };
+    let rg = rg_index as usize;
+    if rg >= writer.inner.num_row_groups() {
+        return JByteArray::default();
+    }
+    let stats = writer.inner.row_group_stats(rg);
+    let idx = stat_index as usize;
+    if idx >= stats.len() {
+        return JByteArray::default();
+    }
+    let buf = match &stats[idx].min {
+        Some(v) => v.to_be_bytes(),
+        None => return JByteArray::default(),
+    };
+    if buf.is_empty() {
+        return JByteArray::default();
+    }
+    env.byte_array_from_slice(&buf).unwrap_or_default()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatMax<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    handle: jlong,
+    rg_index: jint,
+    stat_index: jint,
+) -> JByteArray<'a> {
+    if handle == 0 {
+        return JByteArray::default();
+    }
+    let writer = unsafe { &*(handle as *const WriterHandle) };
+    let rg = rg_index as usize;
+    if rg >= writer.inner.num_row_groups() {
+        return JByteArray::default();
+    }
+    let stats = writer.inner.row_group_stats(rg);
+    let idx = stat_index as usize;
+    if idx >= stats.len() {
+        return JByteArray::default();
+    }
+    let buf = match &stats[idx].max {
+        Some(v) => v.to_be_bytes(),
+        None => return JByteArray::default(),
+    };
+    if buf.is_empty() {
+        return JByteArray::default();
+    }
+    env.byte_array_from_slice(&buf).unwrap_or_default()
+}
+
 // ======================== Writer.writeBatch (Arrow C Data Interface) ========================
 
 #[no_mangle]

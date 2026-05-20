@@ -119,6 +119,8 @@ writer.close().unwrap();
                     <tr><td><code>write_batch(&amp;RecordBatch)</code></td><td><code>io::Result&lt;()&gt;</code></td><td>Write an Arrow RecordBatch</td></tr>
                     <tr><td><code>estimated_file_size()</code></td><td><code>u64</code></td><td>Estimated output file size in bytes (for file rolling)</td></tr>
                     <tr><td><code>close()</code></td><td><code>io::Result&lt;()&gt;</code></td><td>Flush remaining data and write footer</td></tr>
+                    <tr><td><code>num_row_groups()</code></td><td><code>usize</code></td><td>Number of row groups written (available after close)</td></tr>
+                    <tr><td><code>row_group_stats(rg_index)</code></td><td><code>&amp;[ColumnStats]</code></td><td>Column statistics for a row group (available after close)</td></tr>
                 </tbody>
             </table>
 
@@ -225,7 +227,18 @@ writer.close().unwrap();
     ..Default::default()
 })?;</code></pre>
 
-            <h3>Reading Stats</h3>
+            <h3>Getting Stats from Writer (after close)</h3>
+<pre><code>writer.close()?;
+
+<span class="kw">for</span> rg_idx <span class="kw">in</span> <span class="num">0</span>..writer.num_row_groups() {
+    <span class="kw">let</span> stats = writer.row_group_stats(rg_idx);
+    <span class="kw">for</span> stat <span class="kw">in</span> stats {
+        println!(<span class="str">"col={} nulls={} min={:?} max={:?}"</span>,
+            stat.column_index, stat.null_count, stat.min, stat.max);
+    }
+}</code></pre>
+
+            <h3>Reading Stats from Reader</h3>
 <pre><code><span class="kw">for</span> rg_idx <span class="kw">in</span> <span class="num">0</span>..reader.num_row_groups() {
     <span class="kw">let</span> stats = reader.row_group_stats(rg_idx)?;
     <span class="kw">for</span> stat <span class="kw">in</span> stats {

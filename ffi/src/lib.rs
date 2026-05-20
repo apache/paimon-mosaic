@@ -255,6 +255,171 @@ pub unsafe extern "C" fn mosaic_writer_estimated_file_size(
     0
 }
 
+// ======================== Writer Stats ========================
+
+/// Get the number of row groups in a closed writer.
+#[no_mangle]
+pub unsafe extern "C" fn mosaic_writer_num_row_groups(
+    handle: *const MosaicWriterHandle,
+    out: *mut u32,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        set_error("null pointer".into());
+        return -1;
+    }
+    *out = (&*handle).inner.num_row_groups() as u32;
+    0
+}
+
+/// Get number of stats entries for a writer row group.
+#[no_mangle]
+pub unsafe extern "C" fn mosaic_writer_row_group_num_stats(
+    handle: *const MosaicWriterHandle,
+    rg_index: u32,
+    out: *mut u32,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        set_error("null pointer".into());
+        return -1;
+    }
+    let h = &*handle;
+    let rg = rg_index as usize;
+    if rg >= h.inner.num_row_groups() {
+        set_error("rg_index out of range".into());
+        return -1;
+    }
+    *out = h.inner.row_group_stats(rg).len() as u32;
+    0
+}
+
+/// Get the column index for a writer stats entry.
+#[no_mangle]
+pub unsafe extern "C" fn mosaic_writer_row_group_stat_column_index(
+    handle: *const MosaicWriterHandle,
+    rg_index: u32,
+    stat_index: u32,
+    out: *mut u32,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        set_error("null pointer".into());
+        return -1;
+    }
+    let h = &*handle;
+    let rg = rg_index as usize;
+    if rg >= h.inner.num_row_groups() {
+        set_error("rg_index out of range".into());
+        return -1;
+    }
+    let stats = h.inner.row_group_stats(rg);
+    let idx = stat_index as usize;
+    if idx >= stats.len() {
+        set_error("stat_index out of range".into());
+        return -1;
+    }
+    *out = stats[idx].column_index as u32;
+    0
+}
+
+/// Get the null count for a writer stats entry.
+#[no_mangle]
+pub unsafe extern "C" fn mosaic_writer_row_group_stat_null_count(
+    handle: *const MosaicWriterHandle,
+    rg_index: u32,
+    stat_index: u32,
+    out: *mut u64,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        set_error("null pointer".into());
+        return -1;
+    }
+    let h = &*handle;
+    let rg = rg_index as usize;
+    if rg >= h.inner.num_row_groups() {
+        set_error("rg_index out of range".into());
+        return -1;
+    }
+    let stats = h.inner.row_group_stats(rg);
+    let idx = stat_index as usize;
+    if idx >= stats.len() {
+        set_error("stat_index out of range".into());
+        return -1;
+    }
+    *out = stats[idx].null_count as u64;
+    0
+}
+
+thread_local! {
+    static WRITER_STAT_MIN_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static WRITER_STAT_MAX_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Get the min value for a writer stats entry as raw bytes.
+#[no_mangle]
+pub unsafe extern "C" fn mosaic_writer_row_group_stat_min(
+    handle: *const MosaicWriterHandle,
+    rg_index: u32,
+    stat_index: u32,
+    out_len: *mut usize,
+) -> *const u8 {
+    writer_stat_value_ptr(handle, rg_index, stat_index, out_len, true)
+}
+
+/// Get the max value for a writer stats entry as raw bytes.
+#[no_mangle]
+pub unsafe extern "C" fn mosaic_writer_row_group_stat_max(
+    handle: *const MosaicWriterHandle,
+    rg_index: u32,
+    stat_index: u32,
+    out_len: *mut usize,
+) -> *const u8 {
+    writer_stat_value_ptr(handle, rg_index, stat_index, out_len, false)
+}
+
+unsafe fn writer_stat_value_ptr(
+    handle: *const MosaicWriterHandle,
+    rg_index: u32,
+    stat_index: u32,
+    out_len: *mut usize,
+    is_min: bool,
+) -> *const u8 {
+    if handle.is_null() || out_len.is_null() {
+        return ptr::null();
+    }
+    let h = &*handle;
+    let rg = rg_index as usize;
+    if rg >= h.inner.num_row_groups() {
+        *out_len = 0;
+        return ptr::null();
+    }
+    let stats = h.inner.row_group_stats(rg);
+    let idx = stat_index as usize;
+    if idx >= stats.len() {
+        *out_len = 0;
+        return ptr::null();
+    }
+    let value = if is_min {
+        &stats[idx].min
+    } else {
+        &stats[idx].max
+    };
+    match value {
+        Some(v) => {
+            let bytes = v.to_be_bytes();
+            let buf_ref = if is_min { &WRITER_STAT_MIN_BUF } else { &WRITER_STAT_MAX_BUF };
+            buf_ref.with(|buf| {
+                let mut b = buf.borrow_mut();
+                *b = bytes;
+                *out_len = b.len();
+                b.as_ptr()
+            })
+        }
+        None => {
+            *out_len = 0;
+            ptr::null()
+        }
+    }
+}
+
 /// Write an Arrow RecordBatch to the writer via the Arrow C Data Interface.
 /// The caller provides ArrowArray and ArrowSchema pointers that represent the batch.
 /// Ownership of both structs transfers to the callee; the caller's structs are zeroed.

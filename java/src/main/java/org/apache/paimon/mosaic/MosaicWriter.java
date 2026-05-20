@@ -20,6 +20,9 @@
 package org.apache.paimon.mosaic;
 
 import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
@@ -33,6 +36,7 @@ public class MosaicWriter implements AutoCloseable {
     private long handle;
     private boolean closed;
     private final BufferAllocator allocator;
+    private List<List<ColumnStatistics>> rowGroupStats;
 
     public MosaicWriter(OutputStream outputStream, Schema arrowSchema, BufferAllocator allocator) {
         this(outputStream, arrowSchema, new WriterOptions(), allocator);
@@ -95,16 +99,53 @@ public class MosaicWriter implements AutoCloseable {
         return NativeLib.nativeWriterEstimatedSize(handle);
     }
 
+    public int numRowGroups() {
+        if (rowGroupStats == null) {
+            throw new IllegalStateException("writer is not closed yet");
+        }
+        return rowGroupStats.size();
+    }
+
+    public List<ColumnStatistics> getRowGroupStatistics(int rgIndex) {
+        if (rowGroupStats == null) {
+            throw new IllegalStateException("writer is not closed yet");
+        }
+        return rowGroupStats.get(rgIndex);
+    }
+
     @Override
     public void close() {
         if (!closed && handle != 0) {
             closed = true;
             try {
                 NativeLib.nativeWriterClose(handle);
+                collectStatistics();
             } finally {
                 NativeLib.nativeWriterFree(handle);
                 handle = 0;
             }
         }
+    }
+
+    private void collectStatistics() {
+        int numRg = NativeLib.nativeWriterNumRowGroups(handle);
+        List<List<ColumnStatistics>> allStats = new ArrayList<>(numRg);
+        for (int rg = 0; rg < numRg; rg++) {
+            int n = NativeLib.nativeWriterRowGroupNumStats(handle, rg);
+            if (n <= 0) {
+                allStats.add(Collections.emptyList());
+                continue;
+            }
+            List<ColumnStatistics> rgStats = new ArrayList<>(n);
+            for (int i = 0; i < n; i++) {
+                rgStats.add(new ColumnStatistics(
+                        NativeLib.nativeWriterRowGroupStatColumnIndex(handle, rg, i),
+                        NativeLib.nativeWriterRowGroupStatNullCount(handle, rg, i),
+                        NativeLib.nativeWriterRowGroupStatMin(handle, rg, i),
+                        NativeLib.nativeWriterRowGroupStatMax(handle, rg, i)));
+            }
+            allStats.add(Collections.unmodifiableList(rgStats));
+        }
+        this.rowGroupStats = Collections.unmodifiableList(allStats);
     }
 }

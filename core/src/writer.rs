@@ -187,6 +187,14 @@ impl<S: OutputFile> MosaicWriter<S> {
         &mut self.out
     }
 
+    pub fn num_row_groups(&self) -> usize {
+        self.row_group_metas.len()
+    }
+
+    pub fn row_group_stats(&self, rg_index: usize) -> &[ColumnStats] {
+        &self.row_group_metas[rg_index].stats
+    }
+
     pub fn estimated_file_size(&self) -> u64 {
         let written = self.out.pos();
         let buffered_estimate = (self.current_buffered_size as f64 * self.compression_ratio) as u64;

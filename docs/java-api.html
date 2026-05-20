@@ -180,6 +180,8 @@
                     <tr><td><code>write(VectorSchemaRoot)</code></td><td><code>void</code></td><td>Write an Arrow batch (zero-copy via C Data Interface)</td></tr>
                     <tr><td><code>estimatedFileSize()</code></td><td><code>long</code></td><td>Estimated output file size in bytes (for file rolling)</td></tr>
                     <tr><td><code>close()</code></td><td><code>void</code></td><td>Flush remaining data and write footer</td></tr>
+                    <tr><td><code>numRowGroups()</code></td><td><code>int</code></td><td>Number of row groups written (available after close)</td></tr>
+                    <tr><td><code>getRowGroupStatistics(rg)</code></td><td><code>List&lt;ColumnStatistics&gt;</code></td><td>Column statistics for a row group (available after close)</td></tr>
                 </tbody>
             </table>
 
@@ -262,8 +264,22 @@
 
             <h3>Column Statistics (Filter Pushdown)</h3>
             <p>
-                When stats columns are configured during writing, the reader can access per-row-group
-                min/max statistics to skip row groups that don't match a filter predicate:
+                When stats columns are configured during writing, statistics are available both
+                from the writer (after close) and from the reader. This allows you to obtain
+                min/max statistics immediately after writing without re-reading the file:
+            </p>
+<pre><code><span class="cmt">// Get stats directly from the writer after close</span>
+<span class="ty">MosaicWriter</span> writer = <span class="kw">new</span> <span class="ty">MosaicWriter</span>(baos, arrowSchema, opts, allocator);
+writer.write(root);
+writer.close();
+
+<span class="kw">for</span> (<span class="kw">int</span> rg = <span class="num">0</span>; rg &lt; writer.numRowGroups(); rg++) {
+    <span class="ty">List</span>&lt;<span class="ty">ColumnStatistics</span>&gt; stats = writer.getRowGroupStatistics(rg);
+    <span class="cmt">// use stats for indexing, metadata, etc.</span>
+}</code></pre>
+            <p>
+                The reader can also access per-row-group statistics to skip row groups
+                that don't match a filter predicate:
             </p>
 <pre><code><span class="ty">WriterOptions</span> opts = <span class="kw">new</span> <span class="ty">WriterOptions</span>()
     .statsColumns(<span class="num">0</span>, <span class="num">2</span>);  <span class="cmt">// build stats for columns 0 and 2</span></code></pre>

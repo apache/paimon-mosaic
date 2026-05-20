@@ -146,6 +146,26 @@ lib.mosaic_writer_estimated_file_size.restype = c_int
 lib.mosaic_writer_write_batch.argtypes = [c_void_p, c_void_p, c_void_p]
 lib.mosaic_writer_write_batch.restype = c_int
 
+# ======================== Writer Stats ========================
+
+lib.mosaic_writer_num_row_groups.argtypes = [c_void_p, POINTER(c_uint32)]
+lib.mosaic_writer_num_row_groups.restype = c_int
+
+lib.mosaic_writer_row_group_num_stats.argtypes = [c_void_p, c_uint32, POINTER(c_uint32)]
+lib.mosaic_writer_row_group_num_stats.restype = c_int
+
+lib.mosaic_writer_row_group_stat_column_index.argtypes = [c_void_p, c_uint32, c_uint32, POINTER(c_uint32)]
+lib.mosaic_writer_row_group_stat_column_index.restype = c_int
+
+lib.mosaic_writer_row_group_stat_null_count.argtypes = [c_void_p, c_uint32, c_uint32, POINTER(c_uint64)]
+lib.mosaic_writer_row_group_stat_null_count.restype = c_int
+
+lib.mosaic_writer_row_group_stat_min.argtypes = [c_void_p, c_uint32, c_uint32, POINTER(c_size_t)]
+lib.mosaic_writer_row_group_stat_min.restype = POINTER(c_uint8)
+
+lib.mosaic_writer_row_group_stat_max.argtypes = [c_void_p, c_uint32, c_uint32, POINTER(c_size_t)]
+lib.mosaic_writer_row_group_stat_max.restype = POINTER(c_uint8)
+
 # ======================== Reader ========================
 
 lib.mosaic_reader_open.argtypes = [MosaicInputFile]
