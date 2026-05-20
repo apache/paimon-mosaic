@@ -17,17 +17,88 @@
  * under the License.
  */
 
-package io.mosaic;
+package org.apache.paimon.mosaic;
 
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 
 final class NativeLib {
 
+    private static final String LIB_NAME = "mosaic_jni";
+
     static {
-        System.loadLibrary("mosaic_jni");
+        loadNativeLibrary();
     }
 
     private NativeLib() {}
+
+    private static void loadNativeLibrary() {
+        // First try java.library.path (for development / manual override)
+        try {
+            System.loadLibrary(LIB_NAME);
+            return;
+        } catch (UnsatisfiedLinkError ignored) {
+        }
+
+        // Extract from JAR resources
+        String os = normalizeOs(System.getProperty("os.name", ""));
+        String arch = normalizeArch(System.getProperty("os.arch", ""));
+        String libFileName = mapLibraryName(os);
+        String resourcePath = "/native/" + os + "/" + arch + "/" + libFileName;
+
+        try (InputStream in = NativeLib.class.getResourceAsStream(resourcePath)) {
+            if (in == null) {
+                throw new UnsatisfiedLinkError(
+                        "Native library not found in JAR: " + resourcePath);
+            }
+            File tempFile = File.createTempFile("mosaic_jni", libFileName);
+            tempFile.deleteOnExit();
+            Files.copy(in, tempFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            System.load(tempFile.getAbsolutePath());
+        } catch (IOException e) {
+            throw new UnsatisfiedLinkError(
+                    "Failed to extract native library: " + e.getMessage());
+        }
+    }
+
+    private static String normalizeOs(String osName) {
+        String lower = osName.toLowerCase();
+        if (lower.contains("linux")) {
+            return "linux";
+        } else if (lower.contains("mac") || lower.contains("darwin")) {
+            return "macos";
+        } else if (lower.contains("win")) {
+            return "windows";
+        }
+        throw new UnsatisfiedLinkError("Unsupported OS: " + osName);
+    }
+
+    private static String normalizeArch(String archName) {
+        String lower = archName.toLowerCase();
+        if (lower.equals("amd64") || lower.equals("x86_64")) {
+            return "x86_64";
+        } else if (lower.equals("aarch64") || lower.equals("arm64")) {
+            return "aarch64";
+        }
+        throw new UnsatisfiedLinkError("Unsupported architecture: " + archName);
+    }
+
+    private static String mapLibraryName(String os) {
+        switch (os) {
+            case "linux":
+                return "libmosaic_jni.so";
+            case "macos":
+                return "libmosaic_jni.dylib";
+            case "windows":
+                return "mosaic_jni.dll";
+            default:
+                throw new UnsatisfiedLinkError("Unsupported OS: " + os);
+        }
+    }
 
     // Writer
     static native long nativeWriterOpen(OutputStream stream, long arrowSchemaAddr,

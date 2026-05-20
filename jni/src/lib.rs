@@ -194,7 +194,7 @@ struct WriterHandle {
 // ======================== Writer ========================
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeWriterOpen(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
     mut env: JNIEnv,
     _class: JClass,
     stream: JObject,
@@ -321,7 +321,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeWriterOpen(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeWriterClose(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterClose(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -343,7 +343,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeWriterClose(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeWriterFree(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterFree(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -356,7 +356,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeWriterFree(
 // ======================== Writer.estimatedSize ========================
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeWriterEstimatedSize(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterEstimatedSize(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -371,7 +371,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeWriterEstimatedSize(
 // ======================== Writer.writeBatch (Arrow C Data Interface) ========================
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeWriterWriteBatch(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterWriteBatch(
     mut env: JNIEnv,
     _class: JClass,
     writer_handle: jlong,
@@ -427,7 +427,7 @@ struct RowGroupReaderHandle {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderOpen(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpen(
     mut env: JNIEnv,
     _class: JClass,
     input_file: JObject,
@@ -483,7 +483,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderOpen(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderFree(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderFree(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -494,7 +494,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderFree(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderExportSchema(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderExportSchema(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -527,7 +527,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderExportSchema(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderNumRowGroups(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderNumRowGroups(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -541,7 +541,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderNumRowGroups(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderOpenRowGroup(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpenRowGroup(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -576,7 +576,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderOpenRowGroup(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderOpenRowGroupProjected(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpenRowGroupProjected(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -629,7 +629,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderOpenRowGroupProjecte
 // ======================== RowGroupReader ========================
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeRowGroupReaderNumRows(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderNumRows(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -642,7 +642,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeRowGroupReaderNumRows(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeRowGroupReaderFree(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderFree(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -655,7 +655,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeRowGroupReaderFree(
 // ======================== Row Group Stats ========================
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderRowGroupNumStats(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupNumStats(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -672,7 +672,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderRowGroupNumStats(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderRowGroupStatColumnIndex(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatColumnIndex(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -695,7 +695,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderRowGroupStatColumnIn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderRowGroupStatNullCount(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatNullCount(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -718,7 +718,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderRowGroupStatNullCoun
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderRowGroupStatMin<'a>(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatMin<'a>(
     env: JNIEnv<'a>,
     _class: JClass<'a>,
     handle: jlong,
@@ -748,7 +748,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderRowGroupStatMin<'a>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderRowGroupStatMax<'a>(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatMax<'a>(
     env: JNIEnv<'a>,
     _class: JClass<'a>,
     handle: jlong,
@@ -780,7 +780,7 @@ pub extern "system" fn Java_io_mosaic_NativeLib_nativeReaderRowGroupStatMax<'a>(
 // ======================== Columnar Read (Arrow C Data Interface) ========================
 
 #[no_mangle]
-pub extern "system" fn Java_io_mosaic_NativeLib_nativeRowGroupReaderReadColumns(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderReadColumns(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,

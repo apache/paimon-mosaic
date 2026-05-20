@@ -17,39 +17,17 @@
  * under the License.
  */
 
-package io.mosaic;
+package org.apache.paimon.mosaic;
 
-public class ColumnStatistics {
+import java.io.IOException;
 
-    private final int columnIndex;
-    private final long nullCount;
-    private final byte[] min;
-    private final byte[] max;
+public interface InputFile {
 
-    ColumnStatistics(int columnIndex, long nullCount, byte[] min, byte[] max) {
-        this.columnIndex = columnIndex;
-        this.nullCount = nullCount;
-        this.min = min;
-        this.max = max;
-    }
-
-    public int getColumnIndex() {
-        return columnIndex;
-    }
-
-    public long getNullCount() {
-        return nullCount;
-    }
-
-    public boolean hasMinMax() {
-        return min != null;
-    }
-
-    public byte[] getMin() {
-        return min;
-    }
-
-    public byte[] getMax() {
-        return max;
-    }
+    /**
+     * Read {@code length} bytes starting at {@code position} into {@code buffer}.
+     *
+     * <p>This method must be thread-safe: the reader may call it concurrently
+     * from multiple threads to perform parallel IO.
+     */
+    void readFully(long position, byte[] buffer, int offset, int length) throws IOException;
 }

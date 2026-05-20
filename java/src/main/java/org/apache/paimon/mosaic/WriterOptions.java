@@ -17,7 +17,7 @@
  * under the License.
  */
 
-package io.mosaic;
+package org.apache.paimon.mosaic;
 
 public class WriterOptions {
 
