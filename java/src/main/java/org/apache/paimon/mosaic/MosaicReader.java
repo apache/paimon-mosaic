@@ -110,6 +110,10 @@ public class MosaicReader implements AutoCloseable {
         return result;
     }
 
+    /**
+     * Returns column statistics for the given row group. The returned list follows the same order
+     * as the {@code statsColumns} specified in {@link WriterOptions} when the file was written.
+     */
     public List<ColumnStatistics> getRowGroupStatistics(int rgIndex) {
         int n = NativeLib.nativeReaderRowGroupNumStats(handle, rgIndex);
         if (n < 0) {

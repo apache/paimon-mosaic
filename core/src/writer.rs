@@ -99,10 +99,10 @@ impl<S: OutputFile> MosaicWriter<S> {
     pub fn new(out: S, schema: &Schema, options: WriterOptions) -> io::Result<Self> {
         let mosaic_schema = MosaicSchema::from_arrow(schema, options.num_buckets)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        Ok(Self::from_mosaic_schema(out, mosaic_schema, options))
+        Self::from_mosaic_schema(out, mosaic_schema, options)
     }
 
-    pub fn from_mosaic_schema(out: S, schema: MosaicSchema, options: WriterOptions) -> Self {
+    pub fn from_mosaic_schema(out: S, schema: MosaicSchema, options: WriterOptions) -> io::Result<Self> {
         let num_buckets = schema.num_buckets;
         let mut bucket_writers = Vec::with_capacity(num_buckets);
 
@@ -126,20 +126,25 @@ impl<S: OutputFile> MosaicWriter<S> {
         let stats_collector = if options.stats_columns.is_empty() {
             None
         } else {
-            let cols: Vec<(usize, arrow_schema::DataType)> = options
-                .stats_columns
-                .iter()
-                .filter(|&&idx| {
-                    idx < schema.columns.len()
-                        && stats::supports_stats(&schema.columns[idx].data_type)
-                })
-                .map(|&idx| (idx, schema.columns[idx].data_type.clone()))
-                .collect();
-            if cols.is_empty() {
-                None
-            } else {
-                Some(StatsCollector::new(&cols))
+            let mut cols: Vec<(usize, arrow_schema::DataType)> =
+                Vec::with_capacity(options.stats_columns.len());
+            for &idx in &options.stats_columns {
+                if idx >= schema.columns.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("stats_columns index {} is out of range (schema has {} columns)", idx, schema.columns.len()),
+                    ));
+                }
+                let dt = &schema.columns[idx].data_type;
+                if !stats::supports_stats(dt) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("stats_columns index {} has unsupported type {:?} for statistics", idx, dt),
+                    ));
+                }
+                cols.push((idx, dt.clone()));
             }
+            Some(StatsCollector::new(&cols))
         };
 
         let active_buckets: Vec<usize> = bucket_writers
@@ -154,7 +159,7 @@ impl<S: OutputFile> MosaicWriter<S> {
             0.3
         };
 
-        MosaicWriter {
+        Ok(MosaicWriter {
             out,
             schema,
             bucket_writers,
@@ -172,7 +177,7 @@ impl<S: OutputFile> MosaicWriter<S> {
             total_compressed: 0,
             stats_collector,
             closed: false,
-        }
+        })
     }
 
     pub fn schema(&self) -> &MosaicSchema {
@@ -746,6 +751,70 @@ mod tests {
         )
         .unwrap();
         let result = writer.write_batch(&batch2);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_stats_columns_out_of_range() {
+        let arrow_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int64, true),
+        ]);
+        let out = MemOutputFile::new();
+        let result = MosaicWriter::new(
+            out,
+            &arrow_schema,
+            WriterOptions {
+                num_buckets: 1,
+                stats_columns: vec![5],
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err());
+        let err = result.err().expect("should be an error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn test_stats_columns_unsupported_type() {
+        let arrow_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Binary, true),
+        ]);
+        let out = MemOutputFile::new();
+        let result = MosaicWriter::new(
+            out,
+            &arrow_schema,
+            WriterOptions {
+                num_buckets: 1,
+                stats_columns: vec![0, 1],
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err());
+        let err = result.err().expect("should be an error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("unsupported type"));
+    }
+
+    #[test]
+    fn test_stats_columns_valid() {
+        let arrow_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int64, true),
+            Field::new("c", DataType::Utf8, true),
+        ]);
+        let out = MemOutputFile::new();
+        let result = MosaicWriter::new(
+            out,
+            &arrow_schema,
+            WriterOptions {
+                num_buckets: 1,
+                stats_columns: vec![0, 1, 2],
+                ..Default::default()
+            },
+        );
         assert!(result.is_ok());
     }
 }

@@ -106,6 +106,10 @@ public class MosaicWriter implements AutoCloseable {
         return rowGroupStats.size();
     }
 
+    /**
+     * Returns column statistics for the given row group. The returned list follows the same order
+     * as the {@code statsColumns} specified in {@link WriterOptions}.
+     */
     public List<ColumnStatistics> getRowGroupStatistics(int rgIndex) {
         if (rowGroupStats == null) {
             throw new IllegalStateException("writer is not closed yet");
