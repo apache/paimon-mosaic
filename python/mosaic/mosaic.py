@@ -154,13 +154,17 @@ class MosaicWriter:
         return self._pos
 
     def write(self, data):
-        if isinstance(data, pa.Table):
+        is_table = isinstance(data, pa.Table)
+        if not is_table and not isinstance(data, pa.RecordBatch):
+            raise TypeError(f"expected pyarrow.RecordBatch or pyarrow.Table, got {type(data)}")
+        if self._closed or not self._handle:
+            raise RuntimeError("writer is closed")
+
+        if is_table:
             for record_batch in data.to_batches():
                 self._write_single_batch(record_batch)
-        elif isinstance(data, pa.RecordBatch):
-            self._write_single_batch(data)
         else:
-            raise TypeError(f"expected pyarrow.RecordBatch or pyarrow.Table, got {type(data)}")
+            self._write_single_batch(data)
 
     def _write_single_batch(self, batch):
         c_schema = _ArrowSchema()

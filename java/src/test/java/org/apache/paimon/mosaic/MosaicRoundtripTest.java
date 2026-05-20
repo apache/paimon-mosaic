@@ -493,6 +493,21 @@ public class MosaicRoundtripTest {
     }
 
     @Test
+    public void testWriteAfterCloseFailsBeforeExport() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.nullable("x", new ArrowType.Int(32, true))
+        ));
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        MosaicWriter writer = new MosaicWriter(baos, arrowSchema, allocator);
+        writer.close();
+
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            assertThrows(IllegalStateException.class, () -> writer.write(root));
+        }
+    }
+
+    @Test
     public void testSingleRow() {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("v", new ArrowType.Int(32, true))

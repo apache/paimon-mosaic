@@ -576,3 +576,15 @@ class TestWriter:
             writer.write(batch)
             est = writer.estimated_file_size()
             assert est > 0
+
+    def test_write_after_close_fails_before_export(self):
+        pa_schema = pa.schema([pa.field("x", pa.int32())])
+        batch = pa.record_batch(
+            [pa.array([1, 2, 3], type=pa.int32())], names=["x"]
+        )
+
+        writer = MosaicWriter(io.BytesIO(), pa_schema)
+        writer.close()
+
+        with pytest.raises(RuntimeError, match="writer is closed"):
+            writer.write(batch)

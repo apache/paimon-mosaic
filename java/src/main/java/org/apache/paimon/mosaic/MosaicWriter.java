@@ -41,19 +41,22 @@ public class MosaicWriter implements AutoCloseable {
     public MosaicWriter(OutputStream outputStream, Schema arrowSchema, WriterOptions options, BufferAllocator allocator) {
         this.allocator = allocator;
         try (ArrowSchema cSchema = ArrowSchema.allocateNew(allocator)) {
-            Data.exportSchema(allocator, arrowSchema, null, cSchema);
-            this.handle = NativeLib.nativeWriterOpen(
-                    outputStream,
-                    cSchema.memoryAddress(),
-                    options.getNumBuckets(),
-                    options.getCompression(),
-                    options.getZstdLevel(),
-                    options.getRowGroupMaxSize(),
-                    options.getMaxDictTotalBytes(),
-                    options.getMaxDictEntries(),
-                    options.getStatsColumns(),
-                    options.getPageSizeThreshold());
-            cSchema.release();
+            try {
+                Data.exportSchema(allocator, arrowSchema, null, cSchema);
+                this.handle = NativeLib.nativeWriterOpen(
+                        outputStream,
+                        cSchema.memoryAddress(),
+                        options.getNumBuckets(),
+                        options.getCompression(),
+                        options.getZstdLevel(),
+                        options.getRowGroupMaxSize(),
+                        options.getMaxDictTotalBytes(),
+                        options.getMaxDictEntries(),
+                        options.getStatsColumns(),
+                        options.getPageSizeThreshold());
+            } finally {
+                releaseExported(cSchema);
+            }
         }
         if (this.handle == 0) {
             throw new RuntimeException("failed to open writer");
@@ -61,10 +64,30 @@ public class MosaicWriter implements AutoCloseable {
     }
 
     public void write(VectorSchemaRoot root) {
+        if (closed || handle == 0) {
+            throw new IllegalStateException("writer is closed");
+        }
         try (ArrowArray arrowArray = ArrowArray.allocateNew(allocator);
              ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
-            Data.exportVectorSchemaRoot(allocator, root, null, arrowArray, arrowSchema);
-            NativeLib.nativeWriterWriteBatch(handle, arrowArray.memoryAddress(), arrowSchema.memoryAddress());
+            try {
+                Data.exportVectorSchemaRoot(allocator, root, null, arrowArray, arrowSchema);
+                NativeLib.nativeWriterWriteBatch(handle, arrowArray.memoryAddress(), arrowSchema.memoryAddress());
+            } finally {
+                releaseExported(arrowArray);
+                releaseExported(arrowSchema);
+            }
+        }
+    }
+
+    private static void releaseExported(ArrowSchema schema) {
+        if (schema.snapshot().release != 0) {
+            schema.release();
+        }
+    }
+
+    private static void releaseExported(ArrowArray array) {
+        if (array.snapshot().release != 0) {
+            array.release();
         }
     }
 

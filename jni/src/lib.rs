@@ -215,8 +215,9 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
             return 0;
         }
 
-        let ffi_schema = unsafe { &*(arrow_schema_addr as *const FFI_ArrowSchema) };
-        let arrow_schema = match Schema::try_from(ffi_schema) {
+        let ffi_schema =
+            unsafe { FFI_ArrowSchema::from_raw(arrow_schema_addr as *mut FFI_ArrowSchema) };
+        let arrow_schema = match Schema::try_from(&ffi_schema) {
             Ok(s) => s,
             Err(e) => {
                 throw(&mut env, &format!("Arrow schema import failed: {}", e));
@@ -393,20 +394,15 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterWrite
         let ffi_array = array_addr as *mut FFI_ArrowArray;
         let ffi_schema = schema_addr as *mut FFI_ArrowSchema;
 
-        let arr_data = match unsafe {
-            arrow_array::ffi::from_ffi(ptr::read(ffi_array), &ptr::read(ffi_schema))
-        } {
+        let arr_owned = unsafe { FFI_ArrowArray::from_raw(ffi_array) };
+        let schema_owned = unsafe { FFI_ArrowSchema::from_raw(ffi_schema) };
+        let arr_data = match unsafe { arrow_array::ffi::from_ffi(arr_owned, &schema_owned) } {
             Ok(d) => d,
             Err(e) => {
                 throw(&mut env, &format!("Arrow import failed: {}", e));
                 return;
             }
         };
-
-        unsafe {
-            ptr::write(ffi_array, std::mem::zeroed());
-            ptr::write(ffi_schema, std::mem::zeroed());
-        }
 
         let struct_array = StructArray::from(arr_data);
         let batch = RecordBatch::from(struct_array);
