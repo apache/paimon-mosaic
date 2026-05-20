@@ -1222,6 +1222,43 @@ fn test_projection_subset() {
 }
 
 #[test]
+fn test_projection_empty_columns_preserves_row_count() {
+    let columns = vec![
+        ("a".to_string(), DataType::Int32, true),
+        ("b".to_string(), DataType::Utf8, true),
+    ];
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            compression: COMPRESSION_ZSTD,
+            num_buckets: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let rows = vec![
+        vec![Value::Integer(1), Value::String(b"a".to_vec())],
+        vec![Value::Integer(2), Value::String(b"b".to_vec())],
+        vec![Value::Integer(3), Value::String(b"c".to_vec())],
+    ];
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    let reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
+
+    let mut rg = reader.row_group_reader_projected(0, &[]).unwrap();
+    let batch = rg.read_columns().unwrap();
+
+    assert_eq!(batch.num_columns(), 0);
+    assert_eq!(batch.num_rows(), rows.len());
+    assert!(batch.schema().fields().is_empty());
+}
+
+#[test]
 fn test_projection_single_column() {
     let columns = vec![
         ("x".to_string(), DataType::Int32, true),
