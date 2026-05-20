@@ -831,6 +831,7 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
             self.schema.clone(),
             num_cols,
             meta.num_rows,
+            projected,
         ))
     }
 }
@@ -851,6 +852,7 @@ pub struct RowGroupReader {
     schema: MosaicSchema,
     num_rows: usize,
     num_columns: usize,
+    projected_columns: Vec<bool>,
 }
 
 impl RowGroupReader {
@@ -860,6 +862,7 @@ impl RowGroupReader {
         schema: MosaicSchema,
         num_columns: usize,
         num_rows: usize,
+        projected_columns: Vec<bool>,
     ) -> Self {
         let active_buckets: Vec<usize> = bucket_states
             .iter()
@@ -873,6 +876,7 @@ impl RowGroupReader {
             schema,
             num_rows,
             num_columns,
+            projected_columns,
         }
     }
 
@@ -891,14 +895,20 @@ impl RowGroupReader {
             match state {
                 BucketState::Paged { column_readers } => {
                     for (local_idx, &global_idx) in global_indices.iter().enumerate() {
+                        if !self.projected_columns[global_idx] {
+                            continue;
+                        }
                         if let Some(ref cr) = column_readers[local_idx] {
                             arrays[global_idx] = Some(cr.read_all()?);
                         }
                     }
                 }
-                BucketState::Monolithic { reader, .. } => {
+                BucketState::Monolithic { reader } => {
                     let columns = reader.read_all_columns()?;
                     for (local_idx, &global_idx) in global_indices.iter().enumerate() {
+                        if !self.projected_columns[global_idx] {
+                            continue;
+                        }
                         if local_idx < columns.len() {
                             arrays[global_idx] = Some(columns[local_idx].clone());
                         }

@@ -2642,6 +2642,61 @@ fn test_read_columns_with_projection() {
 }
 
 #[test]
+fn test_read_columns_with_projection_monolithic_bucket() {
+    let columns = vec![
+        ("a".to_string(), DataType::Int32, true),
+        ("b".to_string(), DataType::Utf8, true),
+        ("c".to_string(), DataType::Float64, true),
+    ];
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            compression: COMPRESSION_NONE,
+            num_buckets: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let rows: Vec<Vec<Value>> = (0..12)
+        .map(|i| {
+            vec![
+                Value::Integer(i),
+                Value::String(format!("b{}", i).into_bytes()),
+                Value::Double(i as f64 * 2.5),
+            ]
+        })
+        .collect();
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    let reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
+
+    let col_b = reader
+        .schema()
+        .columns
+        .iter()
+        .position(|c| c.name == "b")
+        .unwrap();
+
+    let mut rg = reader.row_group_reader_projected(0, &[col_b]).unwrap();
+    let batch = rg.read_columns().unwrap();
+
+    assert_eq!(batch.num_rows(), 12);
+    assert_eq!(batch.num_columns(), 1);
+    assert!(batch.schema().index_of("a").is_err());
+    assert!(batch.schema().index_of("c").is_err());
+
+    let b = batch_col_string(&batch, "b");
+    for i in 0..12usize {
+        assert_eq!(b.value(i), format!("b{}", i));
+    }
+}
+
+#[test]
 fn test_read_columns_paged() {
     let columns = vec![
         ("id".to_string(), DataType::Int32, true),
