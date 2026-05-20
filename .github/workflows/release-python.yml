@@ -39,27 +39,97 @@ permissions:
   contents: read
 
 jobs:
-  wheels:
+  wheels-linux:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            lib_name: libmosaic_ffi.so
+            arch: x86_64
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            lib_name: libmosaic_ffi.so
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheels via cibuildwheel
+        uses: pypa/cibuildwheel@v2.23
+        with:
+          package-dir: python
+          output-dir: wheelhouse
+        env:
+          CIBW_BUILD: "cp39-manylinux_${{ matrix.arch }}"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+          CIBW_BEFORE_ALL_LINUX: >
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
+            source $HOME/.cargo/env &&
+            cargo build --release -p mosaic-ffi &&
+            cp target/release/libmosaic_ffi.so {package}/mosaic/
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+
+  wheels-macos:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - os: macos-13
             target: x86_64-apple-darwin
             lib_name: libmosaic_ffi.dylib
           - os: macos-latest
             target: aarch64-apple-darwin
             lib_name: libmosaic_ffi.dylib
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            lib_name: mosaic_ffi.dll
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Build native library
+        run: cargo build --release -p mosaic-ffi
+
+      - name: Copy native library into package
+        run: cp target/release/${{ matrix.lib_name }} python/mosaic/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build wheel setuptools delocate
+
+      - name: Build wheel
+        working-directory: python
+        run: python -m build --wheel
+
+      - name: Repair wheel
+        run: |
+          delocate-wheel -w python/dist/repaired python/dist/*.whl
+          rm python/dist/*.whl
+          mv python/dist/repaired/*.whl python/dist/
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: python/dist/*.whl
+
+  wheels-windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -73,7 +143,7 @@ jobs:
 
       - name: Copy native library into package
         shell: bash
-        run: cp target/release/${{ matrix.lib_name }} python/mosaic/
+        run: cp target/release/mosaic_ffi.dll python/mosaic/
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -87,26 +157,10 @@ jobs:
         working-directory: python
         run: python -m build --wheel
 
-      - name: Repair wheel (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          pip install auditwheel patchelf
-          auditwheel repair python/dist/*.whl --wheel-dir python/dist/repaired
-          rm python/dist/*.whl
-          mv python/dist/repaired/*.whl python/dist/
-
-      - name: Repair wheel (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          pip install delocate
-          delocate-wheel -w python/dist/repaired python/dist/*.whl
-          rm python/dist/*.whl
-          mv python/dist/repaired/*.whl python/dist/
-
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          name: wheels-windows-x86_64
           path: python/dist/*.whl
 
   release:
@@ -114,7 +168,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    needs: [wheels]
+    needs: [wheels-linux, wheels-macos, wheels-windows]
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/download-artifact@v4
