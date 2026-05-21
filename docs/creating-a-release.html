@@ -172,10 +172,18 @@ OLD_VERSION=${RELEASE_VERSION} NEW_VERSION=${NEXT_VERSION} ./releasing/update_br
             <!-- ============================================================ -->
             <h2 id="build-a-release-candidate">Build a Release Candidate</h2>
 
+            <h3>Update Versions on the Release Branch</h3>
+            <p>Before tagging, update the release branch to non-SNAPSHOT versions (removing <code>-SNAPSHOT</code> from <code>pom.xml</code>):</p>
+<pre><code>git checkout release-${RELEASE_VERSION}-rc${RC_NUM}
+cd tools
+OLD_VERSION=${RELEASE_VERSION}-SNAPSHOT NEW_VERSION=${RELEASE_VERSION} ./releasing/update_branch_version.sh
+cd ..</code></pre>
+            <p>This ensures the Java artifacts deployed from the RC tag carry the final release version (e.g. <code>0.1.0</code>) rather than a SNAPSHOT suffix.</p>
+
             <h3>Create the RC Tag</h3>
             <p>Push a signed RC tag to trigger CI workflows:</p>
-<pre><code>git checkout release-${RELEASE_VERSION}-rc${RC_NUM}
-git tag -s v${RELEASE_VERSION}-rc${RC_NUM} -m "v${RELEASE_VERSION}-rc${RC_NUM}"
+<pre><code>git tag -s v${RELEASE_VERSION}-rc${RC_NUM} -m "v${RELEASE_VERSION}-rc${RC_NUM}"
+git push origin release-${RELEASE_VERSION}-rc${RC_NUM}
 git push origin v${RELEASE_VERSION}-rc${RC_NUM}</code></pre>
             <p>After pushing, verify in <a href="https://github.com/apache/paimon-mosaic/actions">GitHub Actions</a> that all release workflows succeed:</p>
             <ul>
@@ -236,7 +244,7 @@ Java artifacts (Nexus staging):
 https://repository.apache.org/content/repositories/orgapachepaimon-XXXX/
 
 Python wheels (TestPyPI):
-https://test.pypi.org/project/paimon-mosaic/${RELEASE_VERSION}/
+https://test.pypi.org/project/paimon-mosaic/${RELEASE_VERSION}rc${RC_NUM}/
 
 Verification guide:
 https://github.com/apache/paimon-mosaic/blob/main/docs/verifying-a-release-candidate.html

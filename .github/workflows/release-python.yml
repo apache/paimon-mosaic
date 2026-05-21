@@ -52,6 +52,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Inject RC version into pyproject.toml
+        if: contains(github.ref, '-rc')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          # Convert 0.1.0-rc1 to PEP 440: 0.1.0rc1
+          PEP440_VERSION=$(echo "$TAG" | sed 's/-rc/rc/')
+          sed -i "s/^version = .*/version = \"${PEP440_VERSION}\"/" python/pyproject.toml
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -89,6 +97,13 @@ jobs:
             lib_name: libpaimon_mosaic_ffi.dylib
     steps:
       - uses: actions/checkout@v4
+
+      - name: Inject RC version into pyproject.toml
+        if: contains(github.ref, '-rc')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PEP440_VERSION=$(echo "$TAG" | sed 's/-rc/rc/')
+          sed -i '' "s/^version = .*/version = \"${PEP440_VERSION}\"/" python/pyproject.toml
 
       - name: Setup Rust toolchain
         run: |
@@ -129,6 +144,14 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Inject RC version into pyproject.toml
+        if: contains(github.ref, '-rc')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PEP440_VERSION=$(echo "$TAG" | sed 's/-rc/rc/')
+          sed -i "s/^version = .*/version = \"${PEP440_VERSION}\"/" python/pyproject.toml
 
       - name: Setup Rust toolchain
         run: |

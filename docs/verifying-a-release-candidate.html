@@ -171,7 +171,7 @@ paimon-mosaic-core = { git = "https://github.com/apache/paimon-mosaic", tag = "v
 
             <h3>Python (TestPyPI)</h3>
             <p>The RC tag publishes wheels to TestPyPI. Install and verify:</p>
-<pre><code>pip install -i https://test.pypi.org/simple/ paimon-mosaic==${RELEASE_VERSION}
+<pre><code>pip install -i https://test.pypi.org/simple/ paimon-mosaic==${RELEASE_VERSION}rc${RC_NUM}
 python -c "import mosaic; print('OK')"</code></pre>
             <p>Verify wheels are available for: Linux x86_64, Linux aarch64, macOS aarch64, Windows x86_64.</p>
 

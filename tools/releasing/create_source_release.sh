@@ -93,4 +93,4 @@ echo ""
 echo "Source release created successfully. Artifacts in tools/release/:"
 ls -la ${CURR_DIR}/release/apache-paimon-mosaic-*
 echo ""
-echo "Next: upload contents to SVN (see docs/release/creating-a-release.md)."
+echo "Next: upload contents to SVN (see docs/creating-a-release.html)."
