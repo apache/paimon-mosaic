@@ -411,6 +411,6 @@ def write_table(table, stream, options=None):
 
 def read_table(read_at_fn, file_length, columns=None):
     with MosaicReader.from_input_file(read_at_fn, file_length) as reader:
-        if columns:
+        if columns is not None:
             reader.project(columns)
         return reader.read_all()

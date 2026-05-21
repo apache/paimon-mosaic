@@ -657,6 +657,28 @@ class TestConvenience:
         assert result.column("id").to_pylist() == list(range(30))
         assert result.column("name").to_pylist() == [f"user_{i}" for i in range(30)]
 
+    def test_read_table_empty_projection(self):
+        table = pa.table(
+            {
+                "id": pa.array(list(range(30)), type=pa.int32()),
+                "name": pa.array([f"user_{i}" for i in range(30)]),
+            }
+        )
+
+        buf = io.BytesIO()
+        write_table(table, buf)
+
+        data = buf.getvalue()
+        result = read_table(
+            lambda offset, length: data[offset : offset + length],
+            len(data),
+            columns=[],
+        )
+
+        assert result.num_columns == 0
+        assert result.num_rows == 30
+        assert result.schema.names == []
+
     def test_read_all(self):
         pa_schema = pa.schema(
             [pa.field("x", pa.int32()), pa.field("y", pa.utf8())]
