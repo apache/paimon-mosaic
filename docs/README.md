@@ -42,7 +42,6 @@ Then open http://localhost:8090 in your browser.
 docs/
 ├── index.html        # Home page (overview, benchmarks, types)
 ├── design.html       # Format specification & binary layout
-├── rust-api.html     # Rust API guide
 ├── java-api.html     # Java API guide
 ├── python-api.html   # Python API guide
 ├── cpp-api.html      # C++ API guide

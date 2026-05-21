@@ -32,6 +32,9 @@ use mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess};
 use mosaic_core::spec::*;
 use mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
 
+type MinMaxPair = (Option<Vec<u8>>, Option<Vec<u8>>);
+type MinMaxCache = Vec<Vec<MinMaxPair>>;
+
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
@@ -114,7 +117,7 @@ pub struct MosaicWriterOptions {
     pub row_group_max_size: u64,
     pub max_dict_total_bytes: u32,
     pub max_dict_entries: u32,
-    pub stats_columns: *const u32,
+    pub stats_columns: *const *const c_char,
     pub num_stats_columns: u32,
     pub page_size_threshold: u32,
 }
@@ -139,6 +142,8 @@ pub extern "C" fn mosaic_writer_options_default() -> MosaicWriterOptions {
 
 pub struct MosaicWriterHandle {
     inner: MosaicWriter<FfiOutputFile>,
+    stat_name_cache: Option<Vec<Vec<CString>>>,
+    stat_value_cache: Option<MinMaxCache>,
 }
 
 /// Open a writer. The `ffi_schema` is consumed: ownership transfers to the callee
@@ -170,10 +175,26 @@ pub unsafe extern "C" fn mosaic_writer_open(
         let stats_cols = if options.stats_columns.is_null() || options.num_stats_columns == 0 {
             Vec::new()
         } else {
-            std::slice::from_raw_parts(options.stats_columns, options.num_stats_columns as usize)
-                .iter()
-                .map(|&c| c as usize)
-                .collect()
+            let ptrs = std::slice::from_raw_parts(
+                options.stats_columns,
+                options.num_stats_columns as usize,
+            );
+            let mut names = Vec::with_capacity(ptrs.len());
+            for &p in ptrs {
+                if p.is_null() {
+                    set_error("stats_columns contains null pointer".into());
+                    return ptr::null_mut();
+                }
+                let cstr = std::ffi::CStr::from_ptr(p);
+                match cstr.to_str() {
+                    Ok(s) => names.push(s.to_owned()),
+                    Err(_) => {
+                        set_error("stats_columns contains invalid UTF-8".into());
+                        return ptr::null_mut();
+                    }
+                }
+            }
+            names
         };
         let num_buckets = if options.num_buckets == 0 {
             DEFAULT_NUM_BUCKETS
@@ -191,7 +212,11 @@ pub unsafe extern "C" fn mosaic_writer_open(
             page_size_threshold: options.page_size_threshold as usize,
         };
         match MosaicWriter::new(ffi_stream, &arrow_schema, opts) {
-            Ok(writer) => Box::into_raw(Box::new(MosaicWriterHandle { inner: writer })),
+            Ok(writer) => Box::into_raw(Box::new(MosaicWriterHandle {
+                inner: writer,
+                stat_name_cache: None,
+                stat_value_cache: None,
+            })),
             Err(e) => {
                 set_error(format!("writer open failed: {}", e));
                 ptr::null_mut()
@@ -292,136 +317,109 @@ pub unsafe extern "C" fn mosaic_writer_row_group_num_stats(
     0
 }
 
-/// Get the column index for a writer stats entry.
+/// Batch-fetch all stats for a writer row group.
+/// Caller must pre-allocate arrays with at least `num_stats` elements.
+/// `names` is filled with pointers to NUL-terminated strings (valid until writer is freed).
+/// `null_counts` is filled with null counts.
+/// `min_ptrs`/`min_lens` and `max_ptrs`/`max_lens` are filled with pointers to byte data
+/// (valid until writer is freed). A null pointer with len 0 means no min/max (all-null column).
+/// Returns 0 on success, -1 on error.
 #[no_mangle]
-pub unsafe extern "C" fn mosaic_writer_row_group_stat_column_index(
-    handle: *const MosaicWriterHandle,
+pub unsafe extern "C" fn mosaic_writer_row_group_stats(
+    handle: *mut MosaicWriterHandle,
     rg_index: u32,
-    stat_index: u32,
-    out: *mut u32,
+    names: *mut *const c_char,
+    null_counts: *mut u64,
+    min_ptrs: *mut *const u8,
+    min_lens: *mut usize,
+    max_ptrs: *mut *const u8,
+    max_lens: *mut usize,
 ) -> c_int {
-    if handle.is_null() || out.is_null() {
+    if handle.is_null() {
         set_error("null pointer".into());
         return -1;
     }
-    let h = &*handle;
+    let h = &mut *handle;
     let rg = rg_index as usize;
     if rg >= h.inner.num_row_groups() {
         set_error("rg_index out of range".into());
         return -1;
     }
     let stats = h.inner.row_group_stats(rg);
-    let idx = stat_index as usize;
-    if idx >= stats.len() {
-        set_error("stat_index out of range".into());
-        return -1;
-    }
-    *out = stats[idx].column_index as u32;
-    0
-}
+    let schema = h.inner.schema();
 
-/// Get the null count for a writer stats entry.
-#[no_mangle]
-pub unsafe extern "C" fn mosaic_writer_row_group_stat_null_count(
-    handle: *const MosaicWriterHandle,
-    rg_index: u32,
-    stat_index: u32,
-    out: *mut u64,
-) -> c_int {
-    if handle.is_null() || out.is_null() {
-        set_error("null pointer".into());
-        return -1;
-    }
-    let h = &*handle;
-    let rg = rg_index as usize;
-    if rg >= h.inner.num_row_groups() {
-        set_error("rg_index out of range".into());
-        return -1;
-    }
-    let stats = h.inner.row_group_stats(rg);
-    let idx = stat_index as usize;
-    if idx >= stats.len() {
-        set_error("stat_index out of range".into());
-        return -1;
-    }
-    *out = stats[idx].null_count as u64;
-    0
-}
-
-thread_local! {
-    static WRITER_STAT_MIN_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-    static WRITER_STAT_MAX_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Get the min value for a writer stats entry as raw bytes.
-#[no_mangle]
-pub unsafe extern "C" fn mosaic_writer_row_group_stat_min(
-    handle: *const MosaicWriterHandle,
-    rg_index: u32,
-    stat_index: u32,
-    out_len: *mut usize,
-) -> *const u8 {
-    writer_stat_value_ptr(handle, rg_index, stat_index, out_len, true)
-}
-
-/// Get the max value for a writer stats entry as raw bytes.
-#[no_mangle]
-pub unsafe extern "C" fn mosaic_writer_row_group_stat_max(
-    handle: *const MosaicWriterHandle,
-    rg_index: u32,
-    stat_index: u32,
-    out_len: *mut usize,
-) -> *const u8 {
-    writer_stat_value_ptr(handle, rg_index, stat_index, out_len, false)
-}
-
-unsafe fn writer_stat_value_ptr(
-    handle: *const MosaicWriterHandle,
-    rg_index: u32,
-    stat_index: u32,
-    out_len: *mut usize,
-    is_min: bool,
-) -> *const u8 {
-    if handle.is_null() || out_len.is_null() {
-        return ptr::null();
-    }
-    let h = &*handle;
-    let rg = rg_index as usize;
-    if rg >= h.inner.num_row_groups() {
-        *out_len = 0;
-        return ptr::null();
-    }
-    let stats = h.inner.row_group_stats(rg);
-    let idx = stat_index as usize;
-    if idx >= stats.len() {
-        *out_len = 0;
-        return ptr::null();
-    }
-    let value = if is_min {
-        &stats[idx].min
-    } else {
-        &stats[idx].max
-    };
-    match value {
-        Some(v) => {
-            let bytes = v.to_be_bytes();
-            let buf_ref = if is_min {
-                &WRITER_STAT_MIN_BUF
-            } else {
-                &WRITER_STAT_MAX_BUF
-            };
-            buf_ref.with(|buf| {
-                let mut b = buf.borrow_mut();
-                *b = bytes;
-                *out_len = b.len();
-                b.as_ptr()
-            })
+    // Ensure name CStrings are cached
+    if h.stat_name_cache.is_none() {
+        let num_rg = h.inner.num_row_groups();
+        let mut cache = Vec::with_capacity(num_rg);
+        for r in 0..num_rg {
+            let s = h.inner.row_group_stats(r);
+            let names_vec: Vec<CString> = s
+                .iter()
+                .map(|st| {
+                    CString::new(schema.columns[st.column_index].name.as_str()).unwrap_or_default()
+                })
+                .collect();
+            cache.push(names_vec);
         }
-        None => {
-            *out_len = 0;
-            ptr::null()
+        h.stat_name_cache = Some(cache);
+    }
+    // Ensure value bytes are cached
+    if h.stat_value_cache.is_none() {
+        let num_rg = h.inner.num_row_groups();
+        let mut cache = Vec::with_capacity(num_rg);
+        for r in 0..num_rg {
+            let s = h.inner.row_group_stats(r);
+            let vals: Vec<MinMaxPair> = s
+                .iter()
+                .map(|st| {
+                    (
+                        st.min.as_ref().map(|v| v.to_be_bytes()),
+                        st.max.as_ref().map(|v| v.to_be_bytes()),
+                    )
+                })
+                .collect();
+            cache.push(vals);
+        }
+        h.stat_value_cache = Some(cache);
+    }
+
+    let name_cache = &h.stat_name_cache.as_ref().unwrap()[rg];
+    let value_cache = &h.stat_value_cache.as_ref().unwrap()[rg];
+
+    for (i, st) in stats.iter().enumerate() {
+        if !names.is_null() {
+            *names.add(i) = name_cache[i].as_ptr();
+        }
+        if !null_counts.is_null() {
+            *null_counts.add(i) = st.null_count as u64;
+        }
+        if !min_ptrs.is_null() && !min_lens.is_null() {
+            match &value_cache[i].0 {
+                Some(b) => {
+                    *min_ptrs.add(i) = b.as_ptr();
+                    *min_lens.add(i) = b.len();
+                }
+                None => {
+                    *min_ptrs.add(i) = ptr::null();
+                    *min_lens.add(i) = 0;
+                }
+            }
+        }
+        if !max_ptrs.is_null() && !max_lens.is_null() {
+            match &value_cache[i].1 {
+                Some(b) => {
+                    *max_ptrs.add(i) = b.as_ptr();
+                    *max_lens.add(i) = b.len();
+                }
+                None => {
+                    *max_ptrs.add(i) = ptr::null();
+                    *max_lens.add(i) = 0;
+                }
+            }
         }
     }
+    0
 }
 
 /// Write an Arrow RecordBatch to the writer via the Arrow C Data Interface.
@@ -503,6 +501,8 @@ impl InputFile for FfiInputFile {
 
 pub struct MosaicReaderHandle {
     reader: MosaicReader<FfiInputFile>,
+    stat_name_cache: Option<Vec<Vec<CString>>>,
+    stat_value_cache: Option<MinMaxCache>,
 }
 
 pub struct MosaicRowGroupReaderHandle {
@@ -522,7 +522,11 @@ pub unsafe extern "C" fn mosaic_reader_open(
         };
         let ffi_input = FfiInputFile { raw: input_file };
         match MosaicReader::new(ffi_input, file_len) {
-            Ok(reader) => Box::into_raw(Box::new(MosaicReaderHandle { reader })),
+            Ok(reader) => Box::into_raw(Box::new(MosaicReaderHandle {
+                reader,
+                stat_name_cache: None,
+                stat_value_cache: None,
+            })),
             Err(e) => {
                 set_error(format!("open failed: {}", e));
                 ptr::null_mut()
@@ -577,9 +581,12 @@ pub unsafe extern "C" fn mosaic_reader_export_schema(
         let h = &*handle;
         let schema = h.reader.schema();
         let fields: Vec<Field> = schema
-            .columns
+            .original_order
             .iter()
-            .map(|c| Field::new(&c.name, c.data_type.clone(), c.nullable))
+            .map(|&i| {
+                let c = &schema.columns[i];
+                Field::new(&c.name, c.data_type.clone(), c.nullable)
+            })
             .collect();
         let arrow_schema = Schema::new(fields);
         match FFI_ArrowSchema::try_from(&arrow_schema) {
@@ -631,41 +638,50 @@ pub unsafe extern "C" fn mosaic_reader_open_row_group(
     }
 }
 
-/// Open a row group reader with projection pushdown.
-/// Only decompresses buckets containing the specified columns.
+/// Set projection on the reader. Subsequent row group reads will only
+/// decompress buckets containing the specified columns.
 #[no_mangle]
-pub unsafe extern "C" fn mosaic_reader_open_row_group_projected(
+pub unsafe extern "C" fn mosaic_reader_set_projection(
     handle: *mut MosaicReaderHandle,
-    rg_index: u32,
-    columns: *const u32,
+    columns: *const *const c_char,
     num_columns: u32,
-) -> *mut MosaicRowGroupReaderHandle {
+) -> c_int {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         if handle.is_null() {
             set_error("null reader handle".into());
-            return ptr::null_mut();
+            return -1;
         }
-        if columns.is_null() && num_columns > 0 {
-            set_error("null columns pointer".into());
-            return ptr::null_mut();
+        let h = &mut *handle;
+        if num_columns == 0 || columns.is_null() {
+            match h.reader.project(&[]) {
+                Ok(()) => return 0,
+                Err(e) => {
+                    set_error(e.to_string());
+                    return -1;
+                }
+            }
         }
-        let h = &*handle;
-        let col_indices: Vec<usize> = if num_columns > 0 {
-            std::slice::from_raw_parts(columns, num_columns as usize)
-                .iter()
-                .map(|&c| c as usize)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        match h
-            .reader
-            .row_group_reader_projected(rg_index as usize, &col_indices)
-        {
-            Ok(rg) => Box::into_raw(Box::new(MosaicRowGroupReaderHandle { inner: rg })),
+        let ptrs = std::slice::from_raw_parts(columns, num_columns as usize);
+        let mut names = Vec::with_capacity(num_columns as usize);
+        for &p in ptrs {
+            if p.is_null() {
+                set_error("columns contains null pointer".into());
+                return -1;
+            }
+            match std::ffi::CStr::from_ptr(p).to_str() {
+                Ok(s) => names.push(s),
+                Err(_) => {
+                    set_error("columns contains invalid UTF-8".into());
+                    return -1;
+                }
+            }
+        }
+        let col_refs: Vec<&str> = names.to_vec();
+        match h.reader.project(&col_refs) {
+            Ok(()) => 0,
             Err(e) => {
-                set_error(format!("open row group projected failed: {}", e));
-                ptr::null_mut()
+                set_error(e.to_string());
+                -1
             }
         }
     }));
@@ -673,7 +689,7 @@ pub unsafe extern "C" fn mosaic_reader_open_row_group_projected(
         Ok(val) => val,
         Err(e) => {
             set_error(panic_message(&e));
-            ptr::null_mut()
+            -1
         }
     }
 }
@@ -752,139 +768,104 @@ pub unsafe extern "C" fn mosaic_reader_row_group_num_stats(
     0
 }
 
-/// Get the column index for a stats entry.
-/// Returns 0 on success, -1 on error. Writes result to `out`.
+/// Batch-fetch all stats for a reader row group.
+/// Caller must pre-allocate arrays with at least `num_stats` elements.
+/// `names` is filled with pointers to NUL-terminated strings (valid until reader is freed).
+/// `null_counts` is filled with null counts.
+/// `min_ptrs`/`min_lens` and `max_ptrs`/`max_lens` are filled with pointers to byte data
+/// (valid until reader is freed). A null pointer with len 0 means no min/max (all-null column).
+/// Returns 0 on success, -1 on error.
 #[no_mangle]
-pub unsafe extern "C" fn mosaic_reader_row_group_stat_column_index(
-    handle: *const MosaicReaderHandle,
+pub unsafe extern "C" fn mosaic_reader_row_group_stats(
+    handle: *mut MosaicReaderHandle,
     rg_index: u32,
-    stat_index: u32,
-    out: *mut u32,
+    names: *mut *const c_char,
+    null_counts: *mut u64,
+    min_ptrs: *mut *const u8,
+    min_lens: *mut usize,
+    max_ptrs: *mut *const u8,
+    max_lens: *mut usize,
 ) -> c_int {
-    if handle.is_null() || out.is_null() {
+    if handle.is_null() {
         set_error("null pointer".into());
         return -1;
     }
-    let h = &*handle;
-    let stats = match h.reader.row_group_stats(rg_index as usize) {
+    let h = &mut *handle;
+    let rg = rg_index as usize;
+    let stats = match h.reader.row_group_stats(rg) {
         Ok(s) => s,
         Err(e) => {
             set_error(e.to_string());
             return -1;
         }
     };
-    let idx = stat_index as usize;
-    if idx >= stats.len() {
-        set_error("stat_index out of range".into());
-        return -1;
+    let schema = h.reader.schema();
+
+    // Ensure caches are built
+    if h.stat_name_cache.is_none() {
+        let num_rg = h.reader.num_row_groups();
+        let mut name_cache = Vec::with_capacity(num_rg);
+        let mut value_cache = Vec::with_capacity(num_rg);
+        for r in 0..num_rg {
+            let s = h.reader.row_group_stats(r).unwrap_or(&[]);
+            let names_vec: Vec<CString> = s
+                .iter()
+                .map(|st| {
+                    CString::new(schema.columns[st.column_index].name.as_str()).unwrap_or_default()
+                })
+                .collect();
+            let vals: Vec<MinMaxPair> = s
+                .iter()
+                .map(|st| {
+                    (
+                        st.min.as_ref().map(|v| v.to_be_bytes()),
+                        st.max.as_ref().map(|v| v.to_be_bytes()),
+                    )
+                })
+                .collect();
+            name_cache.push(names_vec);
+            value_cache.push(vals);
+        }
+        h.stat_name_cache = Some(name_cache);
+        h.stat_value_cache = Some(value_cache);
     }
-    *out = stats[idx].column_index as u32;
+
+    let name_cache = &h.stat_name_cache.as_ref().unwrap()[rg];
+    let value_cache = &h.stat_value_cache.as_ref().unwrap()[rg];
+
+    for (i, st) in stats.iter().enumerate() {
+        if !names.is_null() {
+            *names.add(i) = name_cache[i].as_ptr();
+        }
+        if !null_counts.is_null() {
+            *null_counts.add(i) = st.null_count as u64;
+        }
+        if !min_ptrs.is_null() && !min_lens.is_null() {
+            match &value_cache[i].0 {
+                Some(b) => {
+                    *min_ptrs.add(i) = b.as_ptr();
+                    *min_lens.add(i) = b.len();
+                }
+                None => {
+                    *min_ptrs.add(i) = ptr::null();
+                    *min_lens.add(i) = 0;
+                }
+            }
+        }
+        if !max_ptrs.is_null() && !max_lens.is_null() {
+            match &value_cache[i].1 {
+                Some(b) => {
+                    *max_ptrs.add(i) = b.as_ptr();
+                    *max_lens.add(i) = b.len();
+                }
+                None => {
+                    *max_ptrs.add(i) = ptr::null();
+                    *max_lens.add(i) = 0;
+                }
+            }
+        }
+    }
     0
-}
-
-/// Get the null count for a stats entry.
-/// Returns 0 on success, -1 on error. Writes result to `out`.
-#[no_mangle]
-pub unsafe extern "C" fn mosaic_reader_row_group_stat_null_count(
-    handle: *const MosaicReaderHandle,
-    rg_index: u32,
-    stat_index: u32,
-    out: *mut u64,
-) -> c_int {
-    if handle.is_null() || out.is_null() {
-        set_error("null pointer".into());
-        return -1;
-    }
-    let h = &*handle;
-    let stats = match h.reader.row_group_stats(rg_index as usize) {
-        Ok(s) => s,
-        Err(e) => {
-            set_error(e.to_string());
-            return -1;
-        }
-    };
-    let idx = stat_index as usize;
-    if idx >= stats.len() {
-        set_error("stat_index out of range".into());
-        return -1;
-    }
-    *out = stats[idx].null_count as u64;
-    0
-}
-
-/// Get the min value for a stats entry as raw bytes.
-/// Returns null if the column is all-null (no min). Sets out_len to the byte length.
-#[no_mangle]
-pub unsafe extern "C" fn mosaic_reader_row_group_stat_min(
-    handle: *const MosaicReaderHandle,
-    rg_index: u32,
-    stat_index: u32,
-    out_len: *mut usize,
-) -> *const u8 {
-    stat_value_ptr(handle, rg_index, stat_index, out_len, true)
-}
-
-/// Get the max value for a stats entry as raw bytes.
-/// Returns null if the column is all-null (no max). Sets out_len to the byte length.
-#[no_mangle]
-pub unsafe extern "C" fn mosaic_reader_row_group_stat_max(
-    handle: *const MosaicReaderHandle,
-    rg_index: u32,
-    stat_index: u32,
-    out_len: *mut usize,
-) -> *const u8 {
-    stat_value_ptr(handle, rg_index, stat_index, out_len, false)
-}
-
-thread_local! {
-    static STAT_MIN_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-    static STAT_MAX_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
-
-unsafe fn stat_value_ptr(
-    handle: *const MosaicReaderHandle,
-    rg_index: u32,
-    stat_index: u32,
-    out_len: *mut usize,
-    is_min: bool,
-) -> *const u8 {
-    if handle.is_null() || out_len.is_null() {
-        return ptr::null();
-    }
-    let h = &*handle;
-    let stats = match h.reader.row_group_stats(rg_index as usize) {
-        Ok(s) => s,
-        Err(_) => {
-            *out_len = 0;
-            return ptr::null();
-        }
-    };
-    let idx = stat_index as usize;
-    if idx >= stats.len() {
-        *out_len = 0;
-        return ptr::null();
-    }
-    let value = if is_min {
-        &stats[idx].min
-    } else {
-        &stats[idx].max
-    };
-    match value {
-        Some(v) => {
-            let bytes = v.to_be_bytes();
-            let buf_ref = if is_min { &STAT_MIN_BUF } else { &STAT_MAX_BUF };
-            buf_ref.with(|buf| {
-                let mut b = buf.borrow_mut();
-                *b = bytes;
-                *out_len = b.len();
-                b.as_ptr()
-            })
-        }
-        None => {
-            *out_len = 0;
-            ptr::null()
-        }
-    }
 }
 
 // ======================== Record Batch (Arrow C Data Interface) ========================

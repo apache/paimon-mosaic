@@ -39,7 +39,6 @@
             <ul>
                 <li><a href="index.html">Home</a></li>
                 <li><a href="design.html" class="active">Design</a></li>
-                <li><a href="rust-api.html">Rust API</a></li>
                 <li><a href="java-api.html">Java API</a></li>
                 <li><a href="python-api.html">Python API</a></li>
                 <li><a href="cpp-api.html">C++ API</a></li>
@@ -692,8 +691,11 @@ repeated numRules times:
 varint   sharedPrefixLen       (bytes shared with previous column name)
 varint   suffixLen             (bytes of new suffix)
 bytes    suffix                (suffixLen bytes, raw or BPE-encoded)
-varint   globalColumnIndex     (original column index before name-sorting)
-TypeDescriptor</code></pre>
+TypeDescriptor
+
+--- original column order (delta + zigzag encoded) ---
+repeated numColumns times:
+    zigzag_varint   delta     (sorted position delta from previous; first relative to 0)</code></pre>
             <p>
                 The first column has <code>sharedPrefixLen = 0</code>. To reconstruct a column name,
                 take the first <code>sharedPrefixLen</code> bytes from the previous name and append
@@ -701,8 +703,12 @@ TypeDescriptor</code></pre>
                 expanding tokens &ge; 0x80 using the merge rules.
             </p>
             <p>
-                The <code>globalColumnIndex</code> records the original column position before name-sorting.
-                This allows the reader to restore the original schema column order when returning data to the caller.
+                Columns are stored on disk in name-sorted order for front-coding compression.
+                The original (user-defined) column order is preserved via a delta+zigzag-encoded
+                permutation at the end of the schema block. When reading without an explicit
+                projection, columns are returned in their original input order. The delta encoding
+                produces long runs of +1 for locally-ordered column groups, which compress
+                extremely well under zstd.
             </p>
 
             <h3>TypeDescriptor</h3>

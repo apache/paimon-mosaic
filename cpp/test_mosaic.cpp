@@ -87,18 +87,11 @@ static std::vector<uint8_t> write_and_get(
 }
 
 static std::shared_ptr<arrow::RecordBatch> read_row_group(
-    mosaic::Reader& reader, uint32_t rg,
-    const uint32_t* cols = nullptr, uint32_t num_cols = 0)
+    mosaic::Reader& reader, uint32_t rg)
 {
     struct ArrowArray c_array;
     struct ArrowSchema c_schema;
-
-    if (cols && num_cols > 0) {
-        reader.read_row_group(rg, cols, num_cols, &c_array, &c_schema);
-    } else {
-        reader.read_row_group(rg, &c_array, &c_schema);
-    }
-
+    reader.read_row_group(rg, &c_array, &c_schema);
     auto result = arrow::ImportRecordBatch(&c_array, &c_schema);
     assert(result.ok());
     return result.ValueUnsafe();
@@ -141,9 +134,9 @@ static void test_basic_roundtrip() {
     ASSERT_EQ(rb->num_rows(), 50);
     ASSERT_EQ(rb->num_columns(), 3);
 
-    auto ids = std::static_pointer_cast<arrow::Int32Array>(rb->column(0));
-    auto names = std::static_pointer_cast<arrow::StringArray>(rb->column(1));
-    auto scores = std::static_pointer_cast<arrow::DoubleArray>(rb->column(2));
+    auto ids = std::static_pointer_cast<arrow::Int32Array>(rb->GetColumnByName("id"));
+    auto names = std::static_pointer_cast<arrow::StringArray>(rb->GetColumnByName("name"));
+    auto scores = std::static_pointer_cast<arrow::DoubleArray>(rb->GetColumnByName("score"));
 
     for (int i = 0; i < 50; i++) {
         ASSERT_EQ(ids->Value(i), i);
@@ -179,7 +172,7 @@ static void test_null_values() {
     auto rb = read_row_group(reader, 0);
     ASSERT_EQ(rb->num_rows(), 3);
 
-    auto names = std::static_pointer_cast<arrow::StringArray>(rb->column(1));
+    auto names = std::static_pointer_cast<arrow::StringArray>(rb->GetColumnByName("name"));
     ASSERT_TRUE(!names->IsNull(0));
     ASSERT_EQ(names->GetString(0), "hello");
     ASSERT_TRUE(names->IsNull(1));
@@ -242,14 +235,14 @@ static void test_all_types() {
     ASSERT_EQ(rb->num_rows(), 1);
     ASSERT_EQ(rb->num_columns(), 9);
 
-    ASSERT_TRUE(std::static_pointer_cast<arrow::BooleanArray>(rb->column(0))->Value(0));
-    ASSERT_EQ(std::static_pointer_cast<arrow::Int8Array>(rb->column(1))->Value(0), 42);
-    ASSERT_EQ(std::static_pointer_cast<arrow::Int16Array>(rb->column(2))->Value(0), 1234);
-    ASSERT_EQ(std::static_pointer_cast<arrow::Int32Array>(rb->column(3))->Value(0), 100000);
-    ASSERT_EQ(std::static_pointer_cast<arrow::Int64Array>(rb->column(4))->Value(0), 9999999999LL);
-    ASSERT_TRUE(std::abs(std::static_pointer_cast<arrow::FloatArray>(rb->column(5))->Value(0) - 3.14f) < 1e-5f);
-    ASSERT_TRUE(std::abs(std::static_pointer_cast<arrow::DoubleArray>(rb->column(6))->Value(0) - 2.718281828) < 1e-9);
-    ASSERT_EQ(std::static_pointer_cast<arrow::StringArray>(rb->column(7))->GetString(0), "hello");
+    ASSERT_TRUE(std::static_pointer_cast<arrow::BooleanArray>(rb->GetColumnByName("f_bool"))->Value(0));
+    ASSERT_EQ(std::static_pointer_cast<arrow::Int8Array>(rb->GetColumnByName("f_int8"))->Value(0), 42);
+    ASSERT_EQ(std::static_pointer_cast<arrow::Int16Array>(rb->GetColumnByName("f_int16"))->Value(0), 1234);
+    ASSERT_EQ(std::static_pointer_cast<arrow::Int32Array>(rb->GetColumnByName("f_int32"))->Value(0), 100000);
+    ASSERT_EQ(std::static_pointer_cast<arrow::Int64Array>(rb->GetColumnByName("f_int64"))->Value(0), 9999999999LL);
+    ASSERT_TRUE(std::abs(std::static_pointer_cast<arrow::FloatArray>(rb->GetColumnByName("f_float32"))->Value(0) - 3.14f) < 1e-5f);
+    ASSERT_TRUE(std::abs(std::static_pointer_cast<arrow::DoubleArray>(rb->GetColumnByName("f_float64"))->Value(0) - 2.718281828) < 1e-9);
+    ASSERT_EQ(std::static_pointer_cast<arrow::StringArray>(rb->GetColumnByName("f_utf8"))->GetString(0), "hello");
     printf("  PASS test_all_types\n");
 }
 
@@ -329,11 +322,44 @@ static void test_projection() {
     buf.data = data_vec;
     auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
 
-    uint32_t cols[] = {0, 1};
-    auto rb = read_row_group(reader, 0, cols, 2);
-    ASSERT_EQ(rb->num_columns(), 2);
+    const char* cols[] = {"c", "a", "b"};
+    reader.set_projection(cols, 3);
+    auto rb = read_row_group(reader, 0);
+    ASSERT_EQ(rb->num_columns(), 3);
     ASSERT_EQ(rb->num_rows(), 20);
+    ASSERT_EQ(rb->schema()->field(0)->name(), "c");
+    ASSERT_EQ(rb->schema()->field(1)->name(), "a");
+    ASSERT_EQ(rb->schema()->field(2)->name(), "b");
     printf("  PASS test_projection\n");
+}
+
+static void test_projection_empty() {
+    auto schema = arrow::schema({
+        arrow::field("a", arrow::int32()),
+        arrow::field("b", arrow::utf8()),
+    });
+
+    arrow::Int32Builder ab;
+    arrow::StringBuilder bb;
+    for (int i = 0; i < 5; i++) {
+        assert(ab.Append(i).ok());
+        assert(bb.Append("v" + std::to_string(i)).ok());
+    }
+    auto batch = arrow::RecordBatch::Make(schema, 5, {
+        ab.Finish().ValueUnsafe(), bb.Finish().ValueUnsafe(),
+    });
+
+    auto data_vec = write_and_get(schema, batch);
+
+    MemBuffer buf;
+    buf.data = data_vec;
+    auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
+
+    reader.set_projection(nullptr, 0);
+    auto rb = read_row_group(reader, 0);
+    ASSERT_EQ(rb->num_columns(), 0);
+    ASSERT_EQ(rb->num_rows(), 5);
+    printf("  PASS test_projection_empty\n");
 }
 
 static void test_statistics() {
@@ -357,7 +383,7 @@ static void test_statistics() {
     });
 
     mosaic::WriterOptions opts;
-    uint32_t stats_cols[] = {0, 2};
+    const char* stats_cols[] = {"id", "score"};
     opts.stats_columns = stats_cols;
     opts.num_stats_columns = 2;
     auto data_vec = write_and_get(schema, batch, opts);
@@ -370,7 +396,7 @@ static void test_statistics() {
     ASSERT_TRUE(stats.size() > 0);
 
     for (auto& s : stats) {
-        ASSERT_TRUE(s.column_index == 0 || s.column_index == 2);
+        ASSERT_TRUE(s.column_name == "id" || s.column_name == "score");
         ASSERT_EQ(s.null_count, 0u);
         ASSERT_TRUE(s.has_min_max());
     }
@@ -404,7 +430,7 @@ static void test_compression_zstd() {
     auto rb = read_row_group(reader, 0);
     ASSERT_EQ(rb->num_rows(), 100);
 
-    auto xs = std::static_pointer_cast<arrow::Int32Array>(rb->column(0));
+    auto xs = std::static_pointer_cast<arrow::Int32Array>(rb->GetColumnByName("x"));
     for (int i = 0; i < 100; i++) {
         ASSERT_EQ(xs->Value(i), i);
     }
@@ -413,21 +439,21 @@ static void test_compression_zstd() {
 
 static void test_schema_roundtrip() {
     auto schema = arrow::schema({
-        arrow::field("id", arrow::int32(), false),
         arrow::field("name", arrow::utf8(), true),
+        arrow::field("id", arrow::int32(), false),
         arrow::field("score", arrow::float64(), true),
     });
 
-    arrow::Int32Builder sr_id_b;
-    assert(sr_id_b.Append(1).ok());
     arrow::StringBuilder sr_name_b;
     assert(sr_name_b.Append("x").ok());
+    arrow::Int32Builder sr_id_b;
+    assert(sr_id_b.Append(1).ok());
     arrow::DoubleBuilder sr_score_b;
     assert(sr_score_b.Append(1.0).ok());
 
     auto batch = arrow::RecordBatch::Make(schema, 1, {
-        sr_id_b.Finish().ValueUnsafe(),
         sr_name_b.Finish().ValueUnsafe(),
+        sr_id_b.Finish().ValueUnsafe(),
         sr_score_b.Finish().ValueUnsafe(),
     });
 
@@ -444,11 +470,11 @@ static void test_schema_roundtrip() {
     auto read_schema = imported.ValueUnsafe();
 
     ASSERT_EQ(read_schema->num_fields(), 3);
-    ASSERT_EQ(read_schema->field(0)->name(), "id");
-    ASSERT_EQ(read_schema->field(1)->name(), "name");
+    ASSERT_EQ(read_schema->field(0)->name(), "name");
+    ASSERT_EQ(read_schema->field(1)->name(), "id");
     ASSERT_EQ(read_schema->field(2)->name(), "score");
-    ASSERT_TRUE(!read_schema->field(0)->nullable());
-    ASSERT_TRUE(read_schema->field(1)->nullable());
+    ASSERT_TRUE(read_schema->field(0)->nullable());
+    ASSERT_TRUE(!read_schema->field(1)->nullable());
     printf("  PASS test_schema_roundtrip\n");
 }
 
@@ -500,8 +526,8 @@ static void test_multiple_row_groups() {
     int offset = 0;
     for (uint32_t rg = 0; rg < reader.num_row_groups(); rg++) {
         auto rb = read_row_group(reader, rg);
-        auto ids = std::static_pointer_cast<arrow::Int32Array>(rb->column(0));
-        auto datas = std::static_pointer_cast<arrow::Int64Array>(rb->column(1));
+        auto ids = std::static_pointer_cast<arrow::Int32Array>(rb->GetColumnByName("id"));
+        auto datas = std::static_pointer_cast<arrow::Int64Array>(rb->GetColumnByName("data"));
         for (int64_t i = 0; i < rb->num_rows(); i++) {
             ASSERT_EQ(ids->Value(i), offset + static_cast<int>(i));
             ASSERT_EQ(datas->Value(i), static_cast<int64_t>(offset + i) * 3);
@@ -533,7 +559,7 @@ static void test_writer_stats() {
     });
 
     mosaic::WriterOptions opts;
-    uint32_t stats_cols[] = {0, 2};
+    const char* stats_cols[] = {"id", "score"};
     opts.stats_columns = stats_cols;
     opts.num_stats_columns = 2;
 
@@ -555,13 +581,13 @@ static void test_writer_stats() {
     ASSERT_TRUE(stats.size() > 0);
 
     for (auto& s : stats) {
-        ASSERT_TRUE(s.column_index == 0 || s.column_index == 2);
+        ASSERT_TRUE(s.column_name == "id" || s.column_name == "score");
         ASSERT_EQ(s.null_count, 0u);
         ASSERT_TRUE(s.has_min_max());
     }
 
     auto id_stat = std::find_if(stats.begin(), stats.end(),
-        [](const mosaic::ColumnStatistics& s) { return s.column_index == 0; });
+        [](const mosaic::ColumnStatistics& s) { return s.column_name == "id"; });
     ASSERT_TRUE(id_stat != stats.end());
     ASSERT_EQ(id_stat->min_value.size(), 4u);
     ASSERT_EQ(id_stat->max_value.size(), 4u);
@@ -599,7 +625,7 @@ static void test_writer_stats_with_nulls() {
 
     mosaic::WriterOptions opts;
     opts.num_buckets = 1;
-    uint32_t stats_cols[] = {0, 1};
+    const char* stats_cols[] = {"a", "b"};
     opts.stats_columns = stats_cols;
     opts.num_stats_columns = 2;
 
@@ -621,7 +647,7 @@ static void test_writer_stats_with_nulls() {
     ASSERT_EQ(stats.size(), 2u);
 
     auto a_stat = std::find_if(stats.begin(), stats.end(),
-        [](const mosaic::ColumnStatistics& s) { return s.column_index == 0; });
+        [](const mosaic::ColumnStatistics& s) { return s.column_name == "a"; });
     ASSERT_TRUE(a_stat != stats.end());
     ASSERT_EQ(a_stat->null_count, 1u);
     ASSERT_TRUE(a_stat->has_min_max());
@@ -634,7 +660,7 @@ static void test_writer_stats_with_nulls() {
     ASSERT_EQ(max_a, 20);
 
     auto b_stat = std::find_if(stats.begin(), stats.end(),
-        [](const mosaic::ColumnStatistics& s) { return s.column_index == 1; });
+        [](const mosaic::ColumnStatistics& s) { return s.column_name == "b"; });
     ASSERT_TRUE(b_stat != stats.end());
     ASSERT_EQ(b_stat->null_count, 2u);
     ASSERT_TRUE(b_stat->has_min_max());
@@ -664,7 +690,7 @@ static void test_writer_stats_all_null() {
 
     mosaic::WriterOptions opts;
     opts.num_buckets = 1;
-    uint32_t stats_cols[] = {0};
+    const char* stats_cols[] = {"x"};
     opts.stats_columns = stats_cols;
     opts.num_stats_columns = 1;
 
@@ -684,6 +710,7 @@ static void test_writer_stats_all_null() {
     ASSERT_EQ(writer.num_row_groups(), 1u);
     auto stats = writer.get_row_group_statistics(0);
     ASSERT_EQ(stats.size(), 1u);
+    ASSERT_EQ(stats[0].column_name, "x");
     ASSERT_EQ(stats[0].null_count, 3u);
     ASSERT_TRUE(!stats[0].has_min_max());
     printf("  PASS test_writer_stats_all_null\n");
@@ -707,7 +734,7 @@ static void test_writer_stats_matches_reader() {
 
     mosaic::WriterOptions opts;
     opts.num_buckets = 1;
-    uint32_t stats_cols[] = {0, 1};
+    const char* stats_cols[] = {"id", "value"};
     opts.stats_columns = stats_cols;
     opts.num_stats_columns = 2;
 
@@ -733,12 +760,68 @@ static void test_writer_stats_matches_reader() {
 
     ASSERT_EQ(writer_stats.size(), reader_stats.size());
     for (size_t i = 0; i < writer_stats.size(); i++) {
-        ASSERT_EQ(writer_stats[i].column_index, reader_stats[i].column_index);
+        ASSERT_EQ(writer_stats[i].column_name, reader_stats[i].column_name);
         ASSERT_EQ(writer_stats[i].null_count, reader_stats[i].null_count);
         ASSERT_EQ(writer_stats[i].min_value, reader_stats[i].min_value);
         ASSERT_EQ(writer_stats[i].max_value, reader_stats[i].max_value);
     }
     printf("  PASS test_writer_stats_matches_reader\n");
+}
+
+static void test_stats_empty_string_min() {
+    auto schema = arrow::schema({
+        arrow::field("s", arrow::utf8()),
+    });
+
+    arrow::StringBuilder s_b;
+    assert(s_b.Append("").ok());
+    assert(s_b.Append("b").ok());
+
+    auto batch = arrow::RecordBatch::Make(schema, 2, {
+        s_b.Finish().ValueUnsafe(),
+    });
+
+    mosaic::WriterOptions opts;
+    opts.num_buckets = 1;
+    const char* stats_cols[] = {"s"};
+    opts.stats_columns = stats_cols;
+    opts.num_stats_columns = 1;
+
+    MemBuffer write_buf;
+    struct ArrowSchema c_schema;
+    auto st = arrow::ExportSchema(*schema, &c_schema);
+    assert(st.ok());
+    mosaic::Writer writer(make_output(write_buf), &c_schema, opts);
+
+    struct ArrowArray c_array;
+    struct ArrowSchema c_batch_schema;
+    st = arrow::ExportRecordBatch(*batch, &c_array, &c_batch_schema);
+    assert(st.ok());
+    writer.write(&c_array, &c_batch_schema);
+    writer.close();
+
+    // Writer stats
+    ASSERT_EQ(writer.num_row_groups(), 1u);
+    auto writer_stats = writer.get_row_group_statistics(0);
+    ASSERT_EQ(writer_stats.size(), 1u);
+    ASSERT_EQ(writer_stats[0].column_name, "s");
+    ASSERT_TRUE(writer_stats[0].has_min_max());
+    ASSERT_EQ(writer_stats[0].min_value.size(), 0u);
+    ASSERT_EQ(writer_stats[0].max_value, (std::vector<uint8_t>{'b'}));
+    ASSERT_EQ(writer_stats[0].null_count, 0u);
+
+    // Reader stats
+    MemBuffer buf;
+    buf.data = write_buf.data;
+    auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
+    auto reader_stats = reader.get_row_group_statistics(0);
+    ASSERT_EQ(reader_stats.size(), 1u);
+    ASSERT_EQ(reader_stats[0].column_name, "s");
+    ASSERT_TRUE(reader_stats[0].has_min_max());
+    ASSERT_EQ(reader_stats[0].min_value.size(), 0u);
+    ASSERT_EQ(reader_stats[0].max_value, (std::vector<uint8_t>{'b'}));
+    ASSERT_EQ(reader_stats[0].null_count, 0u);
+    printf("  PASS test_stats_empty_string_min\n");
 }
 
 int main() {
@@ -748,6 +831,7 @@ int main() {
     test_all_types();
     test_timestamp_ns_roundtrip();
     test_projection();
+    test_projection_empty();
     test_statistics();
     test_compression_zstd();
     test_schema_roundtrip();
@@ -756,6 +840,7 @@ int main() {
     test_writer_stats_with_nulls();
     test_writer_stats_all_null();
     test_writer_stats_matches_reader();
-    printf("All %d tests passed.\n", 13);
+    test_stats_empty_string_min();
+    printf("All %d tests passed.\n", 15);
     return 0;
 }

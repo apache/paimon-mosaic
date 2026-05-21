@@ -81,6 +81,7 @@ pub fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
 
 struct ColTracker {
     column_index: usize,
+    batch_col_index: usize,
     data_type: DataType,
     null_count: usize,
     min: Option<Value>,
@@ -92,11 +93,12 @@ pub struct StatsCollector {
 }
 
 impl StatsCollector {
-    pub fn new(columns: &[(usize, DataType)]) -> Self {
+    pub fn new(columns: &[(usize, usize, DataType)]) -> Self {
         let trackers = columns
             .iter()
-            .map(|(idx, dt)| ColTracker {
+            .map(|(idx, batch_idx, dt)| ColTracker {
                 column_index: *idx,
+                batch_col_index: *batch_idx,
                 data_type: dt.clone(),
                 null_count: 0,
                 min: None,
@@ -112,7 +114,7 @@ impl StatsCollector {
 
     pub fn update(&mut self, row: &[Value]) {
         for tracker in &mut self.trackers {
-            let value = &row[tracker.column_index];
+            let value = &row[tracker.batch_col_index];
             if value.is_null() {
                 tracker.null_count += 1;
                 continue;
@@ -126,7 +128,7 @@ impl StatsCollector {
 
     pub fn update_batch(&mut self, batch: &RecordBatch) {
         for tracker in &mut self.trackers {
-            let array = batch.column(tracker.column_index);
+            let array = batch.column(tracker.batch_col_index);
             tracker.null_count += array.null_count();
             if !supports_stats(&tracker.data_type) {
                 continue;
@@ -536,7 +538,10 @@ mod tests {
 
     #[test]
     fn test_stats_collector() {
-        let columns = vec![(0usize, DataType::Int32), (1usize, DataType::Float64)];
+        let columns = vec![
+            (0usize, 0usize, DataType::Int32),
+            (1usize, 1usize, DataType::Float64),
+        ];
         let mut collector = StatsCollector::new(&columns);
 
         collector.update(&[Value::Integer(10), Value::Double(1.5)]);

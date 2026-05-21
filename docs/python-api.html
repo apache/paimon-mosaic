@@ -39,7 +39,6 @@
             <ul>
                 <li><a href="index.html">Home</a></li>
                 <li><a href="design.html">Design</a></li>
-                <li><a href="rust-api.html">Rust API</a></li>
                 <li><a href="java-api.html">Java API</a></li>
                 <li><a href="python-api.html" class="active">Python API</a></li>
                 <li><a href="cpp-api.html">C++ API</a></li>
@@ -143,7 +142,7 @@ data = buf.getvalue()</code></pre>
                     <tr><td><code>row_group_max_size</code></td><td>256 MB</td><td>Max uncompressed bytes per row group</td></tr>
                     <tr><td><code>max_dict_total_bytes</code></td><td>32 KB</td><td>Max dictionary size per column</td></tr>
                     <tr><td><code>max_dict_entries</code></td><td>255</td><td>Max distinct values for DICT encoding</td></tr>
-                    <tr><td><code>stats_columns</code></td><td>[]</td><td>Column indices to build min/max stats for filter pushdown</td></tr>
+                    <tr><td><code>stats_columns</code></td><td>[]</td><td>Column names to build min/max stats for filter pushdown</td></tr>
                     <tr><td><code>page_size_threshold</code></td><td>32 KB</td><td>Min avg column page size to enable paged mode (per-column compression)</td></tr>
                 </tbody>
             </table>
@@ -158,7 +157,7 @@ data = buf.getvalue()</code></pre>
                     <tr><td><code>estimated_file_size()</code></td><td><code>int</code></td><td>Estimated output file size in bytes (for file rolling)</td></tr>
                     <tr><td><code>close()</code></td><td><code>None</code></td><td>Flush remaining data and write footer</td></tr>
                     <tr><td><code>num_row_groups</code></td><td><code>int</code></td><td>Number of row groups written (available after close)</td></tr>
-                    <tr><td><code>get_row_group_statistics(rg)</code></td><td><code>list[ColumnStatistics]</code></td><td>Column statistics for a row group (available after close)</td></tr>
+                    <tr><td><code>get_row_group_statistics(rg)</code></td><td><code>dict[str, ColumnStatistics]</code></td><td>Column statistics for a row group, keyed by column name (available after close)</td></tr>
                 </tbody>
             </table>
 
@@ -178,14 +177,12 @@ reader = MosaicReader.from_input_file(read_at, len(data))</code></pre>
 
             <h3>2. Inspect the Schema</h3>
             <p>
-                The reader exposes the file schema as a standard PyArrow <code>Schema</code> object:
+                The reader exposes the file schema as a standard PyArrow <code>Schema</code> object.
+                Columns are in the original input order by default:
             </p>
 <pre><code>print(reader.schema)
 <span class="kw">for</span> field <span class="kw">in</span> reader.schema:
-    print(<span class="str">f"name={field.name} type={field.type} nullable={field.nullable}"</span>)
-
-name_col = reader.schema.get_field_index(<span class="str">"name"</span>)
-score_col = reader.schema.get_field_index(<span class="str">"score"</span>)</code></pre>
+    print(<span class="str">f"name={field.name} type={field.type} nullable={field.nullable}"</span>)</code></pre>
 
             <h3>Reader Methods</h3>
             <table>
@@ -193,12 +190,13 @@ score_col = reader.schema.get_field_index(<span class="str">"score"</span>)</cod
                     <tr><th>Method / Property</th><th>Return</th><th>Description</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td><code>schema</code></td><td><code>pa.Schema</code></td><td>Arrow Schema for the file</td></tr>
+                    <tr><td><code>schema</code></td><td><code>pa.Schema</code></td><td>Arrow Schema for the file (columns in original input order)</td></tr>
                     <tr><td><code>num_row_groups</code></td><td><code>int</code></td><td>Row group count</td></tr>
                     <tr><td><code>row_group_num_rows(rg)</code></td><td><code>int</code></td><td>Number of rows in a specific row group</td></tr>
-                    <tr><td><code>read_row_group(rg, columns=None)</code></td><td><code>pa.RecordBatch</code></td><td>Read a row group (optionally with projection)</td></tr>
-                    <tr><td><code>read_all(columns=None)</code></td><td><code>pa.Table</code></td><td>Read entire file as a Table</td></tr>
-                    <tr><td><code>get_row_group_statistics(rg)</code></td><td><code>list[ColumnStatistics]</code></td><td>Column statistics for a row group</td></tr>
+                    <tr><td><code>project(columns)</code></td><td><code>None</code></td><td>Set projection: subsequent reads return only the named columns in the specified order</td></tr>
+                    <tr><td><code>read_row_group(rg)</code></td><td><code>pa.RecordBatch</code></td><td>Read a row group (all columns or projected columns if project() was called)</td></tr>
+                    <tr><td><code>read_all()</code></td><td><code>pa.Table</code></td><td>Read entire file as a Table</td></tr>
+                    <tr><td><code>get_row_group_statistics(rg)</code></td><td><code>dict[str, ColumnStatistics]</code></td><td>Column statistics for a row group, keyed by column name</td></tr>
                 </tbody>
             </table>
 
@@ -214,33 +212,37 @@ score_col = reader.schema.get_field_index(<span class="str">"score"</span>)</cod
 
             <h3>Projection Pushdown</h3>
             <p>
-                Use <code>read_row_group(rg_index, columns=[...])</code> to read only specific columns.
+                Use <code>project()</code> to select and reorder columns by name.
                 Only the buckets containing the projected columns are decompressed, significantly
-                reducing I/O and memory for wide tables.
+                reducing I/O and memory for wide tables. The output preserves the order you specify:
             </p>
-<pre><code><span class="cmt"># Only read "name" and "score" columns</span>
-projected = [name_col, score_col]
-batch = reader.read_row_group(rg, columns=projected)
-<span class="cmt"># batch contains only the projected columns</span></code></pre>
+<pre><code><span class="cmt"># Only read "name" and "score" columns, in that order</span>
+reader.project([<span class="str">"name"</span>, <span class="str">"score"</span>])
+batch = reader.read_row_group(rg)
+<span class="cmt"># batch contains only "name" and "score", in that order</span>
+
+<span class="cmt"># Empty projection: count-only read (0 columns, row count preserved)</span>
+reader.project([])
+num_rows = reader.row_group_num_rows(rg)</code></pre>
 
             <h3>Column Statistics (Filter Pushdown)</h3>
             <p>
                 When stats columns are configured during writing, statistics are available both
                 from the writer (after close) and from the reader:
             </p>
-<pre><code>opts = WriterOptions(stats_columns=[<span class="num">0</span>, <span class="num">2</span>])  <span class="cmt"># build stats for columns 0 and 2</span></code></pre>
+<pre><code>opts = WriterOptions(stats_columns=[<span class="str">"id"</span>, <span class="str">"score"</span>])  <span class="cmt"># build stats for "id" and "score"</span></code></pre>
 <pre><code><span class="cmt"># Get stats directly from the writer after close</span>
 <span class="kw">with</span> MosaicWriter(buf, pa_schema, opts) <span class="kw">as</span> writer:
     writer.write(batch)
 
 <span class="kw">for</span> rg <span class="kw">in</span> range(writer.num_row_groups):
-    <span class="kw">for</span> stat <span class="kw">in</span> writer.get_row_group_statistics(rg):
-        col_idx = stat.column_index
-        null_count = stat.null_count</code></pre>
+    stats = writer.get_row_group_statistics(rg)  <span class="cmt"># dict[str, ColumnStatistics]</span>
+    id_stats = stats[<span class="str">"id"</span>]
+    null_count = id_stats.null_count</code></pre>
 <pre><code><span class="cmt"># Or read stats from the reader</span>
 <span class="kw">for</span> rg <span class="kw">in</span> range(reader.num_row_groups):
-    <span class="kw">for</span> stat <span class="kw">in</span> reader.get_row_group_statistics(rg):
-        col_idx = stat.column_index
+    stats = reader.get_row_group_statistics(rg)
+    <span class="kw">for</span> col_name, stat <span class="kw">in</span> stats.items():
         null_count = stat.null_count
         <span class="kw">if</span> stat.has_min_max:
             min_val = stat.min   <span class="cmt"># bytes, big-endian wire format</span>
@@ -252,7 +254,6 @@ batch = reader.read_row_group(rg, columns=projected)
                     <tr><th>Attribute</th><th>Type</th><th>Description</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td><code>column_index</code></td><td><code>int</code></td><td>Column index in the schema</td></tr>
                     <tr><td><code>null_count</code></td><td><code>int</code></td><td>Number of null values</td></tr>
                     <tr><td><code>has_min_max</code></td><td><code>bool</code></td><td>Whether min/max are available</td></tr>
                     <tr><td><code>min</code></td><td><code>bytes</code></td><td>Min value as big-endian bytes (None if all-null)</td></tr>
@@ -297,7 +298,7 @@ table = mosaic.read_table(
                 </thead>
                 <tbody>
                     <tr><td><code>write_table(table, stream, options=None)</code></td><td>Write a <code>pa.Table</code> via an OutputFile (file-like object)</td></tr>
-                    <tr><td><code>read_table(read_at_fn, file_length, columns=None)</code></td><td>Read a <code>pa.Table</code> via an InputFile (<code>read_at</code> callback + length)</td></tr>
+                    <tr><td><code>read_table(read_at_fn, file_length, columns=None)</code></td><td>Read a <code>pa.Table</code> via an InputFile; <code>columns</code> is a list of column names to project</td></tr>
                 </tbody>
             </table>
 
@@ -342,8 +343,9 @@ reader = MosaicReader.from_input_file(
 
             <div class="warning">
                 <strong>Column ordering</strong>
-                The reader preserves the original schema column order.
-                Use <code>reader.schema</code> to inspect the schema and locate columns by name.
+                Columns are stored on disk in name-sorted order for compression.
+                The reader returns columns in the original input order by default.
+                Use <code>project()</code> to select and reorder output columns.
             </div>
 
             <div class="tip">

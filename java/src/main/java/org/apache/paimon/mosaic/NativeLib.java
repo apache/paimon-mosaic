@@ -104,18 +104,17 @@ final class NativeLib {
     static native long nativeWriterOpen(OutputStream stream, long arrowSchemaAddr,
                                         int numBuckets, int compression, int zstdLevel,
                                         long rowGroupMaxSize, int maxDictTotalBytes,
-                                        int maxDictEntries, int[] statsColumns,
+                                        int maxDictEntries, String[] statsColumns,
                                         int pageSizeThreshold);
     static native void nativeWriterClose(long handle);
     static native void nativeWriterFree(long handle);
     static native long nativeWriterEstimatedSize(long handle);
     static native void nativeWriterWriteBatch(long writerHandle, long arrayAddr, long schemaAddr);
     static native int nativeWriterNumRowGroups(long handle);
-    static native int nativeWriterRowGroupNumStats(long handle, int rgIndex);
-    static native int nativeWriterRowGroupStatColumnIndex(long handle, int rgIndex, int statIndex);
-    static native long nativeWriterRowGroupStatNullCount(long handle, int rgIndex, int statIndex);
-    static native byte[] nativeWriterRowGroupStatMin(long handle, int rgIndex, int statIndex);
-    static native byte[] nativeWriterRowGroupStatMax(long handle, int rgIndex, int statIndex);
+    static native String[] nativeWriterRowGroupStatNames(long handle, int rgIndex);
+    static native long[] nativeWriterRowGroupStatNullCounts(long handle, int rgIndex);
+    static native byte[][] nativeWriterRowGroupStatMins(long handle, int rgIndex);
+    static native byte[][] nativeWriterRowGroupStatMaxs(long handle, int rgIndex);
 
     // Reader
     static native long nativeReaderOpen(Object inputFile, long fileLength);
@@ -123,7 +122,7 @@ final class NativeLib {
     static native int nativeReaderExportSchema(long handle, long schemaAddr);
     static native int nativeReaderNumRowGroups(long handle);
     static native long nativeReaderOpenRowGroup(long handle, int rgIndex);
-    static native long nativeReaderOpenRowGroupProjected(long handle, int rgIndex, int[] columns);
+    static native void nativeReaderSetProjection(long handle, String[] columns);
 
     // RowGroupReader
     static native int nativeRowGroupReaderNumRows(long handle);
@@ -134,9 +133,8 @@ final class NativeLib {
     static native int nativeReaderRowGroupNumRows(long handle, int rgIndex);
 
     // Row group stats
-    static native int nativeReaderRowGroupNumStats(long handle, int rgIndex);
-    static native int nativeReaderRowGroupStatColumnIndex(long handle, int rgIndex, int statIndex);
-    static native long nativeReaderRowGroupStatNullCount(long handle, int rgIndex, int statIndex);
-    static native byte[] nativeReaderRowGroupStatMin(long handle, int rgIndex, int statIndex);
-    static native byte[] nativeReaderRowGroupStatMax(long handle, int rgIndex, int statIndex);
+    static native String[] nativeReaderRowGroupStatNames(long handle, int rgIndex);
+    static native long[] nativeReaderRowGroupStatNullCounts(long handle, int rgIndex);
+    static native byte[][] nativeReaderRowGroupStatMins(long handle, int rgIndex);
+    static native byte[][] nativeReaderRowGroupStatMaxs(long handle, int rgIndex);
 }

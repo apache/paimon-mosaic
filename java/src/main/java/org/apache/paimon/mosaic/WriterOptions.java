@@ -29,7 +29,7 @@ public class WriterOptions {
     private long rowGroupMaxSize = 256L * 1024 * 1024;
     private int maxDictTotalBytes = 32 * 1024;
     private int maxDictEntries = 255;
-    private int[] statsColumns = new int[0];
+    private String[] statsColumns = new String[0];
     private int pageSizeThreshold = 32 * 1024;
 
     public WriterOptions() {}
@@ -64,7 +64,7 @@ public class WriterOptions {
         return this;
     }
 
-    public WriterOptions statsColumns(int... columns) {
+    public WriterOptions statsColumns(String... columns) {
         this.statsColumns = columns.clone();
         return this;
     }
@@ -80,6 +80,6 @@ public class WriterOptions {
     long getRowGroupMaxSize() { return rowGroupMaxSize; }
     int getMaxDictTotalBytes() { return maxDictTotalBytes; }
     int getMaxDictEntries() { return maxDictEntries; }
-    int[] getStatsColumns() { return statsColumns; }
+    String[] getStatsColumns() { return statsColumns; }
     int getPageSizeThreshold() { return pageSizeThreshold; }
 }

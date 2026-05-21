@@ -39,7 +39,6 @@
             <ul>
                 <li><a href="index.html">Home</a></li>
                 <li><a href="design.html">Design</a></li>
-                <li><a href="rust-api.html">Rust API</a></li>
                 <li><a href="java-api.html">Java API</a></li>
                 <li><a href="python-api.html">Python API</a></li>
                 <li><a href="cpp-api.html">C++ API</a></li>
@@ -160,7 +159,7 @@ g++ -std=c++17 -I include/ example.cpp \
                     <tr><td><code>row_group_max_size</code></td><td>uint64_t</td><td>256 MB</td><td>Max row group size</td></tr>
                     <tr><td><code>max_dict_total_bytes</code></td><td>uint32_t</td><td>32 KB</td><td>Max dict size per column</td></tr>
                     <tr><td><code>max_dict_entries</code></td><td>uint32_t</td><td>255</td><td>Max dict entries per column</td></tr>
-                    <tr><td><code>stats_columns</code></td><td>const uint32_t*</td><td>NULL</td><td>Column indices to build min/max stats for</td></tr>
+                    <tr><td><code>stats_columns</code></td><td>const char* const*</td><td>NULL</td><td>Column names to build min/max stats for</td></tr>
                     <tr><td><code>num_stats_columns</code></td><td>uint32_t</td><td>0</td><td>Length of stats_columns array</td></tr>
                     <tr><td><code>page_size_threshold</code></td><td>uint32_t</td><td>32 KB</td><td>Min avg column page size to enable paged mode</td></tr>
                 </tbody>
@@ -176,7 +175,7 @@ g++ -std=c++17 -I include/ example.cpp \
                     <tr><td><code>estimated_file_size()</code></td><td><code>int64_t</code></td><td>Estimated output file size in bytes (for file rolling)</td></tr>
                     <tr><td><code>close()</code></td><td><code>void</code></td><td>Flush remaining data and write footer</td></tr>
                     <tr><td><code>num_row_groups()</code></td><td><code>uint32_t</code></td><td>Number of row groups written (available after close)</td></tr>
-                    <tr><td><code>get_row_group_statistics(rg)</code></td><td><code>vector&lt;ColumnStatistics&gt;</code></td><td>Column statistics for a row group (available after close)</td></tr>
+                    <tr><td><code>get_row_group_statistics(rg)</code></td><td><code>vector&lt;ColumnStatistics&gt;</code></td><td>Column statistics for a row group (available after close); each entry has a <code>column_name</code> field</td></tr>
                 </tbody>
             </table>
 
@@ -214,10 +213,10 @@ reader.export_schema(&amp;ffi_schema);
                 <tbody>
                     <tr><td><code>num_row_groups()</code></td><td><code>uint32_t</code></td><td>Row group count</td></tr>
                     <tr><td><code>row_group_num_rows(rg)</code></td><td><code>uint32_t</code></td><td>Number of rows in a specific row group</td></tr>
-                    <tr><td><code>export_schema(&amp;ffi_schema)</code></td><td><code>void</code></td><td>Export schema via Arrow C Data Interface</td></tr>
-                    <tr><td><code>read_row_group(rg, &amp;array, &amp;schema)</code></td><td><code>void</code></td><td>Read all columns of a row group</td></tr>
-                    <tr><td><code>read_row_group(rg, cols, n, &amp;array, &amp;schema)</code></td><td><code>void</code></td><td>Read projected columns of a row group</td></tr>
-                    <tr><td><code>get_row_group_statistics(rg)</code></td><td><code>vector&lt;ColumnStatistics&gt;</code></td><td>Column statistics for a row group</td></tr>
+                    <tr><td><code>export_schema(&amp;ffi_schema)</code></td><td><code>void</code></td><td>Export schema via Arrow C Data Interface (columns in original input order)</td></tr>
+                    <tr><td><code>set_projection(cols, num_cols)</code></td><td><code>void</code></td><td>Set projection: subsequent reads return only the named columns in the specified order</td></tr>
+                    <tr><td><code>read_row_group(rg, &amp;array, &amp;schema)</code></td><td><code>void</code></td><td>Read a row group (all columns or projected columns if set_projection() was called)</td></tr>
+                    <tr><td><code>get_row_group_statistics(rg)</code></td><td><code>vector&lt;ColumnStatistics&gt;</code></td><td>Column statistics for a row group; each entry has a <code>column_name</code> field</td></tr>
                 </tbody>
             </table>
 
@@ -252,16 +251,23 @@ reader.export_schema(&amp;ffi_schema);
 
             <h3>Projection Pushdown</h3>
             <p>
-                Use <code>read_row_group</code> with column indices to read only specific columns.
+                Use <code>set_projection()</code> to select and reorder columns by name.
                 Only the buckets containing the projected columns are decompressed, reducing
-                I/O and memory for wide tables. The returned batch contains only the projected columns.
+                I/O and memory for wide tables. The output preserves the order you specify:
             </p>
-<pre><code><span class="kw">uint32_t</span> projected[] = { <span class="num">0</span>, <span class="num">2</span> };
+<pre><code><span class="cmt">// Only read "name" and "score" columns, in that order</span>
+<span class="kw">const char</span>* cols[] = { <span class="str">"name"</span>, <span class="str">"score"</span> };
+reader.set_projection(cols, <span class="num">2</span>);
+
 ArrowArray ffi_array;
 ArrowSchema ffi_schema;
-reader.read_row_group(<span class="num">0</span>, projected, <span class="num">2</span>, &amp;ffi_array, &amp;ffi_schema);
+reader.read_row_group(<span class="num">0</span>, &amp;ffi_array, &amp;ffi_schema);
 <span class="kw">auto</span> batch = arrow::ImportRecordBatch(&amp;ffi_array, &amp;ffi_schema).ValueOrDie();
-<span class="cmt">// batch contains only the projected columns</span></code></pre>
+<span class="cmt">// batch contains only "name" and "score", in that order</span>
+
+<span class="cmt">// Empty projection: count-only read (0 columns, row count preserved)</span>
+reader.set_projection(<span class="kw">nullptr</span>, <span class="num">0</span>);
+<span class="kw">uint32_t</span> num_rows = reader.row_group_num_rows(<span class="num">0</span>);</code></pre>
 
             <h3>Column Statistics (Filter Pushdown)</h3>
             <p>
@@ -269,7 +275,7 @@ reader.read_row_group(<span class="num">0</span>, projected, <span class="num">2
                 from the writer (after close) and from the reader:
             </p>
 <pre><code><span class="cmt">// Writing with stats (arrow_schema is an ArrowSchema* from C Data Interface)</span>
-<span class="kw">uint32_t</span> stats_cols[] = { <span class="num">0</span>, <span class="num">2</span> };
+<span class="kw">const char</span>* stats_cols[] = { <span class="str">"id"</span>, <span class="str">"score"</span> };
 <span class="ty">mosaic</span>::<span class="ty">WriterOptions</span> opts;
 opts.compression = <span class="num">1</span>;
 opts.stats_columns = stats_cols;
@@ -280,7 +286,7 @@ writer.close();
 <span class="kw">for</span> (<span class="kw">uint32_t</span> rg = <span class="num">0</span>; rg &lt; writer.num_row_groups(); rg++) {
     <span class="kw">auto</span> stats = writer.get_row_group_statistics(rg);
     <span class="kw">for</span> (<span class="kw">const auto</span>&amp; stat : stats) {
-        <span class="kw">uint32_t</span> col_idx = stat.column_index;
+        <span class="cmt">// stat.column_name identifies which column</span>
         <span class="kw">uint64_t</span> null_count = stat.null_count;
         <span class="kw">if</span> (stat.has_min_max()) {
             <span class="cmt">// stat.min_value / stat.max_value are std::vector&lt;uint8_t&gt;</span>
@@ -291,7 +297,7 @@ writer.close();
 <span class="kw">for</span> (<span class="kw">uint32_t</span> rg = <span class="num">0</span>; rg &lt; reader.num_row_groups(); rg++) {
     <span class="kw">auto</span> stats = reader.get_row_group_statistics(rg);
     <span class="kw">for</span> (<span class="kw">const auto</span>&amp; stat : stats) {
-        <span class="kw">uint32_t</span> col_idx = stat.column_index;
+        <span class="cmt">// stat.column_name identifies which column</span>
         <span class="kw">uint64_t</span> null_count = stat.null_count;
         <span class="kw">if</span> (stat.has_min_max()) {
             <span class="cmt">// stat.min_value / stat.max_value are std::vector&lt;uint8_t&gt;</span>
@@ -305,7 +311,7 @@ writer.close();
                     <tr><th>Field</th><th>Type</th><th>Description</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td><code>column_index</code></td><td><code>uint32_t</code></td><td>Column index in the schema</td></tr>
+                    <tr><td><code>column_name</code></td><td><code>std::string</code></td><td>Column name</td></tr>
                     <tr><td><code>null_count</code></td><td><code>uint64_t</code></td><td>Number of null values</td></tr>
                     <tr><td><code>has_min_max()</code></td><td><code>bool</code></td><td>Whether min/max are available</td></tr>
                     <tr><td><code>min_value</code></td><td><code>vector&lt;uint8_t&gt;</code></td><td>Min value as big-endian bytes (empty if all-null)</td></tr>
@@ -399,8 +405,9 @@ writer.close();
 
             <div class="warning">
                 <strong>Column ordering</strong>
-                The reader preserves the original schema column order.
-                Use <code>export_schema()</code> to inspect the schema via Arrow C Data Interface.
+                Columns are stored on disk in name-sorted order for compression.
+                The reader returns columns in the original input order by default.
+                Use <code>set_projection()</code> to select and reorder output columns.
             </div>
 
             <div class="tip">

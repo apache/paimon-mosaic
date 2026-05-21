@@ -24,7 +24,6 @@ import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
-import java.util.List;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -271,18 +270,96 @@ public class MosaicRoundtripTest {
         }
 
         try (MosaicReader reader = readerFromBytes(data)) {
-            int aCol = reader.getSchema().getFields().indexOf(reader.getSchema().findField("a"));
-            int bCol = reader.getSchema().getFields().indexOf(reader.getSchema().findField("b"));
-            int[] projected = {aCol, bCol};
+            reader.project(new String[]{"a", "b"});
 
             int totalRows = 0;
             for (int rg = 0; rg < reader.numRowGroups(); rg++) {
-                try (VectorSchemaRoot batch = reader.readRowGroup(rg, projected, allocator)) {
+                try (VectorSchemaRoot batch = reader.readRowGroup(rg, allocator)) {
                     totalRows += batch.getRowCount();
                     assertEquals(2, batch.getFieldVectors().size());
                 }
             }
             assertEquals(20, totalRows);
+        }
+    }
+
+    @Test
+    public void testProjectionOrder() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.nullable("a", new ArrowType.Int(32, true)),
+                Field.nullable("b", ArrowType.Utf8.INSTANCE),
+                Field.nullable("c", new ArrowType.FloatingPoint(org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE))
+        ));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            IntVector aVec = (IntVector) root.getVector("a");
+            VarCharVector bVec = (VarCharVector) root.getVector("b");
+            Float8Vector cVec = (Float8Vector) root.getVector("c");
+
+            int n = 10;
+            aVec.allocateNew(n);
+            bVec.allocateNew(n);
+            cVec.allocateNew(n);
+            for (int i = 0; i < n; i++) {
+                aVec.set(i, i);
+                bVec.setSafe(i, ("s" + i).getBytes());
+                cVec.set(i, i * 0.5);
+            }
+            root.setRowCount(n);
+            data = writeToBytes(arrowSchema, new WriterOptions().numBuckets(2), writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            reader.project(new String[]{"c", "a", "b"});
+            try (VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+                assertEquals(3, batch.getFieldVectors().size());
+                assertEquals("c", batch.getVector(0).getName());
+                assertEquals("a", batch.getVector(1).getName());
+                assertEquals("b", batch.getVector(2).getName());
+                assertEquals(10, batch.getRowCount());
+
+                Float8Vector cOut = (Float8Vector) batch.getVector(0);
+                IntVector aOut = (IntVector) batch.getVector(1);
+                VarCharVector bOut = (VarCharVector) batch.getVector(2);
+                for (int i = 0; i < 10; i++) {
+                    assertEquals(i, aOut.get(i));
+                    assertEquals("s" + i, new String(bOut.get(i)));
+                    assertEquals(i * 0.5, cOut.get(i), 1e-10);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testProjectionEmpty() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.nullable("a", new ArrowType.Int(32, true)),
+                Field.nullable("b", ArrowType.Utf8.INSTANCE)
+        ));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            IntVector aVec = (IntVector) root.getVector("a");
+            VarCharVector bVec = (VarCharVector) root.getVector("b");
+
+            int n = 5;
+            aVec.allocateNew(n);
+            bVec.allocateNew(n);
+            for (int i = 0; i < n; i++) {
+                aVec.set(i, i);
+                bVec.setSafe(i, ("v" + i).getBytes());
+            }
+            root.setRowCount(n);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            reader.project(new String[]{});
+            try (VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+                assertEquals(0, batch.getFieldVectors().size());
+                assertEquals(5, batch.getRowCount());
+            }
         }
     }
 
@@ -294,7 +371,7 @@ public class MosaicRoundtripTest {
                 Field.nullable("value", new ArrowType.FloatingPoint(org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE))
         ));
 
-        WriterOptions opts = new WriterOptions().statsColumns(0, 2);
+        WriterOptions opts = new WriterOptions().statsColumns("id", "value");
 
         byte[] data;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
@@ -318,10 +395,11 @@ public class MosaicRoundtripTest {
 
         try (MosaicReader reader = readerFromBytes(data)) {
             for (int rg = 0; rg < reader.numRowGroups(); rg++) {
-                java.util.List<ColumnStatistics> stats = reader.getRowGroupStatistics(rg);
+                java.util.Map<String, ColumnStatistics> stats = reader.getRowGroupStatistics(rg);
                 assertTrue(stats.size() > 0);
-                for (ColumnStatistics stat : stats) {
-                    assertTrue(stat.getColumnIndex() == 0 || stat.getColumnIndex() == 2);
+                assertTrue(stats.containsKey("id"));
+                assertTrue(stats.containsKey("value"));
+                for (ColumnStatistics stat : stats.values()) {
                     assertEquals(0, stat.getNullCount());
                     assertTrue(stat.hasMinMax());
                     assertNotNull(stat.getMin());
@@ -649,7 +727,7 @@ public class MosaicRoundtripTest {
                 Field.nullable("b", new ArrowType.Int(64, true))
         ));
 
-        WriterOptions opts = new WriterOptions().statsColumns(0, 1).numBuckets(1);
+        WriterOptions opts = new WriterOptions().statsColumns("a", "b").numBuckets(1);
 
         byte[] data;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
@@ -673,10 +751,10 @@ public class MosaicRoundtripTest {
         }
 
         try (MosaicReader reader = readerFromBytes(data)) {
-            List<ColumnStatistics> stats = reader.getRowGroupStatistics(0);
+            java.util.Map<String, ColumnStatistics> stats = reader.getRowGroupStatistics(0);
             assertEquals(2, stats.size());
 
-            ColumnStatistics aStat = stats.stream().filter(s -> s.getColumnIndex() == 0).findFirst().get();
+            ColumnStatistics aStat = stats.get("a");
             assertEquals(1, aStat.getNullCount());
             assertTrue(aStat.hasMinMax());
             int minA = ByteBuffer.wrap(aStat.getMin()).order(ByteOrder.BIG_ENDIAN).getInt();
@@ -684,7 +762,7 @@ public class MosaicRoundtripTest {
             assertEquals(5, minA);
             assertEquals(20, maxA);
 
-            ColumnStatistics bStat = stats.stream().filter(s -> s.getColumnIndex() == 1).findFirst().get();
+            ColumnStatistics bStat = stats.get("b");
             assertEquals(2, bStat.getNullCount());
             assertTrue(bStat.hasMinMax());
             long minB = ByteBuffer.wrap(bStat.getMin()).order(ByteOrder.BIG_ENDIAN).getLong();
@@ -700,7 +778,7 @@ public class MosaicRoundtripTest {
                 Field.nullable("x", new ArrowType.Int(32, true))
         ));
 
-        WriterOptions opts = new WriterOptions().statsColumns(0).numBuckets(1);
+        WriterOptions opts = new WriterOptions().statsColumns("x").numBuckets(1);
 
         byte[] data;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
@@ -714,10 +792,11 @@ public class MosaicRoundtripTest {
         }
 
         try (MosaicReader reader = readerFromBytes(data)) {
-            List<ColumnStatistics> stats = reader.getRowGroupStatistics(0);
+            java.util.Map<String, ColumnStatistics> stats = reader.getRowGroupStatistics(0);
             assertEquals(1, stats.size());
-            assertEquals(3, stats.get(0).getNullCount());
-            assertFalse(stats.get(0).hasMinMax());
+            ColumnStatistics xStat = stats.get("x");
+            assertEquals(3, xStat.getNullCount());
+            assertFalse(xStat.hasMinMax());
         }
     }
 
@@ -750,18 +829,18 @@ public class MosaicRoundtripTest {
     @Test
     public void testSchemaRoundtrip() {
         Schema arrowSchema = new Schema(Arrays.asList(
-                Field.notNullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("name", ArrowType.Utf8.INSTANCE),
+                Field.notNullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("score", new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE))
         ));
 
         byte[] data;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
-            IntVector ids = (IntVector) root.getVector("id");
             VarCharVector names = (VarCharVector) root.getVector("name");
+            IntVector ids = (IntVector) root.getVector("id");
             Float8Vector scores = (Float8Vector) root.getVector("score");
-            ids.allocateNew(1); names.allocateNew(1); scores.allocateNew(1);
-            ids.set(0, 1); names.setSafe(0, "x".getBytes()); scores.set(0, 1.0);
+            names.allocateNew(1); ids.allocateNew(1); scores.allocateNew(1);
+            names.setSafe(0, "x".getBytes()); ids.set(0, 1); scores.set(0, 1.0);
             root.setRowCount(1);
             data = writeToBytes(arrowSchema, writer -> writer.write(root));
         }
@@ -769,11 +848,11 @@ public class MosaicRoundtripTest {
         try (MosaicReader reader = readerFromBytes(data)) {
             Schema readSchema = reader.getSchema();
             assertEquals(3, readSchema.getFields().size());
-            assertEquals("id", readSchema.getFields().get(0).getName());
-            assertEquals("name", readSchema.getFields().get(1).getName());
+            assertEquals("name", readSchema.getFields().get(0).getName());
+            assertEquals("id", readSchema.getFields().get(1).getName());
             assertEquals("score", readSchema.getFields().get(2).getName());
-            assertFalse(readSchema.getFields().get(0).isNullable());
-            assertTrue(readSchema.getFields().get(1).isNullable());
+            assertFalse(readSchema.getFields().get(1).isNullable());
+            assertTrue(readSchema.getFields().get(0).isNullable());
         }
     }
 
@@ -785,7 +864,7 @@ public class MosaicRoundtripTest {
                 Field.nullable("score", new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE))
         ));
 
-        WriterOptions opts = new WriterOptions().statsColumns(0, 2);
+        WriterOptions opts = new WriterOptions().statsColumns("id", "score");
 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         MosaicWriter writer = new MosaicWriter(baos, arrowSchema, opts, allocator);
@@ -810,17 +889,18 @@ public class MosaicRoundtripTest {
         writer.close();
 
         assertEquals(1, writer.numRowGroups());
-        List<ColumnStatistics> stats = writer.getRowGroupStatistics(0);
+        java.util.Map<String, ColumnStatistics> stats = writer.getRowGroupStatistics(0);
         assertTrue(stats.size() > 0);
-        for (ColumnStatistics stat : stats) {
-            assertTrue(stat.getColumnIndex() == 0 || stat.getColumnIndex() == 2);
+        assertTrue(stats.containsKey("id"));
+        assertTrue(stats.containsKey("score"));
+        for (ColumnStatistics stat : stats.values()) {
             assertEquals(0, stat.getNullCount());
             assertTrue(stat.hasMinMax());
             assertNotNull(stat.getMin());
             assertNotNull(stat.getMax());
         }
 
-        ColumnStatistics idStat = stats.stream().filter(s -> s.getColumnIndex() == 0).findFirst().get();
+        ColumnStatistics idStat = stats.get("id");
         int minId = ByteBuffer.wrap(idStat.getMin()).order(ByteOrder.BIG_ENDIAN).getInt();
         int maxId = ByteBuffer.wrap(idStat.getMax()).order(ByteOrder.BIG_ENDIAN).getInt();
         assertEquals(0, minId);
@@ -834,7 +914,7 @@ public class MosaicRoundtripTest {
                 Field.nullable("b", new ArrowType.Int(64, true))
         ));
 
-        WriterOptions opts = new WriterOptions().statsColumns(0, 1).numBuckets(1);
+        WriterOptions opts = new WriterOptions().statsColumns("a", "b").numBuckets(1);
 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         MosaicWriter writer = new MosaicWriter(baos, arrowSchema, opts, allocator);
@@ -860,10 +940,10 @@ public class MosaicRoundtripTest {
         writer.close();
 
         assertEquals(1, writer.numRowGroups());
-        List<ColumnStatistics> stats = writer.getRowGroupStatistics(0);
+        java.util.Map<String, ColumnStatistics> stats = writer.getRowGroupStatistics(0);
         assertEquals(2, stats.size());
 
-        ColumnStatistics aStat = stats.stream().filter(s -> s.getColumnIndex() == 0).findFirst().get();
+        ColumnStatistics aStat = stats.get("a");
         assertEquals(1, aStat.getNullCount());
         assertTrue(aStat.hasMinMax());
         int minA = ByteBuffer.wrap(aStat.getMin()).order(ByteOrder.BIG_ENDIAN).getInt();
@@ -871,7 +951,7 @@ public class MosaicRoundtripTest {
         assertEquals(5, minA);
         assertEquals(20, maxA);
 
-        ColumnStatistics bStat = stats.stream().filter(s -> s.getColumnIndex() == 1).findFirst().get();
+        ColumnStatistics bStat = stats.get("b");
         assertEquals(2, bStat.getNullCount());
         assertTrue(bStat.hasMinMax());
         long minB = ByteBuffer.wrap(bStat.getMin()).order(ByteOrder.BIG_ENDIAN).getLong();
@@ -886,7 +966,7 @@ public class MosaicRoundtripTest {
                 Field.nullable("x", new ArrowType.Int(32, true))
         ));
 
-        WriterOptions opts = new WriterOptions().statsColumns(0).numBuckets(1);
+        WriterOptions opts = new WriterOptions().statsColumns("x").numBuckets(1);
 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         MosaicWriter writer = new MosaicWriter(baos, arrowSchema, opts, allocator);
@@ -902,10 +982,11 @@ public class MosaicRoundtripTest {
         writer.close();
 
         assertEquals(1, writer.numRowGroups());
-        List<ColumnStatistics> stats = writer.getRowGroupStatistics(0);
+        java.util.Map<String, ColumnStatistics> stats = writer.getRowGroupStatistics(0);
         assertEquals(1, stats.size());
-        assertEquals(3, stats.get(0).getNullCount());
-        assertFalse(stats.get(0).hasMinMax());
+        ColumnStatistics xStat = stats.get("x");
+        assertEquals(3, xStat.getNullCount());
+        assertFalse(xStat.hasMinMax());
     }
 
     @Test
@@ -915,7 +996,7 @@ public class MosaicRoundtripTest {
                 Field.nullable("value", new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE))
         ));
 
-        WriterOptions opts = new WriterOptions().statsColumns(0, 1).numBuckets(1);
+        WriterOptions opts = new WriterOptions().statsColumns("id", "value").numBuckets(1);
 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         MosaicWriter writer = new MosaicWriter(baos, arrowSchema, opts, allocator);
@@ -936,14 +1017,14 @@ public class MosaicRoundtripTest {
 
         byte[] data = baos.toByteArray();
         try (MosaicReader reader = readerFromBytes(data)) {
-            List<ColumnStatistics> writerStats = writer.getRowGroupStatistics(0);
-            List<ColumnStatistics> readerStats = reader.getRowGroupStatistics(0);
+            java.util.Map<String, ColumnStatistics> writerStats = writer.getRowGroupStatistics(0);
+            java.util.Map<String, ColumnStatistics> readerStats = reader.getRowGroupStatistics(0);
 
             assertEquals(writerStats.size(), readerStats.size());
-            for (int i = 0; i < writerStats.size(); i++) {
-                ColumnStatistics ws = writerStats.get(i);
-                ColumnStatistics rs = readerStats.get(i);
-                assertEquals(ws.getColumnIndex(), rs.getColumnIndex());
+            for (String colName : writerStats.keySet()) {
+                ColumnStatistics ws = writerStats.get(colName);
+                ColumnStatistics rs = readerStats.get(colName);
+                assertNotNull(rs);
                 assertEquals(ws.getNullCount(), rs.getNullCount());
                 assertEquals(ws.hasMinMax(), rs.hasMinMax());
                 assertArrayEquals(ws.getMin(), rs.getMin());
@@ -992,6 +1073,49 @@ public class MosaicRoundtripTest {
                 sum += numRows;
             }
             assertEquals(totalRows, sum);
+        }
+    }
+
+    @Test
+    public void testStatsEmptyStringMin() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.nullable("s", ArrowType.Utf8.INSTANCE)
+        ));
+
+        WriterOptions opts = new WriterOptions().statsColumns("s").numBuckets(1);
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        MosaicWriter writer = new MosaicWriter(baos, arrowSchema, opts, allocator);
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            VarCharVector sVec = (VarCharVector) root.getVector("s");
+            sVec.allocateNew(2);
+            sVec.setSafe(0, "".getBytes());
+            sVec.setSafe(1, "b".getBytes());
+            root.setRowCount(2);
+            writer.write(root);
+        }
+        writer.close();
+
+        // Writer stats: empty string min should still report hasMinMax
+        assertEquals(1, writer.numRowGroups());
+        java.util.Map<String, ColumnStatistics> writerStats = writer.getRowGroupStatistics(0);
+        assertEquals(1, writerStats.size());
+        ColumnStatistics wStat = writerStats.get("s");
+        assertTrue(wStat.hasMinMax());
+        assertArrayEquals(new byte[0], wStat.getMin());
+        assertArrayEquals("b".getBytes(), wStat.getMax());
+        assertEquals(0, wStat.getNullCount());
+
+        // Reader stats: same assertions
+        byte[] data = baos.toByteArray();
+        try (MosaicReader reader = readerFromBytes(data)) {
+            java.util.Map<String, ColumnStatistics> readerStats = reader.getRowGroupStatistics(0);
+            assertEquals(1, readerStats.size());
+            ColumnStatistics rStat = readerStats.get("s");
+            assertTrue(rStat.hasMinMax());
+            assertArrayEquals(new byte[0], rStat.getMin());
+            assertArrayEquals("b".getBytes(), rStat.getMax());
+            assertEquals(0, rStat.getNullCount());
         }
     }
 

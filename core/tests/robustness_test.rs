@@ -79,6 +79,17 @@ impl InputFile for ByteArrayInputFile {
     }
 }
 
+fn reorder_batch(batch: &RecordBatch, target_schema: &Schema) -> RecordBatch {
+    let mut fields = Vec::new();
+    let mut arrays = Vec::new();
+    for field in target_schema.fields() {
+        let idx = batch.schema().index_of(field.name()).unwrap();
+        fields.push(field.clone());
+        arrays.push(batch.column(idx).clone());
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
+}
+
 fn write_file(schema: &Schema, batches: &[RecordBatch], options: WriterOptions) -> Vec<u8> {
     let out = MemOutputFile::new();
     let mut writer = MosaicWriter::new(out, schema, options).unwrap();
@@ -601,8 +612,9 @@ fn test_row_group_split_preserves_data() {
     for rg in 0..reader.num_row_groups() {
         let mut rg_reader = reader.row_group_reader(rg).unwrap();
         let batch = rg_reader.read_columns().unwrap();
+        let id_idx = batch.schema().index_of("id").unwrap();
         let id_col = batch
-            .column(0)
+            .column(id_idx)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -683,7 +695,7 @@ fn test_stats_min_max_correctness() {
         WriterOptions {
             num_buckets: 1,
             row_group_max_size: 32, // Force each batch to be its own row group
-            stats_columns: vec![0],
+            stats_columns: vec!["v".to_string()],
             ..Default::default()
         },
     )
@@ -721,7 +733,7 @@ fn test_stats_with_all_null_row_group() {
         &schema,
         WriterOptions {
             num_buckets: 1,
-            stats_columns: vec![0],
+            stats_columns: vec!["v".to_string()],
             ..Default::default()
         },
     )
@@ -1078,21 +1090,29 @@ fn test_schema_roundtrip_preserves_types_and_nullability() {
     // Verify all columns preserved
     assert_eq!(mosaic_schema.columns.len(), 14);
 
-    // Verify names and types
-    assert_eq!(mosaic_schema.columns[0].name, "bool");
-    assert_eq!(mosaic_schema.columns[0].data_type, DataType::Boolean);
-    assert!(!mosaic_schema.columns[0].nullable);
+    // Verify names and types (columns are in sorted order)
+    let find = |name: &str| {
+        mosaic_schema
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap()
+    };
 
-    assert_eq!(mosaic_schema.columns[1].name, "i8");
-    assert_eq!(mosaic_schema.columns[1].data_type, DataType::Int8);
-    assert!(mosaic_schema.columns[1].nullable);
+    let c = find("bool");
+    assert_eq!(c.data_type, DataType::Boolean);
+    assert!(!c.nullable);
 
-    assert_eq!(mosaic_schema.columns[9].name, "str");
-    assert_eq!(mosaic_schema.columns[9].data_type, DataType::Utf8);
+    let c = find("i8");
+    assert_eq!(c.data_type, DataType::Int8);
+    assert!(c.nullable);
 
-    assert_eq!(mosaic_schema.columns[10].name, "bin");
-    assert_eq!(mosaic_schema.columns[10].data_type, DataType::Binary);
-    assert!(!mosaic_schema.columns[10].nullable);
+    let c = find("str");
+    assert_eq!(c.data_type, DataType::Utf8);
+
+    let c = find("bin");
+    assert_eq!(c.data_type, DataType::Binary);
+    assert!(!c.nullable);
 }
 
 #[test]
@@ -1183,7 +1203,7 @@ fn test_numeric_limits_roundtrip() {
     );
     let result = read_all(&data);
     assert_eq!(result.len(), 1);
-    assert_eq!(result[0], batch);
+    assert_eq!(reorder_batch(&result[0], &schema), batch);
 }
 
 // ======================== Multiple Writers Compatibility ========================
@@ -1263,7 +1283,7 @@ fn test_single_row_roundtrip() {
     let data = write_file(&schema, &[batch.clone()], WriterOptions::default());
     let result = read_all(&data);
     assert_eq!(result.len(), 1);
-    assert_eq!(result[0], batch);
+    assert_eq!(reorder_batch(&result[0], &schema), batch);
 }
 
 #[test]
@@ -1438,7 +1458,8 @@ fn test_all_null_boolean_column() {
 
     let data = write_file(&schema, &[batch], WriterOptions::default());
     let result = read_all(&data);
-    assert_eq!(result[0].column(1).null_count(), num_rows);
+    let flag_idx = result[0].schema().index_of("flag").unwrap();
+    assert_eq!(result[0].column(flag_idx).null_count(), num_rows);
 }
 
 // ======================== Decimal128 Tests ========================
@@ -2401,5 +2422,10 @@ fn run_random_schema_test(seed: u64, num_cols: usize, num_rows: usize) {
 
     // Verify data integrity by checking a sample of rows
     assert_eq!(result.len(), 1);
-    assert_eq!(result[0], batch, "seed={} data mismatch", seed);
+    assert_eq!(
+        reorder_batch(&result[0], &schema),
+        batch,
+        "seed={} data mismatch",
+        seed
+    );
 }

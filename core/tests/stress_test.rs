@@ -105,6 +105,7 @@ fn assert_batches_equal(expected: &[RecordBatch], actual: &[RecordBatch]) {
     let mut act_batch_idx = 0;
 
     let num_cols = expected[0].num_columns();
+    let exp_schema = expected[0].schema();
     let mut row = 0;
     while row < expected_rows {
         let exp_batch = &expected[exp_batch_idx];
@@ -114,13 +115,15 @@ fn assert_batches_equal(expected: &[RecordBatch], actual: &[RecordBatch]) {
         let chunk = exp_remaining.min(act_remaining);
 
         for col in 0..num_cols {
+            let col_name = exp_schema.field(col).name();
+            let act_col_idx = act_batch.schema().index_of(col_name).unwrap();
             let exp_col = exp_batch.column(col).slice(exp_offset, chunk);
-            let act_col = act_batch.column(col).slice(act_offset, chunk);
+            let act_col = act_batch.column(act_col_idx).slice(act_offset, chunk);
             assert_eq!(
                 &exp_col,
                 &act_col,
                 "mismatch at column {} rows {}..{}",
-                col,
+                col_name,
                 row,
                 row + chunk
             );
@@ -1655,7 +1658,7 @@ fn test_stats_at_scale() {
         WriterOptions {
             num_buckets: 10,
             row_group_max_size: 32 * 1024 * 1024,
-            stats_columns: vec![0, 1],
+            stats_columns: vec!["id".to_string(), "value".to_string()],
             ..Default::default()
         },
     )
