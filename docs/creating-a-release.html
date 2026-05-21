@@ -200,9 +200,13 @@ cargo install cargo-deny
 # Check all dependency licenses are approved
 python3 tools/dependencies.py check
 
-# Generate DEPENDENCIES.rust.tsv (included in source tarball)
-python3 tools/dependencies.py generate</code></pre>
-            <p>Fix any license violations before proceeding. The generated <code>DEPENDENCIES.rust.tsv</code> file will be included in the source release archive.</p>
+# Generate DEPENDENCIES.rust.tsv
+python3 tools/dependencies.py generate
+
+# Commit the generated files (required for inclusion in the source tarball)
+git add DEPENDENCIES.rust.tsv core/DEPENDENCIES.rust.tsv ffi/DEPENDENCIES.rust.tsv jni/DEPENDENCIES.rust.tsv
+git commit -m "Generate DEPENDENCIES.rust.tsv for release ${RELEASE_VERSION}"</code></pre>
+            <p>Fix any license violations before proceeding. The generated files must be committed because <code>create_source_release.sh</code> builds the archive from a git clone.</p>
 
             <h3>Create Source Release Artifacts</h3>
 <pre><code>cd tools
