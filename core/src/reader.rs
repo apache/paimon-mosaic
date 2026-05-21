@@ -264,7 +264,7 @@ impl<I: InputFile> MosaicReader<I> {
         }
 
         let version = footer[25];
-        if version != VERSION {
+        if version != LEGACY_VERSION && version != VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported version: {}", version),
@@ -321,7 +321,7 @@ impl<I: InputFile> MosaicReader<I> {
             }
         };
 
-        let schema = MosaicSchema::deserialize(&schema_raw)?;
+        let schema = MosaicSchema::deserialize_for_version(version, &schema_raw)?;
 
         if schema.num_buckets != num_buckets {
             return Err(io::Error::new(

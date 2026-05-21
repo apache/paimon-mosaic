@@ -16,7 +16,8 @@
 // under the License.
 
 pub const MAGIC: [u8; 4] = [b'M', b'O', b'S', b'A'];
-pub const VERSION: u8 = 1;
+pub const LEGACY_VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 pub const FOOTER_SIZE: usize = 32;
 
 pub const COMPRESSION_NONE: u8 = 0;
