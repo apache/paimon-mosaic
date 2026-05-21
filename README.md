@@ -21,8 +21,8 @@
 
 [Build Status]: https://img.shields.io/github/actions/workflow/status/apache/paimon-mosaic/ci.yml
 [actions]: https://github.com/apache/paimon-mosaic/actions?query=branch%3Amain
-[Latest Version]: https://img.shields.io/crates/v/paimon.svg
-[crates.io]: https://crates.io/crates/mosaic
+[Latest Version]: https://img.shields.io/crates/v/paimon-mosaic.svg
+[crates.io]: https://crates.io/crates/paimon-mosaic
 
 A columnar-bucket hybrid format optimized for wide tables of Apache Paimon. 
 
