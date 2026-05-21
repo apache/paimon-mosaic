@@ -22,7 +22,7 @@
 #   apache-paimon-mosaic-{version}-src.tgz.asc
 #   apache-paimon-mosaic-{version}-src.tgz.sha512
 #
-# Usage: cd tools && RELEASE_VERSION=0.1.0 ./releasing/create_source_release.sh
+# Usage: cd tools && RELEASE_VERSION=0.1.0 ./create_source_release.sh
 
 ##
 ## Variables with defaults (if not overwritten by environment)

@@ -36,6 +36,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Validate .asf.yaml
+        run: pip install pyyaml -q && python3 tools/validate_asf_yaml.py
+
       - name: Format
         run: cargo fmt --all -- --check
 

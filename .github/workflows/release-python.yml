@@ -50,7 +50,7 @@ jobs:
           - os: ubuntu-24.04-arm
             arch: aarch64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Inject RC version into pyproject.toml
         if: contains(github.ref, '-rc')
@@ -81,7 +81,7 @@ jobs:
             cp target/release/libpaimon_mosaic_ffi.so {package}/mosaic/
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: wheels-linux-${{ matrix.arch }}
           path: wheelhouse/*.whl
@@ -96,7 +96,7 @@ jobs:
             target: aarch64-apple-darwin
             lib_name: libpaimon_mosaic_ffi.dylib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Inject RC version into pyproject.toml
         if: contains(github.ref, '-rc')
@@ -135,7 +135,7 @@ jobs:
           mv python/dist/repaired/*.whl python/dist/
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: python/dist/*.whl
@@ -143,7 +143,7 @@ jobs:
   wheels-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Inject RC version into pyproject.toml
         if: contains(github.ref, '-rc')
@@ -178,7 +178,7 @@ jobs:
         run: python -m build --wheel
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: wheels-windows-x86_64
           path: python/dist/*.whl
@@ -191,7 +191,7 @@ jobs:
     needs: [wheels-linux, wheels-macos, wheels-windows]
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           pattern: wheels-*
           merge-multiple: true
