@@ -1,0 +1,98 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Releases - Paimon Mosaic</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="js/main.js"></script>
+</head>
+<body>
+    <button class="menu-toggle" aria-label="Menu">&#9776;</button>
+    <div class="overlay"></div>
+
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <h2>Paimon Mosaic</h2>
+            <p>Columnar-bucket hybrid format</p>
+        </div>
+        <nav>
+            <ul>
+                <li><a href="index.html">Home</a></li>
+                <li><a href="design.html">Design</a></li>
+                <li><a href="java-api.html">Java API</a></li>
+                <li><a href="python-api.html">Python API</a></li>
+                <li><a href="cpp-api.html">C++ API</a></li>
+                <li><a href="releases.html" class="active">Releases</a></li>
+            </ul>
+        </nav>
+        <div class="sidebar-footer">
+            <button class="theme-toggle">Dark Mode</button>
+        </div>
+    </aside>
+
+    <main class="main">
+        <div class="content">
+            <h1>Releases</h1>
+            <p class="subtitle">Release history and download links for Apache Paimon Mosaic.</p>
+
+            <h2>Release Policy</h2>
+            <p>Apache Paimon Mosaic follows <a href="https://semver.org/">Semantic Versioning</a>. Releases are published to:</p>
+            <table>
+                <thead>
+                    <tr><th>Component</th><th>Registry</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>Rust</td><td><a href="https://crates.io/crates/paimon-mosaic-core">crates.io/crates/paimon-mosaic-core</a></td></tr>
+                    <tr><td>Java</td><td><a href="https://search.maven.org/search?q=g:org.apache.paimon%20a:mosaic">Maven Central</a> (groupId: <code>org.apache.paimon</code>, artifactId: <code>mosaic</code>)</td></tr>
+                    <tr><td>Python</td><td><a href="https://pypi.org/project/paimon-mosaic/">PyPI &mdash; paimon-mosaic</a></td></tr>
+                </tbody>
+            </table>
+
+            <h2>Upcoming</h2>
+
+            <h3>0.1.0 (In Development)</h3>
+            <p>The first release of Apache Paimon Mosaic. Planned features:</p>
+            <ul>
+                <li>Mosaic columnar-bucket hybrid format core implementation</li>
+                <li>High-performance reader and writer with ZSTD compression</li>
+                <li>Arrow-compatible data exchange via C Data Interface</li>
+                <li>Java binding with JNI (multi-platform native libraries)</li>
+                <li>Python binding with FFI</li>
+                <li>C++ headers for native integration</li>
+            </ul>
+
+            <h2>Past Releases</h2>
+            <p>(None yet)</p>
+
+            <h2>Download</h2>
+            <p>Official source releases are available from the <a href="https://downloads.apache.org/paimon/">ASF distribution</a>.</p>
+
+            <h2>Release Guides</h2>
+            <ul>
+                <li><a href="creating-a-release.html">Creating a Release</a> &mdash; for Release Managers</li>
+                <li><a href="verifying-a-release-candidate.html">Verifying a Release Candidate</a> &mdash; for vote participants</li>
+            </ul>
+        </div>
+    </main>
+</body>
+</html>

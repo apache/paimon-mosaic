@@ -31,9 +31,9 @@ use std::sync::Arc;
 
 use arrow_array::*;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess};
-use mosaic_core::spec;
-use mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
+use paimon_mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess};
+use paimon_mosaic_core::spec;
+use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
 
 // ======================== Test Infrastructure ========================
 
@@ -1717,7 +1717,7 @@ fn test_timestamp_nanos_basic_roundtrip() {
             assert!(!col.is_null(i));
             assert_eq!(
                 col.value(i),
-                mosaic_core::types::millis_nanos_to_ns(
+                paimon_mosaic_core::types::millis_nanos_to_ns(
                     1_700_000_000_000i64 + i as i64,
                     (i % 1_000_000) as i32,
                 )
@@ -1745,14 +1745,14 @@ fn test_timestamp_nanos_extreme_values() {
         0,
         i64::MAX,
         i64::MIN,
-        mosaic_core::types::millis_nanos_to_ns(1_700_000_000_000, 999_999).unwrap(),
-        mosaic_core::types::millis_nanos_to_ns(-1_700_000_000_000, 1).unwrap(),
+        paimon_mosaic_core::types::millis_nanos_to_ns(1_700_000_000_000, 999_999).unwrap(),
+        paimon_mosaic_core::types::millis_nanos_to_ns(-1_700_000_000_000, 1).unwrap(),
         1,
         -1,
     ];
     let (millis_data, nanos_data): (Vec<i64>, Vec<i32>) = ns_data
         .iter()
-        .map(|&ns| mosaic_core::types::ns_to_millis_nanos(ns))
+        .map(|&ns| paimon_mosaic_core::types::ns_to_millis_nanos(ns))
         .unzip();
 
     let millis_arr = Int64Array::from(millis_data.clone());

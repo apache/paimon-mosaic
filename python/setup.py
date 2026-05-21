@@ -29,10 +29,10 @@ from wheel.bdist_wheel import bdist_wheel
 def _lib_name():
     system = platform.system()
     if system == "Darwin":
-        return "libmosaic_ffi.dylib"
+        return "libpaimon_mosaic_ffi.dylib"
     elif system == "Windows":
-        return "mosaic_ffi.dll"
-    return "libmosaic_ffi.so"
+        return "paimon_mosaic_ffi.dll"
+    return "libpaimon_mosaic_ffi.so"
 
 
 def _find_native_lib():

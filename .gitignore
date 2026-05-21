@@ -34,8 +34,8 @@ __pycache__/
 python/dist/
 python/build/
 .pytest_cache/
-python/mosaic/libmosaic_ffi.*
-python/mosaic/mosaic_ffi.dll
+python/mosaic/libpaimon_mosaic_ffi.*
+python/mosaic/paimon_mosaic_ffi.dll
 
 # IDE
 .idea/

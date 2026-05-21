@@ -20,7 +20,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mosaic-format"
+name = "paimon-mosaic"
 version = "0.1.0"
 description = "Python bindings for the Mosaic columnar-bucket hybrid file format"
 license = {text = "Apache-2.0"}
@@ -34,4 +34,4 @@ test = ["pytest"]
 include = ["mosaic*"]
 
 [tool.setuptools.package-data]
-mosaic = ["libmosaic_ffi.dylib", "libmosaic_ffi.so", "mosaic_ffi.dll"]
+mosaic = ["libpaimon_mosaic_ffi.dylib", "libpaimon_mosaic_ffi.so", "paimon_mosaic_ffi.dll"]

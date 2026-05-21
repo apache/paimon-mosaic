@@ -1,0 +1,344 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Creating a Release - Paimon Mosaic</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="js/main.js"></script>
+</head>
+<body>
+    <button class="menu-toggle" aria-label="Menu">&#9776;</button>
+    <div class="overlay"></div>
+
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <h2>Paimon Mosaic</h2>
+            <p>Columnar-bucket hybrid format</p>
+        </div>
+        <nav>
+            <ul>
+                <li><a href="index.html">Home</a></li>
+                <li><a href="design.html">Design</a></li>
+                <li><a href="java-api.html">Java API</a></li>
+                <li><a href="python-api.html">Python API</a></li>
+                <li><a href="cpp-api.html">C++ API</a></li>
+                <li><a href="releases.html">Releases</a></li>
+            </ul>
+        </nav>
+        <div class="sidebar-footer">
+            <button class="theme-toggle">Dark Mode</button>
+        </div>
+    </aside>
+
+    <main class="main">
+        <div class="content">
+            <h1>Creating a Release</h1>
+            <p class="subtitle">Guide for Release Managers of Apache Paimon Mosaic, following <a href="https://www.apache.org/legal/release-policy.html">ASF Release Policy</a>.</p>
+
+            <!-- ============================================================ -->
+            <h2>Overview</h2>
+            <p>The release process consists of:</p>
+            <ol>
+                <li><a href="#decide-to-release">Decide to release</a></li>
+                <li><a href="#prepare-for-the-release">Prepare for the release</a></li>
+                <li><a href="#build-a-release-candidate">Build a release candidate</a></li>
+                <li><a href="#vote-on-the-release-candidate">Vote on the release candidate</a></li>
+                <li><a href="#fix-any-issues">If necessary, fix any issues and go back to step 3</a></li>
+                <li><a href="#finalize-the-release">Finalize the release</a></li>
+                <li><a href="#promote-the-release">Promote the release</a></li>
+            </ol>
+
+            <h3>Automated Publishing</h3>
+            <p>When a version tag is pushed, GitHub Actions automatically publishes language-specific artifacts:</p>
+            <table>
+                <thead>
+                    <tr><th>Component</th><th>Tag Pattern</th><th>Published To</th><th>Pre-release (<code>-rc</code>) Behavior</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>Rust crate</td><td><code>v0.1.0</code></td><td>crates.io</td><td>Dry-run only</td></tr>
+                    <tr><td>Java binding</td><td><code>v0.1.0</code></td><td>Apache Nexus staging</td><td>Deploys to staging</td></tr>
+                    <tr><td>Python binding</td><td><code>v0.1.0</code></td><td>PyPI</td><td>Publishes to TestPyPI</td></tr>
+                </tbody>
+            </table>
+            <p>The Release Manager's primary responsibility is managing the <strong>source release</strong> (tarball + signature) and coordinating the community vote. Language artifact publishing is handled by CI once the tag is pushed.</p>
+
+            <!-- ============================================================ -->
+            <h2 id="decide-to-release">Decide to Release</h2>
+            <p>Anybody can propose a release on the dev <a href="https://lists.apache.org/list.html?dev@paimon.apache.org">mailing list</a>, giving a short rationale and nominating a committer as Release Manager (including themselves).</p>
+            <p><strong>Checklist:</strong></p>
+            <ul>
+                <li>Community agrees to release</li>
+                <li>A Release Manager is selected</li>
+            </ul>
+
+            <!-- ============================================================ -->
+            <h2 id="prepare-for-the-release">Prepare for the Release</h2>
+
+            <h3>One-time Release Manager Setup</h3>
+
+            <h4>GPG Key</h4>
+            <ol>
+                <li>
+                    <p>Install GnuPG:</p>
+<pre><code># macOS
+brew install gnupg
+
+# Ubuntu / Debian
+sudo apt install gnupg2</code></pre>
+                </li>
+                <li>
+                    <p>Generate a key pair (RSA 4096, does not expire, use your <code>@apache.org</code> email):</p>
+<pre><code>gpg --full-gen-key</code></pre>
+                </li>
+                <li>
+                    <p>Find your key ID:</p>
+<pre><code>gpg --list-keys --keyid-format short</code></pre>
+                </li>
+                <li>
+                    <p>Upload to key server:</p>
+<pre><code>gpg --keyserver hkps://keyserver.ubuntu.com --send-keys &lt;YOUR_KEY_ID&gt;</code></pre>
+                </li>
+                <li>
+                    <p>Append to the project <a href="https://downloads.apache.org/paimon/KEYS">KEYS</a> file:</p>
+<pre><code>svn co https://dist.apache.org/repos/dist/release/paimon/ paimon-dist-release --depth=files
+cd paimon-dist-release
+(gpg --list-sigs &lt;YOUR_KEY_ID&gt; &amp;&amp; gpg --armor --export &lt;YOUR_KEY_ID&gt;) &gt;&gt; KEYS
+svn ci -m "Add &lt;YOUR_NAME&gt;'s public key"</code></pre>
+                </li>
+                <li>
+                    <p>Configure Git to sign tags:</p>
+<pre><code>git config --global user.signingkey &lt;YOUR_KEY_ID&gt;</code></pre>
+                </li>
+            </ol>
+
+            <h4>GitHub Actions Secrets</h4>
+            <p>Ensure the following repository secrets are configured:</p>
+            <table>
+                <thead>
+                    <tr><th>Secret</th><th>Purpose</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>CARGO_REGISTRY_TOKEN</code></td><td>crates.io publishing</td></tr>
+                    <tr><td><code>NEXUS_STAGE_DEPLOYER_USER</code></td><td>Apache Nexus staging</td></tr>
+                    <tr><td><code>NEXUS_STAGE_DEPLOYER_PW</code></td><td>Apache Nexus staging</td></tr>
+                    <tr><td><code>GPG_SECRET_KEY</code></td><td>Java artifact signing</td></tr>
+                    <tr><td><code>GPG_PASSPHRASE</code></td><td>Java artifact signing</td></tr>
+                    <tr><td><code>PYPI_API_TOKEN</code></td><td>PyPI publishing</td></tr>
+                    <tr><td><code>TEST_PYPI_API_TOKEN</code></td><td>TestPyPI publishing</td></tr>
+                </tbody>
+            </table>
+
+            <h3>Clone into a Fresh Workspace</h3>
+<pre><code>git clone https://github.com/apache/paimon-mosaic.git
+cd paimon-mosaic</code></pre>
+
+            <h3>Set Up Environment Variables</h3>
+<pre><code>RELEASE_VERSION="0.1.0"
+NEXT_VERSION="0.2.0"
+RC_NUM="1"</code></pre>
+
+            <h3>Create a Release Branch</h3>
+<pre><code>cd tools
+RELEASE_VERSION=${RELEASE_VERSION} RELEASE_CANDIDATE=${RC_NUM} ./releasing/create_release_branch.sh</code></pre>
+            <p>This creates a branch named <code>release-${RELEASE_VERSION}-rc${RC_NUM}</code> from the current HEAD.</p>
+
+            <h3>Bump Version on Main</h3>
+            <p>After cutting the release branch, bump <code>main</code> to the next version:</p>
+<pre><code>git checkout main
+cd tools
+OLD_VERSION=${RELEASE_VERSION} NEW_VERSION=${NEXT_VERSION} ./releasing/update_branch_version.sh</code></pre>
+            <p>The script updates version strings in all <code>pom.xml</code>, <code>Cargo.toml</code> (excluding <code>target/</code>), and <code>python/pyproject.toml</code> files, then creates a commit.</p>
+
+            <!-- ============================================================ -->
+            <h2 id="build-a-release-candidate">Build a Release Candidate</h2>
+
+            <h3>Create the RC Tag</h3>
+            <p>Push a signed RC tag to trigger CI workflows:</p>
+<pre><code>git checkout release-${RELEASE_VERSION}-rc${RC_NUM}
+git tag -s v${RELEASE_VERSION}-rc${RC_NUM} -m "v${RELEASE_VERSION}-rc${RC_NUM}"
+git push origin v${RELEASE_VERSION}-rc${RC_NUM}</code></pre>
+            <p>After pushing, verify in <a href="https://github.com/apache/paimon-mosaic/actions">GitHub Actions</a> that all release workflows succeed:</p>
+            <ul>
+                <li><strong>Release Rust</strong> &mdash; dry-run check (does not publish for RC tags)</li>
+                <li><strong>Release Java</strong> &mdash; builds native JNI libraries for 4 platforms, deploys JAR to Apache Nexus staging</li>
+                <li><strong>Release Python</strong> &mdash; builds wheels for 4 platforms, publishes to TestPyPI</li>
+            </ul>
+
+            <h3>Create Source Release Artifacts</h3>
+<pre><code>cd tools
+RELEASE_VERSION=${RELEASE_VERSION} ./releasing/create_source_release.sh</code></pre>
+            <p>This creates the following under <code>tools/release/</code>:</p>
+            <ul>
+                <li><code>apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz</code> &mdash; source archive</li>
+                <li><code>apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz.asc</code> &mdash; GPG signature</li>
+                <li><code>apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz.sha512</code> &mdash; SHA-512 checksum</li>
+            </ul>
+
+            <h3>Stage Artifacts to SVN</h3>
+<pre><code>svn checkout https://dist.apache.org/repos/dist/dev/paimon/ paimon-dist-dev --depth=immediates
+cd paimon-dist-dev
+mkdir paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}
+cp ../paimon-mosaic/tools/release/apache-paimon-mosaic-${RELEASE_VERSION}-src.* \
+   paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}/
+svn add paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}
+svn commit -m "Add paimon-mosaic ${RELEASE_VERSION} RC${RC_NUM}"</code></pre>
+
+            <p><strong>Checklist:</strong></p>
+            <ul>
+                <li>RC tag pushed and CI workflows succeeded</li>
+                <li>Source tarball, signature, and checksum staged to <a href="https://dist.apache.org/repos/dist/dev/paimon/">dist.apache.org dev</a></li>
+                <li>Java artifacts deployed to Nexus staging repository</li>
+                <li>Python wheels published to TestPyPI</li>
+            </ul>
+
+            <!-- ============================================================ -->
+            <h2 id="vote-on-the-release-candidate">Vote on the Release Candidate</h2>
+            <p>Start a vote on the dev mailing list.</p>
+            <p><strong>Subject:</strong> <code>[VOTE] Release Apache Paimon Mosaic ${RELEASE_VERSION} (RC${RC_NUM})</code></p>
+<pre><code>Hi everyone,
+
+Please review and vote on release candidate #${RC_NUM} for Apache Paimon Mosaic ${RELEASE_VERSION}.
+
+[ ] +1 Approve the release
+[ ] +0 No opinion
+[ ] -1 Do not approve (please provide specific comments)
+
+The release candidate is available at:
+https://dist.apache.org/repos/dist/dev/paimon/paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}/
+
+Git tag:
+https://github.com/apache/paimon-mosaic/releases/tag/v${RELEASE_VERSION}-rc${RC_NUM}
+
+KEYS for signature verification:
+https://downloads.apache.org/paimon/KEYS
+
+Java artifacts (Nexus staging):
+https://repository.apache.org/content/repositories/orgapachepaimon-XXXX/
+
+Python wheels (TestPyPI):
+https://test.pypi.org/project/paimon-mosaic/${RELEASE_VERSION}/
+
+Verification guide:
+https://github.com/apache/paimon-mosaic/blob/main/docs/verifying-a-release-candidate.html
+
+The vote will be open for at least 72 hours.
+
+Thanks,
+Release Manager</code></pre>
+            <p>After the vote passes, send a result email with subject: <code>[RESULT][VOTE] Release Apache Paimon Mosaic ${RELEASE_VERSION} (RC${RC_NUM})</code></p>
+
+            <!-- ============================================================ -->
+            <h2 id="fix-any-issues">Fix Any Issues</h2>
+            <p>If the vote reveals issues:</p>
+            <ol>
+                <li>Fix them on the release branch via normal PRs.</li>
+                <li>Remove the old RC from dist dev (optional):
+<pre><code>cd paimon-dist-dev
+svn remove paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}
+svn commit -m "Remove paimon-mosaic ${RELEASE_VERSION} RC${RC_NUM} (superseded)"</code></pre>
+                </li>
+                <li>Drop the Nexus staging repository via the <a href="https://repository.apache.org/#stagingRepositories">Nexus UI</a>.</li>
+                <li>Increment <code>RC_NUM</code>, then go back to <a href="#build-a-release-candidate">Build a release candidate</a>.</li>
+            </ol>
+
+            <!-- ============================================================ -->
+            <h2 id="finalize-the-release">Finalize the Release</h2>
+
+            <h3>Push the Release Tag</h3>
+            <p>Once the vote passes, create and push the final release tag. This triggers CI to publish to crates.io and PyPI automatically.</p>
+<pre><code>git checkout v${RELEASE_VERSION}-rc${RC_NUM}
+git tag -s v${RELEASE_VERSION} -m "Release Apache Paimon Mosaic ${RELEASE_VERSION}"
+git push origin v${RELEASE_VERSION}</code></pre>
+
+            <h3>Move Source Artifacts to the Release Repository</h3>
+<pre><code>svn mv -m "Release paimon-mosaic ${RELEASE_VERSION}" \
+  https://dist.apache.org/repos/dist/dev/paimon/paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM} \
+  https://dist.apache.org/repos/dist/release/paimon/paimon-mosaic-${RELEASE_VERSION}</code></pre>
+
+            <h3>Release the Java Artifacts</h3>
+            <ol>
+                <li>Go to <a href="https://repository.apache.org/#stagingRepositories">Apache Nexus Staging Repositories</a>.</li>
+                <li>Find the staging repository for <code>orgapachepaimon-XXXX</code>.</li>
+                <li><strong>Close</strong> the repository (runs validation rules).</li>
+                <li>Once closed, <strong>Release</strong> the repository to Maven Central.</li>
+            </ol>
+
+            <h3>Verify Published Artifacts</h3>
+            <ul>
+                <li><strong>Rust:</strong> <a href="https://crates.io/crates/paimon-mosaic-core">crates.io/crates/paimon-mosaic-core</a> shows version <code>${RELEASE_VERSION}</code></li>
+                <li><strong>Java:</strong> <a href="https://search.maven.org/search?q=g:org.apache.paimon%20a:mosaic">Maven Central</a> shows version <code>${RELEASE_VERSION}</code></li>
+                <li><strong>Python:</strong> <a href="https://pypi.org/project/paimon-mosaic/">PyPI &mdash; paimon-mosaic</a> shows version <code>${RELEASE_VERSION}</code></li>
+            </ul>
+
+            <h3>Create GitHub Release</h3>
+            <ol>
+                <li>Go to <a href="https://github.com/apache/paimon-mosaic/releases/new">Releases &mdash; New release</a>.</li>
+                <li>Choose tag <code>v${RELEASE_VERSION}</code>.</li>
+                <li>Click <strong>Generate release notes</strong> and review.</li>
+                <li>Click <strong>Publish release</strong>.</li>
+            </ol>
+
+            <p><strong>Checklist:</strong></p>
+            <ul>
+                <li>Release tag pushed; CI published to crates.io and PyPI</li>
+                <li>Source artifacts moved to <a href="https://dist.apache.org/repos/dist/release/paimon/">dist release</a></li>
+                <li>Java artifacts released to Maven Central via Nexus</li>
+                <li>GitHub Release created</li>
+            </ul>
+
+            <!-- ============================================================ -->
+            <h2 id="promote-the-release">Promote the Release</h2>
+
+            <h3>Update the Releases Page</h3>
+            <p>Update the <a href="releases.html">Releases</a> page: move the released version from "Upcoming" to "Past Releases" with a summary of key features and a link to the GitHub release notes.</p>
+
+            <h3>Announce the Release</h3>
+            <p>Wait at least 24 hours after finalizing. Send the announcement to <code>dev@paimon.apache.org</code> and <code>announce@apache.org</code> using your <code>@apache.org</code> email in <strong>plain text</strong>.</p>
+            <p><strong>Subject:</strong> <code>[ANNOUNCE] Release Apache Paimon Mosaic ${RELEASE_VERSION}</code></p>
+<pre><code>The Apache Paimon community is pleased to announce the release of
+Apache Paimon Mosaic ${RELEASE_VERSION}.
+
+Apache Paimon Mosaic is a columnar-bucket hybrid format optimized for
+wide tables of Apache Paimon.
+
+Rust:   cargo add paimon-mosaic-core
+Java:   &lt;dependency&gt;
+          &lt;groupId&gt;org.apache.paimon&lt;/groupId&gt;
+          &lt;artifactId&gt;mosaic&lt;/artifactId&gt;
+          &lt;version&gt;${RELEASE_VERSION}&lt;/version&gt;
+        &lt;/dependency&gt;
+Python: pip install paimon-mosaic
+
+Release notes:
+https://github.com/apache/paimon-mosaic/releases/tag/v${RELEASE_VERSION}
+
+Thanks to all contributors!</code></pre>
+
+            <h3>Clean Up Old Releases</h3>
+            <p>ASF policy requires only the latest release in the dist release area. Remove older versions:</p>
+<pre><code>svn rm -m "Remove old release" \
+  https://dist.apache.org/repos/dist/release/paimon/paimon-mosaic-${OLD_VERSION}</code></pre>
+        </div>
+    </main>
+</body>
+</html>

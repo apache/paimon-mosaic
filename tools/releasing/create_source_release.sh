@@ -17,6 +17,13 @@
 # limitations under the License.
 #
 
+# Create ASF source release artifacts under tools/release/:
+#   apache-paimon-mosaic-{version}-src.tgz
+#   apache-paimon-mosaic-{version}-src.tgz.asc
+#   apache-paimon-mosaic-{version}-src.tgz.sha512
+#
+# Usage: cd tools && RELEASE_VERSION=0.1.0 ./releasing/create_source_release.sh
+
 ##
 ## Variables with defaults (if not overwritten by environment)
 ##
@@ -59,7 +66,7 @@ echo "Creating source package"
 git clone . tools/release/paimon-mosaic-tmp-clone
 cd tools/release/paimon-mosaic-tmp-clone
 
-trap 'cd ${CURR_DIR};rm -rf release' ERR
+trap 'cd ${CURR_DIR}/release;rm -rf paimon-mosaic-tmp-clone' ERR
 
 rsync -a \
   --exclude ".git" --exclude ".gitignore" --exclude ".gitattributes" \
@@ -72,6 +79,18 @@ tar czf apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz paimon-mosaic-$RELEASE_V
 gpg --armor --detach-sig apache-paimon-mosaic-$RELEASE_VERSION-src.tgz
 $SHASUM apache-paimon-mosaic-$RELEASE_VERSION-src.tgz > apache-paimon-mosaic-$RELEASE_VERSION-src.tgz.sha512
 
+echo "Verifying GPG signature"
+gpg --verify apache-paimon-mosaic-$RELEASE_VERSION-src.tgz.asc apache-paimon-mosaic-$RELEASE_VERSION-src.tgz
+
+echo "Verifying tarball integrity"
+tar tzf apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz > /dev/null
+
 mv apache-paimon-mosaic-$RELEASE_VERSION-src.* ../
 cd ..
 rm -rf paimon-mosaic-tmp-clone
+
+echo ""
+echo "Source release created successfully. Artifacts in tools/release/:"
+ls -la ${CURR_DIR}/release/apache-paimon-mosaic-*
+echo ""
+echo "Next: upload contents to SVN (see docs/release/creating-a-release.md)."

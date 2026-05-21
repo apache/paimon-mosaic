@@ -1,0 +1,196 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Verifying a Release Candidate - Paimon Mosaic</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="js/main.js"></script>
+</head>
+<body>
+    <button class="menu-toggle" aria-label="Menu">&#9776;</button>
+    <div class="overlay"></div>
+
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <h2>Paimon Mosaic</h2>
+            <p>Columnar-bucket hybrid format</p>
+        </div>
+        <nav>
+            <ul>
+                <li><a href="index.html">Home</a></li>
+                <li><a href="design.html">Design</a></li>
+                <li><a href="java-api.html">Java API</a></li>
+                <li><a href="python-api.html">Python API</a></li>
+                <li><a href="cpp-api.html">C++ API</a></li>
+                <li><a href="releases.html">Releases</a></li>
+            </ul>
+        </nav>
+        <div class="sidebar-footer">
+            <button class="theme-toggle">Dark Mode</button>
+        </div>
+    </aside>
+
+    <main class="main">
+        <div class="content">
+            <h1>Verifying a Release Candidate</h1>
+            <p class="subtitle">Guide for anyone participating in the release vote, based on <a href="https://www.apache.org/legal/release-policy.html">ASF Release Policy</a>.</p>
+
+            <!-- ============================================================ -->
+            <h2>Validating Distributions</h2>
+            <p>The release vote email includes links to:</p>
+            <ul>
+                <li><strong>Distribution archive:</strong> source tarball (<code>apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz</code>) on <a href="https://dist.apache.org/repos/dist/dev/paimon/">dist.apache.org dev</a></li>
+                <li><strong>Signature file:</strong> <code>apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz.asc</code></li>
+                <li><strong>Checksum file:</strong> <code>apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz.sha512</code></li>
+                <li><strong>KEYS file:</strong> <a href="https://downloads.apache.org/paimon/KEYS">https://downloads.apache.org/paimon/KEYS</a></li>
+            </ul>
+            <p>Download the archive (<code>.tgz</code>), <code>.asc</code>, and <code>.sha512</code> from the RC directory (e.g. <code>paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}/</code>) and the KEYS file.</p>
+
+            <!-- ============================================================ -->
+            <h2>Verifying Signatures</h2>
+            <p>Import the keys into your local keyring:</p>
+<pre><code>curl https://downloads.apache.org/paimon/KEYS -o KEYS
+gpg --import KEYS</code></pre>
+            <p>Verify the <code>.asc</code> file:</p>
+<pre><code>gpg --verify apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz.asc \
+             apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz</code></pre>
+            <p>If verification succeeds, you will see:</p>
+<pre><code>gpg: Signature made ...
+gpg: using RSA key ...
+gpg: Good signature from "Release Manager Name (CODE SIGNING KEY) &lt;...@apache.org&gt;"</code></pre>
+
+            <!-- ============================================================ -->
+            <h2>Verifying Checksums</h2>
+            <p><strong>On macOS (shasum):</strong></p>
+<pre><code>shasum -a 512 -c apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz.sha512</code></pre>
+            <p><strong>On Linux (sha512sum):</strong></p>
+<pre><code>sha512sum -c apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz.sha512</code></pre>
+            <p>If successful:</p>
+<pre><code>apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz: OK</code></pre>
+
+            <!-- ============================================================ -->
+            <h2>Verifying Build</h2>
+            <p>Extract the source release and verify it builds. You need <strong>Rust</strong> (stable toolchain).</p>
+<pre><code>tar -xzf apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz
+cd paimon-mosaic-${RELEASE_VERSION}</code></pre>
+
+            <h3>Rust</h3>
+            <p>Build and test all workspace crates:</p>
+<pre><code>cargo build --workspace --release
+cargo test --workspace</code></pre>
+
+            <h3>Java</h3>
+            <p>Build the Java binding (requires JDK 8+ and Maven):</p>
+<pre><code>cargo build --release -p paimon-mosaic-jni
+cp target/release/libpaimon_mosaic_jni.* java/src/main/resources/native/
+cd java
+mvn clean package</code></pre>
+
+            <h3>Python</h3>
+            <p>Build and test the Python binding (requires Python 3.9+):</p>
+<pre><code>cargo build --release -p paimon-mosaic-ffi
+cp target/release/libpaimon_mosaic_ffi.* python/mosaic/
+cd python
+pip install -e .
+python -c "import mosaic"</code></pre>
+
+            <h3>C++</h3>
+            <p>Build the C++ tests (requires CMake):</p>
+<pre><code>cargo build --release -p paimon-mosaic-ffi
+cd cpp
+mkdir build &amp;&amp; cd build
+cmake ..
+make</code></pre>
+
+            <!-- ============================================================ -->
+            <h2>Verifying LICENSE and NOTICE</h2>
+            <p>Verify that:</p>
+            <ol>
+                <li>The <strong>LICENSE</strong> and <strong>NOTICE</strong> files exist in the root directory and are correct.</li>
+                <li>All source files have ASF license headers.</li>
+                <li>All dependencies have licenses compatible with ASL 2.0 (<a href="http://www.apache.org/legal/resolved.html#category-x">ASF third-party license policy</a>).</li>
+                <li>No unexpected files are included (<code>.git</code>, <code>.github</code>, <code>.asf.yaml</code>, <code>.gitignore</code>, <code>.idea</code>, <code>target/</code> should all be excluded).</li>
+            </ol>
+
+            <!-- ============================================================ -->
+            <h2>Testing Published Artifacts</h2>
+
+            <h3>Rust (crates.io)</h3>
+            <p>RC tags do <strong>not</strong> publish to crates.io (dry-run only). You can test the Rust crate from the source tarball or via git tag dependency:</p>
+<pre><code>[dependencies]
+paimon-mosaic-core = { git = "https://github.com/apache/paimon-mosaic", tag = "v${RELEASE_VERSION}-rc${RC_NUM}" }</code></pre>
+
+            <h3>Java (Apache Nexus Staging)</h3>
+            <p>The RC tag deploys to Apache Nexus staging. To test:</p>
+            <ol>
+                <li>Find the staging repository at <a href="https://repository.apache.org/#stagingRepositories">repository.apache.org</a>.</li>
+                <li>Add the staging repository URL to your <code>pom.xml</code>:
+<pre><code>&lt;repositories&gt;
+  &lt;repository&gt;
+    &lt;id&gt;apache-staging&lt;/id&gt;
+    &lt;url&gt;https://repository.apache.org/content/repositories/orgapachepaimon-XXXX/&lt;/url&gt;
+  &lt;/repository&gt;
+&lt;/repositories&gt;</code></pre>
+                </li>
+                <li>Add the dependency:
+<pre><code>&lt;dependency&gt;
+  &lt;groupId&gt;org.apache.paimon&lt;/groupId&gt;
+  &lt;artifactId&gt;mosaic&lt;/artifactId&gt;
+  &lt;version&gt;${RELEASE_VERSION}&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+                </li>
+                <li>Verify the JAR contains native libraries for all 4 platforms:
+                    <ul>
+                        <li><code>native/linux/x86_64/libpaimon_mosaic_jni.so</code></li>
+                        <li><code>native/linux/aarch64/libpaimon_mosaic_jni.so</code></li>
+                        <li><code>native/macos/aarch64/libpaimon_mosaic_jni.dylib</code></li>
+                        <li><code>native/windows/x86_64/paimon_mosaic_jni.dll</code></li>
+                    </ul>
+                </li>
+            </ol>
+
+            <h3>Python (TestPyPI)</h3>
+            <p>The RC tag publishes wheels to TestPyPI. Install and verify:</p>
+<pre><code>pip install -i https://test.pypi.org/simple/ paimon-mosaic==${RELEASE_VERSION}
+python -c "import mosaic; print('OK')"</code></pre>
+            <p>Verify wheels are available for: Linux x86_64, Linux aarch64, macOS aarch64, Windows x86_64.</p>
+
+            <!-- ============================================================ -->
+            <h2>Voting</h2>
+            <p>Votes are cast by replying to the vote email on the dev mailing list with <strong>+1</strong>, <strong>0</strong>, or <strong>-1</strong>.</p>
+            <p>State whether your vote is <strong>binding</strong> or <strong>non-binding</strong>. Only PMC members have formally binding votes. See <a href="https://www.apache.org/foundation/voting.html">Apache Foundation Voting</a>.</p>
+            <p>Include a short list of what you verified. This helps the community see what has been checked.</p>
+
+            <p><strong>Checklist you can reference in your vote:</strong></p>
+            <ul>
+                <li>Validating distributions</li>
+                <li>Verifying signatures</li>
+                <li>Verifying checksums</li>
+                <li>Verifying build</li>
+                <li>Verifying LICENSE and NOTICE</li>
+                <li>Testing published artifacts</li>
+            </ul>
+        </div>
+    </main>
+</body>
+</html>

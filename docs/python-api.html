@@ -22,7 +22,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Python API - Mosaic</title>
+    <title>Python API - Paimon Mosaic</title>
     <link rel="stylesheet" href="css/style.css">
     <script src="js/main.js"></script>
 </head>
@@ -32,7 +32,7 @@
 
     <aside class="sidebar">
         <div class="sidebar-header">
-            <h2>Mosaic</h2>
+            <h2>Paimon Mosaic</h2>
             <p>Columnar-bucket hybrid format</p>
         </div>
         <nav>
@@ -42,6 +42,7 @@
                 <li><a href="java-api.html">Java API</a></li>
                 <li><a href="python-api.html" class="active">Python API</a></li>
                 <li><a href="cpp-api.html">C++ API</a></li>
+                <li><a href="releases.html">Releases</a></li>
             </ul>
         </nav>
         <div class="sidebar-footer">
@@ -57,11 +58,11 @@
             <h2>Setup</h2>
             <p>
                 The Python API lives in the <code>python/</code> directory and depends on the
-                <code>mosaic_ffi</code> shared library and <code>pyarrow</code>.
+                <code>paimon_mosaic_ffi</code> shared library and <code>pyarrow</code>.
                 Build the native library first, then install the Python package:
             </p>
 <pre><code><span class="cmt"># 1. Build the native library</span>
-cargo build --release -p mosaic-ffi
+cargo build --release -p paimon-mosaic-ffi
 
 <span class="cmt"># 2. Install the Python package (bundles the native lib automatically)</span>
 cd python

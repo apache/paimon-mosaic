@@ -16,7 +16,7 @@
 # under the License.
 
 [package]
-name = "mosaic-core"
+name = "paimon-mosaic-core"
 version = "0.1.0"
 edition = "2021"
 description = "Mosaic file format — core Rust library"

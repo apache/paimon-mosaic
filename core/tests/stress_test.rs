@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 use arrow_array::*;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess};
-use mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
+use paimon_mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess};
+use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
 
 struct MemOutputFile {
     pub buf: Vec<u8>,
@@ -483,7 +483,7 @@ fn test_all_types_at_scale() {
                 } else {
                     let millis = 1_700_000_000_000i64 + (batch_start + i) as i64;
                     let nanos = ((batch_start + i) % 1_000_000) as i32;
-                    Some(mosaic_core::types::millis_nanos_to_ns(millis, nanos).unwrap())
+                    Some(paimon_mosaic_core::types::millis_nanos_to_ns(millis, nanos).unwrap())
                 }
             })
             .collect();

@@ -22,7 +22,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Java API - Mosaic</title>
+    <title>Java API - Paimon Mosaic</title>
     <link rel="stylesheet" href="css/style.css">
     <script src="js/main.js"></script>
 </head>
@@ -32,7 +32,7 @@
 
     <aside class="sidebar">
         <div class="sidebar-header">
-            <h2>Mosaic</h2>
+            <h2>Paimon Mosaic</h2>
             <p>Columnar-bucket hybrid format</p>
         </div>
         <nav>
@@ -42,6 +42,7 @@
                 <li><a href="java-api.html" class="active">Java API</a></li>
                 <li><a href="python-api.html">Python API</a></li>
                 <li><a href="cpp-api.html">C++ API</a></li>
+                <li><a href="releases.html">Releases</a></li>
             </ul>
         </nav>
         <div class="sidebar-footer">
@@ -57,14 +58,14 @@
             <h2>Setup</h2>
             <p>
                 The Java API lives in the <code>java/</code> directory and depends on the
-                <code>mosaic_jni</code> native library. Build the native library first:
+                <code>paimon_mosaic_jni</code> native library. Build the native library first:
             </p>
-<pre><code>cargo build --release -p mosaic-jni</code></pre>
+<pre><code>cargo build --release -p paimon-mosaic-jni</code></pre>
             <p>
-                Ensure <code>libmosaic_jni.dylib</code> (macOS) or <code>libmosaic_jni.so</code> (Linux)
+                Ensure <code>libpaimon_mosaic_jni.dylib</code> (macOS) or <code>libpaimon_mosaic_jni.so</code> (Linux)
                 is on <code>java.library.path</code>. The library is loaded automatically via:
             </p>
-<pre><code>System.loadLibrary(<span class="str">"mosaic_jni"</span>);</code></pre>
+<pre><code>System.loadLibrary(<span class="str">"paimon_mosaic_jni"</span>);</code></pre>
             <p>
                 Add the Arrow Java dependencies to your <code>pom.xml</code>:
             </p>

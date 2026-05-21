@@ -28,7 +28,7 @@ import java.nio.file.StandardCopyOption;
 
 final class NativeLib {
 
-    private static final String LIB_NAME = "mosaic_jni";
+    private static final String LIB_NAME = "paimon_mosaic_jni";
 
     static {
         loadNativeLibrary();
@@ -55,7 +55,7 @@ final class NativeLib {
                 throw new UnsatisfiedLinkError(
                         "Native library not found in JAR: " + resourcePath);
             }
-            File tempFile = File.createTempFile("mosaic_jni", libFileName);
+            File tempFile = File.createTempFile("paimon_mosaic_jni", libFileName);
             tempFile.deleteOnExit();
             Files.copy(in, tempFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
             System.load(tempFile.getAbsolutePath());
@@ -90,11 +90,11 @@ final class NativeLib {
     private static String mapLibraryName(String os) {
         switch (os) {
             case "linux":
-                return "libmosaic_jni.so";
+                return "libpaimon_mosaic_jni.so";
             case "macos":
-                return "libmosaic_jni.dylib";
+                return "libpaimon_mosaic_jni.dylib";
             case "windows":
-                return "mosaic_jni.dll";
+                return "paimon_mosaic_jni.dll";
             default:
                 throw new UnsatisfiedLinkError("Unsupported OS: " + os);
         }

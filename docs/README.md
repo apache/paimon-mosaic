@@ -40,15 +40,18 @@ Then open http://localhost:8090 in your browser.
 
 ```
 docs/
-├── index.html        # Home page (overview, benchmarks, types)
-├── design.html       # Format specification & binary layout
-├── java-api.html     # Java API guide
-├── python-api.html   # Python API guide
-├── cpp-api.html      # C++ API guide
+├── index.html                        # Home page (overview, benchmarks, types)
+├── design.html                       # Format specification & binary layout
+├── java-api.html                     # Java API guide
+├── python-api.html                   # Python API guide
+├── cpp-api.html                      # C++ API guide
+├── releases.html                     # Release listing & download links
+├── creating-a-release.html           # Release Manager guide
+├── verifying-a-release-candidate.html # Verification guide for voters
 ├── css/
-│   └── style.css     # Styles (light/dark theme)
+│   └── style.css                     # Styles (light/dark theme)
 └── js/
-    └── main.js       # Theme toggle & mobile menu
+    └── main.js                       # Theme toggle & mobile menu
 ```
 
 ## No Build Step Required

@@ -90,12 +90,12 @@ jobs:
           sudo apt-get install -y libarrow-dev
 
       - name: Build FFI library
-        run: cargo build --release -p mosaic-ffi
+        run: cargo build --release -p paimon-mosaic-ffi
 
       - name: Build C++ test
         run: |
           cmake -S cpp -B cpp/build \
-            -DMOSAIC_FFI_LIB=${{ github.workspace }}/target/release/libmosaic_ffi.so
+            -DMOSAIC_FFI_LIB=${{ github.workspace }}/target/release/libpaimon_mosaic_ffi.so
           cmake --build cpp/build
 
       - name: Run C++ test
@@ -126,7 +126,7 @@ jobs:
           distribution: 'temurin'
 
       - name: Build JNI library
-        run: cargo build -p mosaic-jni --release
+        run: cargo build -p paimon-mosaic-jni --release
 
       - name: Run Java tests
         working-directory: java
@@ -154,7 +154,7 @@ jobs:
           python-version: '3.12'
 
       - name: Build FFI library
-        run: cargo build --release -p mosaic-ffi
+        run: cargo build --release -p paimon-mosaic-ffi
 
       - name: Install Python dependencies
         working-directory: python

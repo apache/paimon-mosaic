@@ -22,7 +22,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>C++ API - Mosaic</title>
+    <title>C++ API - Paimon Mosaic</title>
     <link rel="stylesheet" href="css/style.css">
     <script src="js/main.js"></script>
 </head>
@@ -32,7 +32,7 @@
 
     <aside class="sidebar">
         <div class="sidebar-header">
-            <h2>Mosaic</h2>
+            <h2>Paimon Mosaic</h2>
             <p>Columnar-bucket hybrid format</p>
         </div>
         <nav>
@@ -42,6 +42,7 @@
                 <li><a href="java-api.html">Java API</a></li>
                 <li><a href="python-api.html">Python API</a></li>
                 <li><a href="cpp-api.html">C++ API</a></li>
+                <li><a href="releases.html">Releases</a></li>
             </ul>
         </nav>
         <div class="sidebar-footer">
@@ -56,14 +57,14 @@
 
             <h2>Overview</h2>
             <p>
-                The <code>ffi/</code> crate generates a shared library (<code>libmosaic_ffi</code>) and a
+                The <code>ffi/</code> crate generates a shared library (<code>libpaimon_mosaic_ffi</code>) and a
                 C header (<code>mosaic.h</code>) via <a href="https://github.com/mozilla/cbindgen">cbindgen</a>.
                 The C++ header (<code>mosaic.hpp</code>) is a hand-written RAII wrapper on top of the C API.
             </p>
 
             <h2>Building</h2>
 <pre><code><span class="cmt"># Build the FFI shared library</span>
-cargo build --release -p mosaic-ffi
+cargo build --release -p paimon-mosaic-ffi
 
 <span class="cmt"># C header generated at include/mosaic.h</span>
 <span class="cmt"># C++ RAII wrapper:     include/mosaic.hpp (checked in, not generated)</span></code></pre>
@@ -72,11 +73,11 @@ cargo build --release -p mosaic-ffi
             <p>Link against the shared library and include the appropriate header:</p>
 <pre><code><span class="cmt"># macOS</span>
 g++ -std=c++17 -I include/ example.cpp \
-    -L target/release -lmosaic_ffi -o example
+    -L target/release -lpaimon_mosaic_ffi -o example
 
 <span class="cmt"># Linux</span>
 g++ -std=c++17 -I include/ example.cpp \
-    -L target/release -lmosaic_ffi -Wl,-rpath,target/release -o example</code></pre>
+    -L target/release -lpaimon_mosaic_ffi -Wl,-rpath,target/release -o example</code></pre>
 
             <h2>Writing (C++)</h2>
             <p>

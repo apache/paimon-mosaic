@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Publish the mosaic-format Python package to PyPI.
+# Publish the paimon-mosaic Python package to PyPI.
 #
 # Trigger: push a version tag (e.g. v0.1.0, v0.1.0-rc1).
 # Pre-release tags (containing '-') publish to TestPyPI; release tags publish to PyPI.
@@ -69,8 +69,8 @@ jobs:
           CIBW_BEFORE_ALL_LINUX: >
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
             source $HOME/.cargo/env &&
-            cargo build --release -p mosaic-ffi &&
-            cp target/release/libmosaic_ffi.so {package}/mosaic/
+            cargo build --release -p paimon-mosaic-ffi &&
+            cp target/release/libpaimon_mosaic_ffi.so {package}/mosaic/
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -86,7 +86,7 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-            lib_name: libmosaic_ffi.dylib
+            lib_name: libpaimon_mosaic_ffi.dylib
     steps:
       - uses: actions/checkout@v4
 
@@ -96,7 +96,7 @@ jobs:
           rustup default stable
 
       - name: Build native library
-        run: cargo build --release -p mosaic-ffi
+        run: cargo build --release -p paimon-mosaic-ffi
 
       - name: Copy native library into package
         run: cp target/release/${{ matrix.lib_name }} python/mosaic/
@@ -136,11 +136,11 @@ jobs:
           rustup default stable
 
       - name: Build native library
-        run: cargo build --release -p mosaic-ffi
+        run: cargo build --release -p paimon-mosaic-ffi
 
       - name: Copy native library into package
         shell: bash
-        run: cp target/release/mosaic_ffi.dll python/mosaic/
+        run: cp target/release/paimon_mosaic_ffi.dll python/mosaic/
 
       - name: Set up Python
         uses: actions/setup-python@v5

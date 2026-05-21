@@ -43,11 +43,11 @@ from ctypes import (
 def _load_library():
     system = platform.system()
     if system == "Darwin":
-        lib_name = "libmosaic_ffi.dylib"
+        lib_name = "libpaimon_mosaic_ffi.dylib"
     elif system == "Windows":
-        lib_name = "mosaic_ffi.dll"
+        lib_name = "paimon_mosaic_ffi.dll"
     else:
-        lib_name = "libmosaic_ffi.so"
+        lib_name = "libpaimon_mosaic_ffi.so"
 
     env_path = os.environ.get("MOSAIC_LIB_PATH")
     search_paths = []
@@ -76,7 +76,7 @@ def _load_library():
     except OSError:
         raise OSError(
             f"Cannot find {lib_name}. Build the native library first with "
-            f"'cargo build --release -p mosaic-ffi', or set MOSAIC_LIB_PATH "
+            f"'cargo build --release -p paimon-mosaic-ffi', or set MOSAIC_LIB_PATH "
             f"to the directory containing {lib_name}."
         )
 

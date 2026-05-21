@@ -23,14 +23,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Arrow REQUIRED)
 
-set(MOSAIC_FFI_LIB "" CACHE FILEPATH "Path to libmosaic_ffi shared library")
+set(MOSAIC_FFI_LIB "" CACHE FILEPATH "Path to libpaimon_mosaic_ffi shared library")
 if(NOT MOSAIC_FFI_LIB)
     if(APPLE)
-        set(MOSAIC_FFI_LIB "${CMAKE_SOURCE_DIR}/../target/release/libmosaic_ffi.dylib")
+        set(MOSAIC_FFI_LIB "${CMAKE_SOURCE_DIR}/../target/release/libpaimon_mosaic_ffi.dylib")
     elseif(WIN32)
-        set(MOSAIC_FFI_LIB "${CMAKE_SOURCE_DIR}/../target/release/mosaic_ffi.dll")
+        set(MOSAIC_FFI_LIB "${CMAKE_SOURCE_DIR}/../target/release/paimon_mosaic_ffi.dll")
     else()
-        set(MOSAIC_FFI_LIB "${CMAKE_SOURCE_DIR}/../target/release/libmosaic_ffi.so")
+        set(MOSAIC_FFI_LIB "${CMAKE_SOURCE_DIR}/../target/release/libpaimon_mosaic_ffi.so")
     endif()
 endif()
 
