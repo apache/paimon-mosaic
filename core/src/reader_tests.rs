@@ -2131,7 +2131,7 @@ fn test_timestamp_nanos_stats_min_max() {
         out,
         &columns_to_arrow_schema(&columns),
         WriterOptions {
-            stats_columns: vec![0],
+            stats_columns: vec!["ts".to_string()],
             ..Default::default()
         },
     )
