@@ -679,6 +679,54 @@ class TestConvenience:
         assert result.num_rows == 30
         assert result.schema.names == []
 
+    def test_read_table_projection_with_zero_row_groups(self):
+        pa_schema = pa.schema(
+            [
+                pa.field("id", pa.int32()),
+                pa.field("name", pa.utf8()),
+            ]
+        )
+
+        buf = io.BytesIO()
+        with MosaicWriter(buf, pa_schema):
+            pass
+
+        data = buf.getvalue()
+
+        empty_projection = read_table(
+            lambda offset, length: data[offset : offset + length],
+            len(data),
+            columns=[],
+        )
+        assert empty_projection.num_rows == 0
+        assert empty_projection.num_columns == 0
+        assert empty_projection.schema.names == []
+
+        name_projection = read_table(
+            lambda offset, length: data[offset : offset + length],
+            len(data),
+            columns=["name"],
+        )
+        assert name_projection.num_rows == 0
+        assert name_projection.num_columns == 1
+        assert name_projection.schema.names == ["name"]
+
+        duplicate_projection = read_table(
+            lambda offset, length: data[offset : offset + length],
+            len(data),
+            columns=["name", "name"],
+        )
+        assert duplicate_projection.num_rows == 0
+        assert duplicate_projection.num_columns == 1
+        assert duplicate_projection.schema.names == ["name"]
+
+        with _reader_from_bytes(data) as reader:
+            assert reader.num_row_groups == 0
+            reader.project(["name"])
+            assert reader.schema.names == ["id", "name"]
+            result = reader.read_all()
+            assert result.schema.names == ["name"]
+
     def test_read_all(self):
         pa_schema = pa.schema(
             [pa.field("x", pa.int32()), pa.field("y", pa.utf8())]

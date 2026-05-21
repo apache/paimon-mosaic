@@ -284,6 +284,7 @@ class MosaicReader:
         if rc != 0:
             _check_error("export_schema failed")
         self._schema = pa.Schema._import_from_c(schema_ptr)
+        self._projected_schema = None
 
     @staticmethod
     def from_input_file(read_at_fn, file_length):
@@ -332,11 +333,17 @@ class MosaicReader:
 
     def project(self, columns):
         """Set projection on the reader. Subsequent reads only return the named columns."""
-        c_strs = [c.encode("utf-8") for c in columns]
-        arr = (ctypes.c_char_p * len(columns))(*c_strs)
-        rc = lib.mosaic_reader_set_projection(self._handle, arr, len(columns))
+        column_names = list(columns)
+        c_strs = [c.encode("utf-8") for c in column_names]
+        arr = (ctypes.c_char_p * len(column_names))(*c_strs)
+        rc = lib.mosaic_reader_set_projection(self._handle, arr, len(column_names))
         if rc != 0:
             _check_error("set_projection failed")
+        projected_field_names = list(dict.fromkeys(column_names))
+        self._projected_schema = pa.schema(
+            [self._schema.field(name) for name in projected_field_names],
+            metadata=self._schema.metadata,
+        )
 
     def read_row_group(self, rg_index):
         rg_handle = lib.mosaic_reader_open_row_group(self._handle, rg_index)
@@ -368,7 +375,12 @@ class MosaicReader:
             batches.append(self.read_row_group(rg))
         if batches:
             return pa.Table.from_batches(batches, schema=batches[0].schema)
-        return pa.Table.from_batches([], schema=self._schema)
+        schema = (
+            self._projected_schema
+            if self._projected_schema is not None
+            else self._schema
+        )
+        return pa.Table.from_batches([], schema=schema)
 
     def row_group_num_rows(self, rg_index):
         out = ctypes.c_uint32(0)
