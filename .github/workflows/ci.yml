@@ -76,8 +76,11 @@ jobs:
       - name: Build
         run: cargo build --all-targets
 
-      - name: Test
-        run: cargo test -- --skip test_read_java_written_file --skip test_read_python_written_file
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Test with coverage
+        run: cargo llvm-cov --summary-only -- --skip test_read_java_written_file --skip test_read_python_written_file
 
   cpp-test:
     runs-on: ubuntu-latest
