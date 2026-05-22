@@ -31,13 +31,12 @@ A columnar-bucket hybrid format optimized for wide tables of Apache Paimon.
 Apache Paimon Mosaic is an exciting project currently under active development. Whether you're looking to use it in your projects or contribute to its growth, there are several ways you can get involved:
 
 - Follow the [Contributing Guide](CONTRIBUTING.md) to contribute.
-- Create new [Issue](https://github.com/apache/paimon-mosaic/issues/new) for bug reportor or feature request.
 - Start discussion thread at [dev mailing list](mailto:dev@paimon.apache.org) ([subscribe](<mailto:dev-subscribe@paimon.apache.org?subject=(send%20this%20email%20to%20subscribe)>) / [unsubscribe](<mailto:dev-unsubscribe@paimon.apache.org?subject=(send%20this%20email%20to%20unsubscribe)>) / [archives](https://lists.apache.org/list.html?dev@paimon.apache.org))
 - Talk to community directly at [Slack #paimon channel](https://join.slack.com/t/the-asf/shared_invite/zt-2l9rns8pz-H8PE2Xnz6KraVd2Ap40z4g).
 
 ## Getting help
 
-Submit [issues](https://github.com/apache/paimon-mosaic/issues/new/choose) for bug report or asking questions in [discussion](https://github.com/apache/paimon-mosaic/discussions/new?category=q-a).
+Reach out on Slack at [Slack #paimon channel](https://join.slack.com/t/the-asf/shared_invite/zt-2l9rns8pz-H8PE2Xnz6KraVd2Ap40z4g).
 
 ## License
 
