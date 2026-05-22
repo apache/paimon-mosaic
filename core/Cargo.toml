@@ -27,6 +27,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 zstd = "0.13"
+lz4 = "1.28"
 arrow-schema = "58"
 arrow-array = "58"
 arrow-buffer = "58"

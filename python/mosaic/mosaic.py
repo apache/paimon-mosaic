@@ -88,6 +88,7 @@ def _fetch_rg_stats(num_stats_fn, stats_fn, handle, rg_index):
 class WriterOptions:
     COMPRESSION_NONE = 0
     COMPRESSION_ZSTD = 1
+    COMPRESSION_LZ4 = 2
 
     def __init__(
         self,

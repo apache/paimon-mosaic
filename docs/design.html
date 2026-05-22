@@ -556,7 +556,7 @@ page_content (after decompression):
             </p>
             <h5>Validation Invariants</h5>
             <ul>
-                <li>Paged buckets require <code>compression == ZSTD</code>.</li>
+                <li>Paged buckets require compression (<code>ZSTD</code> or <code>LZ4</code>); <code>NONE</code> is rejected.</li>
                 <li>The paged directory size is <code>num_cols &times; 4</code> bytes;
                     <code>dir_size + sum(slot_sizes) == compressed_size</code> must hold exactly.</li>
                 <li>All varint-encoded sizes (<code>compressed_size</code>,
@@ -575,13 +575,14 @@ page_content (after decompression):
                 <tbody>
                     <tr><td>0</td><td>None</td><td>No compression</td></tr>
                     <tr><td>1</td><td>Zstd</td><td>Zstandard compression (default level 1)</td></tr>
+                    <tr><td>2</td><td>LZ4</td><td>LZ4 block compression (faster decode, lower ratio than Zstd)</td></tr>
                 </tbody>
             </table>
             <p>
                 In monolithic mode, compression is applied to the entire bucket as one block.
                 In paged mode, the page directory is uncompressed (fixed-length, enabling direct offset computation),
-                while each column slot is independently zstd-compressed.
-                Paged mode is only used when the compression method is Zstd.
+                while each column slot is independently compressed with the file's compression method.
+                Paged mode is supported for <code>Zstd</code> and <code>LZ4</code>; <code>None</code> falls back to monolithic.
             </p>
 
             <!-- ============================================================ -->
@@ -604,7 +605,7 @@ page_content (after decompression):
                     <tr><td>8</td><td>8</td><td><code>schemaBlockOffset</code></td><td>Absolute offset of Schema Block</td></tr>
                     <tr><td>16</td><td>4</td><td><code>numBuckets</code></td><td>Total number of buckets</td></tr>
                     <tr><td>20</td><td>4</td><td><code>numRowGroups</code></td><td>Total number of row groups</td></tr>
-                    <tr><td>24</td><td>1</td><td><code>compression</code></td><td>0 = none, 1 = zstd</td></tr>
+                    <tr><td>24</td><td>1</td><td><code>compression</code></td><td>0 = none, 1 = zstd, 2 = lz4</td></tr>
                     <tr><td>25</td><td>1</td><td><code>version</code></td><td>Format version (currently 1)</td></tr>
                     <tr><td>26</td><td>2</td><td><em>(reserved)</em></td><td>Padding, set to 0</td></tr>
                     <tr><td>28</td><td>4</td><td><code>magic</code></td><td><code>MOSA</code> (0x4D4F5341)</td></tr>

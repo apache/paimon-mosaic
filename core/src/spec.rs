@@ -21,6 +21,7 @@ pub const FOOTER_SIZE: usize = 32;
 
 pub const COMPRESSION_NONE: u8 = 0;
 pub const COMPRESSION_ZSTD: u8 = 1;
+pub const COMPRESSION_LZ4: u8 = 2;
 
 pub const ENCODING_PLAIN: u8 = 0;
 pub const ENCODING_CONST: u8 = 1;

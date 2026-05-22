@@ -138,7 +138,7 @@ data = buf.getvalue()</code></pre>
                 </thead>
                 <tbody>
                     <tr><td><code>num_buckets</code></td><td>0</td><td>Number of buckets (0 = auto)</td></tr>
-                    <tr><td><code>compression</code></td><td>ZSTD (1)</td><td>0 = none, 1 = Zstd</td></tr>
+                    <tr><td><code>compression</code></td><td>ZSTD (1)</td><td>0 = none, 1 = Zstd, 2 = LZ4 (constants on <code>WriterOptions</code>)</td></tr>
                     <tr><td><code>zstd_level</code></td><td>1</td><td>Zstd compression level</td></tr>
                     <tr><td><code>row_group_max_size</code></td><td>256 MB</td><td>Max uncompressed bytes per row group</td></tr>
                     <tr><td><code>max_dict_total_bytes</code></td><td>32 KB</td><td>Max dictionary size per column</td></tr>

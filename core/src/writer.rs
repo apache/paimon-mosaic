@@ -313,7 +313,7 @@ impl<S: OutputFile> MosaicWriter<S> {
             }
             let est_size = bw.estimated_raw_size();
             let try_paged =
-                self.compression == COMPRESSION_ZSTD && est_size >= self.page_size_threshold;
+                self.compression != COMPRESSION_NONE && est_size >= self.page_size_threshold;
 
             let paged_output = if try_paged {
                 let paged = bw.finish_paged();
@@ -407,6 +407,12 @@ impl<S: OutputFile> MosaicWriter<S> {
                 self.out.write(&compressed)?;
                 Ok(compressed.len())
             }
+            COMPRESSION_LZ4 => {
+                let compressed =
+                    lz4::block::compress(raw, None, false).map_err(io::Error::other)?;
+                self.out.write(&compressed)?;
+                Ok(compressed.len())
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Unsupported compression: {}", self.compression),
@@ -451,8 +457,19 @@ impl<S: OutputFile> MosaicWriter<S> {
 
             // Compress and build on-disk slot: uncompressed_size varint + compressed data
             let uncompressed_size = page_content.len();
-            let compressed =
-                zstd::bulk::compress(&page_content, self.zstd_level).map_err(io::Error::other)?;
+            let compressed = match self.compression {
+                COMPRESSION_ZSTD => zstd::bulk::compress(&page_content, self.zstd_level)
+                    .map_err(io::Error::other)?,
+                COMPRESSION_LZ4 => {
+                    lz4::block::compress(&page_content, None, false).map_err(io::Error::other)?
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "paged bucket: unsupported compression",
+                    ))
+                }
+            };
             let mut slot = Vec::new();
             varint::encode(
                 &mut slot,
@@ -503,6 +520,11 @@ impl<S: OutputFile> MosaicWriter<S> {
             COMPRESSION_ZSTD => {
                 let compressed =
                     zstd::bulk::compress(&schema_raw, self.zstd_level).map_err(io::Error::other)?;
+                self.out.write(&compressed)?;
+            }
+            COMPRESSION_LZ4 => {
+                let compressed =
+                    lz4::block::compress(&schema_raw, None, false).map_err(io::Error::other)?;
                 self.out.write(&compressed)?;
             }
             _ => {
@@ -680,6 +702,43 @@ mod tests {
         writer.close().unwrap();
         let magic = &writer.out.buf[writer.out.buf.len() - 4..];
         assert_eq!(magic, &MAGIC);
+    }
+
+    #[test]
+    fn test_write_with_lz4() {
+        let arrow_schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]);
+        let out = MemOutputFile::new();
+        let mut writer = MosaicWriter::new(
+            out,
+            &arrow_schema,
+            WriterOptions {
+                num_buckets: 1,
+                compression: COMPRESSION_LZ4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let a_vals: Vec<i64> = (0..1000).collect();
+        let b_vals: Vec<i64> = (0..1000).map(|i| i * 2).collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![
+                Arc::new(Int64Array::from(a_vals)),
+                Arc::new(Int64Array::from(b_vals)),
+            ],
+        )
+        .unwrap();
+        writer.write_batch(&batch).unwrap();
+
+        writer.close().unwrap();
+        let data = &writer.out.buf;
+        assert!(data.len() >= FOOTER_SIZE);
+        assert_eq!(&data[data.len() - 4..], &MAGIC);
+        assert_eq!(data[data.len() - 8], COMPRESSION_LZ4);
     }
 
     #[test]

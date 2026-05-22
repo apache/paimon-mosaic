@@ -161,6 +161,25 @@ class TestRoundtrip:
             assert rb.num_rows == 100
             assert rb.column("x").to_pylist() == list(range(100))
 
+    def test_compression_lz4(self):
+        pa_schema = pa.schema(
+            [pa.field("x", pa.int32()), pa.field("y", pa.utf8())]
+        )
+        batch = pa.record_batch(
+            [
+                pa.array(list(range(100)), type=pa.int32()),
+                pa.array([f"v_{i}" for i in range(100)]),
+            ],
+            names=["x", "y"],
+        )
+        opts = WriterOptions(compression=WriterOptions.COMPRESSION_LZ4)
+        data = _write_to_bytes(pa_schema, batch, opts)
+
+        with _reader_from_bytes(data) as reader:
+            rb = reader.read_row_group(0)
+            assert rb.num_rows == 100
+            assert rb.column("x").to_pylist() == list(range(100))
+
     def test_all_types(self):
         pa_schema = pa.schema(
             [

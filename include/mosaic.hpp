@@ -82,8 +82,13 @@ inline int64_t stream_get_pos(void* ctx) noexcept {
 
 } // namespace detail
 
+// Compression codec IDs (match the on-disk format byte in the file footer).
+constexpr uint8_t kCompressionNone = 0;
+constexpr uint8_t kCompressionZstd = 1;
+constexpr uint8_t kCompressionLz4 = 2;
+
 struct WriterOptions {
-    uint8_t compression = 1;  // ZSTD
+    uint8_t compression = kCompressionZstd;
     int zstd_level = 1;
     uint32_t num_buckets = 0;
     uint64_t row_group_max_size = 256ULL * 1024 * 1024;

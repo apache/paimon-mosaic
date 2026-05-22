@@ -612,6 +612,45 @@ fn test_roundtrip_with_zstd() {
 }
 
 #[test]
+fn test_roundtrip_with_lz4() {
+    let columns = vec![
+        ("a".to_string(), DataType::Int64, true),
+        ("b".to_string(), DataType::Int64, true),
+    ];
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            compression: COMPRESSION_LZ4,
+            num_buckets: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let rows: Vec<Vec<Value>> = (0..1000)
+        .map(|i| vec![Value::BigInt(i), Value::BigInt(i * 2)])
+        .collect();
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    let reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+    assert_eq!(batch.num_rows(), 1000);
+
+    let col_a = batch_col_i64(&batch, "a");
+    let col_b = batch_col_i64(&batch, "b");
+
+    for i in 0..1000usize {
+        assert_eq!(col_a.value(i), i as i64);
+        assert_eq!(col_b.value(i), i as i64 * 2);
+    }
+}
+
+#[test]
 fn test_roundtrip_all_types() {
     let columns = vec![
         ("f_boolean".to_string(), DataType::Boolean, true),
@@ -2671,6 +2710,56 @@ fn test_paged_roundtrip_basic() {
         .collect();
 
     let (reader, _) = write_and_read_paged(columns, &rows);
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+    assert_eq!(batch.num_rows(), 200);
+
+    let ids = batch_col_i32(&batch, "id");
+    let names = batch_col_string(&batch, "name");
+    let scores = batch_col_f64(&batch, "score");
+
+    for i in 0..200usize {
+        assert_eq!(ids.value(i), i as i32);
+        assert_eq!(names.value(i), format!("user_{}", i));
+        assert!((scores.value(i) - i as f64 * 1.5).abs() < 1e-10);
+    }
+}
+
+#[test]
+fn test_paged_roundtrip_with_lz4() {
+    let columns = vec![
+        ("id".to_string(), DataType::Int32, true),
+        ("name".to_string(), DataType::Utf8, true),
+        ("score".to_string(), DataType::Float64, true),
+    ];
+    let rows: Vec<Vec<Value>> = (0..200)
+        .map(|i| {
+            vec![
+                Value::Integer(i),
+                Value::String(format!("user_{}", i).into_bytes()),
+                Value::Double(i as f64 * 1.5),
+            ]
+        })
+        .collect();
+
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            compression: COMPRESSION_LZ4,
+            page_size_threshold: 1,
+            num_buckets: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    let reader = MosaicReader::new(ByteArrayInputFile::new(data.clone()), len).unwrap();
+
     let mut rg = reader.row_group_reader(0).unwrap();
     let batch = rg.read_columns().unwrap();
     assert_eq!(batch.num_rows(), 200);

@@ -534,6 +534,41 @@ public class MosaicRoundtripTest {
     }
 
     @Test
+    public void testCompressionLz4() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.nullable("x", new ArrowType.Int(32, true)),
+                Field.nullable("y", ArrowType.Utf8.INSTANCE)
+        ));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            IntVector xVec = (IntVector) root.getVector("x");
+            VarCharVector yVec = (VarCharVector) root.getVector("y");
+            int n = 100;
+            xVec.allocateNew(n);
+            yVec.allocateNew(n);
+            for (int i = 0; i < n; i++) {
+                xVec.set(i, i);
+                yVec.setSafe(i, ("v_" + i).getBytes());
+            }
+            root.setRowCount(n);
+            data = writeToBytes(
+                    arrowSchema,
+                    new WriterOptions().compression(WriterOptions.COMPRESSION_LZ4),
+                    writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            try (VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+                assertEquals(100, batch.getRowCount());
+                for (int i = 0; i < 100; i++) {
+                    assertEquals(i, ((IntVector) batch.getVector("x")).get(i));
+                }
+            }
+        }
+    }
+
+    @Test
     public void testCompressionNone() {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("x", new ArrowType.Int(32, true)),

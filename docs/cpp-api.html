@@ -155,7 +155,7 @@ g++ -std=c++17 -I include/ example.cpp \
                 </thead>
                 <tbody>
                     <tr><td><code>num_buckets</code></td><td>uint32_t</td><td>0</td><td>Number of buckets (0 = auto)</td></tr>
-                    <tr><td><code>compression</code></td><td>uint8_t</td><td>1</td><td>0=none, 1=zstd</td></tr>
+                    <tr><td><code>compression</code></td><td>uint8_t</td><td>1</td><td>0=none, 1=zstd, 2=lz4 (use <code>mosaic::kCompression*</code> constants)</td></tr>
                     <tr><td><code>zstd_level</code></td><td>int32_t</td><td>1</td><td>Zstd compression level</td></tr>
                     <tr><td><code>row_group_max_size</code></td><td>uint64_t</td><td>256 MB</td><td>Max row group size</td></tr>
                     <tr><td><code>max_dict_total_bytes</code></td><td>uint32_t</td><td>32 KB</td><td>Max dict size per column</td></tr>

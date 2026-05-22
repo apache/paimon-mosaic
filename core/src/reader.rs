@@ -313,6 +313,10 @@ impl<I: InputFile> MosaicReader<I> {
             COMPRESSION_NONE => schema_compressed.to_vec(),
             COMPRESSION_ZSTD => zstd::bulk::decompress(schema_compressed, schema_uncompressed_size)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            COMPRESSION_LZ4 => {
+                lz4::block::decompress(schema_compressed, Some(schema_uncompressed_size as i32))
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -448,6 +452,7 @@ impl<I: InputFile> MosaicReader<I> {
     }
 
     fn parse_column_slot(
+        compression: u8,
         slot_data: &[u8],
         col_type: &DataType,
         num_rows: usize,
@@ -455,8 +460,20 @@ impl<I: InputFile> MosaicReader<I> {
         let mut spos = 0usize;
         let uncompressed_size = varint::decode(slot_data, &mut spos)? as usize;
         let compressed_data = &slot_data[spos..];
-        let page_content = zstd::bulk::decompress(compressed_data, uncompressed_size)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let page_content = match compression {
+            COMPRESSION_ZSTD => zstd::bulk::decompress(compressed_data, uncompressed_size)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            COMPRESSION_LZ4 => {
+                lz4::block::decompress(compressed_data, Some(uncompressed_size as i32))
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "paged bucket: unsupported compression",
+                ))
+            }
+        };
 
         if page_content.len() < 2 {
             return Err(io::Error::new(
@@ -609,10 +626,10 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                     bucket_kinds.push(BucketLayout::Empty);
                 }
                 BucketLayout::Paged { total_size } => {
-                    if self.compression != COMPRESSION_ZSTD {
+                    if self.compression == COMPRESSION_NONE {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "paged bucket requires ZSTD compression",
+                            "paged bucket requires compression",
                         ));
                     }
                     let dir_size = self.schema.bucket_to_global[b].len() * 4;
@@ -673,6 +690,10 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                         COMPRESSION_NONE => buf.to_vec(),
                         COMPRESSION_ZSTD => zstd::bulk::decompress(buf, uncompressed_size)
                             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                        COMPRESSION_LZ4 => {
+                            lz4::block::decompress(buf, Some(uncompressed_size as i32))
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                        }
                         _ => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -735,8 +756,12 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                                 )?));
                             } else {
                                 let slot_data = &buf[data_offset..data_offset + slot_sizes[i]];
-                                let column_reader =
-                                    Self::parse_column_slot(slot_data, &col_type, meta.num_rows)?;
+                                let column_reader = Self::parse_column_slot(
+                                    self.compression,
+                                    slot_data,
+                                    &col_type,
+                                    meta.num_rows,
+                                )?;
                                 column_readers.push(Some(column_reader));
                             }
                             data_offset += slot_sizes[i];
@@ -878,8 +903,12 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                     })?;
                     let group_buffer = r2_buffers[location.group_idx].as_slice();
                     let slot_data = &group_buffer[location.start..location.start + location.len];
-                    let column_reader =
-                        Self::parse_column_slot(slot_data, &col_type, meta.num_rows)?;
+                    let column_reader = Self::parse_column_slot(
+                        self.compression,
+                        slot_data,
+                        &col_type,
+                        meta.num_rows,
+                    )?;
                     column_readers.push(Some(column_reader));
                 }
                 bucket_states[b] = Some(BucketState::Paged { column_readers });

@@ -22,6 +22,7 @@ package org.apache.paimon.mosaic;
 public class WriterOptions {
 
     public static final int COMPRESSION_ZSTD = 1;
+    public static final int COMPRESSION_LZ4 = 2;
 
     private int compression = COMPRESSION_ZSTD;
     private int zstdLevel = 1;

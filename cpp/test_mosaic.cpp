@@ -420,7 +420,7 @@ static void test_compression_zstd() {
     });
 
     mosaic::WriterOptions opts;
-    opts.compression = 1;
+    opts.compression = mosaic::kCompressionZstd;
     opts.zstd_level = 3;
     auto data_vec = write_and_get(schema, batch, opts);
 
@@ -435,6 +435,39 @@ static void test_compression_zstd() {
         ASSERT_EQ(xs->Value(i), i);
     }
     printf("  PASS test_compression_zstd\n");
+}
+
+static void test_compression_lz4() {
+    auto schema = arrow::schema({
+        arrow::field("x", arrow::int32()),
+        arrow::field("y", arrow::utf8()),
+    });
+
+    arrow::Int32Builder xb;
+    arrow::StringBuilder yb;
+    for (int i = 0; i < 100; i++) {
+        assert(xb.Append(i).ok());
+        assert(yb.Append("v_" + std::to_string(i)).ok());
+    }
+    auto batch = arrow::RecordBatch::Make(schema, 100, {
+        xb.Finish().ValueUnsafe(), yb.Finish().ValueUnsafe(),
+    });
+
+    mosaic::WriterOptions opts;
+    opts.compression = mosaic::kCompressionLz4;
+    auto data_vec = write_and_get(schema, batch, opts);
+
+    MemBuffer buf;
+    buf.data = data_vec;
+    auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
+    auto rb = read_row_group(reader, 0);
+    ASSERT_EQ(rb->num_rows(), 100);
+
+    auto xs = std::static_pointer_cast<arrow::Int32Array>(rb->GetColumnByName("x"));
+    for (int i = 0; i < 100; i++) {
+        ASSERT_EQ(xs->Value(i), i);
+    }
+    printf("  PASS test_compression_lz4\n");
 }
 
 static void test_schema_roundtrip() {
@@ -834,6 +867,7 @@ int main() {
     test_projection_empty();
     test_statistics();
     test_compression_zstd();
+    test_compression_lz4();
     test_schema_roundtrip();
     test_multiple_row_groups();
     test_writer_stats();
@@ -841,6 +875,6 @@ int main() {
     test_writer_stats_all_null();
     test_writer_stats_matches_reader();
     test_stats_empty_string_min();
-    printf("All %d tests passed.\n", 15);
+    printf("All %d tests passed.\n", 16);
     return 0;
 }
