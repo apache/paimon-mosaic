@@ -154,48 +154,20 @@ cd paimon-mosaic</code></pre>
 
             <h3>Set Up Environment Variables</h3>
 <pre><code>RELEASE_VERSION="0.1.0"
+SHORT_RELEASE_VERSION="0.1"
 NEXT_VERSION="0.2.0"
-RC_NUM="1"</code></pre>
+RC_NUM="1"
+RELEASE_BRANCH="release-${SHORT_RELEASE_VERSION}"
+RC_TAG="v${RELEASE_VERSION}-rc${RC_NUM}"
+RELEASE_TAG="v${RELEASE_VERSION}"</code></pre>
 
-            <h3>Create a Release Branch</h3>
-<pre><code>cd tools
-RELEASE_VERSION=${RELEASE_VERSION} RELEASE_CANDIDATE=${RC_NUM} ./create_release_branch.sh</code></pre>
-            <p>This creates a branch named <code>release-${RELEASE_VERSION}-rc${RC_NUM}</code> from the current HEAD.</p>
-
-            <h3>Bump Version on Main</h3>
-            <p>After cutting the release branch, bump <code>main</code> to the next development version:</p>
-<pre><code>git checkout main
-cd tools
-OLD_VERSION=${RELEASE_VERSION} NEW_VERSION=${NEXT_VERSION}-SNAPSHOT ./update_branch_version.sh</code></pre>
-            <p>The script updates version strings in all <code>pom.xml</code> (matching both <code>${OLD_VERSION}</code> and <code>${OLD_VERSION}-SNAPSHOT</code>), <code>Cargo.toml</code> (excluding <code>target/</code>), and <code>python/pyproject.toml</code> files, then creates a commit.</p>
-
-            <!-- ============================================================ -->
-            <h2 id="build-a-release-candidate">Build a Release Candidate</h2>
-
-            <h3>Update Versions on the Release Branch</h3>
-            <p>Before tagging, update the release branch to non-SNAPSHOT versions (removing <code>-SNAPSHOT</code> from <code>pom.xml</code>):</p>
-<pre><code>git checkout release-${RELEASE_VERSION}-rc${RC_NUM}
-cd tools
-OLD_VERSION=${RELEASE_VERSION}-SNAPSHOT NEW_VERSION=${RELEASE_VERSION} ./update_branch_version.sh
-cd ..</code></pre>
-            <p>This ensures the Java artifacts deployed from the RC tag carry the final release version (e.g. <code>0.1.0</code>) rather than a SNAPSHOT suffix.</p>
-
-            <h3>Create the RC Tag</h3>
-            <p>Push a signed RC tag to trigger CI workflows:</p>
-<pre><code>git tag -s v${RELEASE_VERSION}-rc${RC_NUM} -m "v${RELEASE_VERSION}-rc${RC_NUM}"
-git push origin release-${RELEASE_VERSION}-rc${RC_NUM}
-git push origin v${RELEASE_VERSION}-rc${RC_NUM}</code></pre>
-            <p>After pushing, verify in <a href="https://github.com/apache/paimon-mosaic/actions">GitHub Actions</a> that all release workflows succeed:</p>
-            <ul>
-                <li><strong>Release Rust</strong> &mdash; dry-run check (does not publish for RC tags)</li>
-                <li><strong>Release Java</strong> &mdash; builds native JNI libraries for 4 platforms, deploys JAR to Apache Nexus staging</li>
-                <li><strong>Release Python</strong> &mdash; builds wheels for 4 platforms, publishes to TestPyPI</li>
-            </ul>
-
-            <h3>Verify and Generate Dependency Licenses</h3>
-            <p>ASF releases must include a declaration of third-party dependency licenses. Use <code>cargo-deny</code> to check and generate the license manifest:</p>
+            <h3>Generate Dependency License Manifests</h3>
+            <p>ASF releases must include a declaration of third-party dependency licenses. Generate and commit dependency manifests on <code>main</code> <strong>before</strong> creating the release branch, so the release branch and source archive contain the same reviewed manifests.</p>
 <pre><code># Install cargo-deny (one-time)
 cargo install cargo-deny
+
+git checkout main
+git pull --ff-only origin main
 
 # Check all dependency licenses are approved
 python3 tools/dependencies.py check
@@ -203,13 +175,57 @@ python3 tools/dependencies.py check
 # Generate DEPENDENCIES.rust.tsv
 python3 tools/dependencies.py generate
 
-# Commit the generated files (required for inclusion in the source tarball)
 git add DEPENDENCIES.rust.tsv core/DEPENDENCIES.rust.tsv ffi/DEPENDENCIES.rust.tsv jni/DEPENDENCIES.rust.tsv
-git commit -m "Generate DEPENDENCIES.rust.tsv for release ${RELEASE_VERSION}"</code></pre>
-            <p>Fix any license violations before proceeding. The generated files must be committed because <code>create_source_release.sh</code> builds the archive from a git clone.</p>
+git commit -m "chore: update dependency list for release ${RELEASE_VERSION}"
+git push origin main</code></pre>
+            <p>Fix any license violations before proceeding. The generated files must be committed before tagging because <code>create_source_release.sh</code> builds the archive from a git clone.</p>
+
+            <h3>Create a Release Branch</h3>
+            <p>Create one stable release branch for the release line. Do not include the RC number in the branch name; RC attempts are represented by tags such as <code>v0.1.0-rc1</code> and <code>v0.1.0-rc2</code>.</p>
+<pre><code>git checkout main
+git pull --ff-only origin main
+git checkout -b ${RELEASE_BRANCH}
+git push origin ${RELEASE_BRANCH}</code></pre>
+
+            <h3>Bump Version on Main</h3>
+            <p>After cutting the release branch, bump <code>main</code> to the next development version:</p>
+<pre><code>git checkout main
+git pull --ff-only origin main
+cd tools
+OLD_VERSION=${RELEASE_VERSION} NEW_VERSION=${NEXT_VERSION}-SNAPSHOT ./update_branch_version.sh
+cd ..
+git push origin main</code></pre>
+            <p>The script updates version strings in all <code>pom.xml</code> (matching both <code>${OLD_VERSION}</code> and <code>${OLD_VERSION}-SNAPSHOT</code>), <code>Cargo.toml</code> (excluding <code>target/</code>), and <code>python/pyproject.toml</code> files, then creates a commit.</p>
+
+            <!-- ============================================================ -->
+            <h2 id="build-a-release-candidate">Build a Release Candidate</h2>
+
+            <h3>Update Versions on the Release Branch</h3>
+            <p>Before tagging, update the release branch to non-SNAPSHOT versions (removing <code>-SNAPSHOT</code> from <code>pom.xml</code>):</p>
+<pre><code>git checkout ${RELEASE_BRANCH}
+git pull --ff-only origin ${RELEASE_BRANCH}
+cd tools
+OLD_VERSION=${RELEASE_VERSION}-SNAPSHOT NEW_VERSION=${RELEASE_VERSION} ./update_branch_version.sh
+cd ..</code></pre>
+            <p>This ensures the Java artifacts deployed from the RC tag carry the final release version (e.g. <code>0.1.0</code>) rather than a SNAPSHOT suffix.</p>
+
+            <h3>Create the RC Tag</h3>
+            <p>Push a signed RC tag to trigger CI workflows:</p>
+<pre><code>git tag -s ${RC_TAG} -m "${RC_TAG}"
+git tag -v ${RC_TAG}
+git push origin ${RELEASE_BRANCH}
+git push origin ${RC_TAG}</code></pre>
+            <p>After pushing, verify in <a href="https://github.com/apache/paimon-mosaic/actions">GitHub Actions</a> that all release workflows succeed:</p>
+            <ul>
+                <li><strong>Release Rust</strong> &mdash; dry-run check (does not publish for RC tags)</li>
+                <li><strong>Release Java</strong> &mdash; builds native JNI libraries for 4 platforms, deploys JAR to Apache Nexus staging</li>
+                <li><strong>Release Python</strong> &mdash; builds wheels for 4 platforms, publishes to TestPyPI</li>
+            </ul>
 
             <h3>Create Source Release Artifacts</h3>
-<pre><code>cd tools
+            <p>Create source release artifacts from the same commit as the RC tag:</p>
+<pre><code>git checkout ${RC_TAG}
+cd tools
 RELEASE_VERSION=${RELEASE_VERSION} ./create_source_release.sh</code></pre>
             <p>This creates the following under <code>tools/release/</code>:</p>
             <ul>
@@ -251,7 +267,10 @@ The release candidate is available at:
 https://dist.apache.org/repos/dist/dev/paimon/paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}/
 
 Git tag:
-https://github.com/apache/paimon-mosaic/releases/tag/v${RELEASE_VERSION}-rc${RC_NUM}
+https://github.com/apache/paimon-mosaic/releases/tag/${RC_TAG}
+
+Git commit:
+&lt;RC_COMMIT_SHA&gt;
 
 KEYS for signature verification:
 https://downloads.apache.org/paimon/KEYS
@@ -290,9 +309,10 @@ svn commit -m "Remove paimon-mosaic ${RELEASE_VERSION} RC${RC_NUM} (superseded)"
 
             <h3>Push the Release Tag</h3>
             <p>Once the vote passes, create and push the final release tag. This triggers CI to publish to crates.io and PyPI automatically.</p>
-<pre><code>git checkout v${RELEASE_VERSION}-rc${RC_NUM}
-git tag -s v${RELEASE_VERSION} -m "Release Apache Paimon Mosaic ${RELEASE_VERSION}"
-git push origin v${RELEASE_VERSION}</code></pre>
+<pre><code>git checkout ${RC_TAG}
+git tag -s ${RELEASE_TAG} -m "Release Apache Paimon Mosaic ${RELEASE_VERSION}"
+git tag -v ${RELEASE_TAG}
+git push origin ${RELEASE_TAG}</code></pre>
 
             <h3>Move Source Artifacts to the Release Repository</h3>
 <pre><code>svn mv -m "Release paimon-mosaic ${RELEASE_VERSION}" \
