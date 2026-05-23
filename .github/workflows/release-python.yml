@@ -130,7 +130,7 @@ jobs:
 
       - name: Repair wheel
         run: |
-          delocate-wheel -w python/dist/repaired python/dist/*.whl
+          delocate-wheel --require-archs arm64 -w python/dist/repaired python/dist/*.whl
           rm python/dist/*.whl
           mv python/dist/repaired/*.whl python/dist/
 
