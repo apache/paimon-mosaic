@@ -66,7 +66,7 @@ jobs:
           python-version: "3.12"
 
       - name: Build wheels via cibuildwheel
-        uses: pypa/cibuildwheel@v2.23
+        uses: pypa/cibuildwheel@298ed2fb2c105540f5ed055e8a6ad78d82dd3a7e
         with:
           package-dir: python
           output-dir: wheelhouse
@@ -199,7 +199,7 @@ jobs:
 
       - name: Publish to TestPyPI
         if: contains(github.ref, '-')
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e
         with:
           repository-url: https://test.pypi.org/legacy/
           skip-existing: true
@@ -208,7 +208,7 @@ jobs:
 
       - name: Publish to PyPI
         if: ${{ !contains(github.ref, '-') }}
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e
         with:
           skip-existing: true
           packages-dir: dist
