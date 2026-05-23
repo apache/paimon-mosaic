@@ -126,6 +126,10 @@ jobs:
 
       - name: Build wheel
         working-directory: python
+        env:
+          _PYTHON_HOST_PLATFORM: macosx-11.0-arm64
+          ARCHFLAGS: "-arch arm64"
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: python -m build --wheel
 
       - name: Repair wheel
