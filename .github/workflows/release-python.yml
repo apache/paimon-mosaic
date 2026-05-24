@@ -15,25 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Publish the paimon-mosaic Python package to PyPI.
+# Build the paimon-mosaic Python release wheels.
 #
-# Trigger: push a version tag (e.g. v0.1.0, v0.1.0-rc1).
-# Pre-release tags (containing '-') publish to TestPyPI; release tags publish to PyPI.
-#
-# Token auth: add secrets PYPI_API_TOKEN / TEST_PYPI_API_TOKEN for publishing.
+# Trigger: called by release.yml or manually dispatched.
+# Publishing is handled by release-python-publish.yml after Rust and Java
+# release jobs complete successfully.
 
-name: Release Python
+name: Release Python Wheels
 
 on:
-  push:
-    tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"
+  workflow_call:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
+  group: release-python-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -53,7 +49,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Inject RC version into pyproject.toml
-        if: contains(github.ref, '-rc')
+        if: startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
           # Convert 0.1.0-rc1 to PEP 440: 0.1.0rc1
@@ -99,7 +95,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Inject RC version into pyproject.toml
-        if: contains(github.ref, '-rc')
+        if: startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
           PEP440_VERSION=$(echo "$TAG" | sed 's/-rc/rc/')
@@ -150,7 +146,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Inject RC version into pyproject.toml
-        if: contains(github.ref, '-rc')
+        if: startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
         shell: bash
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
@@ -186,34 +182,3 @@ jobs:
         with:
           name: wheels-windows-x86_64
           path: python/dist/*.whl
-
-  release:
-    name: Publish to PyPI
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    needs: [wheels-linux, wheels-macos, wheels-windows]
-    if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - uses: actions/download-artifact@v5
-        with:
-          pattern: wheels-*
-          merge-multiple: true
-          path: dist
-
-      - name: Publish to TestPyPI
-        if: contains(github.ref, '-')
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e
-        with:
-          repository-url: https://test.pypi.org/legacy/
-          skip-existing: true
-          packages-dir: dist
-          password: ${{ secrets.TEST_PYPI_API_TOKEN }}
-
-      - name: Publish to PyPI
-        if: ${{ !contains(github.ref, '-') }}
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e
-        with:
-          skip-existing: true
-          packages-dir: dist
-          password: ${{ secrets.PYPI_API_TOKEN }}
