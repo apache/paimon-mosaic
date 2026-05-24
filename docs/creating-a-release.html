@@ -69,15 +69,15 @@
             </ol>
 
             <h3>Automated Publishing</h3>
-            <p>When a version tag is pushed, GitHub Actions automatically publishes language-specific artifacts:</p>
+            <p>When a version tag is pushed, the <code>Release</code> workflow orchestrates language-specific release jobs:</p>
             <table>
                 <thead>
-                    <tr><th>Component</th><th>Tag Pattern</th><th>Published To</th><th>Pre-release (<code>-rc</code>) Behavior</th></tr>
+                    <tr><th>Component</th><th>Tag Pattern</th><th>Published To</th><th>Pre-release (<code>-rc</code>) Behavior</th><th>Ordering</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td>Rust crate</td><td><code>v0.1.0</code></td><td>crates.io</td><td>Dry-run only</td></tr>
-                    <tr><td>Java binding</td><td><code>v0.1.0</code></td><td>Apache Nexus staging</td><td>Deploys to staging</td></tr>
-                    <tr><td>Python binding</td><td><code>v0.1.0</code></td><td>PyPI</td><td>Publishes to TestPyPI</td></tr>
+                    <tr><td>Rust crate</td><td><code>v0.1.0</code></td><td>crates.io</td><td>Dry-run only</td><td>Runs in parallel</td></tr>
+                    <tr><td>Java binding</td><td><code>v0.1.0</code></td><td>Apache Nexus staging</td><td>Deploys to staging</td><td>Runs in parallel</td></tr>
+                    <tr><td>Python binding</td><td><code>v0.1.0</code></td><td>PyPI</td><td>Publishes to TestPyPI</td><td>Publishes only after Rust and Java jobs succeed</td></tr>
                 </tbody>
             </table>
             <p>The Release Manager's primary responsibility is managing the <strong>source release</strong> (tarball + signature) and coordinating the community vote. Language artifact publishing is handled by CI once the tag is pushed.</p>
@@ -215,12 +215,14 @@ cd ..</code></pre>
 git tag -v ${RC_TAG}
 git push origin ${RELEASE_BRANCH}
 git push origin ${RC_TAG}</code></pre>
-            <p>After pushing, verify in <a href="https://github.com/apache/paimon-mosaic/actions">GitHub Actions</a> that all release workflows succeed:</p>
+            <p>After pushing, verify in <a href="https://github.com/apache/paimon-mosaic/actions">GitHub Actions</a> that the <code>Release</code> workflow succeeds:</p>
             <ul>
-                <li><strong>Release Rust</strong> &mdash; dry-run check (does not publish for RC tags)</li>
-                <li><strong>Release Java</strong> &mdash; builds native JNI libraries for 4 platforms, deploys JAR to Apache Nexus staging</li>
-                <li><strong>Release Python</strong> &mdash; builds wheels for 4 platforms, publishes to TestPyPI</li>
+                <li><strong>Rust release</strong> &mdash; dry-run check (does not publish for RC tags)</li>
+                <li><strong>Java release</strong> &mdash; builds native JNI libraries for 4 platforms, deploys JAR to Apache Nexus staging</li>
+                <li><strong>Python wheels</strong> &mdash; builds wheels for 4 platforms</li>
+                <li><strong>Python publish</strong> &mdash; publishes to TestPyPI only after the Rust, Java, and Python wheel jobs succeed</li>
             </ul>
+            <p>If only the Python publish job fails due to a transient PyPI or TestPyPI issue, use <strong>Re-run failed jobs</strong> on the <code>Release</code> workflow. The successful Rust, Java, and Python wheel jobs do not need to be repeated.</p>
 
             <h3>Create Source Release Artifacts</h3>
             <p>Create source release artifacts from the same commit as the RC tag:</p>
@@ -245,7 +247,7 @@ svn commit -m "Add paimon-mosaic ${RELEASE_VERSION} RC${RC_NUM}"</code></pre>
 
             <p><strong>Checklist:</strong></p>
             <ul>
-                <li>RC tag pushed and CI workflows succeeded</li>
+                <li>RC tag pushed and the CI release workflow succeeded</li>
                 <li>Source tarball, signature, and checksum staged to <a href="https://dist.apache.org/repos/dist/dev/paimon/">dist.apache.org dev</a></li>
                 <li>Java artifacts deployed to Nexus staging repository</li>
                 <li>Python wheels published to TestPyPI</li>
@@ -308,7 +310,7 @@ svn commit -m "Remove paimon-mosaic ${RELEASE_VERSION} RC${RC_NUM} (superseded)"
             <h2 id="finalize-the-release">Finalize the Release</h2>
 
             <h3>Push the Release Tag</h3>
-            <p>Once the vote passes, create and push the final release tag. This triggers CI to publish to crates.io and PyPI automatically.</p>
+            <p>Once the vote passes, create and push the final release tag. This triggers CI to publish to crates.io and PyPI automatically; PyPI publishing runs only after the Rust and Java release jobs succeed.</p>
 <pre><code>git checkout ${RC_TAG}
 git tag -s ${RELEASE_TAG} -m "Release Apache Paimon Mosaic ${RELEASE_VERSION}"
 git tag -v ${RELEASE_TAG}
