@@ -164,13 +164,17 @@ jobs:
           gpg-private-key: ${{ secrets.GPG_SECRET_KEY }}
           gpg-passphrase: MAVEN_GPG_PASSPHRASE
 
+      - name: Show Maven version
+        run: mvn --version
+
       - name: Deploy to Apache Nexus staging
         working-directory: java
         run: |
           mvn clean deploy \
             -Prelease \
             -DskipTests \
-            -DretryFailedDeploymentCount=10
+            -DretryFailedDeploymentCount=10 \
+            -Daether.connector.basic.parallelPut=false
         env:
           MAVEN_USERNAME: ${{ secrets.NEXUS_STAGE_DEPLOYER_USER }}
           MAVEN_PASSWORD: ${{ secrets.NEXUS_STAGE_DEPLOYER_PW }}
