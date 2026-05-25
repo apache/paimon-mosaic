@@ -77,14 +77,60 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
+      - name: Setup Python
+        if: matrix.os_name == 'linux'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Linux zigbuild
+        if: matrix.os_name == 'linux'
+        run: pip install cargo-zigbuild
+
+      - name: Build Linux JNI library
+        if: matrix.os_name == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rustup target add "${{ matrix.target }}"
+          unset ZSTD_SYS_USE_PKG_CONFIG
+
+          cargo zigbuild --release -p paimon-mosaic-jni --target "${{ matrix.target }}.2.17"
+
+          artifact="target/${{ matrix.target }}/release/${{ matrix.lib_name }}"
+          test -f "$artifact"
+
+          version_info="$(readelf --version-info "$artifact")"
+          max_glibc="$(
+            printf '%s\n' "$version_info" \
+              | grep -Eo 'GLIBC_[0-9][0-9.]*' \
+              | sort -Vu \
+              | tail -n1 \
+              || true
+          )"
+          echo "Maximum required GLIBC version: ${max_glibc:-none}"
+
+          if [[ -n "$max_glibc" ]]; then
+            allowed_glibc="GLIBC_2.17"
+            highest_glibc="$(printf '%s\n%s\n' "$allowed_glibc" "$max_glibc" | sort -Vu | tail -n1)"
+            if [[ "$highest_glibc" != "$allowed_glibc" ]]; then
+              echo "Linux GNU artifact requires $max_glibc, expected <= $allowed_glibc" >&2
+              exit 1
+            fi
+          fi
+
       - name: Build JNI library
-        run: cargo build --release -p paimon-mosaic-jni
+        if: matrix.os_name != 'linux'
+        run: |
+          rustup target add "${{ matrix.target }}"
+          cargo build --release -p paimon-mosaic-jni --target "${{ matrix.target }}"
 
       - name: Upload native library
         uses: actions/upload-artifact@v5
         with:
           name: native-${{ matrix.os_name }}-${{ matrix.arch }}
-          path: target/release/${{ matrix.lib_name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.lib_name }}
 
   publish-snapshot:
     if: github.repository == 'apache/paimon-mosaic'

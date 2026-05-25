@@ -26,6 +26,12 @@
 
 A columnar-bucket hybrid format optimized for wide tables of Apache Paimon. 
 
+## Java Linux compatibility
+
+Published Java artifacts include JNI libraries for Linux. The Linux GNU
+libraries are built with a `glibc` 2.17 baseline, so they can run on Linux
+distributions with `glibc` 2.17 or newer.
+
 ## Contributing
 
 Apache Paimon Mosaic is an exciting project currently under active development. Whether you're looking to use it in your projects or contribute to its growth, there are several ways you can get involved:
