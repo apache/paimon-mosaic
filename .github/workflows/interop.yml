@@ -1,0 +1,94 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Interop
+
+on:
+  push:
+    branches:
+      - main
+      - release-*
+  pull_request:
+    branches:
+      - main
+      - release-*
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  interop-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Rust Cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-interop-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-interop-
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Step 1: Build all Rust crates (core + JNI + FFI)
+      - name: Build Rust
+        run: cargo build --release --workspace
+
+      # Step 2: Run Rust interop_write_test to produce golden files in /tmp/mosaic_interop/
+      - name: Write interop files (Rust)
+        run: cargo test --release -p paimon-mosaic-core --test interop_write_test
+
+      - name: Verify interop files exist
+        run: ls -la /tmp/mosaic_interop/
+
+      # Step 3: Run Java interop tests that read Rust-written files
+      - name: Run Java interop tests
+        working-directory: java
+        run: mvn test -pl . -Dtest=MosaicInteropTest "-DargLine=-Djava.library.path=${{ github.workspace }}/target/release"
+
+      # Step 4: Run Python interop tests that read Rust-written files
+      - name: Install Python dependencies
+        working-directory: python
+        run: pip install pyarrow pytest
+
+      - name: Run Python interop tests
+        working-directory: python
+        run: pytest -v tests/test_interop.py
+        env:
+          MOSAIC_LIB_PATH: ${{ github.workspace }}/target/release
+
+      # Step 5: Run Rust interop_read_test to read Java/Python-written files
+      - name: Read interop files (Rust reads Java+Python)
+        run: cargo test --release -p paimon-mosaic-core --test interop_read_test -- --ignored
