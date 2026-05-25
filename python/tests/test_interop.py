@@ -49,19 +49,11 @@ def _open_file(filename):
     return MosaicReader.from_input_file(read_at, file_length)
 
 
-def _interop_file_exists(filename):
-    return os.path.exists(os.path.join(INTEROP_DIR, filename))
-
-
 class TestInteropRead:
     """Tests that read .mosaic files written by the Rust test."""
 
     # ======================== 1. Read int_data.mosaic ========================
 
-    @pytest.mark.skipif(
-        not _interop_file_exists("int_data.mosaic"),
-        reason="Interop file not found; run Rust interop_write_test first",
-    )
     def test_read_rust_int_data(self):
         with _open_file("int_data.mosaic") as reader:
             assert len(reader.schema) == 2
@@ -84,10 +76,6 @@ class TestInteropRead:
 
     # ======================== 2. Read string_data.mosaic ========================
 
-    @pytest.mark.skipif(
-        not _interop_file_exists("string_data.mosaic"),
-        reason="Interop file not found; run Rust interop_write_test first",
-    )
     def test_read_rust_string_data(self):
         with _open_file("string_data.mosaic") as reader:
             assert len(reader.schema) == 3
@@ -126,10 +114,6 @@ class TestInteropRead:
 
     # ======================== 3. Read all_types.mosaic ========================
 
-    @pytest.mark.skipif(
-        not _interop_file_exists("all_types.mosaic"),
-        reason="Interop file not found; run Rust interop_write_test first",
-    )
     def test_read_rust_all_types(self):
         with _open_file("all_types.mosaic") as reader:
             assert len(reader.schema) == 11
@@ -237,10 +221,6 @@ class TestInteropRead:
 
     # ======================== 4. Read constant_data.mosaic ========================
 
-    @pytest.mark.skipif(
-        not _interop_file_exists("constant_data.mosaic"),
-        reason="Interop file not found; run Rust interop_write_test first",
-    )
     def test_read_rust_constant_data(self):
         with _open_file("constant_data.mosaic") as reader:
             total_rows = 0
@@ -262,10 +242,6 @@ class TestInteropRead:
 
     # ======================== 5. Read null_heavy.mosaic ========================
 
-    @pytest.mark.skipif(
-        not _interop_file_exists("null_heavy.mosaic"),
-        reason="Interop file not found; run Rust interop_write_test first",
-    )
     def test_read_rust_null_heavy(self):
         with _open_file("null_heavy.mosaic") as reader:
             total_rows = 0
@@ -310,10 +286,6 @@ class TestInteropRead:
 
     # ======================== 6. Read compressed_none.mosaic ========================
 
-    @pytest.mark.skipif(
-        not _interop_file_exists("compressed_none.mosaic"),
-        reason="Interop file not found; run Rust interop_write_test first",
-    )
     def test_read_rust_no_compression(self):
         with _open_file("compressed_none.mosaic") as reader:
             total_rows = 0
@@ -334,10 +306,6 @@ class TestInteropRead:
 
     # ======================== 7. Read multi_rg.mosaic ========================
 
-    @pytest.mark.skipif(
-        not _interop_file_exists("multi_rg.mosaic"),
-        reason="Interop file not found; run Rust interop_write_test first",
-    )
     def test_read_rust_multi_row_group(self):
         with _open_file("multi_rg.mosaic") as reader:
             assert reader.num_row_groups > 1, (

@@ -48,7 +48,6 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import org.junit.After;
-import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -112,8 +111,6 @@ public class MosaicInteropTest {
 
     @Test
     public void testReadRustIntData() throws IOException {
-        Assume.assumeTrue("Interop file not found; run Rust interop_write_test first",
-                new File(INTEROP_DIR + "/int_data.mosaic").exists());
         try (MosaicReader reader = openFile("int_data.mosaic")) {
             assertEquals(2, reader.getSchema().getFields().size());
 
@@ -140,8 +137,6 @@ public class MosaicInteropTest {
 
     @Test
     public void testReadRustStringData() throws IOException {
-        Assume.assumeTrue("Interop file not found; run Rust interop_write_test first",
-                new File(INTEROP_DIR + "/string_data.mosaic").exists());
         try (MosaicReader reader = openFile("string_data.mosaic")) {
             assertEquals(3, reader.getSchema().getFields().size());
 
@@ -189,8 +184,6 @@ public class MosaicInteropTest {
 
     @Test
     public void testReadRustAllTypes() throws IOException {
-        Assume.assumeTrue("Interop file not found; run Rust interop_write_test first",
-                new File(INTEROP_DIR + "/all_types.mosaic").exists());
         try (MosaicReader reader = openFile("all_types.mosaic")) {
             assertEquals(11, reader.getSchema().getFields().size());
 
@@ -316,8 +309,6 @@ public class MosaicInteropTest {
 
     @Test
     public void testReadRustConstantData() throws IOException {
-        Assume.assumeTrue("Interop file not found; run Rust interop_write_test first",
-                new File(INTEROP_DIR + "/constant_data.mosaic").exists());
         try (MosaicReader reader = openFile("constant_data.mosaic")) {
             int totalRows = 0;
             for (int rg = 0; rg < reader.numRowGroups(); rg++) {
@@ -343,8 +334,6 @@ public class MosaicInteropTest {
 
     @Test
     public void testReadRustNullHeavy() throws IOException {
-        Assume.assumeTrue("Interop file not found; run Rust interop_write_test first",
-                new File(INTEROP_DIR + "/null_heavy.mosaic").exists());
         try (MosaicReader reader = openFile("null_heavy.mosaic")) {
             int totalRows = 0;
             int intNulls = 0;
@@ -402,8 +391,6 @@ public class MosaicInteropTest {
 
     @Test
     public void testReadRustNoCompression() throws IOException {
-        Assume.assumeTrue("Interop file not found; run Rust interop_write_test first",
-                new File(INTEROP_DIR + "/compressed_none.mosaic").exists());
         try (MosaicReader reader = openFile("compressed_none.mosaic")) {
             int totalRows = 0;
             for (int rg = 0; rg < reader.numRowGroups(); rg++) {
@@ -428,8 +415,6 @@ public class MosaicInteropTest {
 
     @Test
     public void testReadRustMultiRowGroup() throws IOException {
-        Assume.assumeTrue("Interop file not found; run Rust interop_write_test first",
-                new File(INTEROP_DIR + "/multi_rg.mosaic").exists());
         try (MosaicReader reader = openFile("multi_rg.mosaic")) {
             assertTrue("Expected multiple row groups", reader.numRowGroups() > 1);
 

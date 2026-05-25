@@ -70,7 +70,6 @@ fn open_file(filename: &str) -> MosaicReader<ByteArrayInputFile> {
 // ======================== 1. Read java_written.mosaic ========================
 
 #[test]
-#[ignore] // requires interop files from Java; run locally after interop_write_test + Java tests
 fn test_read_java_written_file() {
     let reader = open_file("java_written.mosaic");
     let num_rgs = reader.num_row_groups();
@@ -148,7 +147,6 @@ fn test_read_java_written_file() {
 // ======================== 2. Read python_written.mosaic ========================
 
 #[test]
-#[ignore] // requires interop files from Python; run locally after interop_write_test + Python tests
 fn test_read_python_written_file() {
     let reader = open_file("python_written.mosaic");
     let num_rgs = reader.num_row_groups();
