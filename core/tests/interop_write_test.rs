@@ -18,7 +18,12 @@
 //! Interop write tests: writes golden .mosaic files to /tmp/mosaic_interop/
 //! that can be read by Java and Python tests to verify cross-language compatibility.
 
-#![allow(clippy::approx_constant, clippy::needless_range_loop)]
+#![allow(
+    clippy::approx_constant,
+    clippy::needless_range_loop,
+    clippy::unnecessary_cast,
+    clippy::manual_is_multiple_of
+)]
 
 use std::fs;
 use std::io;
@@ -102,7 +107,11 @@ fn write_and_verify(
         let batch = rg_reader.read_columns().unwrap();
         actual_rows += batch.num_rows();
     }
-    assert_eq!(expected_rows, actual_rows, "row count mismatch for {}", filename);
+    assert_eq!(
+        expected_rows, actual_rows,
+        "row count mismatch for {}",
+        filename
+    );
 
     // Write to disk
     fs::create_dir_all(INTEROP_DIR).unwrap();
@@ -110,7 +119,12 @@ fn write_and_verify(
     let mut file = fs::File::create(&path).unwrap();
     file.write_all(&data).unwrap();
     file.flush().unwrap();
-    println!("Wrote {} ({} bytes, {} rows)", path, data.len(), expected_rows);
+    println!(
+        "Wrote {} ({} bytes, {} rows)",
+        path,
+        data.len(),
+        expected_rows
+    );
 
     data
 }
@@ -230,13 +244,7 @@ fn test_write_all_types() {
     ]);
 
     let bools: Vec<Option<bool>> = (0..num_rows)
-        .map(|i| {
-            if i % 13 == 0 {
-                None
-            } else {
-                Some(i % 2 == 0)
-            }
-        })
+        .map(|i| if i % 13 == 0 { None } else { Some(i % 2 == 0) })
         .collect();
 
     let i8s: Vec<Option<i8>> = (0..num_rows)
@@ -430,13 +438,7 @@ fn test_write_null_heavy() {
 
     // 80% nulls
     let ints: Vec<Option<i64>> = (0..num_rows)
-        .map(|i| {
-            if i % 5 != 0 {
-                None
-            } else {
-                Some(i as i64)
-            }
-        })
+        .map(|i| if i % 5 != 0 { None } else { Some(i as i64) })
         .collect();
 
     let str_owned: Vec<Option<String>> = (0..num_rows)
@@ -536,7 +538,9 @@ fn test_write_multi_rg() {
     for b in 0..num_batches {
         let start = b * batch_size;
         let ids: Vec<i64> = (start..start + batch_size).map(|i| i as i64).collect();
-        let values: Vec<i32> = (start..start + batch_size).map(|i| (i * 10) as i32).collect();
+        let values: Vec<i32> = (start..start + batch_size)
+            .map(|i| (i * 10) as i32)
+            .collect();
         batches.push(
             RecordBatch::try_new(
                 Arc::new(schema.clone()),
@@ -584,7 +588,10 @@ fn test_write_multi_rg() {
         let rb = rg_reader.read_columns().unwrap();
         actual_rows += rb.num_rows();
     }
-    assert_eq!(num_rows, actual_rows, "row count mismatch for multi_rg.mosaic");
+    assert_eq!(
+        num_rows, actual_rows,
+        "row count mismatch for multi_rg.mosaic"
+    );
     println!("Wrote {} ({} bytes, {} rows)", path, data.len(), num_rows);
 
     // Verify multiple row groups were created

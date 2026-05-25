@@ -171,7 +171,9 @@ fn test_10_million_int64_sequential() {
         let end = (batch_start + batch_size).min(num_rows);
         let count = end - batch_start;
         let ids: Vec<i64> = (batch_start as i64..(batch_start + count) as i64).collect();
-        let values: Vec<i64> = (0..count).map(|i| (batch_start + i) as i64 * 7 + 3).collect();
+        let values: Vec<i64> = (0..count)
+            .map(|i| (batch_start + i) as i64 * 7 + 3)
+            .collect();
         let batch = RecordBatch::try_new(
             Arc::new(schema.clone()),
             vec![
@@ -183,7 +185,10 @@ fn test_10_million_int64_sequential() {
         batches.push(batch);
     }
 
-    println!("test_10_million_int64_sequential: writing {} rows...", num_rows);
+    println!(
+        "test_10_million_int64_sequential: writing {} rows...",
+        num_rows
+    );
 
     let result = roundtrip(
         &schema,
@@ -325,7 +330,10 @@ fn test_5_million_mixed_types_random() {
         batches.push(batch);
     }
 
-    println!("test_5_million_mixed_types_random: writing {} rows...", num_rows);
+    println!(
+        "test_5_million_mixed_types_random: writing {} rows...",
+        num_rows
+    );
 
     let result = roundtrip(
         &schema,
@@ -374,14 +382,20 @@ fn test_2_million_all_same_value() {
                 Arc::new(Float64Array::from(vec![3.14159; count])),
                 Arc::new(StringArray::from(vec!["constant_value"; count])),
                 Arc::new(BooleanArray::from(vec![true; count])),
-                Arc::new(BinaryArray::from(vec![&[0xDE, 0xAD, 0xBE, 0xEF][..]; count])),
+                Arc::new(BinaryArray::from(vec![
+                    &[0xDE, 0xAD, 0xBE, 0xEF][..];
+                    count
+                ])),
             ],
         )
         .unwrap();
         batches.push(batch);
     }
 
-    println!("test_2_million_all_same_value: writing {} rows...", num_rows);
+    println!(
+        "test_2_million_all_same_value: writing {} rows...",
+        num_rows
+    );
 
     let out = MemOutputFile::new();
     let mut writer = MosaicWriter::new(

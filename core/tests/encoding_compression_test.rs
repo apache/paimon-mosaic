@@ -744,7 +744,11 @@ fn test_all_null_encoding() {
         // All values should be null
         for b in &result {
             let idx = b.schema().index_of("v").unwrap();
-            let arr = b.column(idx).as_any().downcast_ref::<BooleanArray>().unwrap();
+            let arr = b
+                .column(idx)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap();
             assert_eq!(arr.null_count(), arr.len());
         }
     }
@@ -913,10 +917,10 @@ fn test_all_null_encoding() {
 fn test_encoding_mixed_in_same_file() {
     let num_rows = 200_000;
     let schema = Schema::new(vec![
-        Field::new("const_col", DataType::Int64, false),   // CONST: single value
-        Field::new("dict_col", DataType::Utf8, false),     // DICT: few distinct values
-        Field::new("plain_col", DataType::Int64, false),   // PLAIN: all unique values
-        Field::new("null_col", DataType::Float64, true),   // ALL_NULL
+        Field::new("const_col", DataType::Int64, false), // CONST: single value
+        Field::new("dict_col", DataType::Utf8, false),   // DICT: few distinct values
+        Field::new("plain_col", DataType::Int64, false), // PLAIN: all unique values
+        Field::new("null_col", DataType::Float64, true), // ALL_NULL
     ]);
 
     let batch_size = 50_000;
@@ -936,7 +940,9 @@ fn test_encoding_mixed_in_same_file() {
                 _ => "epsilon",
             })
             .collect();
-        let plain_vals: Vec<i64> = (batch_start..batch_start + count).map(|i| i as i64).collect();
+        let plain_vals: Vec<i64> = (batch_start..batch_start + count)
+            .map(|i| i as i64)
+            .collect();
         let null_vals: Vec<Option<f64>> = vec![None; count];
 
         let batch = RecordBatch::try_new(
@@ -1206,7 +1212,13 @@ fn test_zstd_compression_levels() {
         let out_ids = concat_column_i64(&result, "id");
         assert_eq!(out_ids.len(), num_rows);
         for (i, v) in out_ids.iter().enumerate() {
-            assert_eq!(*v, Some(ids[i]), "id mismatch at row {} for level {}", i, level);
+            assert_eq!(
+                *v,
+                Some(ids[i]),
+                "id mismatch at row {} for level {}",
+                i,
+                level
+            );
         }
 
         sizes.push((level, data.len()));
@@ -1410,7 +1422,9 @@ fn test_projection_single_column_from_100() {
 
     let mut all_vals: Vec<i32> = Vec::new();
     for rg in 0..reader.num_row_groups() {
-        let mut rg_reader = reader.row_group_reader_projected(rg, &[target_col]).unwrap();
+        let mut rg_reader = reader
+            .row_group_reader_projected(rg, &[target_col])
+            .unwrap();
         let result = rg_reader.read_columns().unwrap();
         assert_eq!(result.num_columns(), 1);
         let col_name = format!("col_{:04}", target_col);
@@ -1423,7 +1437,9 @@ fn test_projection_single_column_from_100() {
         all_vals.extend(arr.values().iter().copied());
     }
 
-    let expected: Vec<i32> = (0..num_rows).map(|i| (target_col * 10000 + i) as i32).collect();
+    let expected: Vec<i32> = (0..num_rows)
+        .map(|i| (target_col * 10000 + i) as i32)
+        .collect();
     assert_eq!(all_vals, expected);
 
     println!("test_projection_single_column_from_100: PASSED");
@@ -1589,7 +1605,9 @@ fn test_projection_reverse_order() {
     let reader = MosaicReader::new(input, file_data.len() as u64).unwrap();
 
     for rg in 0..reader.num_row_groups() {
-        let mut rg_reader = reader.row_group_reader_projected(rg, &[3, 2, 1, 0]).unwrap();
+        let mut rg_reader = reader
+            .row_group_reader_projected(rg, &[3, 2, 1, 0])
+            .unwrap();
         let result = rg_reader.read_columns().unwrap();
         assert_eq!(result.num_columns(), 4);
 
@@ -1616,9 +1634,7 @@ fn test_projection_same_column_twice() {
         Arc::new(schema.clone()),
         vec![
             Arc::new(Int32Array::from((0..num_rows as i32).collect::<Vec<_>>())),
-            Arc::new(Int64Array::from(
-                (0..num_rows as i64).collect::<Vec<_>>(),
-            )),
+            Arc::new(Int64Array::from((0..num_rows as i64).collect::<Vec<_>>())),
         ],
     )
     .unwrap();
@@ -1682,9 +1698,7 @@ fn test_projection_by_name() {
             Arc::new(Float64Array::from(
                 (0..num_rows).map(|i| i as f64).collect::<Vec<_>>(),
             )),
-            Arc::new(Int64Array::from(
-                (0..num_rows as i64).collect::<Vec<_>>(),
-            )),
+            Arc::new(Int64Array::from((0..num_rows as i64).collect::<Vec<_>>())),
         ],
     )
     .unwrap();
@@ -1723,10 +1737,10 @@ fn test_projection_by_name() {
 fn test_projection_with_all_encodings() {
     let num_rows = 50_000;
     let schema = Schema::new(vec![
-        Field::new("const_col", DataType::Int32, false),  // CONST
-        Field::new("dict_col", DataType::Utf8, false),    // DICT
-        Field::new("null_col", DataType::Float64, true),  // ALL_NULL
-        Field::new("plain_col", DataType::Int64, false),  // PLAIN
+        Field::new("const_col", DataType::Int32, false), // CONST
+        Field::new("dict_col", DataType::Utf8, false),   // DICT
+        Field::new("null_col", DataType::Float64, true), // ALL_NULL
+        Field::new("plain_col", DataType::Int64, false), // PLAIN
     ]);
 
     let const_vals: Vec<i32> = vec![42; num_rows];
@@ -1890,18 +1904,14 @@ fn test_projection_across_multiple_row_groups() {
     for rg in 0..reader.num_row_groups() {
         if rg % 2 == 0 {
             // Even row groups: project "a"
-            let mut rg_reader = reader
-                .row_group_reader_by_names(rg, &["a"])
-                .unwrap();
+            let mut rg_reader = reader.row_group_reader_by_names(rg, &["a"]).unwrap();
             let result = rg_reader.read_columns().unwrap();
             assert_eq!(result.num_columns(), 1);
             assert!(result.schema().index_of("a").is_ok());
             a_total += result.num_rows();
         } else {
             // Odd row groups: project "c"
-            let mut rg_reader = reader
-                .row_group_reader_by_names(rg, &["c"])
-                .unwrap();
+            let mut rg_reader = reader.row_group_reader_by_names(rg, &["c"]).unwrap();
             let result = rg_reader.read_columns().unwrap();
             assert_eq!(result.num_columns(), 1);
             assert!(result.schema().index_of("c").is_ok());
@@ -1947,9 +1957,7 @@ fn test_bucket_count_1() {
                 }
             })
             .collect();
-        let i64_vals: Vec<i64> = (0..count)
-            .map(|i| (batch_start + i) as i64 * 100)
-            .collect();
+        let i64_vals: Vec<i64> = (0..count).map(|i| (batch_start + i) as i64 * 100).collect();
         let str_vals: Vec<Option<String>> = (0..count)
             .map(|i| {
                 if (batch_start + i) % 5 == 0 {
@@ -1987,16 +1995,17 @@ fn test_bucket_count_1() {
         },
     );
 
-    let input = ByteArrayInputFile {
-        data: data.clone(),
-    };
+    let input = ByteArrayInputFile { data: data.clone() };
     let reader = MosaicReader::new(input, data.len() as u64).unwrap();
     assert_eq!(reader.schema().num_buckets, 1);
 
     let result = read_all(&data);
     assert_batches_equal(&batches, &result);
 
-    println!("test_bucket_count_1: PASSED - file size = {} bytes", data.len());
+    println!(
+        "test_bucket_count_1: PASSED - file size = {} bytes",
+        data.len()
+    );
 }
 
 // 21. test_bucket_count_equals_columns
@@ -2028,9 +2037,7 @@ fn test_bucket_count_equals_columns() {
         },
     );
 
-    let input = ByteArrayInputFile {
-        data: data.clone(),
-    };
+    let input = ByteArrayInputFile { data: data.clone() };
     let reader = MosaicReader::new(input, data.len() as u64).unwrap();
     assert_eq!(reader.schema().num_buckets, num_cols);
 
@@ -2069,13 +2076,12 @@ fn test_bucket_count_exceeds_columns() {
         },
     );
 
-    let input = ByteArrayInputFile {
-        data: data.clone(),
-    };
+    let input = ByteArrayInputFile { data: data.clone() };
     let reader = MosaicReader::new(input, data.len() as u64).unwrap();
     // Should be capped to num_cols
     assert_eq!(
-        reader.schema().num_buckets, num_cols,
+        reader.schema().num_buckets,
+        num_cols,
         "num_buckets should be capped to column count"
     );
 
@@ -2177,9 +2183,7 @@ fn test_huge_row_group_max() {
 
     let num_rows = 50_000;
     let ids: Vec<i64> = (0..num_rows as i64).collect();
-    let strs: Vec<String> = (0..num_rows)
-        .map(|i| format!("row_{:06}", i))
-        .collect();
+    let strs: Vec<String> = (0..num_rows).map(|i| format!("row_{:06}", i)).collect();
     let str_refs: Vec<&str> = strs.iter().map(|s| s.as_str()).collect();
 
     let batch = RecordBatch::try_new(
@@ -2202,9 +2206,7 @@ fn test_huge_row_group_max() {
         },
     );
 
-    let input = ByteArrayInputFile {
-        data: data.clone(),
-    };
+    let input = ByteArrayInputFile { data: data.clone() };
     let reader = MosaicReader::new(input, data.len() as u64).unwrap();
     assert_eq!(
         reader.num_row_groups(),
@@ -2286,9 +2288,7 @@ fn test_page_size_threshold_large() {
 
     let num_rows = 50_000;
     let ids: Vec<i64> = (0..num_rows as i64).collect();
-    let strs: Vec<String> = (0..num_rows)
-        .map(|i| format!("row_{:08}", i))
-        .collect();
+    let strs: Vec<String> = (0..num_rows).map(|i| format!("row_{:08}", i)).collect();
     let str_refs: Vec<&str> = strs.iter().map(|s| s.as_str()).collect();
 
     let batch = RecordBatch::try_new(
@@ -2412,9 +2412,7 @@ fn test_stats_all_columns() {
     writer.close().unwrap();
 
     let data = writer.output().buf.clone();
-    let input = ByteArrayInputFile {
-        data: data.clone(),
-    };
+    let input = ByteArrayInputFile { data: data.clone() };
     let reader = MosaicReader::new(input, data.len() as u64).unwrap();
 
     for rg in 0..reader.num_row_groups() {
@@ -2486,9 +2484,7 @@ fn test_stats_subset_columns() {
     writer.close().unwrap();
 
     let data = writer.output().buf.clone();
-    let input = ByteArrayInputFile {
-        data: data.clone(),
-    };
+    let input = ByteArrayInputFile { data: data.clone() };
     let reader = MosaicReader::new(input, data.len() as u64).unwrap();
 
     for rg in 0..reader.num_row_groups() {
@@ -2675,12 +2671,7 @@ fn test_data_split_across_many_row_groups() {
     let all_vals = concat_column_i32(&result, "value");
     for (i, v) in all_vals.iter().enumerate() {
         let expected = simple_hash(77, i) as i32;
-        assert_eq!(
-            *v,
-            Some(expected),
-            "value mismatch at row {}",
-            i
-        );
+        assert_eq!(*v, Some(expected), "value mismatch at row {}", i);
     }
 
     println!("test_data_split_across_many_row_groups: PASSED");

@@ -304,9 +304,7 @@ fn test_correlated_null_columns() {
     // When col_a is null, col_b is always null too
     let b_vals: Vec<Option<i64>> = (0..num_rows)
         .map(|i| {
-            if a_vals[i].is_none() {
-                None
-            } else if simple_hash(20, i) % 7 == 0 {
+            if a_vals[i].is_none() || simple_hash(20, i) % 7 == 0 {
                 None
             } else {
                 Some(i as i64 * 100)
@@ -346,10 +344,7 @@ fn test_correlated_null_columns() {
     );
 
     assert_batches_equal(&[batch], &result);
-    println!(
-        "test_correlated_null_columns: PASSED ({} rows)",
-        num_rows
-    );
+    println!("test_correlated_null_columns: PASSED ({} rows)", num_rows);
 }
 
 // ======================== 5. All Extremes Int ========================
@@ -400,16 +395,16 @@ fn test_unicode_strings() {
     let schema = Schema::new(vec![Field::new("text", DataType::Utf8, false)]);
 
     let unicode_fragments: &[&str] = &[
-        "\u{4e2d}\u{6587}\u{6d4b}\u{8bd5}",                     // Chinese
-        "\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30b9}\u{30c8}",     // Japanese
-        "\u{d55c}\u{ad6d}\u{c5b4}\u{d14c}\u{c2a4}\u{d2b8}",     // Korean
+        "\u{4e2d}\u{6587}\u{6d4b}\u{8bd5}",                 // Chinese
+        "\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30b9}\u{30c8}", // Japanese
+        "\u{d55c}\u{ad6d}\u{c5b4}\u{d14c}\u{c2a4}\u{d2b8}", // Korean
         "\u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629}", // Arabic
         "\u{1f600}\u{1f60d}\u{1f680}\u{1f4a5}\u{2764}\u{fe0f}", // Emoji
-        "Hello\u{4e16}\u{754c}\u{d558}\u{c138}\u{c694}",        // Mixed scripts
-        "\u{00e9}\u{00e8}\u{00ea}\u{00eb}\u{00fc}\u{00f6}",     // European accents
-        "\u{0410}\u{0411}\u{0412}\u{0413}\u{0414}",             // Cyrillic
-        "\u{0e01}\u{0e02}\u{0e03}\u{0e04}\u{0e05}",             // Thai
-        "\u{05d0}\u{05d1}\u{05d2}\u{05d3}\u{05d4}",             // Hebrew
+        "Hello\u{4e16}\u{754c}\u{d558}\u{c138}\u{c694}",    // Mixed scripts
+        "\u{00e9}\u{00e8}\u{00ea}\u{00eb}\u{00fc}\u{00f6}", // European accents
+        "\u{0410}\u{0411}\u{0412}\u{0413}\u{0414}",         // Cyrillic
+        "\u{0e01}\u{0e02}\u{0e03}\u{0e04}\u{0e05}",         // Thai
+        "\u{05d0}\u{05d1}\u{05d2}\u{05d3}\u{05d4}",         // Hebrew
     ];
 
     let str_vals: Vec<String> = (0..num_rows)
@@ -496,9 +491,7 @@ fn test_power_of_two_values() {
 
     // Powers of 2: 1, 2, 4, 8, ..., 2^62, then cycle
     let num_powers = 63; // 2^0 through 2^62
-    let vals: Vec<i64> = (0..num_rows)
-        .map(|i| 1i64 << (i % num_powers))
-        .collect();
+    let vals: Vec<i64> = (0..num_rows).map(|i| 1i64 << (i % num_powers)).collect();
 
     let batch = RecordBatch::try_new(
         Arc::new(schema.clone()),
@@ -622,13 +615,9 @@ fn test_dense_data_no_nulls() {
     let i64s: Vec<i64> = (0..num_rows).map(|i| i as i64 * 1000).collect();
     let f32s: Vec<f32> = (0..num_rows).map(|i| i as f32 * 0.1).collect();
     let f64s: Vec<f64> = (0..num_rows).map(|i| i as f64 * 0.001).collect();
-    let str_vals: Vec<String> = (0..num_rows)
-        .map(|i| format!("row_{:06}", i))
-        .collect();
+    let str_vals: Vec<String> = (0..num_rows).map(|i| format!("row_{:06}", i)).collect();
     let str_refs: Vec<&str> = str_vals.iter().map(|s| s.as_str()).collect();
-    let bin_vals: Vec<Vec<u8>> = (0..num_rows)
-        .map(|i| vec![(i % 256) as u8; 8])
-        .collect();
+    let bin_vals: Vec<Vec<u8>> = (0..num_rows).map(|i| vec![(i % 256) as u8; 8]).collect();
     let bin_refs: Vec<&[u8]> = bin_vals.iter().map(|v| v.as_slice()).collect();
     let dates: Vec<i32> = (0..num_rows).map(|i| 18000 + (i % 3650) as i32).collect();
     let times: Vec<i32> = (0..num_rows)
@@ -790,10 +779,7 @@ fn test_string_with_special_chars() {
     );
 
     assert_batches_equal(&[batch], &result);
-    println!(
-        "test_string_with_special_chars: PASSED ({} rows)",
-        num_rows
-    );
+    println!("test_string_with_special_chars: PASSED ({} rows)", num_rows);
 }
 
 // ======================== 14. Decimal Near Overflow ========================
@@ -806,16 +792,14 @@ fn test_decimal_near_overflow() {
     let max_decimal38: i128 = 99_999_999_999_999_999_999_999_999_999_999_999_999;
 
     let vals: Vec<Option<i128>> = (0..num_rows)
-        .map(|i| {
-            match simple_hash(130, i) % 7 {
-                0 => None,
-                1 => Some(max_decimal38),
-                2 => Some(-max_decimal38),
-                3 => Some(max_decimal38 - i as i128),
-                4 => Some(-max_decimal38 + i as i128),
-                5 => Some(0),
-                _ => Some((simple_hash(131, i) as i128) * 1_000_000_000_000_000_000),
-            }
+        .map(|i| match simple_hash(130, i) % 7 {
+            0 => None,
+            1 => Some(max_decimal38),
+            2 => Some(-max_decimal38),
+            3 => Some(max_decimal38 - i as i128),
+            4 => Some(-max_decimal38 + i as i128),
+            5 => Some(0),
+            _ => Some((simple_hash(131, i) as i128) * 1_000_000_000_000_000_000),
         })
         .collect();
 
@@ -928,10 +912,7 @@ fn test_monotonic_then_random() {
     );
 
     assert_batches_equal(&[batch], &result);
-    println!(
-        "test_monotonic_then_random: PASSED ({} rows)",
-        num_rows
-    );
+    println!("test_monotonic_then_random: PASSED ({} rows)", num_rows);
 }
 
 // ======================== 17. Single Value Then Varied ========================
@@ -966,10 +947,7 @@ fn test_single_value_then_varied() {
     );
 
     assert_batches_equal(&[batch], &result);
-    println!(
-        "test_single_value_then_varied: PASSED ({} rows)",
-        num_rows
-    );
+    println!("test_single_value_then_varied: PASSED ({} rows)", num_rows);
 }
 
 // ======================== 18. Run-Length Encoding Friendly ========================
@@ -980,9 +958,7 @@ fn test_run_length_encoding_friendly() {
     let run_length = 1000;
     let schema = Schema::new(vec![Field::new("v", DataType::Int32, false)]);
 
-    let vals: Vec<i32> = (0..num_rows)
-        .map(|i| (i / run_length) as i32)
-        .collect();
+    let vals: Vec<i32> = (0..num_rows).map(|i| (i / run_length) as i32).collect();
 
     let batch = RecordBatch::try_new(
         Arc::new(schema.clone()),
@@ -1050,10 +1026,7 @@ fn test_high_cardinality_strings() {
     );
 
     assert_batches_equal(&[batch], &result);
-    println!(
-        "test_high_cardinality_strings: PASSED ({} rows)",
-        num_rows
-    );
+    println!("test_high_cardinality_strings: PASSED ({} rows)", num_rows);
 }
 
 // ======================== 20. Low Cardinality With Skew ========================
@@ -1099,8 +1072,5 @@ fn test_low_cardinality_with_skew() {
     );
 
     assert_batches_equal(&[batch], &result);
-    println!(
-        "test_low_cardinality_with_skew: PASSED ({} rows)",
-        num_rows
-    );
+    println!("test_low_cardinality_with_skew: PASSED ({} rows)", num_rows);
 }

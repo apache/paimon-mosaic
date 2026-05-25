@@ -160,7 +160,10 @@ fn test_footer_version_byte() {
         "version byte at len-7 must equal spec::VERSION ({})",
         spec::VERSION
     );
-    println!("test_footer_version_byte: PASSED (version={})", version_byte);
+    println!(
+        "test_footer_version_byte: PASSED (version={})",
+        version_byte
+    );
 }
 
 // 3. test_footer_size_exactly_32
@@ -563,7 +566,10 @@ fn test_column_order_alphabetical() {
     assert_eq!(middle_val, 20);
     assert_eq!(zebra_val, 30);
 
-    println!("test_column_order_alphabetical: PASSED (order={:?})", col_names);
+    println!(
+        "test_column_order_alphabetical: PASSED (order={:?})",
+        col_names
+    );
 }
 
 // 10. test_multiple_files_different_schemas
@@ -693,7 +699,10 @@ fn test_stats_int64_min_max_exact() {
         other => panic!("expected BigInt max, got {:?}", other),
     }
 
-    println!("test_stats_int64_min_max_exact: PASSED (min={}, max={})", expected_min, expected_max);
+    println!(
+        "test_stats_int64_min_max_exact: PASSED (min={}, max={})",
+        expected_min, expected_max
+    );
 }
 
 // 12. test_stats_int32_min_max_exact
@@ -791,21 +800,13 @@ fn test_stats_float64_min_max_exact() {
     let col_stats = &stats[0];
     match &col_stats.min {
         Some(paimon_mosaic_core::values::Value::Double(v)) => {
-            assert!(
-                (*v - expected_min).abs() < 1e-10,
-                "min mismatch: got {}",
-                v
-            );
+            assert!((*v - expected_min).abs() < 1e-10, "min mismatch: got {}", v);
         }
         other => panic!("expected Double min, got {:?}", other),
     }
     match &col_stats.max {
         Some(paimon_mosaic_core::values::Value::Double(v)) => {
-            assert!(
-                (*v - expected_max).abs() < 1e-10,
-                "max mismatch: got {}",
-                v
-            );
+            assert!((*v - expected_max).abs() < 1e-10, "max mismatch: got {}", v);
         }
         other => panic!("expected Double max, got {:?}", other),
     }
@@ -848,13 +849,23 @@ fn test_stats_string_min_max_exact() {
     let col_stats = &stats[0];
     match &col_stats.min {
         Some(paimon_mosaic_core::values::Value::String(v)) => {
-            assert_eq!(v, b"aaa", "min should be 'aaa', got {:?}", std::str::from_utf8(v));
+            assert_eq!(
+                v,
+                b"aaa",
+                "min should be 'aaa', got {:?}",
+                std::str::from_utf8(v)
+            );
         }
         other => panic!("expected String min, got {:?}", other),
     }
     match &col_stats.max {
         Some(paimon_mosaic_core::values::Value::String(v)) => {
-            assert_eq!(v, b"zzz", "max should be 'zzz', got {:?}", std::str::from_utf8(v));
+            assert_eq!(
+                v,
+                b"zzz",
+                "max should be 'zzz', got {:?}",
+                std::str::from_utf8(v)
+            );
         }
         other => panic!("expected String max, got {:?}", other),
     }
@@ -869,13 +880,7 @@ fn test_stats_null_count_exact() {
 
     // Exactly 300 nulls out of 1000 rows
     let vals: Vec<Option<i32>> = (0..1000)
-        .map(|i| {
-            if i < 300 {
-                None
-            } else {
-                Some(i as i32)
-            }
-        })
+        .map(|i| if i < 300 { None } else { Some(i as i32) })
         .collect();
 
     let batch = RecordBatch::try_new(
@@ -904,9 +909,15 @@ fn test_stats_null_count_exact() {
     assert!(!stats.is_empty());
 
     let col_stats = &stats[0];
-    assert_eq!(col_stats.null_count, 300, "null_count should be exactly 300");
+    assert_eq!(
+        col_stats.null_count, 300,
+        "null_count should be exactly 300"
+    );
 
-    println!("test_stats_null_count_exact: PASSED (null_count={})", col_stats.null_count);
+    println!(
+        "test_stats_null_count_exact: PASSED (null_count={})",
+        col_stats.null_count
+    );
 }
 
 // 16. test_stats_all_null_column
@@ -947,8 +958,14 @@ fn test_stats_all_null_column() {
         col_stats.null_count, num_rows,
         "null_count should equal num_rows for all-null column"
     );
-    assert!(col_stats.min.is_none(), "min should be None for all-null column");
-    assert!(col_stats.max.is_none(), "max should be None for all-null column");
+    assert!(
+        col_stats.min.is_none(),
+        "min should be None for all-null column"
+    );
+    assert!(
+        col_stats.max.is_none(),
+        "max should be None for all-null column"
+    );
 
     println!("test_stats_all_null_column: PASSED");
 }
@@ -987,7 +1004,10 @@ fn test_stats_no_null_column() {
     assert!(!stats.is_empty());
 
     let col_stats = &stats[0];
-    assert_eq!(col_stats.null_count, 0, "null_count should be 0 for no-null column");
+    assert_eq!(
+        col_stats.null_count, 0,
+        "null_count should be 0 for no-null column"
+    );
     assert!(col_stats.min.is_some(), "min should be present");
     assert!(col_stats.max.is_some(), "max should be present");
 
@@ -1064,10 +1084,7 @@ fn test_stats_across_multiple_row_groups() {
                     // The global max grows across row groups, but each row group
                     // should have its own local min/max, not the global one
                     // (unless all data happens to be in one row group)
-                    println!(
-                        "  rg {}: min={}, max={}, prev_max={}",
-                        rg, min_v, max_v, pm
-                    );
+                    println!("  rg {}: min={}, max={}, prev_max={}", rg, min_v, max_v, pm);
                 }
                 prev_max = Some(*max_v);
             }
@@ -1249,7 +1266,10 @@ fn test_stats_disabled_columns() {
 
     let reader2 = open_reader(&data2);
     let stats2 = reader2.row_group_stats(0).unwrap();
-    assert!(stats2.is_empty(), "no stats should be present when disabled");
+    assert!(
+        stats2.is_empty(),
+        "no stats should be present when disabled"
+    );
 
     println!("test_stats_disabled_columns: PASSED");
 }

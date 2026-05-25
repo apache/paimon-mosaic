@@ -162,13 +162,7 @@ fn write_small_test_file() -> Vec<u8> {
     let num_rows = 100;
     let ids: Vec<i64> = (0..num_rows as i64).collect();
     let vals: Vec<Option<i32>> = (0..num_rows)
-        .map(|i| {
-            if i % 3 == 0 {
-                None
-            } else {
-                Some(i as i32 * 7)
-            }
-        })
+        .map(|i| if i % 3 == 0 { None } else { Some(i as i32 * 7) })
         .collect();
     let scores: Vec<Option<f64>> = (0..num_rows)
         .map(|i| {
@@ -215,9 +209,7 @@ fn try_read_file(data: &[u8]) -> io::Result<Vec<RecordBatch>> {
 
 /// Generate a pseudo-random byte vector of a given length from a seed.
 fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
-    (0..len)
-        .map(|i| simple_hash(seed, i) as u8)
-        .collect()
+    (0..len).map(|i| simple_hash(seed, i) as u8).collect()
 }
 
 // ======================== Fuzz Robustness Tests ========================
@@ -329,7 +321,10 @@ fn test_random_bytes_with_valid_footer() {
         let result = catch_unwind(AssertUnwindSafe(|| try_read_file(&data)));
         if result.is_err() {
             panics += 1;
-            eprintln!("PANIC at iteration {} (seed={}, len={})", i, seed, total_len);
+            eprintln!(
+                "PANIC at iteration {} (seed={}, len={})",
+                i, seed, total_len
+            );
         }
     }
     assert_eq!(panics, 0, "{} out of 50 iterations panicked", panics);
@@ -458,10 +453,7 @@ fn test_extension_with_random_bytes() {
             }
             Err(_) => {
                 panics += 1;
-                eprintln!(
-                    "PANIC at iteration {} (extra_len={})",
-                    i, extra_len
-                );
+                eprintln!("PANIC at iteration {} (extra_len={})", i, extra_len);
             }
         }
 
@@ -488,7 +480,11 @@ fn test_zero_filled_file() {
         let result = catch_unwind(AssertUnwindSafe(|| try_read_file(&data)));
         match &result {
             Ok(inner) => {
-                assert!(inner.is_err(), "zero-filled file of size {} should fail", size);
+                assert!(
+                    inner.is_err(),
+                    "zero-filled file of size {} should fail",
+                    size
+                );
             }
             Err(_) => {
                 panics += 1;
@@ -497,7 +493,8 @@ fn test_zero_filled_file() {
         }
     }
     assert_eq!(
-        panics, 0,
+        panics,
+        0,
         "{} out of {} sizes panicked",
         panics,
         sizes.len()
@@ -523,7 +520,8 @@ fn test_all_ones_file() {
         }
     }
     assert_eq!(
-        panics, 0,
+        panics,
+        0,
         "{} out of {} sizes panicked",
         panics,
         sizes.len()
@@ -543,10 +541,7 @@ fn test_repeated_valid_footer() {
     }
 
     let result = catch_unwind(AssertUnwindSafe(|| try_read_file(&data)));
-    assert!(
-        result.is_ok(),
-        "repeated footer file caused a panic"
-    );
+    assert!(result.is_ok(), "repeated footer file caused a panic");
     // The reader should either error or return results -- both are acceptable
 }
 
@@ -718,11 +713,7 @@ fn test_concurrent_different_row_groups() {
     };
     let probe_reader = MosaicReader::new(probe_input, file_len).unwrap();
     let num_rgs = probe_reader.num_row_groups();
-    assert!(
-        num_rgs > 1,
-        "expected multiple row groups, got {}",
-        num_rgs
-    );
+    assert!(num_rgs > 1, "expected multiple row groups, got {}", num_rgs);
     println!(
         "test_concurrent_different_row_groups: {} row groups",
         num_rgs

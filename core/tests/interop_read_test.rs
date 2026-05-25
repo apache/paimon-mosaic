@@ -18,7 +18,12 @@
 //! Interop read tests: reads .mosaic files written by Java and Python,
 //! verifying that Rust can correctly read files produced by other languages.
 
-#![allow(clippy::approx_constant, clippy::needless_range_loop)]
+#![allow(
+    clippy::approx_constant,
+    clippy::needless_range_loop,
+    clippy::unnecessary_cast,
+    clippy::manual_is_multiple_of
+)]
 
 use std::fs;
 use std::io;
@@ -96,12 +101,21 @@ fn test_read_java_written_file() {
 
         for i in 0..batch.num_rows() {
             let row_idx = total_rows + i;
-            assert_eq!(ids.value(i), row_idx as i64, "id mismatch at row {}", row_idx);
+            assert_eq!(
+                ids.value(i),
+                row_idx as i64,
+                "id mismatch at row {}",
+                row_idx
+            );
 
             if row_idx % 3 == 0 {
                 assert!(names.is_null(i), "name should be null at row {}", row_idx);
             } else {
-                assert!(!names.is_null(i), "name should not be null at row {}", row_idx);
+                assert!(
+                    !names.is_null(i),
+                    "name should not be null at row {}",
+                    row_idx
+                );
                 assert_eq!(
                     names.value(i),
                     format!("java_name_{}", row_idx),
@@ -120,7 +134,10 @@ fn test_read_java_written_file() {
         total_rows += batch.num_rows();
     }
 
-    assert_eq!(total_rows, 5000, "Expected 5000 rows from Java-written file");
+    assert_eq!(
+        total_rows, 5000,
+        "Expected 5000 rows from Java-written file"
+    );
     println!(
         "test_read_java_written_file: PASSED ({} rows, {} row groups)",
         total_rows, num_rgs
@@ -161,12 +178,21 @@ fn test_read_python_written_file() {
 
         for i in 0..batch.num_rows() {
             let row_idx = total_rows + i;
-            assert_eq!(ids.value(i), row_idx as i64, "id mismatch at row {}", row_idx);
+            assert_eq!(
+                ids.value(i),
+                row_idx as i64,
+                "id mismatch at row {}",
+                row_idx
+            );
 
             if row_idx % 3 == 0 {
                 assert!(names.is_null(i), "name should be null at row {}", row_idx);
             } else {
-                assert!(!names.is_null(i), "name should not be null at row {}", row_idx);
+                assert!(
+                    !names.is_null(i),
+                    "name should not be null at row {}",
+                    row_idx
+                );
                 assert_eq!(
                     names.value(i),
                     format!("py_name_{}", row_idx),

@@ -278,7 +278,10 @@ fn test_deterministic_int_output() {
         data1.len(),
         data2.len()
     );
-    assert_eq!(data1, data2, "byte-level mismatch for deterministic int output");
+    assert_eq!(
+        data1, data2,
+        "byte-level mismatch for deterministic int output"
+    );
 
     println!(
         "test_deterministic_int_output: PASSED - {} bytes, byte-identical",
@@ -344,7 +347,10 @@ fn test_deterministic_string_output() {
     let data2 = write_file(&schema, &[batch.clone()], options());
 
     assert_eq!(data1.len(), data2.len(), "file sizes differ");
-    assert_eq!(data1, data2, "byte-level mismatch for deterministic string output");
+    assert_eq!(
+        data1, data2,
+        "byte-level mismatch for deterministic string output"
+    );
 
     println!(
         "test_deterministic_string_output: PASSED - {} bytes, byte-identical",
@@ -363,30 +369,14 @@ fn test_deterministic_all_types() {
         Field::new("f", DataType::Float32, true),
         Field::new("g", DataType::Float64, true),
         Field::new("h", DataType::Date32, true),
-        Field::new(
-            "j",
-            DataType::Time32(TimeUnit::Millisecond),
-            true,
-        ),
+        Field::new("j", DataType::Time32(TimeUnit::Millisecond), true),
         Field::new("k", DataType::Utf8, true),
         Field::new("m", DataType::Binary, true),
         Field::new("n", DataType::Decimal128(10, 2), true),
         Field::new("p", DataType::Decimal128(38, 10), true),
-        Field::new(
-            "q",
-            DataType::Timestamp(TimeUnit::Millisecond, None),
-            true,
-        ),
-        Field::new(
-            "r",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            true,
-        ),
-        Field::new(
-            "s",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            true,
-        ),
+        Field::new("q", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+        Field::new("r", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        Field::new("s", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
     ]);
 
     let num_rows = 50_000;
@@ -592,7 +582,10 @@ fn test_deterministic_all_types() {
     let data2 = write_file(&schema, &[batch.clone()], options());
 
     assert_eq!(data1.len(), data2.len(), "file sizes differ");
-    assert_eq!(data1, data2, "byte-level mismatch for all-types deterministic output");
+    assert_eq!(
+        data1, data2,
+        "byte-level mismatch for all-types deterministic output"
+    );
 
     println!(
         "test_deterministic_all_types: PASSED - {} bytes, byte-identical",
@@ -616,15 +609,27 @@ fn test_deterministic_with_nulls() {
         .map(|i| {
             // Dense nulls in first quarter
             if i < num_rows / 4 {
-                if i % 2 == 0 { None } else { Some(i as i32) }
+                if i % 2 == 0 {
+                    None
+                } else {
+                    Some(i as i32)
+                }
             }
             // Sparse nulls in second quarter
             else if i < num_rows / 2 {
-                if i % 100 == 0 { None } else { Some(i as i32) }
+                if i % 100 == 0 {
+                    None
+                } else {
+                    Some(i as i32)
+                }
             }
             // Runs of nulls in third quarter
             else if i < 3 * num_rows / 4 {
-                if (i / 50) % 2 == 0 { None } else { Some(i as i32) }
+                if (i / 50) % 2 == 0 {
+                    None
+                } else {
+                    Some(i as i32)
+                }
             }
             // All non-null in last quarter
             else {
@@ -685,7 +690,10 @@ fn test_deterministic_with_nulls() {
     let data2 = write_file(&schema, &[batch.clone()], options());
 
     assert_eq!(data1.len(), data2.len(), "file sizes differ");
-    assert_eq!(data1, data2, "byte-level mismatch for null-pattern deterministic output");
+    assert_eq!(
+        data1, data2,
+        "byte-level mismatch for null-pattern deterministic output"
+    );
 
     println!(
         "test_deterministic_with_nulls: PASSED - {} bytes, byte-identical",
@@ -782,7 +790,11 @@ fn test_deterministic_with_no_compression() {
     let data1 = write_file(&schema, &[batch.clone()], options());
     let data2 = write_file(&schema, &[batch.clone()], options());
 
-    assert_eq!(data1.len(), data2.len(), "file sizes differ with no compression");
+    assert_eq!(
+        data1.len(),
+        data2.len(),
+        "file sizes differ with no compression"
+    );
     assert_eq!(data1, data2, "byte-level mismatch with no compression");
 
     println!(
@@ -958,8 +970,7 @@ fn test_reroundtrip_int_data() {
     )
     .unwrap();
 
-    let (cycle2, cycle3, batches1, batches2) =
-        reroundtrip(&schema, &[batch], make_default_options);
+    let (cycle2, cycle3, batches1, batches2) = reroundtrip(&schema, &[batch], make_default_options);
 
     // Cycle 1 read should equal cycle 2 read (data stability)
     assert!(
@@ -1035,8 +1046,7 @@ fn test_reroundtrip_string_data() {
     )
     .unwrap();
 
-    let (cycle2, cycle3, batches1, batches2) =
-        reroundtrip(&schema, &[batch], make_default_options);
+    let (cycle2, cycle3, batches1, batches2) = reroundtrip(&schema, &[batch], make_default_options);
 
     assert!(
         batches_equal_unordered(&batches1, &batches2),
@@ -1061,30 +1071,14 @@ fn test_reroundtrip_all_types() {
         Field::new("f", DataType::Float32, true),
         Field::new("g", DataType::Float64, true),
         Field::new("h", DataType::Date32, true),
-        Field::new(
-            "j",
-            DataType::Time32(TimeUnit::Millisecond),
-            true,
-        ),
+        Field::new("j", DataType::Time32(TimeUnit::Millisecond), true),
         Field::new("k", DataType::Utf8, true),
         Field::new("m", DataType::Binary, true),
         Field::new("n", DataType::Decimal128(10, 2), true),
         Field::new("p", DataType::Decimal128(38, 10), true),
-        Field::new(
-            "q",
-            DataType::Timestamp(TimeUnit::Millisecond, None),
-            true,
-        ),
-        Field::new(
-            "r",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            true,
-        ),
-        Field::new(
-            "s",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            true,
-        ),
+        Field::new("q", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+        Field::new("r", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        Field::new("s", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
     ]);
 
     let num_rows = 30_000;
@@ -1280,8 +1274,7 @@ fn test_reroundtrip_all_types() {
     )
     .unwrap();
 
-    let (cycle2, cycle3, batches1, batches2) =
-        reroundtrip(&schema, &[batch], make_default_options);
+    let (cycle2, cycle3, batches1, batches2) = reroundtrip(&schema, &[batch], make_default_options);
 
     assert!(
         batches_equal_unordered(&batches1, &batches2),
@@ -1307,13 +1300,7 @@ fn test_reroundtrip_with_nulls() {
     let num_rows = 50_000;
 
     let mostly_null: Vec<Option<i32>> = (0..num_rows)
-        .map(|i| {
-            if i % 100 == 0 {
-                Some(i as i32)
-            } else {
-                None
-            }
-        })
+        .map(|i| if i % 100 == 0 { Some(i as i32) } else { None })
         .collect();
     let half_null: Vec<Option<String>> = (0..num_rows)
         .map(|i| {
@@ -1347,8 +1334,7 @@ fn test_reroundtrip_with_nulls() {
     )
     .unwrap();
 
-    let (cycle2, cycle3, batches1, batches2) =
-        reroundtrip(&schema, &[batch], make_default_options);
+    let (cycle2, cycle3, batches1, batches2) = reroundtrip(&schema, &[batch], make_default_options);
 
     assert!(
         batches_equal_unordered(&batches1, &batches2),
@@ -1478,7 +1464,11 @@ fn test_reroundtrip_with_projection() {
     assert_eq!(projected_schema.fields().len(), 5);
 
     // Write the 5 columns
-    let data2 = write_file(&projected_schema, &projected_batches, WriterOptions::default());
+    let data2 = write_file(
+        &projected_schema,
+        &projected_batches,
+        WriterOptions::default(),
+    );
 
     // Read again
     let reread_batches = read_all(&data2);
@@ -1488,9 +1478,7 @@ fn test_reroundtrip_with_projection() {
         "re-roundtrip with projection: data mismatch"
     );
 
-    println!(
-        "test_reroundtrip_with_projection: PASSED - 20 cols -> 5 projected, roundtrip stable"
-    );
+    println!("test_reroundtrip_with_projection: PASSED - 20 cols -> 5 projected, roundtrip stable");
 }
 
 #[test]
@@ -1774,7 +1762,13 @@ fn test_deterministic_shared_substring_columns() {
             )),
             Arc::new(Float64Array::from(
                 (0..num_rows)
-                    .map(|i| if i % 7 == 0 { None } else { Some(i as f64 * 0.1) })
+                    .map(|i| {
+                        if i % 7 == 0 {
+                            None
+                        } else {
+                            Some(i as f64 * 0.1)
+                        }
+                    })
                     .collect::<Vec<_>>(),
             )),
             Arc::new(Int32Array::from(
@@ -1784,7 +1778,13 @@ fn test_deterministic_shared_substring_columns() {
             )),
             Arc::new(Float64Array::from(
                 (0..num_rows)
-                    .map(|i| if i % 8 == 0 { None } else { Some(i as f64 * 0.5) })
+                    .map(|i| {
+                        if i % 8 == 0 {
+                            None
+                        } else {
+                            Some(i as f64 * 0.5)
+                        }
+                    })
                     .collect::<Vec<_>>(),
             )),
             Arc::new(Int64Array::from((0..num_rows as i64).collect::<Vec<_>>())),
@@ -1800,7 +1800,13 @@ fn test_deterministic_shared_substring_columns() {
             )),
             Arc::new(Float64Array::from(
                 (0..num_rows)
-                    .map(|i| if i % 11 == 0 { None } else { Some(i as f64 * 0.3) })
+                    .map(|i| {
+                        if i % 11 == 0 {
+                            None
+                        } else {
+                            Some(i as f64 * 0.3)
+                        }
+                    })
                     .collect::<Vec<_>>(),
             )),
         ],
