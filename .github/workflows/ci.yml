@@ -57,7 +57,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --workspace -- -D warnings
 
-  build-and-test:
+  rust-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
