@@ -41,7 +41,7 @@ pub fn build_vocabulary(names: &[&[u8]]) -> Vec<[u8; 2]> {
             }
         }
 
-        let best = pair_counts.iter().max_by_key(|&(_, &v)| v);
+        let best = pair_counts.iter().max_by_key(|&(&k, &v)| (v, k));
         match best {
             Some((&pair, &count)) if count > 1 => {
                 let left = (pair >> 16) as u16;
