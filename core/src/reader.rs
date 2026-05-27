@@ -21,6 +21,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema};
 
+use crate::bloom::{self, BloomEntryMeta, SplitBlockBloomFilter};
 use crate::bucket_reader::{read_typed_value, read_variable_value, BucketReader, ColumnPageReader};
 use crate::schema::MosaicSchema;
 use crate::spec::*;
@@ -184,6 +185,7 @@ pub struct RowGroupMeta {
     pub bucket_offsets: Vec<u64>,
     pub bucket_layouts: Vec<BucketLayout>,
     pub stats: Vec<ColumnStats>,
+    pub blooms: Vec<BloomEntryMeta>,
 }
 
 pub trait ReaderAccess {
@@ -220,6 +222,12 @@ pub trait ReaderAccess {
     fn project(&mut self, column_names: &[&str]) -> io::Result<()>;
     fn row_group_stats(&self, rg_index: usize) -> io::Result<&[ColumnStats]>;
     fn row_group_num_rows(&self, rg_index: usize) -> io::Result<usize>;
+    fn row_group_bloom_meta(&self, rg_index: usize) -> io::Result<&[BloomEntryMeta]>;
+    fn bloom_filter(
+        &self,
+        rg_index: usize,
+        column_index: usize,
+    ) -> io::Result<Option<SplitBlockBloomFilter>>;
 }
 
 pub struct MosaicReader<I: InputFile> {
@@ -264,7 +272,7 @@ impl<I: InputFile> MosaicReader<I> {
         }
 
         let version = footer[25];
-        if version != VERSION {
+        if version < VERSION_MIN_SUPPORTED || version > VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported version: {}", version),
@@ -398,11 +406,18 @@ impl<I: InputFile> MosaicReader<I> {
             let rg_stats =
                 stats::deserialize_stats(index_data, &mut pos, &schema.columns, num_rows)?;
 
+            let rg_blooms = if version >= 2 {
+                bloom::deserialize_index_tail(index_data, &mut pos)?
+            } else {
+                Vec::new()
+            };
+
             row_group_metas.push(RowGroupMeta {
                 num_rows,
                 bucket_offsets,
                 bucket_layouts,
                 stats: rg_stats,
+                blooms: rg_blooms,
             });
         }
 
@@ -535,6 +550,50 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
             ));
         }
         Ok(self.row_group_metas[rg_index].num_rows)
+    }
+
+    fn row_group_bloom_meta(&self, rg_index: usize) -> io::Result<&[BloomEntryMeta]> {
+        if rg_index >= self.row_group_metas.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "row group index {} out of range (num_row_groups={})",
+                    rg_index,
+                    self.row_group_metas.len()
+                ),
+            ));
+        }
+        Ok(&self.row_group_metas[rg_index].blooms)
+    }
+
+    fn bloom_filter(
+        &self,
+        rg_index: usize,
+        column_index: usize,
+    ) -> io::Result<Option<SplitBlockBloomFilter>> {
+        if rg_index >= self.row_group_metas.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "row group index {} out of range (num_row_groups={})",
+                    rg_index,
+                    self.row_group_metas.len()
+                ),
+            ));
+        }
+        let meta = self
+            .row_group_metas[rg_index]
+            .blooms
+            .iter()
+            .find(|b| b.column_index == column_index);
+        let meta = match meta {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let mut buf = vec![0u8; meta.total_bytes];
+        self.input.read_at(meta.offset, &mut buf)?;
+        let filter = SplitBlockBloomFilter::read_from(&buf)?;
+        Ok(Some(filter))
     }
 
     fn row_group_reader(&self, rg_index: usize) -> io::Result<RowGroupReader> {

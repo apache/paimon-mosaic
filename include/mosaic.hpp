@@ -82,6 +82,12 @@ inline int64_t stream_get_pos(void* ctx) noexcept {
 
 } // namespace detail
 
+struct BloomFilterConfig {
+    std::string column_name;
+    uint64_t ndv = 0;
+    double fpp = 0.01;
+};
+
 struct WriterOptions {
     uint8_t compression = 1;  // ZSTD
     int zstd_level = 1;
@@ -92,6 +98,7 @@ struct WriterOptions {
     const char* const* stats_columns = nullptr;
     uint32_t num_stats_columns = 0;
     uint32_t page_size_threshold = 32 * 1024;
+    std::vector<BloomFilterConfig> bloom_filter_columns;
 };
 
 // ======================== Statistics ========================
@@ -126,6 +133,20 @@ public:
         c_opts.stats_columns = opts.stats_columns;
         c_opts.num_stats_columns = opts.num_stats_columns;
         c_opts.page_size_threshold = opts.page_size_threshold;
+
+        std::vector<MosaicBloomConfig> bloom_c_opts;
+        bloom_c_opts.reserve(opts.bloom_filter_columns.size());
+        for (auto const& b : opts.bloom_filter_columns) {
+            MosaicBloomConfig bc{};
+            bc.column_name = b.column_name.c_str();
+            bc.ndv = b.ndv;
+            bc.fpp = b.fpp;
+            bloom_c_opts.push_back(bc);
+        }
+        if (!bloom_c_opts.empty()) {
+            c_opts.bloom_filter_columns = bloom_c_opts.data();
+            c_opts.num_bloom_filter_columns = static_cast<uint32_t>(bloom_c_opts.size());
+        }
 
         handle_ = mosaic_writer_open(stream, static_cast<ArrowSchema*>(arrow_schema), c_opts);
         if (!handle_) throw Error("failed to open writer");
@@ -294,6 +315,20 @@ public:
         uint32_t out = 0;
         check(mosaic_reader_row_group_num_rows(handle_, rg_index, &out));
         return out;
+    }
+
+    bool bloom_might_contain(uint32_t rg_index, uint32_t column_index,
+                             uint8_t type_byte,
+                             const uint8_t* value_bytes, uint32_t value_len) const {
+        uint8_t out = 1;
+        int rc = mosaic_reader_bloom_might_contain(
+            handle_, rg_index, column_index, type_byte,
+            value_bytes, value_len, &out);
+        if (rc < 0) {
+            const char* err = mosaic_last_error();
+            throw Error(err ? err : "bloom_might_contain failed");
+        }
+        return out != 0;
     }
 
     std::vector<ColumnStatistics> get_row_group_statistics(uint32_t rg_index) {

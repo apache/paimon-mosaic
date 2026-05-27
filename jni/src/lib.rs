@@ -21,9 +21,9 @@ use std::ptr;
 use std::sync::Arc;
 
 use jni::objects::{
-    GlobalRef, JByteArray, JClass, JMethodID, JObject, JObjectArray, JString, JValue,
+    GlobalRef, JByteArray, JClass, JDoubleArray, JMethodID, JObject, JObjectArray, JString, JValue,
 };
-use jni::sys::{jint, jlong, jlongArray};
+use jni::sys::{jboolean, jint, jlong, jlongArray, JNI_TRUE};
 use jni::JNIEnv;
 use jni::JavaVM;
 
@@ -31,8 +31,10 @@ use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{RecordBatch, StructArray};
 use arrow_schema::Schema;
 
+use mosaic_core::bloom::{self, BloomFilterConfig};
 use mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess, RowGroupReader};
 use mosaic_core::spec::*;
+use mosaic_core::values::Value;
 use mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
 
 fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
@@ -209,6 +211,9 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
     max_dict_entries: jint,
     stats_columns: JObjectArray<'_>,
     page_size_threshold: jint,
+    bloom_columns: JObjectArray<'_>,
+    bloom_ndvs: jlongArray,
+    bloom_fpps: JDoubleArray<'_>,
 ) -> jlong {
     let raw_env = env.get_raw();
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -303,6 +308,51 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
             num_buckets as usize
         };
 
+        let bloom_cols: Vec<BloomFilterConfig> = match env.get_array_length(&bloom_columns) {
+            Ok(len) if len > 0 => {
+                let count = len as usize;
+                let ndvs_arr = unsafe { jni::objects::JLongArray::from_raw(bloom_ndvs) };
+                let mut ndvs_buf = vec![0i64; count];
+                if let Err(e) = env.get_long_array_region(&ndvs_arr, 0, &mut ndvs_buf) {
+                    throw(&mut env, &format!("failed to read bloom_ndvs: {}", e));
+                    return 0;
+                }
+                let mut fpps_buf = vec![0f64; count];
+                if let Err(e) = env.get_double_array_region(&bloom_fpps, 0, &mut fpps_buf) {
+                    throw(&mut env, &format!("failed to read bloom_fpps: {}", e));
+                    return 0;
+                }
+                let mut out = Vec::with_capacity(count);
+                for i in 0..count {
+                    let obj = match env.get_object_array_element(&bloom_columns, i as jint) {
+                        Ok(o) => o,
+                        Err(_) => {
+                            throw(&mut env, "failed to read bloom_columns element");
+                            return 0;
+                        }
+                    };
+                    let jstr = JString::from(obj);
+                    let name: String = match env.get_string(&jstr) {
+                        Ok(s) => s.into(),
+                        Err(_) => {
+                            throw(
+                                &mut env,
+                                "failed to convert bloom_columns element to string",
+                            );
+                            return 0;
+                        }
+                    };
+                    out.push(BloomFilterConfig {
+                        column_name: name,
+                        ndv: ndvs_buf[i] as u64,
+                        fpp: fpps_buf[i],
+                    });
+                }
+                out
+            }
+            _ => Vec::new(),
+        };
+
         let opts = WriterOptions {
             compression: compression as u8,
             zstd_level,
@@ -312,6 +362,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
             max_dict_entries: max_dict_entries as usize,
             stats_columns: stats_cols,
             page_size_threshold: page_size_threshold as usize,
+            bloom_filter_columns: bloom_cols,
         };
 
         let writer = match MosaicWriter::new(jni_stream, &arrow_schema, opts) {
@@ -1003,5 +1054,124 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
             throw(&mut env, &panic_message(&e));
             -1
         }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderBloomMightContain(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    rg_index: jint,
+    column_index: jint,
+    type_byte: jint,
+    value_bytes: JByteArray<'_>,
+) -> jboolean {
+    let raw_env = env.get_raw();
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle == 0 {
+            throw(&mut env, "null reader handle");
+            return JNI_TRUE;
+        }
+        let len = match env.get_array_length(&value_bytes) {
+            Ok(n) => n as usize,
+            Err(e) => {
+                throw(&mut env, &format!("failed to read value bytes length: {}", e));
+                return JNI_TRUE;
+            }
+        };
+        let mut buf = vec![0i8; len];
+        if len > 0
+            && env
+                .get_byte_array_region(&value_bytes, 0, &mut buf)
+                .is_err()
+        {
+            throw(&mut env, "failed to copy value bytes");
+            return JNI_TRUE;
+        }
+        let bytes: Vec<u8> = buf.into_iter().map(|b| b as u8).collect();
+        let value = match jni_value_from_type_byte(type_byte as u8, &bytes) {
+            Ok(v) => v,
+            Err(msg) => {
+                throw(&mut env, &msg);
+                return JNI_TRUE;
+            }
+        };
+        let rh = unsafe { &*(handle as *const ReaderHandle) };
+        let filter = match rh.reader.bloom_filter(rg_index as usize, column_index as usize) {
+            Ok(opt) => opt,
+            Err(e) => {
+                throw(&mut env, &format!("bloom_filter fetch failed: {}", e));
+                return JNI_TRUE;
+            }
+        };
+        let result = match filter {
+            None => true,
+            Some(f) => f.contains_hash(bloom::hash_value(&value)),
+        };
+        if result {
+            JNI_TRUE
+        } else {
+            0u8
+        }
+    }));
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            let mut env = unsafe { JNIEnv::from_raw(raw_env).unwrap() };
+            throw(&mut env, &panic_message(&e));
+            JNI_TRUE
+        }
+    }
+}
+
+fn jni_value_from_type_byte(type_byte: u8, bytes: &[u8]) -> Result<Value, String> {
+    let need = |n: usize| -> Result<(), String> {
+        if bytes.len() != n {
+            Err(format!(
+                "value bytes length {} does not match expected {} for type {}",
+                bytes.len(),
+                n,
+                type_byte
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    match type_byte {
+        0 => {
+            need(1)?;
+            Ok(Value::Boolean(bytes[0] != 0))
+        }
+        1 => {
+            need(1)?;
+            Ok(Value::TinyInt(bytes[0] as i8))
+        }
+        2 => {
+            need(2)?;
+            Ok(Value::SmallInt(i16::from_le_bytes([bytes[0], bytes[1]])))
+        }
+        3 => {
+            need(4)?;
+            Ok(Value::Integer(i32::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        4 => {
+            need(8)?;
+            Ok(Value::BigInt(i64::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        5 => {
+            need(4)?;
+            Ok(Value::Float(f32::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        6 => {
+            need(8)?;
+            Ok(Value::Double(f64::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        7 => {
+            need(4)?;
+            Ok(Value::Date(i32::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        10 => Ok(Value::String(bytes.to_vec())),
+        other => Err(format!("unsupported bloom value type_byte {}", other)),
     }
 }

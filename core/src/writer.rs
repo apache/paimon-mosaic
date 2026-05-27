@@ -20,6 +20,7 @@ use std::io;
 use arrow_array::*;
 use arrow_schema::Schema;
 
+use crate::bloom::{self, BloomEntryMeta, BloomFilterCollector, BloomFilterConfig};
 use crate::bucket_writer::{BucketWriter, PagedBucketOutput};
 use crate::schema::MosaicSchema;
 use crate::spec::*;
@@ -50,6 +51,7 @@ pub struct WriterOptions {
     pub max_dict_entries: usize,
     pub stats_columns: Vec<String>,
     pub page_size_threshold: usize,
+    pub bloom_filter_columns: Vec<BloomFilterConfig>,
 }
 
 impl Default for WriterOptions {
@@ -63,6 +65,7 @@ impl Default for WriterOptions {
             max_dict_entries: DEFAULT_DICT_MAX_ENTRIES,
             stats_columns: Vec::new(),
             page_size_threshold: DEFAULT_PAGE_SIZE_THRESHOLD,
+            bloom_filter_columns: Vec::new(),
         }
     }
 }
@@ -72,6 +75,7 @@ struct RowGroupMeta {
     bucket_offsets: Vec<u64>,
     bucket_layouts: Vec<BucketLayout>,
     stats: Vec<ColumnStats>,
+    blooms: Vec<BloomEntryMeta>,
 }
 
 pub struct MosaicWriter<S: OutputFile> {
@@ -93,6 +97,7 @@ pub struct MosaicWriter<S: OutputFile> {
     total_uncompressed: u64,
     total_compressed: u64,
     stats_collector: Option<StatsCollector>,
+    bloom_collector: Option<BloomFilterCollector>,
     closed: bool,
 }
 
@@ -175,6 +180,17 @@ impl<S: OutputFile> MosaicWriter<S> {
             Some(StatsCollector::new(&cols))
         };
 
+        let bloom_collector = if options.bloom_filter_columns.is_empty() {
+            None
+        } else {
+            let resolved = bloom::resolve_configs(
+                &options.bloom_filter_columns,
+                &schema.columns,
+                &batch_col_map,
+            )?;
+            Some(BloomFilterCollector::new(&resolved))
+        };
+
         let active_buckets: Vec<usize> = bucket_writers
             .iter()
             .enumerate()
@@ -205,6 +221,7 @@ impl<S: OutputFile> MosaicWriter<S> {
             total_uncompressed: 0,
             total_compressed: 0,
             stats_collector,
+            bloom_collector,
             closed: false,
         })
     }
@@ -283,6 +300,9 @@ impl<S: OutputFile> MosaicWriter<S> {
         }
 
         if let Some(ref mut collector) = self.stats_collector {
+            collector.update_batch(batch);
+        }
+        if let Some(ref mut collector) = self.bloom_collector {
             collector.update_batch(batch);
         }
 
@@ -383,11 +403,33 @@ impl<S: OutputFile> MosaicWriter<S> {
             None => Vec::new(),
         };
 
+        let row_blooms = match &mut self.bloom_collector {
+            Some(collector) => {
+                let filters = collector.finish();
+                let mut metas = Vec::with_capacity(filters.len());
+                let mut filter_bytes = Vec::new();
+                for (column_index, filter) in filters {
+                    filter_bytes.clear();
+                    filter.write_to(&mut filter_bytes);
+                    let offset = self.out.pos();
+                    self.out.write(&filter_bytes)?;
+                    metas.push(BloomEntryMeta {
+                        column_index,
+                        offset,
+                        total_bytes: filter_bytes.len(),
+                    });
+                }
+                metas
+            }
+            None => Vec::new(),
+        };
+
         self.row_group_metas.push(RowGroupMeta {
             num_rows: self.current_row_group_rows,
             bucket_offsets,
             bucket_layouts,
             stats: row_stats,
+            blooms: row_blooms,
         });
 
         self.current_row_group_rows = 0;
@@ -543,6 +585,8 @@ impl<S: OutputFile> MosaicWriter<S> {
             }
             let stats_bytes = stats::serialize_stats(&meta.stats, &self.schema.columns);
             index_buf.extend_from_slice(&stats_bytes);
+            let bloom_bytes = bloom::serialize_index_tail(&meta.blooms);
+            index_buf.extend_from_slice(&bloom_bytes);
         }
         self.out.write(&index_buf)?;
 

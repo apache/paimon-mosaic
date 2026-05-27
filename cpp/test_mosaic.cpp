@@ -824,6 +824,92 @@ static void test_stats_empty_string_min() {
     printf("  PASS test_stats_empty_string_min\n");
 }
 
+static void test_bloom_int64_hits_and_misses() {
+    auto schema = arrow::schema({arrow::field("id", arrow::int64(), false)});
+    arrow::Int64Builder id_b;
+    for (int64_t i = 0; i < 2000; i++) {
+        assert(id_b.Append(i).ok());
+    }
+    auto batch = arrow::RecordBatch::Make(schema, 2000, {id_b.Finish().ValueUnsafe()});
+
+    mosaic::WriterOptions opts;
+    opts.num_buckets = 2;
+    opts.bloom_filter_columns.push_back({"id", 2000, 0.01});
+
+    MemBuffer write_buf;
+    struct ArrowSchema c_schema;
+    auto st = arrow::ExportSchema(*schema, &c_schema);
+    assert(st.ok());
+    mosaic::Writer writer(make_output(write_buf), &c_schema, opts);
+
+    struct ArrowArray c_array;
+    struct ArrowSchema c_batch_schema;
+    st = arrow::ExportRecordBatch(*batch, &c_array, &c_batch_schema);
+    assert(st.ok());
+    writer.write(&c_array, &c_batch_schema);
+    writer.close();
+
+    auto reader = mosaic::make_reader(make_input(write_buf), write_buf.data.size());
+    for (int64_t i = 0; i < 2000; i++) {
+        ASSERT_TRUE(reader.bloom_might_contain(
+            0, 0, 4, reinterpret_cast<const uint8_t*>(&i), sizeof(int64_t)));
+    }
+    uint64_t fp = 0;
+    const uint64_t probe = 5000;
+    for (int64_t i = 1000000; i < 1000000 + (int64_t)probe; i++) {
+        if (reader.bloom_might_contain(0, 0, 4,
+                                       reinterpret_cast<const uint8_t*>(&i),
+                                       sizeof(int64_t))) {
+            fp++;
+        }
+    }
+    double observed = static_cast<double>(fp) / probe;
+    ASSERT_TRUE(observed < 0.05);
+    printf("  PASS test_bloom_int64_hits_and_misses (observed fpp %f)\n", observed);
+}
+
+static void test_bloom_string_rejects_absent() {
+    auto schema = arrow::schema({arrow::field("name", arrow::utf8(), false)});
+    arrow::StringBuilder name_b;
+    const std::vector<std::string> names = {"alice", "bob", "carol", "dave", "eve"};
+    for (auto const& n : names) {
+        assert(name_b.Append(n).ok());
+    }
+    auto batch = arrow::RecordBatch::Make(schema, names.size(),
+                                          {name_b.Finish().ValueUnsafe()});
+
+    mosaic::WriterOptions opts;
+    opts.num_buckets = 1;
+    opts.bloom_filter_columns.push_back({"name", 1024, 0.001});
+
+    MemBuffer write_buf;
+    struct ArrowSchema c_schema;
+    auto st = arrow::ExportSchema(*schema, &c_schema);
+    assert(st.ok());
+    mosaic::Writer writer(make_output(write_buf), &c_schema, opts);
+
+    struct ArrowArray c_array;
+    struct ArrowSchema c_batch_schema;
+    st = arrow::ExportRecordBatch(*batch, &c_array, &c_batch_schema);
+    assert(st.ok());
+    writer.write(&c_array, &c_batch_schema);
+    writer.close();
+
+    auto reader = mosaic::make_reader(make_input(write_buf), write_buf.data.size());
+    for (auto const& n : names) {
+        ASSERT_TRUE(reader.bloom_might_contain(
+            0, 0, 10,
+            reinterpret_cast<const uint8_t*>(n.data()),
+            static_cast<uint32_t>(n.size())));
+    }
+    std::string absent = "zachary";
+    ASSERT_TRUE(!reader.bloom_might_contain(
+        0, 0, 10,
+        reinterpret_cast<const uint8_t*>(absent.data()),
+        static_cast<uint32_t>(absent.size())));
+    printf("  PASS test_bloom_string_rejects_absent\n");
+}
+
 int main() {
     printf("Running Mosaic C++ tests...\n");
     test_basic_roundtrip();
@@ -841,6 +927,8 @@ int main() {
     test_writer_stats_all_null();
     test_writer_stats_matches_reader();
     test_stats_empty_string_min();
-    printf("All %d tests passed.\n", 15);
+    test_bloom_int64_hits_and_misses();
+    test_bloom_string_rejects_absent();
+    printf("All %d tests passed.\n", 17);
     return 0;
 }

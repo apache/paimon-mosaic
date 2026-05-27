@@ -19,6 +19,10 @@
 
 package org.apache.paimon.mosaic;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
 public class WriterOptions {
 
     public static final int COMPRESSION_ZSTD = 1;
@@ -31,6 +35,7 @@ public class WriterOptions {
     private int maxDictEntries = 255;
     private String[] statsColumns = new String[0];
     private int pageSizeThreshold = 32 * 1024;
+    private List<BloomFilterConfig> bloomFilterColumns = Collections.emptyList();
 
     public WriterOptions() {}
 
@@ -74,6 +79,26 @@ public class WriterOptions {
         return this;
     }
 
+    public WriterOptions bloomFilterColumns(List<BloomFilterConfig> configs) {
+        this.bloomFilterColumns = configs == null
+                ? Collections.emptyList()
+                : new ArrayList<>(configs);
+        return this;
+    }
+
+    public WriterOptions bloomFilterColumns(BloomFilterConfig... configs) {
+        if (configs == null || configs.length == 0) {
+            this.bloomFilterColumns = Collections.emptyList();
+        } else {
+            List<BloomFilterConfig> list = new ArrayList<>(configs.length);
+            for (BloomFilterConfig c : configs) {
+                list.add(c);
+            }
+            this.bloomFilterColumns = list;
+        }
+        return this;
+    }
+
     int getCompression() { return compression; }
     int getZstdLevel() { return zstdLevel; }
     int getNumBuckets() { return numBuckets; }
@@ -82,4 +107,5 @@ public class WriterOptions {
     int getMaxDictEntries() { return maxDictEntries; }
     String[] getStatsColumns() { return statsColumns; }
     int getPageSizeThreshold() { return pageSizeThreshold; }
+    List<BloomFilterConfig> getBloomFilterColumns() { return bloomFilterColumns; }
 }
