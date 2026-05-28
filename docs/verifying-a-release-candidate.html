@@ -101,9 +101,25 @@ cargo test --workspace</code></pre>
 
             <h3>Java</h3>
             <p>Build the Java binding (requires JDK 8+ and Maven):</p>
-<pre><code>cargo build --release -p paimon-mosaic-jni
-cp target/release/libpaimon_mosaic_jni.* java/src/main/resources/native/
-cd java
+<pre><code>cargo build --release -p paimon-mosaic-jni</code></pre>
+            <p>Copy the built native library into the resource directory for the platform being verified.</p>
+            <p><strong>Linux x86_64:</strong></p>
+<pre><code>mkdir -p java/src/main/resources/native/linux/x86_64
+cp target/release/libpaimon_mosaic_jni.so \
+  java/src/main/resources/native/linux/x86_64/</code></pre>
+            <p><strong>Linux aarch64:</strong></p>
+<pre><code>mkdir -p java/src/main/resources/native/linux/aarch64
+cp target/release/libpaimon_mosaic_jni.so \
+  java/src/main/resources/native/linux/aarch64/</code></pre>
+            <p><strong>macOS aarch64:</strong></p>
+<pre><code>mkdir -p java/src/main/resources/native/macos/aarch64
+cp target/release/libpaimon_mosaic_jni.dylib \
+  java/src/main/resources/native/macos/aarch64/</code></pre>
+            <p><strong>Windows x86_64:</strong></p>
+<pre><code>mkdir -p java/src/main/resources/native/windows/x86_64
+cp target/release/paimon_mosaic_jni.dll \
+  java/src/main/resources/native/windows/x86_64/</code></pre>
+<pre><code>cd java
 mvn clean package</code></pre>
 
             <h3>Python</h3>
