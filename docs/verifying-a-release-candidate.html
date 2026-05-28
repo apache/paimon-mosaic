@@ -102,7 +102,7 @@ cargo test --workspace</code></pre>
             <h3>Java</h3>
             <p>Build the Java binding (requires JDK 8+ and Maven):</p>
 <pre><code>cargo build --release -p paimon-mosaic-jni</code></pre>
-            <p>Copy the built native library into the resource directory for the platform being verified.</p>
+            <p>Copy the built native library into the resource directory for the platform being verified. Run only the snippet for your current platform.</p>
             <p><strong>Linux x86_64:</strong></p>
 <pre><code>mkdir -p java/src/main/resources/native/linux/x86_64
 cp target/release/libpaimon_mosaic_jni.so \
