@@ -57,8 +57,7 @@ pub struct SplitBlockBloomFilter {
 impl SplitBlockBloomFilter {
     pub fn with_num_blocks(num_blocks: usize) -> Self {
         let n = num_blocks
-            .max(BLOOM_MIN_BLOCKS)
-            .min(BLOOM_MAX_BLOCKS)
+            .clamp(BLOOM_MIN_BLOCKS, BLOOM_MAX_BLOCKS)
             .next_power_of_two();
         Self {
             blocks: vec![[0u32; BLOOM_BLOCK_WORDS]; n],
@@ -151,7 +150,7 @@ impl SplitBlockBloomFilter {
         }
         let mut pos = 4;
         let num_bytes = varint::decode(data, &mut pos)? as usize;
-        if num_bytes % BLOOM_BLOCK_BYTES != 0 {
+        if !num_bytes.is_multiple_of(BLOOM_BLOCK_BYTES) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -164,13 +163,19 @@ impl SplitBlockBloomFilter {
         if num_blocks == 0 || !num_blocks.is_power_of_two() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("bloom: numBlocks {} not a positive power of two", num_blocks),
+                format!(
+                    "bloom: numBlocks {} not a positive power of two",
+                    num_blocks
+                ),
             ));
         }
         if num_blocks > BLOOM_MAX_BLOCKS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("bloom: numBlocks {} exceeds cap {}", num_blocks, BLOOM_MAX_BLOCKS),
+                format!(
+                    "bloom: numBlocks {} exceeds cap {}",
+                    num_blocks, BLOOM_MAX_BLOCKS
+                ),
             ));
         }
         if pos + num_bytes > data.len() {
@@ -182,9 +187,9 @@ impl SplitBlockBloomFilter {
         let mut blocks = Vec::with_capacity(num_blocks);
         for b in 0..num_blocks {
             let mut block = [0u32; BLOOM_BLOCK_WORDS];
-            for i in 0..BLOOM_BLOCK_WORDS {
+            for (i, word) in block.iter_mut().enumerate() {
                 let off = pos + b * BLOOM_BLOCK_BYTES + i * 4;
-                block[i] = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+                *word = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
             }
             blocks.push(block);
         }
@@ -277,12 +282,14 @@ struct ColEntry {
     filter: SplitBlockBloomFilter,
 }
 
+pub type ResolvedBloomColumn = (usize, usize, DataType, u64, f64);
+
 pub struct BloomFilterCollector {
     entries: Vec<ColEntry>,
 }
 
 impl BloomFilterCollector {
-    pub fn new(columns: &[(usize, usize, DataType, u64, f64)]) -> Self {
+    pub fn new(columns: &[ResolvedBloomColumn]) -> Self {
         let entries = columns
             .iter()
             .map(|(idx, batch_idx, dt, ndv, fpp)| ColEntry {
@@ -417,7 +424,7 @@ pub fn resolve_configs(
     configs: &[BloomFilterConfig],
     schema_columns: &[crate::schema::ColumnMeta],
     batch_col_map: &[usize],
-) -> io::Result<Vec<(usize, usize, DataType, u64, f64)>> {
+) -> io::Result<Vec<ResolvedBloomColumn>> {
     let mut name_to_idx: HashMap<&str, usize> = HashMap::with_capacity(schema_columns.len());
     for (i, c) in schema_columns.iter().enumerate() {
         name_to_idx.insert(c.name.as_str(), i);
@@ -531,7 +538,12 @@ mod tests {
 
     #[test]
     fn read_rejects_bad_discriminants() {
-        let mut buf = vec![BLOOM_HEADER_VERSION, 99, BLOOM_HASH_XXHASH64, BLOOM_COMPRESSION_NONE];
+        let mut buf = vec![
+            BLOOM_HEADER_VERSION,
+            99,
+            BLOOM_HASH_XXHASH64,
+            BLOOM_COMPRESSION_NONE,
+        ];
         varint::encode(&mut buf, 32);
         buf.extend(vec![0u8; 32]);
         let err = SplitBlockBloomFilter::read_from(&buf).unwrap_err();

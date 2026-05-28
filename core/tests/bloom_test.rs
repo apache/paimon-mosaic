@@ -105,8 +105,7 @@ fn bloom_present_values_match() {
         4,
     );
     let len = bytes.len() as u64;
-    let reader =
-        MosaicReader::new(ByteArrayInputFile { data: bytes }, len).expect("reader open");
+    let reader = MosaicReader::new(ByteArrayInputFile { data: bytes }, len).expect("reader open");
 
     assert_eq!(reader.num_row_groups(), 1);
     let metas = reader.row_group_bloom_meta(0).unwrap();
@@ -142,11 +141,7 @@ fn bloom_present_values_match() {
 
 #[test]
 fn no_bloom_when_not_configured() {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int64,
-        false,
-    )]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let id_array: Int64Array = (0..100i64).collect();
     let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array)]).unwrap();
     let bytes = write_file(schema.clone(), vec![batch], Vec::new(), 1);
@@ -160,11 +155,7 @@ fn no_bloom_when_not_configured() {
 
 #[test]
 fn bloom_string_column_skips_absent_value() {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "name",
-        DataType::Utf8,
-        false,
-    )]));
+    let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
     let names: Vec<&str> = vec!["alice", "bob", "carol", "dave", "eve"];
     let arr = StringArray::from(names.clone());
     let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
@@ -188,16 +179,15 @@ fn bloom_string_column_skips_absent_value() {
     }
     let absent = "zachary";
     let h = hash_value(&Value::String(absent.as_bytes().to_vec()));
-    assert!(!filter.contains_hash(h), "filter false-positive on small set");
+    assert!(
+        !filter.contains_hash(h),
+        "filter false-positive on small set"
+    );
 }
 
 #[test]
 fn bloom_per_row_group_independent() {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int64,
-        false,
-    )]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
     let batches: Vec<RecordBatch> = vec![
         RecordBatch::try_new(

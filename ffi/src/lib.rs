@@ -214,37 +214,36 @@ pub unsafe extern "C" fn mosaic_writer_open(
         } else {
             options.num_buckets as usize
         };
-        let bloom_cols = if options.bloom_filter_columns.is_null()
-            || options.num_bloom_filter_columns == 0
-        {
-            Vec::new()
-        } else {
-            let entries = std::slice::from_raw_parts(
-                options.bloom_filter_columns,
-                options.num_bloom_filter_columns as usize,
-            );
-            let mut out = Vec::with_capacity(entries.len());
-            for entry in entries {
-                if entry.column_name.is_null() {
-                    set_error("bloom_filter_columns contains null column_name".into());
-                    return ptr::null_mut();
-                }
-                let cstr = std::ffi::CStr::from_ptr(entry.column_name);
-                let name = match cstr.to_str() {
-                    Ok(s) => s.to_owned(),
-                    Err(_) => {
-                        set_error("bloom_filter_columns contains invalid UTF-8 name".into());
+        let bloom_cols =
+            if options.bloom_filter_columns.is_null() || options.num_bloom_filter_columns == 0 {
+                Vec::new()
+            } else {
+                let entries = std::slice::from_raw_parts(
+                    options.bloom_filter_columns,
+                    options.num_bloom_filter_columns as usize,
+                );
+                let mut out = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    if entry.column_name.is_null() {
+                        set_error("bloom_filter_columns contains null column_name".into());
                         return ptr::null_mut();
                     }
-                };
-                out.push(BloomFilterConfig {
-                    column_name: name,
-                    ndv: entry.ndv,
-                    fpp: entry.fpp,
-                });
-            }
-            out
-        };
+                    let cstr = std::ffi::CStr::from_ptr(entry.column_name);
+                    let name = match cstr.to_str() {
+                        Ok(s) => s.to_owned(),
+                        Err(_) => {
+                            set_error("bloom_filter_columns contains invalid UTF-8 name".into());
+                            return ptr::null_mut();
+                        }
+                    };
+                    out.push(BloomFilterConfig {
+                        column_name: name,
+                        ndv: entry.ndv,
+                        fpp: entry.fpp,
+                    });
+                }
+                out
+            };
         let opts = WriterOptions {
             compression: options.compression,
             zstd_level: options.zstd_level,
@@ -1054,7 +1053,10 @@ pub unsafe extern "C" fn mosaic_reader_bloom_might_contain(
         }
     };
     let h = &*handle;
-    let filter = match h.reader.bloom_filter(rg_index as usize, column_index as usize) {
+    let filter = match h
+        .reader
+        .bloom_filter(rg_index as usize, column_index as usize)
+    {
         Ok(opt) => opt,
         Err(e) => {
             set_error(e.to_string());
@@ -1102,7 +1104,9 @@ fn value_from_type_byte(type_byte: u8, bytes: &[u8]) -> Result<Value, String> {
         }
         3 => {
             need(4)?;
-            Ok(Value::Integer(i32::from_le_bytes(bytes.try_into().unwrap())))
+            Ok(Value::Integer(i32::from_le_bytes(
+                bytes.try_into().unwrap(),
+            )))
         }
         4 => {
             need(8)?;

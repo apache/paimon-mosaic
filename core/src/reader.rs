@@ -272,7 +272,7 @@ impl<I: InputFile> MosaicReader<I> {
         }
 
         let version = footer[25];
-        if version < VERSION_MIN_SUPPORTED || version > VERSION {
+        if !(VERSION_MIN_SUPPORTED..=VERSION).contains(&version) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported version: {}", version),
@@ -581,8 +581,7 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                 ),
             ));
         }
-        let meta = self
-            .row_group_metas[rg_index]
+        let meta = self.row_group_metas[rg_index]
             .blooms
             .iter()
             .find(|b| b.column_index == column_index);

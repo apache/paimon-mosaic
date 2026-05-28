@@ -21,7 +21,8 @@ use std::ptr;
 use std::sync::Arc;
 
 use jni::objects::{
-    GlobalRef, JByteArray, JClass, JDoubleArray, JMethodID, JObject, JObjectArray, JString, JValue,
+    GlobalRef, JByteArray, JClass, JDoubleArray, JLongArray, JMethodID, JObject, JObjectArray,
+    JString, JValue,
 };
 use jni::sys::{jboolean, jint, jlong, jlongArray, JNI_TRUE};
 use jni::JNIEnv;
@@ -212,7 +213,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
     stats_columns: JObjectArray<'_>,
     page_size_threshold: jint,
     bloom_columns: JObjectArray<'_>,
-    bloom_ndvs: jlongArray,
+    bloom_ndvs: JLongArray<'_>,
     bloom_fpps: JDoubleArray<'_>,
 ) -> jlong {
     let raw_env = env.get_raw();
@@ -311,9 +312,8 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
         let bloom_cols: Vec<BloomFilterConfig> = match env.get_array_length(&bloom_columns) {
             Ok(len) if len > 0 => {
                 let count = len as usize;
-                let ndvs_arr = unsafe { jni::objects::JLongArray::from_raw(bloom_ndvs) };
                 let mut ndvs_buf = vec![0i64; count];
-                if let Err(e) = env.get_long_array_region(&ndvs_arr, 0, &mut ndvs_buf) {
+                if let Err(e) = env.get_long_array_region(&bloom_ndvs, 0, &mut ndvs_buf) {
                     throw(&mut env, &format!("failed to read bloom_ndvs: {}", e));
                     return 0;
                 }
@@ -1076,7 +1076,10 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderBloom
         let len = match env.get_array_length(&value_bytes) {
             Ok(n) => n as usize,
             Err(e) => {
-                throw(&mut env, &format!("failed to read value bytes length: {}", e));
+                throw(
+                    &mut env,
+                    &format!("failed to read value bytes length: {}", e),
+                );
                 return JNI_TRUE;
             }
         };
@@ -1098,7 +1101,10 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderBloom
             }
         };
         let rh = unsafe { &*(handle as *const ReaderHandle) };
-        let filter = match rh.reader.bloom_filter(rg_index as usize, column_index as usize) {
+        let filter = match rh
+            .reader
+            .bloom_filter(rg_index as usize, column_index as usize)
+        {
             Ok(opt) => opt,
             Err(e) => {
                 throw(&mut env, &format!("bloom_filter fetch failed: {}", e));
@@ -1153,7 +1159,9 @@ fn jni_value_from_type_byte(type_byte: u8, bytes: &[u8]) -> Result<Value, String
         }
         3 => {
             need(4)?;
-            Ok(Value::Integer(i32::from_le_bytes(bytes.try_into().unwrap())))
+            Ok(Value::Integer(i32::from_le_bytes(
+                bytes.try_into().unwrap(),
+            )))
         }
         4 => {
             need(8)?;
