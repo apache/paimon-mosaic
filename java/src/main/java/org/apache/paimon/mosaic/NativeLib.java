@@ -105,7 +105,9 @@ final class NativeLib {
                                         int numBuckets, int compression, int zstdLevel,
                                         long rowGroupMaxSize, int maxDictTotalBytes,
                                         int maxDictEntries, String[] statsColumns,
-                                        int pageSizeThreshold);
+                                        int pageSizeThreshold,
+                                        String[] bloomColumns, long[] bloomNdvs,
+                                        double[] bloomFpps);
     static native void nativeWriterClose(long handle);
     static native void nativeWriterFree(long handle);
     static native long nativeWriterEstimatedSize(long handle);
@@ -137,4 +139,9 @@ final class NativeLib {
     static native long[] nativeReaderRowGroupStatNullCounts(long handle, int rgIndex);
     static native byte[][] nativeReaderRowGroupStatMins(long handle, int rgIndex);
     static native byte[][] nativeReaderRowGroupStatMaxs(long handle, int rgIndex);
+
+    // Bloom filter
+    static native boolean nativeReaderBloomMightContain(long handle, int rgIndex,
+                                                        int columnIndex, int typeByte,
+                                                        byte[] valueBytes);
 }

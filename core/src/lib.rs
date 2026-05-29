@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod bloom;
 pub mod bpe;
 pub mod bucket_reader;
 pub mod bucket_writer;

@@ -28,8 +28,10 @@ use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{RecordBatch, StructArray};
 use arrow_schema::{Field, Schema};
 
+use mosaic_core::bloom::{self, BloomFilterConfig};
 use mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess};
 use mosaic_core::spec::*;
+use mosaic_core::values::Value;
 use mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
 
 type MinMaxPair = (Option<Vec<u8>>, Option<Vec<u8>>);
@@ -110,6 +112,13 @@ impl OutputFile for FfiOutputFile {
 // ======================== Writer Options ========================
 
 #[repr(C)]
+pub struct MosaicBloomConfig {
+    pub column_name: *const c_char,
+    pub ndv: u64,
+    pub fpp: f64,
+}
+
+#[repr(C)]
 pub struct MosaicWriterOptions {
     pub compression: u8,
     pub zstd_level: c_int,
@@ -120,6 +129,8 @@ pub struct MosaicWriterOptions {
     pub stats_columns: *const *const c_char,
     pub num_stats_columns: u32,
     pub page_size_threshold: u32,
+    pub bloom_filter_columns: *const MosaicBloomConfig,
+    pub num_bloom_filter_columns: u32,
 }
 
 /// Returns default writer options.
@@ -135,6 +146,8 @@ pub extern "C" fn mosaic_writer_options_default() -> MosaicWriterOptions {
         stats_columns: ptr::null(),
         num_stats_columns: 0,
         page_size_threshold: DEFAULT_PAGE_SIZE_THRESHOLD as u32,
+        bloom_filter_columns: ptr::null(),
+        num_bloom_filter_columns: 0,
     }
 }
 
@@ -201,6 +214,36 @@ pub unsafe extern "C" fn mosaic_writer_open(
         } else {
             options.num_buckets as usize
         };
+        let bloom_cols =
+            if options.bloom_filter_columns.is_null() || options.num_bloom_filter_columns == 0 {
+                Vec::new()
+            } else {
+                let entries = std::slice::from_raw_parts(
+                    options.bloom_filter_columns,
+                    options.num_bloom_filter_columns as usize,
+                );
+                let mut out = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    if entry.column_name.is_null() {
+                        set_error("bloom_filter_columns contains null column_name".into());
+                        return ptr::null_mut();
+                    }
+                    let cstr = std::ffi::CStr::from_ptr(entry.column_name);
+                    let name = match cstr.to_str() {
+                        Ok(s) => s.to_owned(),
+                        Err(_) => {
+                            set_error("bloom_filter_columns contains invalid UTF-8 name".into());
+                            return ptr::null_mut();
+                        }
+                    };
+                    out.push(BloomFilterConfig {
+                        column_name: name,
+                        ndv: entry.ndv,
+                        fpp: entry.fpp,
+                    });
+                }
+                out
+            };
         let opts = WriterOptions {
             compression: options.compression,
             zstd_level: options.zstd_level,
@@ -210,6 +253,7 @@ pub unsafe extern "C" fn mosaic_writer_open(
             max_dict_entries: options.max_dict_entries as usize,
             stats_columns: stats_cols,
             page_size_threshold: options.page_size_threshold as usize,
+            bloom_filter_columns: bloom_cols,
         };
         match MosaicWriter::new(ffi_stream, &arrow_schema, opts) {
             Ok(writer) => Box::into_raw(Box::new(MosaicWriterHandle {
@@ -975,6 +1019,113 @@ pub unsafe extern "C" fn mosaic_record_batch_export(
 pub unsafe extern "C" fn mosaic_record_batch_free(handle: *mut MosaicRecordBatchHandle) {
     if !handle.is_null() {
         drop(Box::from_raw(handle));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mosaic_reader_bloom_might_contain(
+    handle: *const MosaicReaderHandle,
+    rg_index: u32,
+    column_index: u32,
+    type_byte: u8,
+    value_bytes: *const u8,
+    value_len: u32,
+    out_might_contain: *mut u8,
+) -> c_int {
+    if handle.is_null() || out_might_contain.is_null() {
+        set_error("null pointer".into());
+        return -1;
+    }
+    if value_bytes.is_null() && value_len > 0 {
+        set_error("value_bytes is null with non-zero length".into());
+        return -1;
+    }
+    let bytes = if value_len == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(value_bytes, value_len as usize)
+    };
+    let value = match value_from_type_byte(type_byte, bytes) {
+        Ok(v) => v,
+        Err(msg) => {
+            set_error(msg);
+            return -1;
+        }
+    };
+    let h = &*handle;
+    let filter = match h
+        .reader
+        .bloom_filter(rg_index as usize, column_index as usize)
+    {
+        Ok(opt) => opt,
+        Err(e) => {
+            set_error(e.to_string());
+            return -1;
+        }
+    };
+    match filter {
+        None => {
+            *out_might_contain = 1;
+            1
+        }
+        Some(f) => {
+            let hv = bloom::hash_value(&value);
+            *out_might_contain = if f.contains_hash(hv) { 1 } else { 0 };
+            0
+        }
+    }
+}
+
+fn value_from_type_byte(type_byte: u8, bytes: &[u8]) -> Result<Value, String> {
+    let need = |n: usize| -> Result<(), String> {
+        if bytes.len() != n {
+            Err(format!(
+                "value_bytes length {} does not match expected {} for type {}",
+                bytes.len(),
+                n,
+                type_byte
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    match type_byte {
+        0 => {
+            need(1)?;
+            Ok(Value::Boolean(bytes[0] != 0))
+        }
+        1 => {
+            need(1)?;
+            Ok(Value::TinyInt(bytes[0] as i8))
+        }
+        2 => {
+            need(2)?;
+            Ok(Value::SmallInt(i16::from_le_bytes([bytes[0], bytes[1]])))
+        }
+        3 => {
+            need(4)?;
+            Ok(Value::Integer(i32::from_le_bytes(
+                bytes.try_into().unwrap(),
+            )))
+        }
+        4 => {
+            need(8)?;
+            Ok(Value::BigInt(i64::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        5 => {
+            need(4)?;
+            Ok(Value::Float(f32::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        6 => {
+            need(8)?;
+            Ok(Value::Double(f64::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        7 => {
+            need(4)?;
+            Ok(Value::Date(i32::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        10 => Ok(Value::String(bytes.to_vec())),
+        other => Err(format!("unsupported bloom value type_byte {}", other)),
     }
 }
 
