@@ -36,7 +36,7 @@
     <name>Mosaic</name>
     <description>Mosaic file format for Java (backed by Rust via JNI)</description>
     <url>https://paimon.apache.org</url>
-    <inceptionYear>2025</inceptionYear>
+    <inceptionYear>2026</inceptionYear>
 
     <licenses>
         <license>
@@ -64,6 +64,8 @@
     <properties>
         <maven.compiler.source>1.8</maven.compiler.source>
         <maven.compiler.target>1.8</maven.compiler.target>
+        <!-- Used by maven-remote-resources-plugin when generating META-INF/NOTICE. -->
+        <project.build.outputTimestamp>2026-01-01T00:00:00Z</project.build.outputTimestamp>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <arrow.version>15.0.0</arrow.version>
     </properties>
