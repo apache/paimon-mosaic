@@ -18,8 +18,7 @@
 # Build the paimon-mosaic Python release wheels.
 #
 # Trigger: called by release.yml or manually dispatched.
-# Publishing is handled by release-python-publish.yml after Rust and Java
-# release jobs complete successfully.
+# Publishing is handled by release-python-publish.yml after wheels are built.
 
 name: Release Python Wheels
 

@@ -15,8 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Publish Python wheels after the orchestrator has confirmed Rust and Java
-# release jobs completed successfully.
+# Publish Python wheels after the orchestrator has confirmed the wheel
+# build completed successfully.
 
 name: Release Python Publish
 
