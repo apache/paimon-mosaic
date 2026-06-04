@@ -19,8 +19,12 @@
 
 package org.apache.paimon.mosaic;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 import org.apache.arrow.c.ArrowArray;
@@ -28,6 +32,8 @@ import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 public class MosaicReader implements AutoCloseable {
@@ -119,6 +125,89 @@ public class MosaicReader implements AutoCloseable {
             result.put(names[i], new ColumnStatistics(nullCounts[i], mins[i], maxs[i]));
         }
         return Collections.unmodifiableMap(result);
+    }
+
+    public boolean bloomMightContain(int rgIndex, String columnName, Object value) {
+        List<Field> fields = schema.getFields();
+        int columnIndex = -1;
+        ArrowType arrowType = null;
+        for (int i = 0; i < fields.size(); i++) {
+            if (fields.get(i).getName().equals(columnName)) {
+                columnIndex = i;
+                arrowType = fields.get(i).getType();
+                break;
+            }
+        }
+        if (columnIndex < 0) {
+            throw new IllegalArgumentException("column not found: " + columnName);
+        }
+        int typeByte = arrowTypeByte(arrowType);
+        byte[] encoded = encodeValue(typeByte, value);
+        return NativeLib.nativeReaderBloomMightContain(
+                handle, rgIndex, columnIndex, typeByte, encoded);
+    }
+
+    private static int arrowTypeByte(ArrowType type) {
+        if (type instanceof ArrowType.Bool) return 0;
+        if (type instanceof ArrowType.Int) {
+            int bw = ((ArrowType.Int) type).getBitWidth();
+            switch (bw) {
+                case 8: return 1;
+                case 16: return 2;
+                case 32: return 3;
+                case 64: return 4;
+                default: throw new IllegalArgumentException("unsupported int width: " + bw);
+            }
+        }
+        if (type instanceof ArrowType.FloatingPoint) {
+            switch (((ArrowType.FloatingPoint) type).getPrecision()) {
+                case SINGLE: return 5;
+                case DOUBLE: return 6;
+                default: throw new IllegalArgumentException("unsupported float precision");
+            }
+        }
+        if (type instanceof ArrowType.Date) return 7;
+        if (type instanceof ArrowType.Utf8) return 10;
+        throw new IllegalArgumentException("unsupported arrow type for bloom: " + type);
+    }
+
+    private static byte[] encodeValue(int typeByte, Object value) {
+        switch (typeByte) {
+            case 0:
+                return new byte[] { (byte) (((Boolean) value) ? 1 : 0) };
+            case 1:
+                return new byte[] { ((Number) value).byteValue() };
+            case 2: {
+                ByteBuffer bb = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN);
+                bb.putShort(((Number) value).shortValue());
+                return bb.array();
+            }
+            case 3:
+            case 7: {
+                ByteBuffer bb = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
+                bb.putInt(((Number) value).intValue());
+                return bb.array();
+            }
+            case 5: {
+                ByteBuffer bb = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
+                bb.putFloat(((Number) value).floatValue());
+                return bb.array();
+            }
+            case 4: {
+                ByteBuffer bb = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+                bb.putLong(((Number) value).longValue());
+                return bb.array();
+            }
+            case 6: {
+                ByteBuffer bb = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+                bb.putDouble(((Number) value).doubleValue());
+                return bb.array();
+            }
+            case 10:
+                return ((String) value).getBytes(StandardCharsets.UTF_8);
+            default:
+                throw new IllegalArgumentException("unsupported type byte for value encoding: " + typeByte);
+        }
     }
 
     @Override

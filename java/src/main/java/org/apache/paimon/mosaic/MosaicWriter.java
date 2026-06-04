@@ -49,6 +49,16 @@ public class MosaicWriter implements AutoCloseable {
         try (ArrowSchema cSchema = ArrowSchema.allocateNew(allocator)) {
             try {
                 Data.exportSchema(allocator, arrowSchema, null, cSchema);
+                java.util.List<BloomFilterConfig> blooms = options.getBloomFilterColumns();
+                String[] bloomNames = new String[blooms.size()];
+                long[] bloomNdvs = new long[blooms.size()];
+                double[] bloomFpps = new double[blooms.size()];
+                for (int i = 0; i < blooms.size(); i++) {
+                    BloomFilterConfig c = blooms.get(i);
+                    bloomNames[i] = c.columnName();
+                    bloomNdvs[i] = c.ndv();
+                    bloomFpps[i] = c.fpp();
+                }
                 this.handle = NativeLib.nativeWriterOpen(
                         outputStream,
                         cSchema.memoryAddress(),
@@ -59,7 +69,10 @@ public class MosaicWriter implements AutoCloseable {
                         options.getMaxDictTotalBytes(),
                         options.getMaxDictEntries(),
                         options.getStatsColumns(),
-                        options.getPageSizeThreshold());
+                        options.getPageSizeThreshold(),
+                        bloomNames,
+                        bloomNdvs,
+                        bloomFpps);
             } finally {
                 releaseExported(cSchema);
             }

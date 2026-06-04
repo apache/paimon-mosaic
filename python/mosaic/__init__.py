@@ -16,6 +16,7 @@
 # under the License.
 
 from .mosaic import (
+    BloomFilterConfig,
     ColumnStatistics,
     MosaicReader,
     MosaicWriter,
@@ -25,6 +26,7 @@ from .mosaic import (
 )
 
 __all__ = [
+    "BloomFilterConfig",
     "ColumnStatistics",
     "WriterOptions",
     "MosaicWriter",

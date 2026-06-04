@@ -85,6 +85,17 @@ def _fetch_rg_stats(num_stats_fn, stats_fn, handle, rg_index):
     return result
 
 
+class BloomFilterConfig:
+    def __init__(self, column_name, ndv, fpp=0.01):
+        if ndv < 0:
+            raise ValueError("ndv must be non-negative")
+        if not (0.0 < fpp < 1.0):
+            raise ValueError(f"fpp must be in (0, 1), got {fpp}")
+        self.column_name = column_name
+        self.ndv = int(ndv)
+        self.fpp = float(fpp)
+
+
 class WriterOptions:
     COMPRESSION_NONE = 0
     COMPRESSION_ZSTD = 1
@@ -99,6 +110,7 @@ class WriterOptions:
         max_dict_entries=255,
         stats_columns=None,
         page_size_threshold=32 * 1024,
+        bloom_filter_columns=None,
     ):
         self.compression = compression
         self.zstd_level = zstd_level
@@ -108,6 +120,7 @@ class WriterOptions:
         self.max_dict_entries = max_dict_entries
         self.stats_columns = stats_columns or []
         self.page_size_threshold = page_size_threshold
+        self.bloom_filter_columns = bloom_filter_columns or []
 
     def _to_ffi(self):
         opts = _ffi.MosaicWriterOptions()
@@ -129,6 +142,20 @@ class WriterOptions:
             opts.stats_columns = None
             opts.num_stats_columns = 0
         opts.page_size_threshold = self.page_size_threshold
+        if self.bloom_filter_columns:
+            encoded_names = [c.column_name.encode("utf-8") for c in self.bloom_filter_columns]
+            bloom_arr = (_ffi.MosaicBloomConfig * len(self.bloom_filter_columns))()
+            for i, c in enumerate(self.bloom_filter_columns):
+                bloom_arr[i].column_name = encoded_names[i]
+                bloom_arr[i].ndv = c.ndv
+                bloom_arr[i].fpp = c.fpp
+            refs.append(bloom_arr)
+            refs.append(encoded_names)
+            opts.bloom_filter_columns = bloom_arr
+            opts.num_bloom_filter_columns = len(self.bloom_filter_columns)
+        else:
+            opts.bloom_filter_columns = None
+            opts.num_bloom_filter_columns = 0
         return opts, refs
 
 
@@ -396,6 +423,27 @@ class MosaicReader:
             lib.mosaic_reader_row_group_stats,
             self._handle, rg_index)
 
+    def bloom_might_contain(self, rg_index, column_name, value):
+        column_index = self._schema.get_field_index(column_name)
+        if column_index < 0:
+            raise ValueError(f"column not found: {column_name}")
+        field = self._schema.field(column_index)
+        type_byte, encoded = _encode_bloom_value(field.type, value)
+        buf = (ctypes.c_uint8 * len(encoded)).from_buffer_copy(encoded)
+        out = ctypes.c_uint8(0)
+        rc = lib.mosaic_reader_bloom_might_contain(
+            self._handle,
+            rg_index,
+            column_index,
+            type_byte,
+            buf,
+            len(encoded),
+            ctypes.byref(out),
+        )
+        if rc < 0:
+            _check_error("bloom_might_contain failed")
+        return out.value != 0
+
     def close(self):
         if self._handle:
             lib.mosaic_reader_free(self._handle)
@@ -412,6 +460,29 @@ class MosaicReader:
 
     def __del__(self):
         self.close()
+
+
+def _encode_bloom_value(arrow_type, value):
+    import struct
+    if pa.types.is_boolean(arrow_type):
+        return 0, bytes([1 if value else 0])
+    if pa.types.is_int8(arrow_type):
+        return 1, struct.pack("<b", int(value))
+    if pa.types.is_int16(arrow_type):
+        return 2, struct.pack("<h", int(value))
+    if pa.types.is_int32(arrow_type):
+        return 3, struct.pack("<i", int(value))
+    if pa.types.is_int64(arrow_type):
+        return 4, struct.pack("<q", int(value))
+    if pa.types.is_float32(arrow_type):
+        return 5, struct.pack("<f", float(value))
+    if pa.types.is_float64(arrow_type):
+        return 6, struct.pack("<d", float(value))
+    if pa.types.is_date32(arrow_type):
+        return 7, struct.pack("<i", int(value))
+    if pa.types.is_string(arrow_type):
+        return 10, value.encode("utf-8") if isinstance(value, str) else bytes(value)
+    raise ValueError(f"unsupported arrow type for bloom: {arrow_type}")
 
 
 def write_table(table, stream, options=None):

@@ -110,6 +110,14 @@ class MosaicInputFile(Structure):
     ]
 
 
+class MosaicBloomConfig(Structure):
+    _fields_ = [
+        ("column_name", c_char_p),
+        ("ndv", c_uint64),
+        ("fpp", c_double),
+    ]
+
+
 class MosaicWriterOptions(Structure):
     _fields_ = [
         ("compression", c_uint8),
@@ -121,6 +129,8 @@ class MosaicWriterOptions(Structure):
         ("stats_columns", POINTER(c_char_p)),
         ("num_stats_columns", c_uint32),
         ("page_size_threshold", c_uint32),
+        ("bloom_filter_columns", POINTER(MosaicBloomConfig)),
+        ("num_bloom_filter_columns", c_uint32),
     ]
 
 
@@ -226,6 +236,12 @@ lib.mosaic_reader_row_group_stats.argtypes = [
     POINTER(POINTER(c_uint8)), POINTER(c_size_t),
 ]
 lib.mosaic_reader_row_group_stats.restype = c_int
+
+lib.mosaic_reader_bloom_might_contain.argtypes = [
+    c_void_p, c_uint32, c_uint32, c_uint8,
+    POINTER(c_uint8), c_uint32, POINTER(c_uint8),
+]
+lib.mosaic_reader_bloom_might_contain.restype = c_int
 
 # ======================== Error ========================
 
