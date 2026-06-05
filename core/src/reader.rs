@@ -21,7 +21,9 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema};
 
-use crate::bucket_reader::{read_typed_value, read_variable_value, BucketReader, ColumnPageReader};
+use crate::bucket_reader::{
+    read_typed_value, read_variable_value, BucketReader, ColumnPageReader, ListPageState,
+};
 use crate::schema::MosaicSchema;
 use crate::spec::*;
 use crate::stats::{self, ColumnStats};
@@ -458,6 +460,18 @@ impl<I: InputFile> MosaicReader<I> {
         let page_content = zstd::bulk::decompress(compressed_data, uncompressed_size)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+        if let DataType::List(element_field) = col_type {
+            return Self::parse_list_column_slot(page_content, element_field, num_rows);
+        }
+
+        Self::parse_simple_column_slot(page_content, col_type, num_rows)
+    }
+
+    fn parse_simple_column_slot(
+        page_content: Vec<u8>,
+        col_type: &DataType,
+        num_rows: usize,
+    ) -> io::Result<ColumnPageReader> {
         if page_content.len() < 2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -497,6 +511,85 @@ impl<I: InputFile> MosaicReader<I> {
             ppos,
             num_rows,
         )
+    }
+
+    fn parse_list_column_slot(
+        page_content: Vec<u8>,
+        element_field: &Arc<Field>,
+        num_rows: usize,
+    ) -> io::Result<ColumnPageReader> {
+        let mut pos = 0usize;
+        let total_elements = varint::decode(&page_content, &mut pos)? as usize;
+        let lengths_page_size = varint::decode(&page_content, &mut pos)? as usize;
+
+        let lengths_data = page_content[pos..pos + lengths_page_size].to_vec();
+        pos += lengths_page_size;
+
+        let int32_type = DataType::Int32;
+        let mut lengths_reader = if lengths_page_size > 0 {
+            Self::parse_simple_column_slot(lengths_data, &int32_type, num_rows)?
+        } else {
+            ColumnPageReader::new(int32_type.clone(), ENCODING_ALL_NULL, false, Value::Null, Vec::new(), num_rows)?
+        };
+
+        let values_encoding = if pos < page_content.len() {
+            page_content[pos]
+        } else {
+            ENCODING_ALL_NULL
+        };
+        pos += 1;
+        let values_has_nulls = if pos < page_content.len() {
+            page_content[pos] != 0
+        } else {
+            false
+        };
+        pos += 1;
+        let values_const_len = if pos < page_content.len() {
+            varint::decode(&page_content, &mut pos)? as usize
+        } else {
+            0
+        };
+        let mut values_const_value = Value::Null;
+        let elem_dt = element_field.data_type();
+        if values_encoding == ENCODING_CONST && values_const_len > 0 {
+            let w = types::fixed_width(elem_dt);
+            if w > 0 {
+                values_const_value = read_typed_value(elem_dt, &page_content, pos, w);
+            } else {
+                let (val, _) = read_variable_value(elem_dt, &page_content, pos)?;
+                values_const_value = val;
+            }
+        }
+        pos += values_const_len;
+
+        let values_page_len = if pos < page_content.len() {
+            varint::decode(&page_content, &mut pos)? as usize
+        } else {
+            0
+        };
+        let values_data = if values_page_len > 0 {
+            page_content[pos..pos + values_page_len].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let values_reader = ColumnPageReader::new(
+            elem_dt.clone(),
+            values_encoding,
+            values_has_nulls,
+            values_const_value,
+            values_data,
+            total_elements,
+        )?;
+
+        lengths_reader.list_state = Some(ListPageState {
+            element_field: element_field.clone(),
+            total_elements,
+            values_reader: Box::new(values_reader),
+        });
+        lengths_reader.col_type = DataType::List(element_field.clone());
+
+        Ok(lengths_reader)
     }
 }
 

@@ -965,3 +965,96 @@ class TestWriter:
         with _reader_from_bytes(data) as reader:
             assert reader.num_row_groups == 1
             assert reader.row_group_num_rows(0) == 10
+
+    def test_array_type(self):
+        pa_schema = pa.schema(
+            [
+                pa.field("id", pa.int32(), nullable=False),
+                pa.field("tags", pa.list_(pa.int32())),
+            ]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array([1, 2, 3, 4], type=pa.int32()),
+                pa.array([[10, 20, 30], [40, 50], [], None], type=pa.list_(pa.int32())),
+            ],
+            names=["id", "tags"],
+        )
+
+        data = _write_to_bytes(pa_schema, batch)
+
+        with _reader_from_bytes(data) as reader:
+            rb = reader.read_row_group(0)
+            assert rb.num_rows == 4
+
+            ids = rb.column("id").to_pylist()
+            assert ids == [1, 2, 3, 4]
+
+            tags = rb.column("tags").to_pylist()
+            assert tags[0] == [10, 20, 30]
+            assert tags[1] == [40, 50]
+            assert tags[2] == []
+            assert tags[3] is None
+
+    def test_array_with_null_elements(self):
+        pa_schema = pa.schema(
+            [pa.field("arr", pa.list_(pa.int64()))]
+        )
+
+        batch = pa.record_batch(
+            [pa.array([[100, None, 300], [None, None], [999]], type=pa.list_(pa.int64()))],
+            names=["arr"],
+        )
+
+        data = _write_to_bytes(pa_schema, batch)
+
+        with _reader_from_bytes(data) as reader:
+            rb = reader.read_row_group(0)
+            arr = rb.column("arr").to_pylist()
+            assert arr[0] == [100, None, 300]
+            assert arr[1] == [None, None]
+            assert arr[2] == [999]
+
+    def test_array_string_elements(self):
+        pa_schema = pa.schema(
+            [pa.field("arr", pa.list_(pa.utf8()))]
+        )
+
+        batch = pa.record_batch(
+            [pa.array([["hello", "world"], [None, "foo"], []], type=pa.list_(pa.utf8()))],
+            names=["arr"],
+        )
+
+        data = _write_to_bytes(pa_schema, batch)
+
+        with _reader_from_bytes(data) as reader:
+            rb = reader.read_row_group(0)
+            arr = rb.column("arr").to_pylist()
+            assert arr[0] == ["hello", "world"]
+            assert arr[1] == [None, "foo"]
+            assert arr[2] == []
+
+    def test_array_nested(self):
+        pa_schema = pa.schema(
+            [pa.field("nested", pa.list_(pa.list_(pa.int32())))]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array(
+                    [[[1, 2], [3]], [[4]], None],
+                    type=pa.list_(pa.list_(pa.int32())),
+                )
+            ],
+            names=["nested"],
+        )
+
+        data = _write_to_bytes(pa_schema, batch)
+
+        with _reader_from_bytes(data) as reader:
+            rb = reader.read_row_group(0)
+            nested = rb.column("nested").to_pylist()
+            assert nested[0] == [[1, 2], [3]]
+            assert nested[1] == [[4]]
+            assert nested[2] is None

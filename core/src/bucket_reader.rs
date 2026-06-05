@@ -342,6 +342,39 @@ fn build_array(
     })
 }
 
+fn reassemble_list_array(
+    lengths: ArrayRef,
+    values: ArrayRef,
+    element_field: Arc<Field>,
+    num_rows: usize,
+) -> ArrayRef {
+    let lengths_arr = lengths
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("list lengths must be Int32Array");
+
+    let mut offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+    offsets.push(0);
+    for i in 0..num_rows {
+        let len = if lengths_arr.is_null(i) {
+            0
+        } else {
+            lengths_arr.value(i)
+        };
+        offsets.push(offsets.last().unwrap() + len);
+    }
+
+    let null_buf = lengths_arr.nulls().cloned();
+    let offset_buf = OffsetBuffer::new(ScalarBuffer::from(offsets));
+    Arc::new(ListArray::new(element_field, offset_buf, values, null_buf))
+}
+
+struct ListColumnReader {
+    physical_col: usize,
+    element_field: Arc<Field>,
+    sub_reader: BucketReader,
+}
+
 pub struct BucketReader {
     data: Vec<u8>,
     num_columns: usize,
@@ -355,16 +388,33 @@ pub struct BucketReader {
     dict_values: Vec<Vec<Value>>,
     dict_bit_widths: Vec<usize>,
     data_cursors: Vec<usize>,
+    main_data_end: usize,
+
+    logical_types: Vec<DataType>,
+    list_readers: Vec<ListColumnReader>,
 }
 
 impl BucketReader {
     pub fn new(col_types: Vec<DataType>, data: Vec<u8>, num_rows: usize) -> io::Result<Self> {
+        let logical_types = col_types.clone();
         let num_columns = col_types.len();
+
+        let physical_types: Vec<DataType> = col_types
+            .into_iter()
+            .map(|t| {
+                if matches!(t, DataType::List(_)) {
+                    DataType::Int32
+                } else {
+                    t
+                }
+            })
+            .collect();
+
         let mut reader = BucketReader {
             data,
             num_columns,
             num_rows,
-            col_types,
+            col_types: physical_types,
             encodings: vec![0; num_columns],
             has_nulls: vec![false; num_columns],
             null_bitmaps: Vec::new(),
@@ -372,8 +422,12 @@ impl BucketReader {
             dict_values: Vec::new(),
             dict_bit_widths: vec![0; num_columns],
             data_cursors: vec![0; num_columns],
+            main_data_end: 0,
+            logical_types,
+            list_readers: Vec::new(),
         };
         reader.init()?;
+        reader.init_list_sub_buckets()?;
         Ok(reader)
     }
 
@@ -394,6 +448,10 @@ impl BucketReader {
         self.null_bitmaps = vec![Vec::new(); self.num_columns];
         self.const_values = vec![Value::Null; self.num_columns];
         self.dict_values = vec![Vec::new(); self.num_columns];
+
+        if self.num_rows == 0 || self.data.is_empty() {
+            return Ok(());
+        }
 
         let mut pos = 0;
 
@@ -473,6 +531,79 @@ impl BucketReader {
                 pos += size;
             }
         }
+        self.main_data_end = pos;
+        Ok(())
+    }
+
+    fn init_list_sub_buckets(&mut self) -> io::Result<()> {
+        let has_lists = self
+            .logical_types
+            .iter()
+            .any(|t| matches!(t, DataType::List(_)));
+        if !has_lists {
+            return Ok(());
+        }
+
+        let mut pos = self.main_data_end;
+        if pos >= self.data.len() {
+            return Ok(());
+        }
+
+        let num_list_cols = varint::decode(&self.data, &mut pos)? as usize;
+        for _ in 0..num_list_cols {
+            let total_elements = varint::decode(&self.data, &mut pos)? as usize;
+            let sub_blob_size = varint::decode(&self.data, &mut pos)? as usize;
+
+            let list_col_idx = self.list_readers.len();
+            let mut physical_col = 0;
+            let mut found = false;
+            let mut list_count = 0;
+            for (i, lt) in self.logical_types.iter().enumerate() {
+                if matches!(lt, DataType::List(_)) {
+                    if list_count == list_col_idx {
+                        physical_col = i;
+                        found = true;
+                        break;
+                    }
+                    list_count += 1;
+                }
+            }
+            if !found {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sub-bucket count exceeds list columns",
+                ));
+            }
+
+            let element_field = match &self.logical_types[physical_col] {
+                DataType::List(f) => f.clone(),
+                _ => unreachable!(),
+            };
+
+            let sub_data = if sub_blob_size > 0 && total_elements > 0 {
+                self.data[pos..pos + sub_blob_size].to_vec()
+            } else {
+                Vec::new()
+            };
+
+            let sub_reader = if total_elements > 0 && !sub_data.is_empty() {
+                BucketReader::new(
+                    vec![element_field.data_type().clone()],
+                    sub_data,
+                    total_elements,
+                )?
+            } else {
+                BucketReader::new(vec![element_field.data_type().clone()], Vec::new(), 0)?
+            };
+
+            self.list_readers.push(ListColumnReader {
+                physical_col,
+                element_field,
+                sub_reader,
+            });
+
+            pos += sub_blob_size;
+        }
         Ok(())
     }
 
@@ -515,7 +646,11 @@ impl BucketReader {
             let variant = data_variant_for_type(&self.col_types[i]);
 
             if self.encodings[i] == ENCODING_ALL_NULL {
-                result.push(build_all_null_array(&self.col_types[i], num_rows));
+                if matches!(self.logical_types[i], DataType::List(_)) {
+                    result.push(build_all_null_array(&self.logical_types[i], num_rows));
+                } else {
+                    result.push(build_all_null_array(&self.col_types[i], num_rows));
+                }
                 continue;
             }
 
@@ -564,12 +699,37 @@ impl BucketReader {
             )?);
         }
 
+        for lr in &self.list_readers {
+            let col = lr.physical_col;
+            if self.encodings[col] == ENCODING_ALL_NULL {
+                continue;
+            }
+            let values = if lr.sub_reader.num_rows > 0 {
+                let sub_cols = lr.sub_reader.read_all_columns()?;
+                sub_cols.into_iter().next().unwrap_or_else(|| {
+                    arrow_array::new_null_array(lr.element_field.data_type(), 0)
+                })
+            } else {
+                arrow_array::new_null_array(lr.element_field.data_type(), 0)
+            };
+
+            let lengths = result[col].clone();
+            result[col] =
+                reassemble_list_array(lengths, values, lr.element_field.clone(), num_rows);
+        }
+
         Ok(result)
     }
 }
 
+pub(crate) struct ListPageState {
+    pub(crate) element_field: Arc<Field>,
+    pub(crate) total_elements: usize,
+    pub(crate) values_reader: Box<ColumnPageReader>,
+}
+
 pub struct ColumnPageReader {
-    col_type: DataType,
+    pub(crate) col_type: DataType,
     encoding: u8,
     has_nulls: bool,
     const_value: Value,
@@ -579,6 +739,7 @@ pub struct ColumnPageReader {
     data: Vec<u8>,
     data_cursor: usize,
     num_rows: usize,
+    pub(crate) list_state: Option<ListPageState>,
 }
 
 impl ColumnPageReader {
@@ -628,6 +789,7 @@ impl ColumnPageReader {
             data,
             data_cursor: page_data_start,
             num_rows,
+            list_state: None,
         };
         reader.init_page()?;
         Ok(reader)
@@ -769,6 +931,10 @@ impl ColumnPageReader {
     }
 
     pub fn read_all(&self) -> io::Result<ArrayRef> {
+        if let Some(ref list_state) = self.list_state {
+            return self.read_all_list(list_state);
+        }
+
         let num_rows = self.num_rows;
         let variant = data_variant_for_type(&self.col_type);
 
@@ -814,6 +980,71 @@ impl ColumnPageReader {
         };
 
         build_array(data, &self.col_type, null_bitmap, num_rows)
+    }
+
+    fn read_all_list(&self, list_state: &ListPageState) -> io::Result<ArrayRef> {
+        let num_rows = self.num_rows;
+
+        if self.encoding == ENCODING_ALL_NULL {
+            return Ok(build_all_null_array(
+                &DataType::List(list_state.element_field.clone()),
+                num_rows,
+            ));
+        }
+
+        let int32_type = DataType::Int32;
+        let variant = data_variant_for_type(&int32_type);
+        let has_nulls = self.has_nulls;
+        let null_bitmap = if has_nulls {
+            Some(invert_bitmap(&self.null_bitmap))
+        } else {
+            None
+        };
+
+        let lengths_data = match self.encoding {
+            ENCODING_CONST => read_all_const(
+                &self.const_value,
+                num_rows,
+                has_nulls,
+                &self.null_bitmap,
+                variant,
+            )?,
+            ENCODING_DICT => read_all_dict(
+                &self.data,
+                self.data_cursor,
+                &self.dict_values,
+                self.dict_bit_width,
+                num_rows,
+                has_nulls,
+                &self.null_bitmap,
+                variant,
+            )?,
+            ENCODING_PLAIN => read_all_plain(
+                &self.data,
+                self.data_cursor,
+                &int32_type,
+                num_rows,
+                has_nulls,
+                &self.null_bitmap,
+                variant,
+            )?,
+            _ => empty_raw_data_for_type(&int32_type),
+        };
+
+        let lengths = build_array(lengths_data, &int32_type, null_bitmap, num_rows)?;
+
+        let values = if list_state.total_elements > 0 {
+            list_state.values_reader.read_all()?
+        } else {
+            arrow_array::new_null_array(list_state.element_field.data_type(), 0)
+        };
+
+        Ok(reassemble_list_array(
+            lengths,
+            values,
+            list_state.element_field.clone(),
+            num_rows,
+        ))
     }
 }
 

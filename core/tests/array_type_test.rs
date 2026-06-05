@@ -1,0 +1,452 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::io;
+use std::sync::Arc;
+
+use arrow_array::*;
+use arrow_array::builder::*;
+use arrow_schema::{DataType, Field, Schema};
+use paimon_mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess};
+use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
+
+struct MemOutputFile {
+    pub buf: Vec<u8>,
+}
+
+impl MemOutputFile {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+}
+
+impl OutputFile for MemOutputFile {
+    fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        self.buf.extend_from_slice(data);
+        Ok(())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn pos(&self) -> u64 {
+        self.buf.len() as u64
+    }
+}
+
+struct ByteArrayInputFile {
+    data: Vec<u8>,
+}
+
+impl InputFile for ByteArrayInputFile {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        let start = offset as usize;
+        let end = start + buf.len();
+        if end > self.data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "read past end",
+            ));
+        }
+        buf.copy_from_slice(&self.data[start..end]);
+        Ok(())
+    }
+}
+
+fn roundtrip(schema: &Schema, batches: &[RecordBatch]) -> Vec<RecordBatch> {
+    let out = MemOutputFile::new();
+    let options = WriterOptions::default();
+    let mut writer = MosaicWriter::new(out, schema, options).unwrap();
+    for batch in batches {
+        writer.write_batch(batch).unwrap();
+    }
+    writer.close().unwrap();
+
+    let data = writer.output().buf.clone();
+    let file_len = data.len() as u64;
+    let input = ByteArrayInputFile { data };
+    let reader = MosaicReader::new(input, file_len).unwrap();
+
+    let mut result = Vec::new();
+    for rg in 0..reader.num_row_groups() {
+        let mut rg_reader = reader.row_group_reader(rg).unwrap();
+        result.push(rg_reader.read_columns().unwrap());
+    }
+    result
+}
+
+#[test]
+fn test_array_int32_basic() {
+    let element_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let schema = Schema::new(vec![Field::new(
+        "arr",
+        DataType::List(element_field.clone()),
+        true,
+    )]);
+
+    let mut builder = ListBuilder::new(Int32Builder::new());
+    builder.values().append_value(1);
+    builder.values().append_value(2);
+    builder.values().append_value(3);
+    builder.append(true);
+
+    builder.values().append_value(4);
+    builder.values().append_value(5);
+    builder.append(true);
+
+    builder.append(true); // empty array
+
+    builder.append(false); // null
+
+    let array = builder.finish();
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)]).unwrap();
+
+    let result = roundtrip(&schema, &[batch.clone()]);
+    assert_eq!(result.len(), 1);
+    let result_batch = &result[0];
+    assert_eq!(result_batch.num_rows(), 4);
+
+    let result_col = result_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+
+    assert!(!result_col.is_null(0));
+    assert!(!result_col.is_null(1));
+    assert!(!result_col.is_null(2));
+    assert!(result_col.is_null(3));
+
+    let row0 = result_col.value(0);
+    let row0_ints = row0.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(row0_ints.len(), 3);
+    assert_eq!(row0_ints.value(0), 1);
+    assert_eq!(row0_ints.value(1), 2);
+    assert_eq!(row0_ints.value(2), 3);
+
+    let row1 = result_col.value(1);
+    let row1_ints = row1.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(row1_ints.len(), 2);
+    assert_eq!(row1_ints.value(0), 4);
+    assert_eq!(row1_ints.value(1), 5);
+
+    let row2 = result_col.value(2);
+    let row2_ints = row2.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(row2_ints.len(), 0);
+}
+
+#[test]
+fn test_array_with_null_elements() {
+    let element_field = Arc::new(Field::new("item", DataType::Int64, true));
+    let schema = Schema::new(vec![Field::new(
+        "arr",
+        DataType::List(element_field.clone()),
+        true,
+    )]);
+
+    let mut builder = ListBuilder::new(Int64Builder::new());
+    builder.values().append_value(100);
+    builder.values().append_null();
+    builder.values().append_value(300);
+    builder.append(true);
+
+    builder.values().append_null();
+    builder.values().append_null();
+    builder.append(true);
+
+    builder.values().append_value(999);
+    builder.append(true);
+
+    let array = builder.finish();
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let result_col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+
+    let row0 = result_col.value(0);
+    let row0_arr = row0.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(row0_arr.len(), 3);
+    assert_eq!(row0_arr.value(0), 100);
+    assert!(row0_arr.is_null(1));
+    assert_eq!(row0_arr.value(2), 300);
+
+    let row1 = result_col.value(1);
+    let row1_arr = row1.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(row1_arr.len(), 2);
+    assert!(row1_arr.is_null(0));
+    assert!(row1_arr.is_null(1));
+
+    let row2 = result_col.value(2);
+    let row2_arr = row2.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(row2_arr.len(), 1);
+    assert_eq!(row2_arr.value(0), 999);
+}
+
+#[test]
+fn test_array_string_elements() {
+    let element_field = Arc::new(Field::new("item", DataType::Utf8, true));
+    let schema = Schema::new(vec![Field::new(
+        "arr",
+        DataType::List(element_field.clone()),
+        true,
+    )]);
+
+    let mut builder = ListBuilder::new(StringBuilder::new());
+    builder.values().append_value("hello");
+    builder.values().append_value("world");
+    builder.append(true);
+
+    builder.values().append_null();
+    builder.values().append_value("foo");
+    builder.append(true);
+
+    builder.append(true); // empty
+
+    let array = builder.finish();
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let result_col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+
+    let row0 = result_col.value(0);
+    let row0_arr = row0.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(row0_arr.len(), 2);
+    assert_eq!(row0_arr.value(0), "hello");
+    assert_eq!(row0_arr.value(1), "world");
+
+    let row1 = result_col.value(1);
+    let row1_arr = row1.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(row1_arr.len(), 2);
+    assert!(row1_arr.is_null(0));
+    assert_eq!(row1_arr.value(1), "foo");
+
+    let row2 = result_col.value(2);
+    let row2_arr = row2.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(row2_arr.len(), 0);
+}
+
+#[test]
+fn test_array_nested_array() {
+    let inner_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let outer_field = Arc::new(Field::new(
+        "item",
+        DataType::List(inner_field.clone()),
+        true,
+    ));
+    let schema = Schema::new(vec![Field::new(
+        "nested",
+        DataType::List(outer_field.clone()),
+        true,
+    )]);
+
+    let inner_builder = ListBuilder::new(Int32Builder::new());
+    let mut outer_builder = ListBuilder::new(inner_builder);
+
+    // Row 0: [[1, 2], [3]]
+    outer_builder.values().values().append_value(1);
+    outer_builder.values().values().append_value(2);
+    outer_builder.values().append(true);
+    outer_builder.values().values().append_value(3);
+    outer_builder.values().append(true);
+    outer_builder.append(true);
+
+    // Row 1: [[4]]
+    outer_builder.values().values().append_value(4);
+    outer_builder.values().append(true);
+    outer_builder.append(true);
+
+    // Row 2: null
+    outer_builder.append(false);
+
+    let array = outer_builder.finish();
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let result_col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+
+    assert!(!result_col.is_null(0));
+    assert!(!result_col.is_null(1));
+    assert!(result_col.is_null(2));
+
+    let row0 = result_col.value(0);
+    let row0_outer = row0.as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(row0_outer.len(), 2);
+
+    let inner0 = row0_outer.value(0);
+    let inner0_arr = inner0.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(inner0_arr.len(), 2);
+    assert_eq!(inner0_arr.value(0), 1);
+    assert_eq!(inner0_arr.value(1), 2);
+
+    let inner1 = row0_outer.value(1);
+    let inner1_arr = inner1.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(inner1_arr.len(), 1);
+    assert_eq!(inner1_arr.value(0), 3);
+
+    let row1 = result_col.value(1);
+    let row1_outer = row1.as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(row1_outer.len(), 1);
+    let inner2 = row1_outer.value(0);
+    let inner2_arr = inner2.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(inner2_arr.value(0), 4);
+}
+
+#[test]
+fn test_array_all_null() {
+    let element_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let schema = Schema::new(vec![Field::new(
+        "arr",
+        DataType::List(element_field.clone()),
+        true,
+    )]);
+
+    let mut builder = ListBuilder::new(Int32Builder::new());
+    builder.append(false);
+    builder.append(false);
+    builder.append(false);
+    let array = builder.finish();
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let result_col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(result_col.len(), 3);
+    assert!(result_col.is_null(0));
+    assert!(result_col.is_null(1));
+    assert!(result_col.is_null(2));
+}
+
+#[test]
+fn test_array_with_other_columns() {
+    let element_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("tags", DataType::List(element_field.clone()), true),
+        Field::new("name", DataType::Utf8, true),
+    ]);
+
+    let ids = Int64Array::from(vec![1, 2, 3]);
+
+    let mut list_builder = ListBuilder::new(Int32Builder::new());
+    list_builder.values().append_value(10);
+    list_builder.values().append_value(20);
+    list_builder.append(true);
+    list_builder.append(false); // null
+    list_builder.values().append_value(30);
+    list_builder.append(true);
+    let tags = list_builder.finish();
+
+    let names = StringArray::from(vec![Some("alice"), None, Some("charlie")]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids), Arc::new(tags), Arc::new(names)],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    assert_eq!(rb.num_rows(), 3);
+
+    let result_ids = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(result_ids.value(0), 1);
+    assert_eq!(result_ids.value(1), 2);
+    assert_eq!(result_ids.value(2), 3);
+
+    let result_tags = rb.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    assert!(!result_tags.is_null(0));
+    assert!(result_tags.is_null(1));
+    assert!(!result_tags.is_null(2));
+
+    let row0 = result_tags.value(0);
+    let row0_arr = row0.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(row0_arr.len(), 2);
+    assert_eq!(row0_arr.value(0), 10);
+    assert_eq!(row0_arr.value(1), 20);
+
+    let result_names = rb.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(result_names.value(0), "alice");
+    assert!(result_names.is_null(1));
+    assert_eq!(result_names.value(2), "charlie");
+}
+
+#[test]
+fn test_array_large_batch() {
+    let element_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let schema = Schema::new(vec![Field::new(
+        "arr",
+        DataType::List(element_field.clone()),
+        true,
+    )]);
+
+    let mut builder = ListBuilder::new(Int32Builder::new());
+    for i in 0..1000 {
+        if i % 10 == 0 {
+            builder.append(false); // null every 10th row
+        } else {
+            let num_elements = (i % 5) + 1;
+            for j in 0..num_elements {
+                if j == 2 && i % 3 == 0 {
+                    builder.values().append_null();
+                } else {
+                    builder.values().append_value((i * 10 + j) as i32);
+                }
+            }
+            builder.append(true);
+        }
+    }
+    let array = builder.finish();
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array.clone())]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let result_col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+
+    assert_eq!(result_col.len(), 1000);
+
+    for i in 0..1000 {
+        if i % 10 == 0 {
+            assert!(result_col.is_null(i), "row {} should be null", i);
+        } else {
+            assert!(!result_col.is_null(i), "row {} should not be null", i);
+            let expected = array.value(i);
+            let actual = result_col.value(i);
+            assert_eq!(
+                &expected, &actual,
+                "mismatch at row {}",
+                i
+            );
+        }
+    }
+}

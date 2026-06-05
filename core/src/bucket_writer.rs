@@ -17,9 +17,11 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 
 use arrow_array::*;
-use arrow_schema::DataType;
+use arrow_buffer::ScalarBuffer;
+use arrow_schema::{DataType, Field};
 
 use crate::spec::*;
 use crate::types;
@@ -31,6 +33,13 @@ pub struct PagedBucketOutput {
     pub has_nulls: Vec<bool>,
     pub const_data: Vec<Vec<u8>>,
     pub column_pages: Vec<Option<Vec<u8>>>,
+}
+
+struct ListColumnState {
+    physical_col: usize,
+    element_field: Arc<Field>,
+    values_writer: BucketWriter,
+    total_elements: usize,
 }
 
 pub struct BucketWriter {
@@ -53,6 +62,8 @@ pub struct BucketWriter {
     max_dict_entries: usize,
 
     num_rows: usize,
+
+    list_columns: Vec<ListColumnState>,
 }
 
 impl BucketWriter {
@@ -62,7 +73,33 @@ impl BucketWriter {
         max_dict_entries: usize,
     ) -> Self {
         let num_columns = col_types.len();
-        let fixed_widths: Vec<i32> = col_types.iter().map(|t| types::fixed_width(t)).collect();
+
+        let physical_types: Vec<DataType> = col_types
+            .iter()
+            .map(|t| {
+                if matches!(t, DataType::List(_)) {
+                    DataType::Int32
+                } else {
+                    (*t).clone()
+                }
+            })
+            .collect();
+        let fixed_widths: Vec<i32> = physical_types.iter().map(types::fixed_width).collect();
+
+        let mut list_columns = Vec::new();
+        for (i, t) in col_types.iter().enumerate() {
+            if let DataType::List(element_field) = t {
+                let elem_dt = element_field.data_type();
+                let values_writer =
+                    BucketWriter::new(&[elem_dt], max_dict_total_bytes, max_dict_entries);
+                list_columns.push(ListColumnState {
+                    physical_col: i,
+                    element_field: element_field.clone(),
+                    values_writer,
+                    total_elements: 0,
+                });
+            }
+        }
 
         let mut long_dict_maps = Vec::with_capacity(num_columns);
         let mut byte_dict_maps = Vec::with_capacity(num_columns);
@@ -91,6 +128,7 @@ impl BucketWriter {
             max_dict_total_bytes,
             max_dict_entries,
             num_rows: 0,
+            list_columns,
         }
     }
 
@@ -103,7 +141,11 @@ impl BucketWriter {
             return 0;
         }
         let (encodings, has_nulls) = self.compute_encodings();
-        self.compute_out_size(&encodings, &has_nulls)
+        let mut size = self.compute_out_size(&encodings, &has_nulls);
+        for lc in &self.list_columns {
+            size += lc.values_writer.estimated_raw_size();
+        }
+        size
     }
 
     pub fn write_columns(
@@ -119,8 +161,36 @@ impl BucketWriter {
         let start_row = self.num_rows;
         let mut total_size = 0;
 
+        let mut list_writes: Vec<(usize, Int32Array, ArrayRef)> = Vec::new();
+        for lc in &self.list_columns {
+            let col = lc.physical_col;
+            let list_array = arrays[col]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "expected ListArray")
+                })?;
+            let lengths = extract_list_lengths(list_array);
+            let values = flatten_list_values(list_array);
+            list_writes.push((col, lengths, values));
+        }
+
+        let int32_dt = DataType::Int32;
         for i in 0..self.num_columns {
-            total_size += self.append_array_column(i, arrays[i], data_types[i], start_row)?;
+            if let Some(lw) = list_writes.iter().find(|(col, _, _)| *col == i) {
+                total_size +=
+                    self.append_array_column(i, &lw.1, &int32_dt, start_row)?;
+            } else {
+                total_size +=
+                    self.append_array_column(i, arrays[i], data_types[i], start_row)?;
+            }
+        }
+
+        for (lc, (_, _, values)) in self.list_columns.iter_mut().zip(list_writes) {
+            let elem_dt = lc.element_field.data_type();
+            lc.values_writer
+                .write_columns(&[values.as_ref()], &[elem_dt])?;
+            lc.total_elements += values.len();
         }
 
         self.num_rows += num_new_rows;
@@ -488,6 +558,17 @@ impl BucketWriter {
         }
 
         debug_assert_eq!(pos, out.len());
+
+        if !self.list_columns.is_empty() {
+            varint::encode(&mut out, self.list_columns.len() as u32);
+            for lc in &self.list_columns {
+                varint::encode(&mut out, lc.total_elements as u32);
+                let sub_blob = lc.values_writer.finish();
+                varint::encode(&mut out, sub_blob.len() as u32);
+                out.extend_from_slice(&sub_blob);
+            }
+        }
+
         out
     }
 
@@ -566,6 +647,56 @@ impl BucketWriter {
             }
         }
 
+        for lc in &self.list_columns {
+            let col = lc.physical_col;
+            let values_paged = lc.values_writer.finish_paged();
+
+            let mut composite = Vec::new();
+            varint::encode(&mut composite, lc.total_elements as u32);
+
+            if let Some(ref lengths_page) = column_pages[col] {
+                varint::encode(&mut composite, lengths_page.len() as u32);
+                composite.extend_from_slice(lengths_page);
+            } else {
+                varint::encode(&mut composite, 0u32);
+            }
+
+            let values_blob = if values_paged.column_pages.len() == 1 {
+                if let Some(ref vp) = values_paged.column_pages[0] {
+                    vp.clone()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            let values_encoding = if !values_paged.encodings.is_empty() {
+                values_paged.encodings[0]
+            } else {
+                ENCODING_ALL_NULL
+            };
+            let values_has_nulls = if !values_paged.has_nulls.is_empty() {
+                values_paged.has_nulls[0]
+            } else {
+                false
+            };
+            let values_const = if !values_paged.const_data.is_empty() {
+                &values_paged.const_data[0]
+            } else {
+                &vec![]
+            };
+
+            composite.push(values_encoding);
+            composite.push(if values_has_nulls { 1 } else { 0 });
+            varint::encode(&mut composite, values_const.len() as u32);
+            composite.extend_from_slice(values_const);
+            varint::encode(&mut composite, values_blob.len() as u32);
+            composite.extend_from_slice(&values_blob);
+
+            column_pages[col] = Some(composite);
+        }
+
         PagedBucketOutput {
             encodings,
             has_nulls,
@@ -597,6 +728,10 @@ impl BucketWriter {
             }
         }
         self.num_rows = 0;
+        for lc in &mut self.list_columns {
+            lc.values_writer.reset();
+            lc.total_elements = 0;
+        }
     }
 
     fn get_dict_size(&self, col: usize) -> usize {
@@ -924,6 +1059,24 @@ fn i128_to_biginteger_bytes(val: i128) -> Vec<u8> {
         start += 1;
     }
     bytes[start..].to_vec()
+}
+
+fn extract_list_lengths(list_array: &ListArray) -> Int32Array {
+    let offsets = list_array.value_offsets();
+    let num_rows = list_array.len();
+    let mut lengths = Vec::with_capacity(num_rows);
+    for i in 0..num_rows {
+        lengths.push(offsets[i + 1] - offsets[i]);
+    }
+    let null_buf = list_array.nulls().cloned();
+    Int32Array::new(ScalarBuffer::from(lengths), null_buf)
+}
+
+fn flatten_list_values(list_array: &ListArray) -> ArrayRef {
+    let offsets = list_array.value_offsets();
+    let start = offsets[0] as usize;
+    let end = offsets[list_array.len()] as usize;
+    list_array.values().slice(start, end - start)
 }
 
 fn uses_long_dict(fixed_width: i32) -> bool {

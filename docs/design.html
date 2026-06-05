@@ -739,9 +739,10 @@ repeated numColumns times:
                     <tr><td>15</td><td>TIME</td><td>varint precision</td></tr>
                     <tr><td>16</td><td>TIMESTAMP</td><td>varint precision</td></tr>
                     <tr><td>17</td><td>TIMESTAMP_LTZ</td><td>varint precision, varint timezoneLength, bytes timezone</td></tr>
+                    <tr><td>18</td><td>ARRAY</td><td>TypeDescriptor (recursive element type)</td></tr>
                 </tbody>
             </table>
-            <p>Complex types (ARRAY, MAP, ROW, etc.), VARIANT, and BLOB are not supported.</p>
+            <p>MAP, ROW, VARIANT, and BLOB are not yet supported.</p>
 
             <!-- ============================================================ -->
             <h2>Value Serialization</h2>
@@ -765,6 +766,7 @@ repeated numColumns times:
                     <tr><td>TIMESTAMP (precision &gt; 6)</td><td>8 bytes (epoch millis) + 4 bytes (nanos of millis)</td></tr>
                     <tr><td>CHAR / VARCHAR / STRING</td><td>varint length + UTF-8 bytes</td></tr>
                     <tr><td>BINARY / VARBINARY / BYTES</td><td>varint length + raw bytes</td></tr>
+                    <tr><td>ARRAY</td><td>Flattened columnar: lengths (INT32) + values sub-bucket (see below)</td></tr>
                 </tbody>
             </table>
             <p>
@@ -776,6 +778,89 @@ repeated numColumns times:
                 range cannot be represented through this Arrow API; readers return InvalidData for
                 those values, and legacy Struct timestamp writes reject them before writing.
             </p>
+
+            <!-- ============================================================ -->
+            <h2>ARRAY Type Storage</h2>
+            <p>
+                ARRAY columns use a <strong>flattened columnar</strong> storage layout.
+                Instead of serializing each array value as an opaque blob, the column is decomposed into
+                two independent streams that each benefit from standard column encoding (DICT, CONST, PLAIN).
+            </p>
+
+            <h3>Decomposition</h3>
+            <p>An <code>ARRAY&lt;T&gt;</code> column with N rows is stored as:</p>
+            <ol>
+                <li><strong>Lengths column</strong> (INT32, N entries): the number of elements in each array.
+                    Null arrays are represented by a null in the lengths column (contributing 0 elements).
+                    Empty arrays (<code>[]</code>) have length 0 and are non-null.</li>
+                <li><strong>Values column</strong> (type T, M entries): all elements from all rows flattened
+                    into a single contiguous column, where M = sum of all non-null lengths.
+                    Element-level nulls are tracked by this column&rsquo;s own null bitmap.</li>
+            </ol>
+            <p>
+                Both columns independently go through the standard encoding selection (DICT, CONST, PLAIN, ALL_NULL),
+                enabling dictionary compression of element values across all arrays in the column.
+            </p>
+
+            <h4>Example</h4>
+<pre><code>Input rows:  [1, 2, 3],  null,  [1, 2],  []
+
+Lengths column (INT32):    3, null, 2, 0    &larr; standard INT32 encoding (DICT/CONST/PLAIN)
+Values column  (INT32):    1, 2, 3, 1, 2    &larr; standard INT32 encoding (DICT: {1&rarr;0, 2&rarr;1, 3&rarr;2})</code></pre>
+
+            <h4>Nested Arrays</h4>
+            <p>
+                <code>ARRAY&lt;ARRAY&lt;INT&gt;&gt;</code> is stored recursively. The outer values column
+                is itself an <code>ARRAY&lt;INT&gt;</code>, which decomposes into its own lengths + values pair.
+                All leaf INT values across all nesting levels end up in a single INT32 column,
+                sharing one dictionary across the entire column.
+            </p>
+<pre><code>ARRAY&lt;ARRAY&lt;INT&gt;&gt; with rows:  [[1,2], [3]],  [[1,2]]
+
+Outer lengths (INT32):   2, 1                         &larr; 2 inner arrays, 1 inner array
+Inner lengths (INT32):   2, 1, 2                      &larr; element counts of inner arrays
+Leaf values   (INT32):   1, 2, 3, 1, 2                &larr; all INTs in one column, shared DICT</code></pre>
+
+            <h3>Bucket Internal Format</h3>
+
+            <h4>Monolithic Bucket</h4>
+            <p>
+                The lengths column is stored as a regular INT32 column in the main bucket data.
+                The values column is stored in a <strong>sub-bucket</strong> appended after the main bucket data:
+            </p>
+<pre><code>[standard main bucket data: ARRAY columns stored as INT32 lengths]
+varint   numListColumns         (0 if no ARRAY columns)
+repeated numListColumns times (in physical column index order):
+    varint   totalElements      (total element count across all rows)
+    varint   subBucketSize      (byte size of the sub-bucket blob)
+    bytes    subBucketBlob      (standard BucketWriter format, 1 column, totalElements rows)</code></pre>
+            <p>
+                The sub-bucket blob uses the same format as any other bucket &mdash; it has its own
+                encoding flags, null bitmaps, and column data. This means element values benefit from
+                DICT, CONST, or PLAIN encoding independently.
+            </p>
+
+            <h4>Paged Bucket</h4>
+            <p>
+                In paged mode, an ARRAY column&rsquo;s page slot contains a composite blob with
+                both the lengths page and the values page:
+            </p>
+<pre><code>varint   totalElements
+varint   lengthsPageSize
+bytes    lengthsPage            (standard page_content for INT32)
+1 byte   valuesEncoding
+1 byte   valuesFlags
+varint   valuesConstLen
+bytes    valuesConstData        (if CONST encoding)
+varint   valuesPageLen
+bytes    valuesPage             (standard page data for element type)</code></pre>
+            <p>
+                The reader knows a column is ARRAY from the schema&rsquo;s TypeDescriptor,
+                and parses the composite blob accordingly.
+            </p>
+
+            <h3>Statistics</h3>
+            <p>ARRAY columns do not support min/max statistics (no meaningful ordering).</p>
 
             <!-- ============================================================ -->
             <h2>Varint Encoding</h2>
@@ -793,7 +878,7 @@ repeated numColumns times:
             <!-- ============================================================ -->
             <h2>Limitations</h2>
             <ol>
-                <li>Complex types (ARRAY, MAP, MULTISET, ROW) are not supported.</li>
+                <li>Complex types MAP, MULTISET, and ROW are not yet supported. ARRAY is supported with flattened columnar storage.</li>
                 <li>Mosaic format is designed for wide tables and may not be efficient for narrow tables with few columns.</li>
             </ol>
         </div>
