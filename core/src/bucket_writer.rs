@@ -33,28 +33,30 @@ pub struct PagedBucketOutput {
     pub has_nulls: Vec<bool>,
     pub const_data: Vec<Vec<u8>>,
     pub column_pages: Vec<Option<Vec<u8>>>,
+    pub num_primary: usize,
+    pub children: Vec<ChildColumnMeta>,
 }
 
-struct ListColumnState {
-    physical_col: usize,
-    element_field: Arc<Field>,
-    values_writer: BucketWriter,
-    total_elements: usize,
+#[derive(Clone)]
+pub struct ChildColumnMeta {
+    pub parent_logical_col: usize,
+    pub physical_index: usize,
+    pub element_field: Arc<Field>,
+    pub num_elements: usize,
 }
 
 pub struct BucketWriter {
-    num_columns: usize,
+    num_primary: usize,
+    total_columns: usize,
     fixed_widths: Vec<i32>,
 
     null_bitmaps: Vec<Vec<u8>>,
     value_buffers: Vec<Vec<u8>>,
     non_null_counts: Vec<usize>,
 
-    // CONST tracking
     const_tracking: Vec<bool>,
     first_value_len: Vec<usize>,
 
-    // Dict tracking: fixed-width <=8 uses u64 keys, variable-width uses byte keys
     long_dict_maps: Vec<Option<HashMap<u64, usize>>>,
     byte_dict_maps: Vec<Option<HashMap<Vec<u8>, usize>>>,
     dict_total_bytes: Vec<usize>,
@@ -62,8 +64,7 @@ pub struct BucketWriter {
     max_dict_entries: usize,
 
     num_rows: usize,
-
-    list_columns: Vec<ListColumnState>,
+    children: Vec<ChildColumnMeta>,
 }
 
 impl BucketWriter {
@@ -72,39 +73,14 @@ impl BucketWriter {
         max_dict_total_bytes: usize,
         max_dict_entries: usize,
     ) -> Self {
-        let num_columns = col_types.len();
-
-        let physical_types: Vec<DataType> = col_types
-            .iter()
-            .map(|t| {
-                if matches!(t, DataType::List(_)) {
-                    DataType::Int32
-                } else {
-                    (*t).clone()
-                }
-            })
-            .collect();
+        let num_primary = col_types.len();
+        let (physical_types, children) = expand_col_types(col_types);
+        let total_columns = physical_types.len();
         let fixed_widths: Vec<i32> = physical_types.iter().map(types::fixed_width).collect();
 
-        let mut list_columns = Vec::new();
-        for (i, t) in col_types.iter().enumerate() {
-            if let DataType::List(element_field) = t {
-                let elem_dt = element_field.data_type();
-                let values_writer =
-                    BucketWriter::new(&[elem_dt], max_dict_total_bytes, max_dict_entries);
-                list_columns.push(ListColumnState {
-                    physical_col: i,
-                    element_field: element_field.clone(),
-                    values_writer,
-                    total_elements: 0,
-                });
-            }
-        }
-
-        let mut long_dict_maps = Vec::with_capacity(num_columns);
-        let mut byte_dict_maps = Vec::with_capacity(num_columns);
-
-        for fw in fixed_widths.iter().take(num_columns) {
+        let mut long_dict_maps = Vec::with_capacity(total_columns);
+        let mut byte_dict_maps = Vec::with_capacity(total_columns);
+        for fw in &fixed_widths {
             if uses_long_dict(*fw) {
                 long_dict_maps.push(Some(HashMap::new()));
                 byte_dict_maps.push(None);
@@ -115,20 +91,40 @@ impl BucketWriter {
         }
 
         BucketWriter {
-            num_columns,
+            num_primary,
+            total_columns,
             fixed_widths,
-            null_bitmaps: vec![vec![0u8; 128]; num_columns],
-            value_buffers: vec![Vec::with_capacity(1024); num_columns],
-            non_null_counts: vec![0; num_columns],
-            const_tracking: vec![true; num_columns],
-            first_value_len: vec![0; num_columns],
+            null_bitmaps: vec![vec![0u8; 128]; total_columns],
+            value_buffers: vec![Vec::with_capacity(1024); total_columns],
+            non_null_counts: vec![0; total_columns],
+            const_tracking: vec![true; total_columns],
+            first_value_len: vec![0; total_columns],
             long_dict_maps,
             byte_dict_maps,
-            dict_total_bytes: vec![0; num_columns],
+            dict_total_bytes: vec![0; total_columns],
             max_dict_total_bytes,
             max_dict_entries,
             num_rows: 0,
-            list_columns,
+            children,
+        }
+    }
+
+    pub fn num_primary(&self) -> usize {
+        self.num_primary
+    }
+
+    pub fn children(&self) -> &[ChildColumnMeta] {
+        &self.children
+    }
+
+    fn col_num_rows(&self, col: usize) -> usize {
+        if col < self.num_primary {
+            self.num_rows
+        } else {
+            self.children
+                .iter()
+                .find(|c| c.physical_index == col)
+                .map_or(0, |c| c.num_elements)
         }
     }
 
@@ -141,11 +137,7 @@ impl BucketWriter {
             return 0;
         }
         let (encodings, has_nulls) = self.compute_encodings();
-        let mut size = self.compute_out_size(&encodings, &has_nulls);
-        for lc in &self.list_columns {
-            size += lc.values_writer.estimated_raw_size();
-        }
-        size
+        self.compute_out_size(&encodings, &has_nulls)
     }
 
     pub fn write_columns(
@@ -153,7 +145,7 @@ impl BucketWriter {
         arrays: &[&dyn Array],
         data_types: &[&DataType],
     ) -> io::Result<usize> {
-        debug_assert_eq!(arrays.len(), self.num_columns);
+        debug_assert_eq!(arrays.len(), self.num_primary);
         let num_new_rows = arrays[0].len();
         if num_new_rows == 0 {
             return Ok(0);
@@ -161,36 +153,76 @@ impl BucketWriter {
         let start_row = self.num_rows;
         let mut total_size = 0;
 
-        let mut list_writes: Vec<(usize, Int32Array, ArrayRef)> = Vec::new();
-        for lc in &self.list_columns {
-            let col = lc.physical_col;
+        // Split List arrays into lengths + values, collect child writes
+        let mut list_splits: Vec<(usize, Int32Array, ArrayRef)> = Vec::new();
+        for child in &self.children {
+            let col = child.parent_logical_col;
+            if list_splits.iter().any(|(c, _, _)| *c == col) {
+                continue; // already split this column (nested lists share parent)
+            }
             let list_array = arrays[col]
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected ListArray"))?;
             let lengths = extract_list_lengths(list_array);
             let values = flatten_list_values(list_array);
-            list_writes.push((col, lengths, values));
+            list_splits.push((col, lengths, values));
         }
 
+        // Write primary columns (lengths for ARRAY cols, regular data for others)
         let int32_dt = DataType::Int32;
-        for i in 0..self.num_columns {
-            if let Some(lw) = list_writes.iter().find(|(col, _, _)| *col == i) {
-                total_size += self.append_array_column(i, &lw.1, &int32_dt, start_row)?;
+        for i in 0..self.num_primary {
+            if let Some(split) = list_splits.iter().find(|(col, _, _)| *col == i) {
+                total_size += self.append_array_column(i, &split.1, &int32_dt, start_row)?;
             } else {
                 total_size += self.append_array_column(i, arrays[i], data_types[i], start_row)?;
             }
         }
 
-        for (lc, (_, _, values)) in self.list_columns.iter_mut().zip(list_writes) {
-            let elem_dt = lc.element_field.data_type();
-            lc.values_writer
-                .write_columns(&[values.as_ref()], &[elem_dt])?;
-            lc.total_elements += values.len();
+        // Recursively flatten all list levels and write to child columns
+        let mut pending: Vec<(usize, ArrayRef)> = Vec::new(); // (child_index, values)
+        for split in &list_splits {
+            let parent = split.0;
+            // Find the first child for this parent
+            if let Some(child_idx) = self
+                .children
+                .iter()
+                .position(|c| c.parent_logical_col == parent)
+            {
+                pending.push((child_idx, split.2.clone()));
+            }
+        }
+
+        while let Some((child_idx, values)) = pending.pop() {
+            if child_idx >= self.children.len() || values.is_empty() {
+                continue;
+            }
+            let phys_idx = self.children[child_idx].physical_index;
+            let child_start = self.children[child_idx].num_elements;
+
+            if let DataType::List(_) = values.data_type() {
+                let inner_list = values.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "expected ListArray")
+                })?;
+                let inner_lengths = extract_list_lengths(inner_list);
+                let inner_values = flatten_list_values(inner_list);
+                total_size +=
+                    self.append_array_column(phys_idx, &inner_lengths, &int32_dt, child_start)?;
+                self.children[child_idx].num_elements += inner_lengths.len();
+                // Queue the inner values for the next child
+                if child_idx + 1 < self.children.len() {
+                    pending.push((child_idx + 1, inner_values));
+                }
+            } else {
+                let elem_dt = self.children[child_idx].element_field.data_type().clone();
+                total_size +=
+                    self.append_array_column(phys_idx, values.as_ref(), &elem_dt, child_start)?;
+                self.children[child_idx].num_elements += values.len();
+            }
         }
 
         self.num_rows += num_new_rows;
-        total_size += num_new_rows * self.num_columns.div_ceil(8);
+        total_size += num_new_rows * self.num_primary.div_ceil(8);
         Ok(total_size)
     }
 
@@ -440,14 +472,15 @@ impl BucketWriter {
     }
 
     fn compute_encodings(&self) -> (Vec<u8>, Vec<bool>) {
-        let mut encodings = vec![0u8; self.num_columns];
-        let mut has_nulls = vec![false; self.num_columns];
-        for i in 0..self.num_columns {
+        let mut encodings = vec![0u8; self.total_columns];
+        let mut has_nulls = vec![false; self.total_columns];
+        for i in 0..self.total_columns {
+            let col_rows = self.col_num_rows(i);
             if self.non_null_counts[i] == 0 {
                 encodings[i] = ENCODING_ALL_NULL;
             } else if self.const_tracking[i] {
                 encodings[i] = ENCODING_CONST;
-                has_nulls[i] = self.non_null_counts[i] < self.num_rows;
+                has_nulls[i] = self.non_null_counts[i] < col_rows;
             } else {
                 let dict_size = self.get_dict_size(i);
                 if dict_size >= 2
@@ -458,7 +491,7 @@ impl BucketWriter {
                 } else {
                     encodings[i] = ENCODING_PLAIN;
                 }
-                has_nulls[i] = self.non_null_counts[i] < self.num_rows;
+                has_nulls[i] = self.non_null_counts[i] < col_rows;
             }
         }
         (encodings, has_nulls)
@@ -472,96 +505,87 @@ impl BucketWriter {
 
         let (encodings, has_nulls) = self.compute_encodings();
 
-        let out_size = self.compute_out_size(&encodings, &has_nulls);
-        let mut out = vec![0u8; out_size];
-        let mut pos = 0;
+        let mut out = Vec::new();
+
+        // Header: num_primary + num_children + child element counts
+        varint::encode(&mut out, self.num_primary as u32);
+        varint::encode(&mut out, self.children.len() as u32);
+        for child in &self.children {
+            varint::encode(&mut out, child.num_elements as u32);
+        }
 
         // Encoding flags: 2 bits per column
-        let encoding_flags_bytes = (self.num_columns * 2).div_ceil(8);
-        for i in 0..self.num_columns {
+        let encoding_flags_bytes = (self.total_columns * 2).div_ceil(8);
+        let ef_start = out.len();
+        out.resize(ef_start + encoding_flags_bytes, 0);
+        for i in 0..self.total_columns {
             let byte_idx = (i * 2) / 8;
             let bit_idx = (i * 2) % 8;
-            out[pos + byte_idx] |= encodings[i] << bit_idx;
+            out[ef_start + byte_idx] |= encodings[i] << bit_idx;
         }
-        pos += encoding_flags_bytes;
 
         // Has-nulls flags: 1 bit per column
-        let has_nulls_bytes = self.num_columns.div_ceil(8);
-        for i in 0..self.num_columns {
+        let has_nulls_bytes = self.total_columns.div_ceil(8);
+        let hn_start = out.len();
+        out.resize(hn_start + has_nulls_bytes, 0);
+        for i in 0..self.total_columns {
             if has_nulls[i] {
-                out[pos + i / 8] |= 1 << (i % 8);
+                out[hn_start + i / 8] |= 1 << (i % 8);
             }
         }
-        pos += has_nulls_bytes;
 
         // CONST metadata
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
             if encodings[i] == ENCODING_CONST {
                 let len = self.first_value_len[i];
-                out[pos..pos + len].copy_from_slice(&self.value_buffers[i][..len]);
-                pos += len;
+                out.extend_from_slice(&self.value_buffers[i][..len]);
             }
         }
 
         // Dict metadata
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
             if encodings[i] == ENCODING_DICT {
                 if let Some(ref dict) = self.long_dict_maps[i] {
                     let num_entries = dict.len();
-                    pos = varint::encode_to_slice(&mut out, pos, num_entries as u32);
+                    varint::encode(&mut out, num_entries as u32);
                     let w = self.fixed_widths[i];
                     let mut keys = vec![0u64; num_entries];
                     for (&key, &idx) in dict {
                         keys[idx] = key;
                     }
                     for key in &keys {
-                        write_fixed_key_to_slice(&mut out, &mut pos, *key, w);
+                        write_fixed_key_to_vec(&mut out, *key, w);
                     }
                 } else if let Some(ref dict) = self.byte_dict_maps[i] {
                     let num_entries = dict.len();
-                    pos = varint::encode_to_slice(&mut out, pos, num_entries as u32);
+                    varint::encode(&mut out, num_entries as u32);
                     let mut keys: Vec<(&Vec<u8>, &usize)> = dict.iter().collect();
                     keys.sort_by_key(|&(_, idx)| *idx);
                     for (key, _) in keys {
-                        out[pos..pos + key.len()].copy_from_slice(key);
-                        pos += key.len();
+                        out.extend_from_slice(key);
                     }
                 }
             }
         }
 
-        // Null bitmaps
-        let null_bitmap_bytes = self.num_rows.div_ceil(8);
-        for i in 0..self.num_columns {
+        // Null bitmaps (per-column row count)
+        for i in 0..self.total_columns {
             if has_nulls[i] && encodings[i] != ENCODING_ALL_NULL {
-                out[pos..pos + null_bitmap_bytes]
-                    .copy_from_slice(&self.null_bitmaps[i][..null_bitmap_bytes]);
-                pos += null_bitmap_bytes;
+                let nbytes = self.col_num_rows(i).div_ceil(8);
+                out.extend_from_slice(&self.null_bitmaps[i][..nbytes]);
             }
         }
 
         // Column data
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
             if encodings[i] == ENCODING_PLAIN {
-                let len = self.value_buffers[i].len();
-                out[pos..pos + len].copy_from_slice(&self.value_buffers[i]);
-                pos += len;
+                out.extend_from_slice(&self.value_buffers[i]);
             } else if encodings[i] == ENCODING_DICT {
-                let data_start = pos;
-                let bit_offset = self.write_dict_bit_packed(i, &mut out, data_start);
-                pos += bit_offset.div_ceil(8);
-            }
-        }
-
-        debug_assert_eq!(pos, out.len());
-
-        if !self.list_columns.is_empty() {
-            varint::encode(&mut out, self.list_columns.len() as u32);
-            for lc in &self.list_columns {
-                varint::encode(&mut out, lc.total_elements as u32);
-                let sub_blob = lc.values_writer.finish();
-                varint::encode(&mut out, sub_blob.len() as u32);
-                out.extend_from_slice(&sub_blob);
+                let bw = bit_width(self.get_dict_size(i));
+                let packed_bytes = (self.non_null_counts[i] * bw).div_ceil(8);
+                let data_start = out.len();
+                out.resize(data_start + packed_bytes, 0);
+                self.write_dict_bit_packed(i, &mut out, data_start);
             }
         }
 
@@ -576,16 +600,20 @@ impl BucketWriter {
                 has_nulls: Vec::new(),
                 const_data: Vec::new(),
                 column_pages: Vec::new(),
+                num_primary: self.num_primary,
+                children: self.children.clone(),
             };
         }
 
-        let (mut encodings, mut has_nulls) = self.compute_encodings();
-        let null_bitmap_bytes = self.num_rows.div_ceil(8);
+        let (encodings, has_nulls) = self.compute_encodings();
 
-        let mut const_data = vec![Vec::new(); self.num_columns];
-        let mut column_pages: Vec<Option<Vec<u8>>> = vec![None; self.num_columns];
+        let mut const_data = vec![Vec::new(); self.total_columns];
+        let mut column_pages: Vec<Option<Vec<u8>>> = vec![None; self.total_columns];
 
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
+            let col_rows = self.col_num_rows(i);
+            let null_bitmap_bytes = col_rows.div_ceil(8);
+
             match encodings[i] {
                 ENCODING_ALL_NULL => {}
                 ENCODING_CONST => {
@@ -597,7 +625,6 @@ impl BucketWriter {
                 }
                 ENCODING_DICT => {
                     let mut page = Vec::new();
-                    // Dict table
                     if let Some(ref dict) = self.long_dict_maps[i] {
                         let num_entries = dict.len();
                         varint::encode(&mut page, num_entries as u32);
@@ -618,11 +645,9 @@ impl BucketWriter {
                             page.extend_from_slice(key);
                         }
                     }
-                    // Null bitmap
                     if has_nulls[i] {
                         page.extend_from_slice(&self.null_bitmaps[i][..null_bitmap_bytes]);
                     }
-                    // Bit-packed indices
                     let dict_size = self.get_dict_size(i);
                     let bw = bit_width(dict_size);
                     let packed_bytes = (self.non_null_counts[i] * bw).div_ceil(8);
@@ -643,69 +668,18 @@ impl BucketWriter {
             }
         }
 
-        for lc in &self.list_columns {
-            let col = lc.physical_col;
-
-            let mut composite = Vec::new();
-            varint::encode(&mut composite, lc.total_elements as u32);
-
-            // Build complete lengths page_content: encoding(1B) + flags(1B) + [const_value] + page_data
-            let lengths_encoding = encodings[col];
-            let lengths_has_nulls = has_nulls[col];
-            let mut lengths_content = vec![lengths_encoding, if lengths_has_nulls { 1 } else { 0 }];
-            if lengths_encoding == ENCODING_CONST {
-                lengths_content.extend_from_slice(&const_data[col]);
-            }
-            if let Some(ref page_data) = column_pages[col] {
-                lengths_content.extend_from_slice(page_data);
-            }
-            varint::encode(&mut composite, lengths_content.len() as u32);
-            composite.extend_from_slice(&lengths_content);
-
-            // Build complete values page_content: encoding(1B) + flags(1B) + [const_value] + page_data
-            let values_paged = lc.values_writer.finish_paged();
-            let v_encoding = values_paged
-                .encodings
-                .first()
-                .copied()
-                .unwrap_or(ENCODING_ALL_NULL);
-            let v_has_nulls = values_paged.has_nulls.first().copied().unwrap_or(false);
-            let v_const = values_paged.const_data.first().cloned().unwrap_or_default();
-            let v_page = values_paged
-                .column_pages
-                .first()
-                .and_then(|p| p.clone())
-                .unwrap_or_default();
-
-            let mut values_content = vec![v_encoding, if v_has_nulls { 1 } else { 0 }];
-            if v_encoding == ENCODING_CONST {
-                values_content.extend_from_slice(&v_const);
-            }
-            values_content.extend_from_slice(&v_page);
-
-            varint::encode(&mut composite, lc.total_elements as u32);
-            varint::encode(&mut composite, values_content.len() as u32);
-            composite.extend_from_slice(&values_content);
-
-            // Override: use ENCODING_PLAIN so write_paged_bucket includes this slot.
-            // The 2-byte [PLAIN, 0x00] prefix added by write_paged_bucket will be
-            // skipped by parse_list_column_slot on the read side.
-            encodings[col] = ENCODING_PLAIN;
-            has_nulls[col] = false;
-            const_data[col] = Vec::new();
-            column_pages[col] = Some(composite);
-        }
-
         PagedBucketOutput {
             encodings,
             has_nulls,
             const_data,
             column_pages,
+            num_primary: self.num_primary,
+            children: self.children.clone(),
         }
     }
 
     pub fn reset(&mut self) {
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
             for b in &mut self.null_bitmaps[i] {
                 *b = 0;
             }
@@ -727,9 +701,8 @@ impl BucketWriter {
             }
         }
         self.num_rows = 0;
-        for lc in &mut self.list_columns {
-            lc.values_writer.reset();
-            lc.total_elements = 0;
+        for child in &mut self.children {
+            child.num_elements = 0;
         }
     }
 
@@ -793,15 +766,21 @@ impl BucketWriter {
     }
 
     fn compute_out_size(&self, encodings: &[u8], has_nulls: &[bool]) -> usize {
-        let null_bitmap_bytes = self.num_rows.div_ceil(8);
-        let mut size = (self.num_columns * 2).div_ceil(8) + self.num_columns.div_ceil(8);
+        // Header: varint(num_primary) + varint(num_children) + varint per child
+        let mut size = varint::encoded_size(self.num_primary as u32)
+            + varint::encoded_size(self.children.len() as u32);
+        for child in &self.children {
+            size += varint::encoded_size(child.num_elements as u32);
+        }
 
-        for i in 0..self.num_columns {
+        size += (self.total_columns * 2).div_ceil(8) + self.total_columns.div_ceil(8);
+
+        for i in 0..self.total_columns {
             if encodings[i] == ENCODING_ALL_NULL {
                 continue;
             }
             if has_nulls[i] {
-                size += null_bitmap_bytes;
+                size += self.col_num_rows(i).div_ceil(8);
             }
             match encodings[i] {
                 ENCODING_CONST => {
@@ -1078,6 +1057,50 @@ fn flatten_list_values(list_array: &ListArray) -> ArrayRef {
     list_array.values().slice(start, end - start)
 }
 
+pub(crate) fn expand_col_types(col_types: &[&DataType]) -> (Vec<DataType>, Vec<ChildColumnMeta>) {
+    let mut physical_types = Vec::new();
+    let mut children = Vec::new();
+
+    for (i, t) in col_types.iter().enumerate() {
+        if let DataType::List(element_field) = t {
+            physical_types.push(DataType::Int32);
+            expand_child(i, element_field, &mut physical_types, &mut children);
+        } else {
+            physical_types.push((*t).clone());
+        }
+    }
+    (physical_types, children)
+}
+
+fn expand_child(
+    parent_logical: usize,
+    element_field: &Arc<Field>,
+    physical_types: &mut Vec<DataType>,
+    children: &mut Vec<ChildColumnMeta>,
+) {
+    let elem_dt = element_field.data_type();
+    let child_phys_idx = physical_types.len();
+
+    if let DataType::List(inner_field) = elem_dt {
+        physical_types.push(DataType::Int32);
+        children.push(ChildColumnMeta {
+            parent_logical_col: parent_logical,
+            physical_index: child_phys_idx,
+            element_field: element_field.clone(),
+            num_elements: 0,
+        });
+        expand_child(parent_logical, inner_field, physical_types, children);
+    } else {
+        physical_types.push(elem_dt.clone());
+        children.push(ChildColumnMeta {
+            parent_logical_col: parent_logical,
+            physical_index: child_phys_idx,
+            element_field: element_field.clone(),
+            num_elements: 0,
+        });
+    }
+}
+
 fn uses_long_dict(fixed_width: i32) -> bool {
     fixed_width > 0 && fixed_width <= 8
 }
@@ -1118,34 +1141,19 @@ fn write_fixed_key_to_vec(buf: &mut Vec<u8>, key: u64, width: i32) {
     }
 }
 
-fn write_fixed_key_to_slice(buf: &mut [u8], pos: &mut usize, key: u64, width: i32) {
-    match width {
-        1 => {
-            buf[*pos] = key as u8;
-            *pos += 1;
-        }
-        2 => {
-            let bytes = (key as u16).to_be_bytes();
-            buf[*pos..*pos + 2].copy_from_slice(&bytes);
-            *pos += 2;
-        }
-        4 => {
-            let bytes = (key as u32).to_be_bytes();
-            buf[*pos..*pos + 4].copy_from_slice(&bytes);
-            *pos += 4;
-        }
-        8 => {
-            let bytes = key.to_be_bytes();
-            buf[*pos..*pos + 8].copy_from_slice(&bytes);
-            *pos += 8;
-        }
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn header_size(data: &[u8]) -> usize {
+        let mut pos = 0;
+        let _np = varint::decode(data, &mut pos).unwrap();
+        let nc = varint::decode(data, &mut pos).unwrap();
+        for _ in 0..nc {
+            let _ = varint::decode(data, &mut pos).unwrap();
+        }
+        pos
+    }
 
     #[test]
     fn test_all_null_encoding() {
@@ -1158,7 +1166,8 @@ mod tests {
 
         let data = writer.finish();
         assert!(!data.is_empty());
-        assert_eq!(data[0] & 0x03, ENCODING_ALL_NULL);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_ALL_NULL);
     }
 
     #[test]
@@ -1171,7 +1180,8 @@ mod tests {
         writer.write_columns(&[&arr], &[&DataType::Int32]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_CONST);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_CONST);
     }
 
     #[test]
@@ -1185,7 +1195,8 @@ mod tests {
         writer.write_columns(&[&arr], &[&DataType::Int32]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_DICT);
     }
 
     #[test]
@@ -1199,7 +1210,8 @@ mod tests {
         writer.write_columns(&[&arr], &[&DataType::Int32]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_PLAIN);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_PLAIN);
     }
 
     #[test]
@@ -1212,7 +1224,8 @@ mod tests {
         writer.write_columns(&[&arr], &[&DataType::Utf8]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_CONST);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_CONST);
     }
 
     #[test]
@@ -1226,7 +1239,8 @@ mod tests {
         writer.write_columns(&[&arr], &[&DataType::Utf8]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_DICT);
     }
 
     #[test]
@@ -1242,7 +1256,8 @@ mod tests {
         writer.write_columns(&[&arr], &[&DataType::Int32]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_CONST);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_CONST);
     }
 
     #[test]
@@ -1258,7 +1273,8 @@ mod tests {
         writer.write_columns(&[&arr], &[&DataType::Int32]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_DICT);
     }
 
     #[test]
@@ -1278,7 +1294,8 @@ mod tests {
         writer.write_columns(&[&second], &[&types[0]]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_DICT);
     }
 
     #[test]
@@ -1300,9 +1317,10 @@ mod tests {
             .unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_ALL_NULL);
-        assert_eq!((data[0] >> 2) & 0x03, ENCODING_CONST);
-        assert_eq!((data[0] >> 4) & 0x03, ENCODING_DICT);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_ALL_NULL);
+        assert_eq!((data[h] >> 2) & 0x03, ENCODING_CONST);
+        assert_eq!((data[h] >> 4) & 0x03, ENCODING_DICT);
     }
 
     #[test]
@@ -1323,6 +1341,7 @@ mod tests {
         let arr2 = Int32Array::from(vals);
         writer.write_columns(&[&arr2], &[&DataType::Int32]).unwrap();
         let data2 = writer.finish();
-        assert_eq!(data2[0] & 0x03, ENCODING_PLAIN);
+        let h2 = header_size(&data2);
+        assert_eq!(data2[h2] & 0x03, ENCODING_PLAIN);
     }
 }

@@ -21,9 +21,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema};
 
-use crate::bucket_reader::{
-    read_typed_value, read_variable_value, BucketReader, ColumnPageReader, ListPageState,
-};
+use crate::bucket_reader::{read_typed_value, read_variable_value, BucketReader, ColumnPageReader};
 use crate::schema::MosaicSchema;
 use crate::spec::*;
 use crate::stats::{self, ColumnStats};
@@ -460,10 +458,6 @@ impl<I: InputFile> MosaicReader<I> {
         let page_content = zstd::bulk::decompress(compressed_data, uncompressed_size)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        if let DataType::List(element_field) = col_type {
-            return Self::parse_list_column_slot(page_content, element_field, num_rows);
-        }
-
         Self::parse_simple_column_slot(page_content, col_type, num_rows)
     }
 
@@ -511,63 +505,6 @@ impl<I: InputFile> MosaicReader<I> {
             ppos,
             num_rows,
         )
-    }
-
-    fn parse_list_column_slot(
-        page_content: Vec<u8>,
-        element_field: &Arc<Field>,
-        num_rows: usize,
-    ) -> io::Result<ColumnPageReader> {
-        // Skip the 2-byte [encoding, flags] prefix added by write_paged_bucket
-        let mut pos = 2usize;
-        let total_elements = varint::decode(&page_content, &mut pos)? as usize;
-
-        // Lengths: complete page_content with encoding/flags header
-        let lengths_page_size = varint::decode(&page_content, &mut pos)? as usize;
-        let lengths_data = page_content[pos..pos + lengths_page_size].to_vec();
-        pos += lengths_page_size;
-
-        let int32_type = DataType::Int32;
-        let mut lengths_reader = if lengths_page_size > 0 {
-            Self::parse_simple_column_slot(lengths_data, &int32_type, num_rows)?
-        } else {
-            ColumnPageReader::new(
-                int32_type.clone(),
-                ENCODING_ALL_NULL,
-                false,
-                Value::Null,
-                Vec::new(),
-                num_rows,
-            )?
-        };
-
-        // Values: total_elements + complete page_content with encoding/flags header
-        let values_total = varint::decode(&page_content, &mut pos)? as usize;
-        let values_page_size = varint::decode(&page_content, &mut pos)? as usize;
-        let values_data = page_content[pos..pos + values_page_size].to_vec();
-
-        let elem_dt = element_field.data_type();
-        let values_reader = if values_page_size > 0 {
-            Self::parse_simple_column_slot(values_data, elem_dt, values_total)?
-        } else {
-            ColumnPageReader::new(
-                elem_dt.clone(),
-                ENCODING_ALL_NULL,
-                false,
-                Value::Null,
-                Vec::new(),
-                values_total,
-            )?
-        };
-
-        lengths_reader.list_state = Some(ListPageState {
-            element_field: element_field.clone(),
-            total_elements,
-            values_reader: Box::new(values_reader),
-        });
-        lengths_reader.col_type = DataType::List(element_field.clone());
-
-        Ok(lengths_reader)
     }
 }
 
@@ -686,7 +623,14 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                             "paged bucket requires ZSTD compression",
                         ));
                     }
-                    let dir_size = self.schema.bucket_to_global[b].len() * 4;
+                    let bucket_col_refs: Vec<&DataType> = self.schema.bucket_to_global[b]
+                        .iter()
+                        .map(|&gi| &self.schema.columns[gi].data_type)
+                        .collect();
+                    let (bucket_phys, bucket_children) =
+                        crate::bucket_writer::expand_col_types(&bucket_col_refs);
+                    // Fixed-size header: u16(num_children) + u32(elem) * num_children
+                    let dir_size = 2 + bucket_children.len() * 4 + bucket_phys.len() * 4;
                     if dir_size > total_size {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -761,19 +705,35 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                 }
                 BucketLayout::Paged { total_size } => {
                     let global_indices = &self.schema.bucket_to_global[b];
-                    let num_columns = global_indices.len();
+                    let col_type_refs: Vec<&DataType> = global_indices
+                        .iter()
+                        .map(|&gi| &self.schema.columns[gi].data_type)
+                        .collect();
+                    let (phys_types, _bucket_children) =
+                        crate::bucket_writer::expand_col_types(&col_type_refs);
+                    let num_columns = phys_types.len();
 
-                    // Parse directory
+                    // Parse fixed-size child header: u16(num_children) + u32(elem_count) * num_children
+                    let nc = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+                    let hdr_len = 2 + nc * 4;
+                    let mut child_element_counts = Vec::with_capacity(nc);
+                    for ci in 0..nc {
+                        let off = 2 + ci * 4;
+                        child_element_counts.push(u32::from_le_bytes(
+                            buf[off..off + 4].try_into().unwrap(),
+                        ) as usize);
+                    }
+
+                    // Parse directory (after header)
                     let mut slot_sizes = Vec::with_capacity(num_columns);
                     for i in 0..num_columns {
-                        let off = i * 4;
+                        let off = hdr_len + i * 4;
                         let size =
                             u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
                         slot_sizes.push(size);
                     }
 
-                    // Validate: directory + slots must exactly equal total_size
-                    let dir_size = num_columns * 4;
+                    let dir_size = hdr_len + num_columns * 4;
                     let slot_total: usize = slot_sizes.iter().sum();
                     if dir_size + slot_total != total_size {
                         return Err(io::Error::new(
@@ -786,14 +746,18 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                     }
 
                     if all_projected_in_bucket[b] {
-                        // All columns projected — we already read the full bucket in round 1,
-                        // parse all slots directly without a second read_ranges call.
+                        let num_primary_in_bucket = global_indices.len();
                         let mut column_readers: Vec<Option<ColumnPageReader>> =
                             Vec::with_capacity(num_columns);
                         let mut data_offset = dir_size;
                         for i in 0..num_columns {
-                            let gi = global_indices[i];
-                            let col_type = self.schema.columns[gi].data_type.clone();
+                            let col_type = phys_types[i].clone();
+                            let col_rows = if i < num_primary_in_bucket {
+                                meta.num_rows
+                            } else {
+                                let child_idx = i - num_primary_in_bucket;
+                                child_element_counts.get(child_idx).copied().unwrap_or(0)
+                            };
 
                             if slot_sizes[i] == 0 {
                                 column_readers.push(Some(ColumnPageReader::new(
@@ -802,12 +766,12 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                                     false,
                                     Value::Null,
                                     Vec::new(),
-                                    meta.num_rows,
+                                    col_rows,
                                 )?));
                             } else {
                                 let slot_data = &buf[data_offset..data_offset + slot_sizes[i]];
                                 let column_reader =
-                                    Self::parse_column_slot(slot_data, &col_type, meta.num_rows)?;
+                                    Self::parse_column_slot(slot_data, &col_type, col_rows)?;
                                 column_readers.push(Some(column_reader));
                             }
                             data_offset += slot_sizes[i];
@@ -1050,12 +1014,41 @@ impl RowGroupReader {
 
             match state {
                 BucketState::Paged { column_readers } => {
+                    // Read all physical columns (N+C)
+                    let mut phys_arrays: Vec<ArrayRef> = Vec::new();
+                    for cr_opt in column_readers {
+                        if let Some(ref cr) = cr_opt {
+                            phys_arrays.push(cr.read_all()?);
+                        } else {
+                            phys_arrays
+                                .push(arrow_array::new_null_array(&DataType::Int32, self.num_rows));
+                        }
+                    }
+
+                    // Get child column metadata for this bucket
+                    let col_type_refs: Vec<&DataType> = global_indices
+                        .iter()
+                        .map(|&gi| &self.schema.columns[gi].data_type)
+                        .collect();
+                    let (_, bucket_children) =
+                        crate::bucket_writer::expand_col_types(&col_type_refs);
+
+                    // Reassemble list columns
+                    crate::bucket_reader::reassemble_list_columns_pub(
+                        &mut phys_arrays,
+                        &bucket_children,
+                        &col_type_refs,
+                        global_indices.len(),
+                        self.num_rows,
+                    );
+
+                    // Map logical columns to global array positions
                     for (local_idx, &global_idx) in global_indices.iter().enumerate() {
                         if !self.projected_columns[global_idx] {
                             continue;
                         }
-                        if let Some(ref cr) = column_readers[local_idx] {
-                            arrays[global_idx] = Some(cr.read_all()?);
+                        if local_idx < phys_arrays.len() {
+                            arrays[global_idx] = Some(phys_arrays[local_idx].clone());
                         }
                     }
                 }
