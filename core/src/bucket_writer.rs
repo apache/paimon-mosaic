@@ -579,7 +579,7 @@ impl BucketWriter {
             };
         }
 
-        let (encodings, has_nulls) = self.compute_encodings();
+        let (mut encodings, mut has_nulls) = self.compute_encodings();
         let null_bitmap_bytes = self.num_rows.div_ceil(8);
 
         let mut const_data = vec![Vec::new(); self.num_columns];
@@ -645,51 +645,54 @@ impl BucketWriter {
 
         for lc in &self.list_columns {
             let col = lc.physical_col;
-            let values_paged = lc.values_writer.finish_paged();
 
             let mut composite = Vec::new();
             varint::encode(&mut composite, lc.total_elements as u32);
 
-            if let Some(ref lengths_page) = column_pages[col] {
-                varint::encode(&mut composite, lengths_page.len() as u32);
-                composite.extend_from_slice(lengths_page);
-            } else {
-                varint::encode(&mut composite, 0u32);
+            // Build complete lengths page_content: encoding(1B) + flags(1B) + [const_value] + page_data
+            let lengths_encoding = encodings[col];
+            let lengths_has_nulls = has_nulls[col];
+            let mut lengths_content = vec![lengths_encoding, if lengths_has_nulls { 1 } else { 0 }];
+            if lengths_encoding == ENCODING_CONST {
+                lengths_content.extend_from_slice(&const_data[col]);
             }
+            if let Some(ref page_data) = column_pages[col] {
+                lengths_content.extend_from_slice(page_data);
+            }
+            varint::encode(&mut composite, lengths_content.len() as u32);
+            composite.extend_from_slice(&lengths_content);
 
-            let values_blob = if values_paged.column_pages.len() == 1 {
-                if let Some(ref vp) = values_paged.column_pages[0] {
-                    vp.clone()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
+            // Build complete values page_content: encoding(1B) + flags(1B) + [const_value] + page_data
+            let values_paged = lc.values_writer.finish_paged();
+            let v_encoding = values_paged
+                .encodings
+                .first()
+                .copied()
+                .unwrap_or(ENCODING_ALL_NULL);
+            let v_has_nulls = values_paged.has_nulls.first().copied().unwrap_or(false);
+            let v_const = values_paged.const_data.first().cloned().unwrap_or_default();
+            let v_page = values_paged
+                .column_pages
+                .first()
+                .and_then(|p| p.clone())
+                .unwrap_or_default();
 
-            let values_encoding = if !values_paged.encodings.is_empty() {
-                values_paged.encodings[0]
-            } else {
-                ENCODING_ALL_NULL
-            };
-            let values_has_nulls = if !values_paged.has_nulls.is_empty() {
-                values_paged.has_nulls[0]
-            } else {
-                false
-            };
-            let values_const = if !values_paged.const_data.is_empty() {
-                &values_paged.const_data[0]
-            } else {
-                &vec![]
-            };
+            let mut values_content = vec![v_encoding, if v_has_nulls { 1 } else { 0 }];
+            if v_encoding == ENCODING_CONST {
+                values_content.extend_from_slice(&v_const);
+            }
+            values_content.extend_from_slice(&v_page);
 
-            composite.push(values_encoding);
-            composite.push(if values_has_nulls { 1 } else { 0 });
-            varint::encode(&mut composite, values_const.len() as u32);
-            composite.extend_from_slice(values_const);
-            varint::encode(&mut composite, values_blob.len() as u32);
-            composite.extend_from_slice(&values_blob);
+            varint::encode(&mut composite, lc.total_elements as u32);
+            varint::encode(&mut composite, values_content.len() as u32);
+            composite.extend_from_slice(&values_content);
 
+            // Override: use ENCODING_PLAIN so write_paged_bucket includes this slot.
+            // The 2-byte [PLAIN, 0x00] prefix added by write_paged_bucket will be
+            // skipped by parse_list_column_slot on the read side.
+            encodings[col] = ENCODING_PLAIN;
+            has_nulls[col] = false;
+            const_data[col] = Vec::new();
             column_pages[col] = Some(composite);
         }
 

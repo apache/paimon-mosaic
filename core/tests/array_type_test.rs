@@ -15,6 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![allow(
+    clippy::cloned_ref_to_slice_refs,
+    clippy::unnecessary_cast,
+    clippy::field_reassign_with_default
+)]
+
 use std::io;
 use std::sync::Arc;
 
@@ -67,8 +73,15 @@ impl InputFile for ByteArrayInputFile {
 }
 
 fn roundtrip(schema: &Schema, batches: &[RecordBatch]) -> Vec<RecordBatch> {
+    roundtrip_with_options(schema, batches, WriterOptions::default())
+}
+
+fn roundtrip_with_options(
+    schema: &Schema,
+    batches: &[RecordBatch],
+    options: WriterOptions,
+) -> Vec<RecordBatch> {
     let out = MemOutputFile::new();
-    let options = WriterOptions::default();
     let mut writer = MosaicWriter::new(out, schema, options).unwrap();
     for batch in batches {
         writer.write_batch(batch).unwrap();
@@ -444,6 +457,62 @@ fn test_array_large_batch() {
             let expected = array.value(i);
             let actual = result_col.value(i);
             assert_eq!(&expected, &actual, "mismatch at row {}", i);
+        }
+    }
+}
+
+#[test]
+fn test_array_paged_layout() {
+    let element_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("arr", DataType::List(element_field.clone()), true),
+    ]);
+
+    let mut list_builder = ListBuilder::new(Int32Builder::new());
+    let mut ids = Vec::new();
+    for i in 0..200 {
+        ids.push(i as i64);
+        if i % 5 == 0 {
+            list_builder.append(false);
+        } else {
+            let n = (i % 4) + 1;
+            for j in 0..n {
+                if j == 1 && i % 3 == 0 {
+                    list_builder.values().append_null();
+                } else {
+                    list_builder.values().append_value((i * 10 + j) as i32);
+                }
+            }
+            list_builder.append(true);
+        }
+    }
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int64Array::from(ids.clone())),
+            Arc::new(list_builder.finish()),
+        ],
+    )
+    .unwrap();
+
+    let mut opts = WriterOptions::default();
+    opts.page_size_threshold = 1;
+
+    let result = roundtrip_with_options(&schema, &[batch.clone()], opts);
+    let rb = &result[0];
+    assert_eq!(rb.num_rows(), 200);
+
+    let result_ids = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let result_arr = rb.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+
+    for i in 0..200 {
+        assert_eq!(result_ids.value(i), i as i64);
+        if i % 5 == 0 {
+            assert!(result_arr.is_null(i), "row {} should be null", i);
+        } else {
+            assert!(!result_arr.is_null(i), "row {} should not be null", i);
         }
     }
 }

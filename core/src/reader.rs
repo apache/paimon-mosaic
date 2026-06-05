@@ -518,10 +518,12 @@ impl<I: InputFile> MosaicReader<I> {
         element_field: &Arc<Field>,
         num_rows: usize,
     ) -> io::Result<ColumnPageReader> {
-        let mut pos = 0usize;
+        // Skip the 2-byte [encoding, flags] prefix added by write_paged_bucket
+        let mut pos = 2usize;
         let total_elements = varint::decode(&page_content, &mut pos)? as usize;
-        let lengths_page_size = varint::decode(&page_content, &mut pos)? as usize;
 
+        // Lengths: complete page_content with encoding/flags header
+        let lengths_page_size = varint::decode(&page_content, &mut pos)? as usize;
         let lengths_data = page_content[pos..pos + lengths_page_size].to_vec();
         pos += lengths_page_size;
 
@@ -539,55 +541,24 @@ impl<I: InputFile> MosaicReader<I> {
             )?
         };
 
-        let values_encoding = if pos < page_content.len() {
-            page_content[pos]
-        } else {
-            ENCODING_ALL_NULL
-        };
-        pos += 1;
-        let values_has_nulls = if pos < page_content.len() {
-            page_content[pos] != 0
-        } else {
-            false
-        };
-        pos += 1;
-        let values_const_len = if pos < page_content.len() {
-            varint::decode(&page_content, &mut pos)? as usize
-        } else {
-            0
-        };
-        let mut values_const_value = Value::Null;
+        // Values: total_elements + complete page_content with encoding/flags header
+        let values_total = varint::decode(&page_content, &mut pos)? as usize;
+        let values_page_size = varint::decode(&page_content, &mut pos)? as usize;
+        let values_data = page_content[pos..pos + values_page_size].to_vec();
+
         let elem_dt = element_field.data_type();
-        if values_encoding == ENCODING_CONST && values_const_len > 0 {
-            let w = types::fixed_width(elem_dt);
-            if w > 0 {
-                values_const_value = read_typed_value(elem_dt, &page_content, pos, w);
-            } else {
-                let (val, _) = read_variable_value(elem_dt, &page_content, pos)?;
-                values_const_value = val;
-            }
-        }
-        pos += values_const_len;
-
-        let values_page_len = if pos < page_content.len() {
-            varint::decode(&page_content, &mut pos)? as usize
+        let values_reader = if values_page_size > 0 {
+            Self::parse_simple_column_slot(values_data, elem_dt, values_total)?
         } else {
-            0
+            ColumnPageReader::new(
+                elem_dt.clone(),
+                ENCODING_ALL_NULL,
+                false,
+                Value::Null,
+                Vec::new(),
+                values_total,
+            )?
         };
-        let values_data = if values_page_len > 0 {
-            page_content[pos..pos + values_page_len].to_vec()
-        } else {
-            Vec::new()
-        };
-
-        let values_reader = ColumnPageReader::new(
-            elem_dt.clone(),
-            values_encoding,
-            values_has_nulls,
-            values_const_value,
-            values_data,
-            total_elements,
-        )?;
 
         lengths_reader.list_state = Some(ListPageState {
             element_field: element_field.clone(),
