@@ -529,7 +529,14 @@ impl<I: InputFile> MosaicReader<I> {
         let mut lengths_reader = if lengths_page_size > 0 {
             Self::parse_simple_column_slot(lengths_data, &int32_type, num_rows)?
         } else {
-            ColumnPageReader::new(int32_type.clone(), ENCODING_ALL_NULL, false, Value::Null, Vec::new(), num_rows)?
+            ColumnPageReader::new(
+                int32_type.clone(),
+                ENCODING_ALL_NULL,
+                false,
+                Value::Null,
+                Vec::new(),
+                num_rows,
+            )?
         };
 
         let values_encoding = if pos < page_content.len() {

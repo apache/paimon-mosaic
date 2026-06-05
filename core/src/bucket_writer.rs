@@ -167,9 +167,7 @@ impl BucketWriter {
             let list_array = arrays[col]
                 .as_any()
                 .downcast_ref::<ListArray>()
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "expected ListArray")
-                })?;
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected ListArray"))?;
             let lengths = extract_list_lengths(list_array);
             let values = flatten_list_values(list_array);
             list_writes.push((col, lengths, values));
@@ -178,11 +176,9 @@ impl BucketWriter {
         let int32_dt = DataType::Int32;
         for i in 0..self.num_columns {
             if let Some(lw) = list_writes.iter().find(|(col, _, _)| *col == i) {
-                total_size +=
-                    self.append_array_column(i, &lw.1, &int32_dt, start_row)?;
+                total_size += self.append_array_column(i, &lw.1, &int32_dt, start_row)?;
             } else {
-                total_size +=
-                    self.append_array_column(i, arrays[i], data_types[i], start_row)?;
+                total_size += self.append_array_column(i, arrays[i], data_types[i], start_row)?;
             }
         }
 

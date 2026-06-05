@@ -18,8 +18,8 @@
 use std::io;
 use std::sync::Arc;
 
-use arrow_array::*;
 use arrow_array::builder::*;
+use arrow_array::*;
 use arrow_schema::{DataType, Field, Schema};
 use paimon_mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess};
 use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
@@ -424,7 +424,8 @@ fn test_array_large_batch() {
         }
     }
     let array = builder.finish();
-    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array.clone())]).unwrap();
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array.clone())]).unwrap();
 
     let result = roundtrip(&schema, &[batch]);
     let result_col = result[0]
@@ -442,11 +443,7 @@ fn test_array_large_batch() {
             assert!(!result_col.is_null(i), "row {} should not be null", i);
             let expected = array.value(i);
             let actual = result_col.value(i);
-            assert_eq!(
-                &expected, &actual,
-                "mismatch at row {}",
-                i
-            );
+            assert_eq!(&expected, &actual, "mismatch at row {}", i);
         }
     }
 }

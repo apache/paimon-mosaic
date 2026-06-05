@@ -706,9 +706,10 @@ impl BucketReader {
             }
             let values = if lr.sub_reader.num_rows > 0 {
                 let sub_cols = lr.sub_reader.read_all_columns()?;
-                sub_cols.into_iter().next().unwrap_or_else(|| {
-                    arrow_array::new_null_array(lr.element_field.data_type(), 0)
-                })
+                sub_cols
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| arrow_array::new_null_array(lr.element_field.data_type(), 0))
             } else {
                 arrow_array::new_null_array(lr.element_field.data_type(), 0)
             };
