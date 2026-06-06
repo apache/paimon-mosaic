@@ -629,8 +629,12 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                         .collect();
                     let (bucket_phys, bucket_children) =
                         crate::bucket_writer::expand_col_types(&bucket_col_refs);
-                    // Fixed-size header: u16(num_children) + u32(elem) * num_children
-                    let dir_size = 2 + bucket_children.len() * 4 + bucket_phys.len() * 4;
+                    let child_header_len = if bucket_children.is_empty() {
+                        0
+                    } else {
+                        2 + bucket_children.len() * 4
+                    };
+                    let dir_size = child_header_len + bucket_phys.len() * 4;
                     if dir_size > total_size {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -715,28 +719,33 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                         crate::bucket_writer::expand_col_types(&col_type_refs);
                     let num_columns = phys_types.len();
 
-                    // Parse fixed-size child header: u16(num_children) + u32(elem_count) * num_children
-                    if buf.len() < 2 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "paged bucket: too short for child header",
-                        ));
-                    }
-                    let nc = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-                    let hdr_len = 2 + nc * 4;
-                    if buf.len() < hdr_len {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "paged bucket: truncated child header",
-                        ));
-                    }
-                    let mut child_element_counts = Vec::with_capacity(nc);
-                    for ci in 0..nc {
-                        let off = 2 + ci * 4;
-                        child_element_counts.push(u32::from_le_bytes(
-                            buf[off..off + 4].try_into().unwrap(),
-                        ) as usize);
-                    }
+                    // Parse fixed-size child header (only when ARRAY columns exist)
+                    let (hdr_len, child_element_counts) = if bucket_children.is_empty() {
+                        (0, Vec::new())
+                    } else {
+                        if buf.len() < 2 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "paged bucket: too short for child header",
+                            ));
+                        }
+                        let nc = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+                        let hl = 2 + nc * 4;
+                        if buf.len() < hl {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "paged bucket: truncated child header",
+                            ));
+                        }
+                        let mut counts = Vec::with_capacity(nc);
+                        for ci in 0..nc {
+                            let off = 2 + ci * 4;
+                            counts
+                                .push(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+                                    as usize);
+                        }
+                        (hl, counts)
+                    };
 
                     // Parse directory (after header)
                     if buf.len() < hdr_len + num_columns * 4 {

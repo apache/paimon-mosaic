@@ -505,13 +505,16 @@ impl BucketReader {
 
         let mut pos = 0;
 
-        // Header: num_primary + num_children + child element counts
-        let _num_primary = varint::decode(&self.data, &mut pos)? as usize;
-        let num_children = varint::decode(&self.data, &mut pos)? as usize;
-        self.child_num_rows = Vec::with_capacity(num_children);
-        for _ in 0..num_children {
-            self.child_num_rows
-                .push(varint::decode(&self.data, &mut pos)? as usize);
+        // Header: only present when ARRAY columns exist (backward compatible with v1)
+        let has_children = !self.children.is_empty();
+        if has_children {
+            let _num_primary = varint::decode(&self.data, &mut pos)? as usize;
+            let num_children = varint::decode(&self.data, &mut pos)? as usize;
+            self.child_num_rows = Vec::with_capacity(num_children);
+            for _ in 0..num_children {
+                self.child_num_rows
+                    .push(varint::decode(&self.data, &mut pos)? as usize);
+            }
         }
 
         // 1. Encoding flags (2 bits per column)

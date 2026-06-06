@@ -507,11 +507,13 @@ impl BucketWriter {
 
         let mut out = Vec::new();
 
-        // Header: num_primary + num_children + child element counts
-        varint::encode(&mut out, self.num_primary as u32);
-        varint::encode(&mut out, self.children.len() as u32);
-        for child in &self.children {
-            varint::encode(&mut out, child.num_elements as u32);
+        // Header: only written when ARRAY columns exist (backward compatible with v1)
+        if !self.children.is_empty() {
+            varint::encode(&mut out, self.num_primary as u32);
+            varint::encode(&mut out, self.children.len() as u32);
+            for child in &self.children {
+                varint::encode(&mut out, child.num_elements as u32);
+            }
         }
 
         // Encoding flags: 2 bits per column
@@ -767,10 +769,13 @@ impl BucketWriter {
 
     fn compute_out_size(&self, encodings: &[u8], has_nulls: &[bool]) -> usize {
         // Header: varint(num_primary) + varint(num_children) + varint per child
-        let mut size = varint::encoded_size(self.num_primary as u32)
-            + varint::encoded_size(self.children.len() as u32);
-        for child in &self.children {
-            size += varint::encoded_size(child.num_elements as u32);
+        let mut size = 0;
+        if !self.children.is_empty() {
+            size += varint::encoded_size(self.num_primary as u32)
+                + varint::encoded_size(self.children.len() as u32);
+            for child in &self.children {
+                size += varint::encoded_size(child.num_elements as u32);
+            }
         }
 
         size += (self.total_columns * 2).div_ceil(8) + self.total_columns.div_ceil(8);
@@ -1361,14 +1366,9 @@ fn write_fixed_key_to_vec(buf: &mut Vec<u8>, key: u64, width: i32) {
 mod tests {
     use super::*;
 
-    fn header_size(data: &[u8]) -> usize {
-        let mut pos = 0;
-        let _np = varint::decode(data, &mut pos).unwrap();
-        let nc = varint::decode(data, &mut pos).unwrap();
-        for _ in 0..nc {
-            let _ = varint::decode(data, &mut pos).unwrap();
-        }
-        pos
+    fn header_size(_data: &[u8]) -> usize {
+        // No header for non-ARRAY buckets (v1 compatible)
+        0
     }
 
     #[test]

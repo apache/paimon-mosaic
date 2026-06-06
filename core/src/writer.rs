@@ -462,13 +462,17 @@ impl<S: OutputFile> MosaicWriter<S> {
             column_slots.push(slot);
         }
 
-        // Write child element counts header (fixed-size for deterministic directory offset)
-        let num_children = paged.children.len() as u16;
-        self.out.write(&num_children.to_le_bytes())?;
-        for child in &paged.children {
-            self.out.write(&(child.num_elements as u32).to_le_bytes())?;
-        }
-        let child_header_len = 2 + paged.children.len() * 4;
+        // Write child element counts header only when ARRAY columns exist
+        let child_header_len = if paged.children.is_empty() {
+            0
+        } else {
+            let num_children = paged.children.len() as u16;
+            self.out.write(&num_children.to_le_bytes())?;
+            for child in &paged.children {
+                self.out.write(&(child.num_elements as u32).to_le_bytes())?;
+            }
+            2 + paged.children.len() * 4
+        };
 
         // Write fixed-length directory: num_columns * 4 bytes (u32 LE per column = slot size)
         let dir_size = child_header_len + num_columns * 4;
