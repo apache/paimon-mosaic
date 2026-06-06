@@ -342,9 +342,87 @@ fn build_array(
     })
 }
 
+pub fn reassemble_list_columns_pub(
+    arrays: &mut [ArrayRef],
+    children: &[ChildColumnMeta],
+    logical_type_refs: &[&DataType],
+    num_primary: usize,
+    num_rows: usize,
+) {
+    let logical_types: Vec<DataType> = logical_type_refs.iter().map(|t| (*t).clone()).collect();
+    reassemble_list_columns(arrays, children, &logical_types, num_primary, num_rows);
+}
+
+fn reassemble_list_columns(
+    arrays: &mut [ArrayRef],
+    children: &[ChildColumnMeta],
+    logical_types: &[DataType],
+    _num_primary: usize,
+    num_rows: usize,
+) {
+    for child in children.iter().rev() {
+        let phys_idx = child.physical_index;
+        let parent = child.parent_logical_col;
+        let values = arrays[phys_idx].clone();
+
+        // Find the lengths column for this child:
+        // - If the previous physical column (phys_idx - 1) is a child with the same parent,
+        //   this is a nested child and lengths are at phys_idx - 1.
+        // - Otherwise, this is a first-level child and lengths are at the parent primary column.
+        let is_nested = children
+            .iter()
+            .any(|c| c.physical_index == phys_idx - 1 && c.parent_logical_col == parent);
+        let lengths_idx = if is_nested { phys_idx - 1 } else { parent };
+
+        let lengths = arrays[lengths_idx].clone();
+        let lengths_rows = lengths.len();
+
+        let element_field = child.element_field.clone();
+        let reassembled = reassemble_list_array(lengths, values, element_field, lengths_rows);
+        arrays[lengths_idx] = reassembled;
+    }
+
+    // Handle ALL_NULL list columns (where no children were created because all null)
+    for (i, lt) in logical_types.iter().enumerate() {
+        if matches!(lt, DataType::List(_)) && !children.iter().any(|c| c.parent_logical_col == i) {
+            arrays[i] = arrow_array::new_null_array(lt, num_rows);
+        }
+    }
+}
+
+fn reassemble_list_array(
+    lengths: ArrayRef,
+    values: ArrayRef,
+    element_field: Arc<Field>,
+    num_rows: usize,
+) -> ArrayRef {
+    let lengths_arr = lengths
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("list lengths must be Int32Array");
+
+    let mut offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+    offsets.push(0);
+    for i in 0..num_rows {
+        let len = if lengths_arr.is_null(i) {
+            0
+        } else {
+            lengths_arr.value(i)
+        };
+        offsets.push(offsets.last().unwrap() + len);
+    }
+
+    let null_buf = lengths_arr.nulls().cloned();
+    let offset_buf = OffsetBuffer::new(ScalarBuffer::from(offsets));
+    Arc::new(ListArray::new(element_field, offset_buf, values, null_buf))
+}
+
+use crate::bucket_writer::{expand_col_types, ChildColumnMeta};
+
 pub struct BucketReader {
     data: Vec<u8>,
-    num_columns: usize,
+    num_primary: usize,
+    total_columns: usize,
     num_rows: usize,
     col_types: Vec<DataType>,
 
@@ -355,23 +433,49 @@ pub struct BucketReader {
     dict_values: Vec<Vec<Value>>,
     dict_bit_widths: Vec<usize>,
     data_cursors: Vec<usize>,
+
+    logical_types: Vec<DataType>,
+    children: Vec<ChildColumnMeta>,
+    child_num_rows: Vec<usize>,
 }
 
 impl BucketReader {
+    fn col_num_rows(&self, col: usize) -> usize {
+        if col < self.num_primary {
+            self.num_rows
+        } else {
+            let child_idx = col - self.num_primary;
+            if child_idx < self.child_num_rows.len() {
+                self.child_num_rows[child_idx]
+            } else {
+                0
+            }
+        }
+    }
+
     pub fn new(col_types: Vec<DataType>, data: Vec<u8>, num_rows: usize) -> io::Result<Self> {
-        let num_columns = col_types.len();
+        let logical_types = col_types.clone();
+        let num_primary = col_types.len();
+        let col_refs: Vec<&DataType> = col_types.iter().collect();
+        let (physical_types, children) = expand_col_types(&col_refs);
+        let total_columns = physical_types.len();
+
         let mut reader = BucketReader {
             data,
-            num_columns,
+            num_primary,
+            total_columns,
             num_rows,
-            col_types,
-            encodings: vec![0; num_columns],
-            has_nulls: vec![false; num_columns],
+            col_types: physical_types,
+            encodings: vec![0; total_columns],
+            has_nulls: vec![false; total_columns],
             null_bitmaps: Vec::new(),
             const_values: Vec::new(),
             dict_values: Vec::new(),
-            dict_bit_widths: vec![0; num_columns],
-            data_cursors: vec![0; num_columns],
+            dict_bit_widths: vec![0; total_columns],
+            data_cursors: vec![0; total_columns],
+            logical_types,
+            children,
+            child_num_rows: Vec::new(),
         };
         reader.init()?;
         Ok(reader)
@@ -391,16 +495,32 @@ impl BucketReader {
     }
 
     fn init(&mut self) -> io::Result<()> {
-        self.null_bitmaps = vec![Vec::new(); self.num_columns];
-        self.const_values = vec![Value::Null; self.num_columns];
-        self.dict_values = vec![Vec::new(); self.num_columns];
+        self.null_bitmaps = vec![Vec::new(); self.total_columns];
+        self.const_values = vec![Value::Null; self.total_columns];
+        self.dict_values = vec![Vec::new(); self.total_columns];
+
+        if self.num_rows == 0 || self.data.is_empty() {
+            return Ok(());
+        }
 
         let mut pos = 0;
 
+        // Header: only present when ARRAY columns exist (backward compatible with v1)
+        let has_children = !self.children.is_empty();
+        if has_children {
+            let _num_primary = varint::decode(&self.data, &mut pos)? as usize;
+            let num_children = varint::decode(&self.data, &mut pos)? as usize;
+            self.child_num_rows = Vec::with_capacity(num_children);
+            for _ in 0..num_children {
+                self.child_num_rows
+                    .push(varint::decode(&self.data, &mut pos)? as usize);
+            }
+        }
+
         // 1. Encoding flags (2 bits per column)
-        let encoding_flags_bytes = (self.num_columns * 2).div_ceil(8);
+        let encoding_flags_bytes = (self.total_columns * 2).div_ceil(8);
         self.check_bounds(pos, encoding_flags_bytes)?;
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
             let byte_idx = (i * 2) / 8;
             let bit_idx = (i * 2) % 8;
             self.encodings[i] = (self.data[pos + byte_idx] >> bit_idx) & 0x03;
@@ -408,15 +528,15 @@ impl BucketReader {
         pos += encoding_flags_bytes;
 
         // 2. Has-nulls flags (1 bit per column)
-        let has_nulls_bytes = self.num_columns.div_ceil(8);
+        let has_nulls_bytes = self.total_columns.div_ceil(8);
         self.check_bounds(pos, has_nulls_bytes)?;
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
             self.has_nulls[i] = (self.data[pos + i / 8] & (1 << (i % 8))) != 0;
         }
         pos += has_nulls_bytes;
 
         // 3. CONST metadata
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
             if self.encodings[i] == ENCODING_CONST {
                 let (value, size) = self.read_value_at(&self.col_types[i], pos)?;
                 self.const_values[i] = value;
@@ -425,7 +545,7 @@ impl BucketReader {
         }
 
         // 4. DICT metadata
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
             if self.encodings[i] == ENCODING_DICT {
                 let num_entries = varint::decode(&self.data, &mut pos)? as usize;
                 self.dict_bit_widths[i] = bit_width(num_entries);
@@ -439,10 +559,10 @@ impl BucketReader {
             }
         }
 
-        // 5. Null bitmaps
-        let null_bitmap_bytes = self.num_rows.div_ceil(8);
-        for i in 0..self.num_columns {
+        // 5. Null bitmaps (per-column row count)
+        for i in 0..self.total_columns {
             if self.has_nulls[i] && self.encodings[i] != ENCODING_ALL_NULL {
+                let null_bitmap_bytes = self.col_num_rows(i).div_ceil(8);
                 self.check_bounds(pos, null_bitmap_bytes)?;
                 self.null_bitmaps[i] = self.data[pos..pos + null_bitmap_bytes].to_vec();
                 pos += null_bitmap_bytes;
@@ -450,7 +570,7 @@ impl BucketReader {
         }
 
         // 6. Record column data start offsets, skip past data
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
             self.data_cursors[i] = pos;
             if self.encodings[i] == ENCODING_PLAIN {
                 let w = types::fixed_width(&self.col_types[i]);
@@ -487,35 +607,37 @@ impl BucketReader {
     }
 
     fn count_non_null(&self, col: usize) -> usize {
+        let col_rows = self.col_num_rows(col);
         if !self.has_nulls[col] {
-            return self.num_rows;
+            return col_rows;
         }
         if self.encodings[col] == ENCODING_ALL_NULL {
             return 0;
         }
         let bitmap = &self.null_bitmaps[col];
-        let full_bytes = self.num_rows / 8;
+        let full_bytes = col_rows / 8;
         let mut null_count = 0usize;
         for byte in bitmap.iter().take(full_bytes) {
             null_count += (*byte as u32).count_ones() as usize;
         }
-        let remaining = self.num_rows % 8;
+        let remaining = col_rows % 8;
         if remaining > 0 {
             let mask = (1u8 << remaining) - 1;
             null_count += (bitmap[full_bytes] & mask).count_ones() as usize;
         }
-        self.num_rows - null_count
+        col_rows - null_count
     }
 
     pub fn read_all_columns(&self) -> io::Result<Vec<ArrayRef>> {
-        let num_rows = self.num_rows;
-        let mut result = Vec::with_capacity(self.num_columns);
+        // Read all N+C physical columns
+        let mut all_arrays: Vec<ArrayRef> = Vec::with_capacity(self.total_columns);
 
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
+            let col_rows = self.col_num_rows(i);
             let variant = data_variant_for_type(&self.col_types[i]);
 
             if self.encodings[i] == ENCODING_ALL_NULL {
-                result.push(build_all_null_array(&self.col_types[i], num_rows));
+                all_arrays.push(build_all_null_array(&self.col_types[i], col_rows));
                 continue;
             }
 
@@ -529,7 +651,7 @@ impl BucketReader {
             let data = match self.encodings[i] {
                 ENCODING_CONST => read_all_const(
                     &self.const_values[i],
-                    num_rows,
+                    col_rows,
                     has_nulls,
                     &self.null_bitmaps[i],
                     variant,
@@ -539,7 +661,7 @@ impl BucketReader {
                     self.data_cursors[i],
                     &self.dict_values[i],
                     self.dict_bit_widths[i],
-                    num_rows,
+                    col_rows,
                     has_nulls,
                     &self.null_bitmaps[i],
                     variant,
@@ -548,7 +670,7 @@ impl BucketReader {
                     &self.data,
                     self.data_cursors[i],
                     &self.col_types[i],
-                    num_rows,
+                    col_rows,
                     has_nulls,
                     &self.null_bitmaps[i],
                     variant,
@@ -556,20 +678,29 @@ impl BucketReader {
                 _ => empty_raw_data_for_type(&self.col_types[i]),
             };
 
-            result.push(build_array(
+            all_arrays.push(build_array(
                 data,
                 &self.col_types[i],
                 null_bitmap,
-                num_rows,
+                col_rows,
             )?);
         }
 
-        Ok(result)
+        reassemble_list_columns(
+            &mut all_arrays,
+            &self.children,
+            &self.logical_types,
+            self.num_primary,
+            self.num_rows,
+        );
+
+        // Return only the primary (logical) columns
+        Ok(all_arrays.into_iter().take(self.num_primary).collect())
     }
 }
 
 pub struct ColumnPageReader {
-    col_type: DataType,
+    pub(crate) col_type: DataType,
     encoding: u8,
     has_nulls: bool,
     const_value: Value,

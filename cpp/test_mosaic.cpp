@@ -824,6 +824,187 @@ static void test_stats_empty_string_min() {
     printf("  PASS test_stats_empty_string_min\n");
 }
 
+static void test_array_type() {
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::int32(), false),
+        arrow::field("tags", arrow::list(arrow::field("item", arrow::int32()))),
+    });
+
+    arrow::Int32Builder id_b;
+    assert(id_b.Append(1).ok());
+    assert(id_b.Append(2).ok());
+    assert(id_b.Append(3).ok());
+    assert(id_b.Append(4).ok());
+
+    auto val_builder = std::make_shared<arrow::Int32Builder>();
+    arrow::ListBuilder list_b(arrow::default_memory_pool(), val_builder);
+
+    // Row 0: [10, 20, 30]
+    assert(list_b.Append().ok());
+    assert(val_builder->Append(10).ok());
+    assert(val_builder->Append(20).ok());
+    assert(val_builder->Append(30).ok());
+
+    // Row 1: [40, 50]
+    assert(list_b.Append().ok());
+    assert(val_builder->Append(40).ok());
+    assert(val_builder->Append(50).ok());
+
+    // Row 2: []
+    assert(list_b.Append().ok());
+
+    // Row 3: null
+    assert(list_b.AppendNull().ok());
+
+    auto batch = arrow::RecordBatch::Make(schema, 4, {
+        id_b.Finish().ValueUnsafe(),
+        list_b.Finish().ValueUnsafe(),
+    });
+
+    auto data_vec = write_and_get(schema, batch);
+
+    MemBuffer buf;
+    buf.data = data_vec;
+    auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
+    auto rb = read_row_group(reader, 0);
+    ASSERT_EQ(rb->num_rows(), 4);
+
+    auto ids = std::static_pointer_cast<arrow::Int32Array>(rb->GetColumnByName("id"));
+    ASSERT_EQ(ids->Value(0), 1);
+    ASSERT_EQ(ids->Value(1), 2);
+    ASSERT_EQ(ids->Value(2), 3);
+    ASSERT_EQ(ids->Value(3), 4);
+
+    auto tags = std::static_pointer_cast<arrow::ListArray>(rb->GetColumnByName("tags"));
+    ASSERT_TRUE(!tags->IsNull(0));
+    ASSERT_TRUE(!tags->IsNull(1));
+    ASSERT_TRUE(!tags->IsNull(2));
+    ASSERT_TRUE(tags->IsNull(3));
+
+    // Row 0: [10, 20, 30]
+    auto row0 = std::static_pointer_cast<arrow::Int32Array>(tags->value_slice(0));
+    ASSERT_EQ(row0->length(), 3);
+    ASSERT_EQ(row0->Value(0), 10);
+    ASSERT_EQ(row0->Value(1), 20);
+    ASSERT_EQ(row0->Value(2), 30);
+
+    // Row 1: [40, 50]
+    auto row1 = std::static_pointer_cast<arrow::Int32Array>(tags->value_slice(1));
+    ASSERT_EQ(row1->length(), 2);
+    ASSERT_EQ(row1->Value(0), 40);
+    ASSERT_EQ(row1->Value(1), 50);
+
+    // Row 2: []
+    auto row2 = std::static_pointer_cast<arrow::Int32Array>(tags->value_slice(2));
+    ASSERT_EQ(row2->length(), 0);
+
+    printf("  PASS test_array_type\n");
+}
+
+static void test_array_with_null_elements() {
+    auto schema = arrow::schema({
+        arrow::field("arr", arrow::list(arrow::field("item", arrow::int64()))),
+    });
+
+    auto val_builder = std::make_shared<arrow::Int64Builder>();
+    arrow::ListBuilder list_b(arrow::default_memory_pool(), val_builder);
+
+    // [100, null, 300]
+    assert(list_b.Append().ok());
+    assert(val_builder->Append(100).ok());
+    assert(val_builder->AppendNull().ok());
+    assert(val_builder->Append(300).ok());
+
+    // [null, null]
+    assert(list_b.Append().ok());
+    assert(val_builder->AppendNull().ok());
+    assert(val_builder->AppendNull().ok());
+
+    // [999]
+    assert(list_b.Append().ok());
+    assert(val_builder->Append(999).ok());
+
+    auto batch = arrow::RecordBatch::Make(schema, 3, {
+        list_b.Finish().ValueUnsafe(),
+    });
+
+    auto data_vec = write_and_get(schema, batch);
+
+    MemBuffer buf;
+    buf.data = data_vec;
+    auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
+    auto rb = read_row_group(reader, 0);
+
+    auto arr = std::static_pointer_cast<arrow::ListArray>(rb->column(0));
+
+    auto row0 = std::static_pointer_cast<arrow::Int64Array>(arr->value_slice(0));
+    ASSERT_EQ(row0->length(), 3);
+    ASSERT_EQ(row0->Value(0), 100);
+    ASSERT_TRUE(row0->IsNull(1));
+    ASSERT_EQ(row0->Value(2), 300);
+
+    auto row1 = std::static_pointer_cast<arrow::Int64Array>(arr->value_slice(1));
+    ASSERT_EQ(row1->length(), 2);
+    ASSERT_TRUE(row1->IsNull(0));
+    ASSERT_TRUE(row1->IsNull(1));
+
+    auto row2 = std::static_pointer_cast<arrow::Int64Array>(arr->value_slice(2));
+    ASSERT_EQ(row2->length(), 1);
+    ASSERT_EQ(row2->Value(0), 999);
+
+    printf("  PASS test_array_with_null_elements\n");
+}
+
+static void test_array_string_elements() {
+    auto schema = arrow::schema({
+        arrow::field("arr", arrow::list(arrow::field("item", arrow::utf8()))),
+    });
+
+    auto val_builder = std::make_shared<arrow::StringBuilder>();
+    arrow::ListBuilder list_b(arrow::default_memory_pool(), val_builder);
+
+    // ["hello", "world"]
+    assert(list_b.Append().ok());
+    assert(val_builder->Append("hello").ok());
+    assert(val_builder->Append("world").ok());
+
+    // [null, "foo"]
+    assert(list_b.Append().ok());
+    assert(val_builder->AppendNull().ok());
+    assert(val_builder->Append("foo").ok());
+
+    // []
+    assert(list_b.Append().ok());
+
+    auto batch = arrow::RecordBatch::Make(schema, 3, {
+        list_b.Finish().ValueUnsafe(),
+    });
+
+    auto data_vec = write_and_get(schema, batch);
+
+    MemBuffer buf;
+    buf.data = data_vec;
+    auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
+    auto rb = read_row_group(reader, 0);
+
+    auto arr = std::static_pointer_cast<arrow::ListArray>(rb->column(0));
+
+    auto row0 = std::static_pointer_cast<arrow::StringArray>(arr->value_slice(0));
+    ASSERT_EQ(row0->length(), 2);
+    ASSERT_EQ(row0->GetString(0), "hello");
+    ASSERT_EQ(row0->GetString(1), "world");
+
+    auto row1 = std::static_pointer_cast<arrow::StringArray>(arr->value_slice(1));
+    ASSERT_EQ(row1->length(), 2);
+    ASSERT_TRUE(row1->IsNull(0));
+    ASSERT_EQ(row1->GetString(1), "foo");
+
+    auto row2 = std::static_pointer_cast<arrow::StringArray>(arr->value_slice(2));
+    ASSERT_EQ(row2->length(), 0);
+
+    printf("  PASS test_array_string_elements\n");
+}
+
 int main() {
     printf("Running Mosaic C++ tests...\n");
     test_basic_roundtrip();
@@ -841,6 +1022,9 @@ int main() {
     test_writer_stats_all_null();
     test_writer_stats_matches_reader();
     test_stats_empty_string_min();
-    printf("All %d tests passed.\n", 15);
+    test_array_type();
+    test_array_with_null_elements();
+    test_array_string_elements();
+    printf("All %d tests passed.\n", 18);
     return 0;
 }

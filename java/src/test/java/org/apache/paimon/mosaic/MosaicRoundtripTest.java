@@ -39,10 +39,13 @@ import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.impl.UnionListWriter;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import org.junit.After;
@@ -1139,6 +1142,94 @@ public class MosaicRoundtripTest {
         try (MosaicReader reader = readerFromBytes(data)) {
             assertEquals(1, reader.numRowGroups());
             assertEquals(10, reader.rowGroupNumRows(0));
+        }
+    }
+
+    @Test
+    public void testArrayType() {
+        Field elementField = new Field("item", FieldType.nullable(new ArrowType.Int(32, true)), null);
+        Field listField = new Field("tags", FieldType.nullable(ArrowType.List.INSTANCE), Arrays.asList(elementField));
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.nullable("id", new ArrowType.Int(32, true)),
+                listField
+        ));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            ListVector tags = (ListVector) root.getVector("tags");
+
+            ids.allocateNew(4);
+            tags.allocateNew();
+
+            UnionListWriter listWriter = tags.getWriter();
+
+            // Row 0: [10, 20, 30]
+            ids.set(0, 1);
+            listWriter.setPosition(0);
+            listWriter.startList();
+            listWriter.writeInt(10);
+            listWriter.writeInt(20);
+            listWriter.writeInt(30);
+            listWriter.endList();
+
+            // Row 1: [40, 50]
+            ids.set(1, 2);
+            listWriter.setPosition(1);
+            listWriter.startList();
+            listWriter.writeInt(40);
+            listWriter.writeInt(50);
+            listWriter.endList();
+
+            // Row 2: [] (empty array)
+            ids.set(2, 3);
+            listWriter.setPosition(2);
+            listWriter.startList();
+            listWriter.endList();
+
+            // Row 3: null
+            ids.set(3, 4);
+            tags.setNull(3);
+
+            root.setRowCount(4);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            try (VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+                assertEquals(4, batch.getRowCount());
+
+                IntVector readIds = (IntVector) batch.getVector("id");
+                ListVector readTags = (ListVector) batch.getVector("tags");
+
+                assertEquals(1, readIds.get(0));
+                assertEquals(2, readIds.get(1));
+                assertEquals(3, readIds.get(2));
+                assertEquals(4, readIds.get(3));
+
+                // Row 0: [10, 20, 30]
+                assertFalse(readTags.isNull(0));
+                java.util.List<?> row0 = readTags.getObject(0);
+                assertEquals(3, row0.size());
+                assertEquals(10, row0.get(0));
+                assertEquals(20, row0.get(1));
+                assertEquals(30, row0.get(2));
+
+                // Row 1: [40, 50]
+                assertFalse(readTags.isNull(1));
+                java.util.List<?> row1 = readTags.getObject(1);
+                assertEquals(2, row1.size());
+                assertEquals(40, row1.get(0));
+                assertEquals(50, row1.get(1));
+
+                // Row 2: []
+                assertFalse(readTags.isNull(2));
+                java.util.List<?> row2 = readTags.getObject(2);
+                assertEquals(0, row2.size());
+
+                // Row 3: null
+                assertTrue(readTags.isNull(3));
+            }
         }
     }
 }

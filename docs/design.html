@@ -739,9 +739,10 @@ repeated numColumns times:
                     <tr><td>15</td><td>TIME</td><td>varint precision</td></tr>
                     <tr><td>16</td><td>TIMESTAMP</td><td>varint precision</td></tr>
                     <tr><td>17</td><td>TIMESTAMP_LTZ</td><td>varint precision, varint timezoneLength, bytes timezone</td></tr>
+                    <tr><td>18</td><td>ARRAY</td><td>varint nameLength, bytes name (element field name), TypeDescriptor (recursive element type)</td></tr>
                 </tbody>
             </table>
-            <p>Complex types (ARRAY, MAP, ROW, etc.), VARIANT, and BLOB are not supported.</p>
+            <p>MAP, ROW, VARIANT, and BLOB are not yet supported.</p>
 
             <!-- ============================================================ -->
             <h2>Value Serialization</h2>
@@ -765,6 +766,7 @@ repeated numColumns times:
                     <tr><td>TIMESTAMP (precision &gt; 6)</td><td>8 bytes (epoch millis) + 4 bytes (nanos of millis)</td></tr>
                     <tr><td>CHAR / VARCHAR / STRING</td><td>varint length + UTF-8 bytes</td></tr>
                     <tr><td>BINARY / VARBINARY / BYTES</td><td>varint length + raw bytes</td></tr>
+                    <tr><td>ARRAY</td><td>Flattened columnar: lengths (INT32) + values column (see ARRAY Type Storage below)</td></tr>
                 </tbody>
             </table>
             <p>
@@ -775,6 +777,159 @@ repeated numColumns times:
                 Existing 12-byte timestamp values outside Arrow's signed 64-bit epoch-nanosecond
                 range cannot be represented through this Arrow API; readers return InvalidData for
                 those values, and legacy Struct timestamp writes reject them before writing.
+            </p>
+
+            <!-- ============================================================ -->
+            <h2>ARRAY Type Storage</h2>
+            <p>
+                ARRAY columns use a <strong>flattened columnar</strong> storage layout.
+                Each ARRAY column is decomposed into physical columns within the same bucket &mdash;
+                a lengths column and a values column &mdash; both first-class columns that benefit from
+                standard column encoding (DICT, CONST, PLAIN).
+            </p>
+
+            <h3>Decomposition</h3>
+            <p>An <code>ARRAY&lt;T&gt;</code> column with N rows is stored as:</p>
+            <ol>
+                <li><strong>Lengths column</strong> (INT32, N entries): the number of elements in each array.
+                    Null arrays are represented by a null in the lengths column (contributing 0 elements).
+                    Empty arrays (<code>[]</code>) have length 0 and are non-null.</li>
+                <li><strong>Values column</strong> (type T, M entries): all elements from all rows flattened
+                    into a single contiguous column, where M = sum of all non-null lengths.
+                    Element-level nulls are tracked by this column&rsquo;s own null bitmap.</li>
+            </ol>
+            <p>
+                Both columns independently go through the standard encoding selection (DICT, CONST, PLAIN, ALL_NULL),
+                enabling dictionary compression of element values across all arrays in the column.
+            </p>
+
+            <h4>Example</h4>
+<pre><code>Input rows:  [1, 2, 3],  null,  [1, 2],  []
+
+Lengths column (INT32):    3, null, 2, 0    &larr; standard INT32 encoding (DICT/CONST/PLAIN)
+Values column  (INT32):    1, 2, 3, 1, 2    &larr; standard INT32 encoding (DICT: {1&rarr;0, 2&rarr;1, 3&rarr;2})</code></pre>
+
+            <h4>Nested Arrays</h4>
+            <p>
+                <code>ARRAY&lt;ARRAY&lt;INT&gt;&gt;</code> is stored recursively. The outer values column
+                is itself an <code>ARRAY&lt;INT&gt;</code>, which decomposes into its own lengths + values pair.
+                All leaf INT values across all nesting levels end up in a single INT32 column,
+                sharing one dictionary across the entire column.
+            </p>
+<pre><code>ARRAY&lt;ARRAY&lt;INT&gt;&gt; with rows:  [[1,2], [3]],  [[1,2]]
+
+Outer lengths (INT32):   2, 1                         &larr; 2 inner arrays, 1 inner array
+Inner lengths (INT32):   2, 1, 2                      &larr; element counts of inner arrays
+Leaf values   (INT32):   1, 2, 3, 1, 2                &larr; all INTs in one column, shared DICT</code></pre>
+
+            <h3>Bucket Internal Format</h3>
+            <p>
+                ARRAY columns are expanded into <strong>physical columns</strong> within the same bucket.
+                An <code>ARRAY&lt;T&gt;</code> becomes two physical columns: a lengths column (INT32)
+                and a values column (type T). Both are first-class columns in the bucket &mdash;
+                they share the same encoding flags, null bitmaps, and column data sections
+                as all other columns. There is no sub-bucket or nested container.
+            </p>
+
+            <h4>Monolithic Bucket with ARRAY Columns</h4>
+<pre><code>varint   numPrimary             (number of logical/primary columns = N)
+varint   numChildren            (number of child value columns = C; 0 if no ARRAY)
+repeated C times:
+    varint  childElementCount   (total element count for each child column)
+
+[encoding flags: 2 bits &times; (N + C) columns]
+[has-nulls flags: 1 bit &times; (N + C) columns]
+[CONST metadata for all N + C columns]
+[DICT metadata for all N + C columns]
+[null bitmaps: primary columns use ceil(numRows/8), child columns use ceil(childElementCount/8)]
+[column data for all N + C columns]</code></pre>
+
+            <h4>Paged Bucket with ARRAY Columns</h4>
+            <p>
+                The page directory includes entries for all N + C physical columns.
+                Each column (including child value columns) has its own independently compressed slot.
+                A fixed-size child header precedes the directory:
+            </p>
+<pre><code>u16     numChildren (LE)
+repeated numChildren times:
+    u32  childElementCount (LE)
+[directory: (N + C) &times; u32 LE slot sizes]
+[column slots: each independently compressed, including child columns]</code></pre>
+
+            <h3>Statistics</h3>
+            <p>ARRAY columns do not support min/max statistics (no meaningful ordering).</p>
+
+            <h3>Design Rationale: Comparison with Parquet and ORC</h3>
+            <p>
+                There are two mainstream approaches to storing nested ARRAY types in columnar formats.
+                Mosaic follows the <strong>ORC-style</strong> approach (lengths + child columns)
+                rather than the <strong>Parquet/Dremel-style</strong> approach (repetition/definition levels).
+            </p>
+
+            <h4>Mosaic vs ORC</h4>
+            <p>
+                Both Mosaic and ORC decompose <code>ARRAY&lt;T&gt;</code> into a lengths stream and a
+                child column. The key differences:
+            </p>
+            <table>
+                <thead>
+                    <tr><th>Aspect</th><th>Mosaic</th><th>ORC</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Lengths encoding</td>
+                        <td>DICT / CONST / PLAIN &mdash; all-same-length arrays use CONST (near zero bytes)</td>
+                        <td>Run-Length Encoding (RLE v1/v2)</td>
+                    </tr>
+                    <tr>
+                        <td>Child column encoding</td>
+                        <td>DICT / CONST / PLAIN &mdash; shared dictionary across all arrays</td>
+                        <td>DICT / DIRECT / RLE &mdash; same cross-array sharing</td>
+                    </tr>
+                    <tr>
+                        <td>Column placement</td>
+                        <td>Lengths and values are physical columns within the same bucket</td>
+                        <td>Lengths and values are independent streams within the same stripe</td>
+                    </tr>
+                    <tr>
+                        <td>Null representation</td>
+                        <td>Lengths column null bitmap (shared infrastructure)</td>
+                        <td>Separate PRESENT stream (Boolean RLE)</td>
+                    </tr>
+                </tbody>
+            </table>
+            <p>
+                The designs are structurally equivalent. Mosaic&rsquo;s CONST encoding for lengths
+                can be more compact than ORC&rsquo;s RLE when all arrays have the same length
+                (a common case in feature vectors and fixed-size embeddings).
+            </p>
+
+            <h4>Why Not Parquet&rsquo;s Repetition/Definition Levels?</h4>
+            <p>
+                Parquet uses the Dremel encoding: regardless of nesting depth, each ARRAY column
+                produces a single physical column with repetition and definition level arrays attached
+                to every leaf value. This has the advantage of constant physical column count
+                (always 1 per ARRAY column), but significant disadvantages:
+            </p>
+            <ul>
+                <li><strong>Implementation complexity</strong>: The shredding (decomposition) and assembly
+                    (reconstruction) algorithms for rep/def levels are substantially more complex than
+                    the lengths + child approach, especially for multi-level nesting. Correct handling
+                    of nulls at different nesting levels requires careful tracking of definition level
+                    thresholds.</li>
+                <li><strong>Overhead for common cases</strong>: Most real-world schemas use at most
+                    1&ndash;2 levels of ARRAY nesting. The rep/def approach adds per-value overhead
+                    (two extra integers per leaf value) that only pays off at deep nesting levels
+                    (&ge; 3), which are rare in practice.</li>
+                <li><strong>No encoding benefit</strong>: Rep/def levels themselves need encoding
+                    (typically RLE or bit-packing). The lengths + child approach achieves equivalent
+                    compression by applying standard column encodings to both the lengths column
+                    (which captures the same structural information) and the values column.</li>
+            </ul>
+            <p>
+                The ORC-style approach was chosen for its simplicity, debuggability, and
+                natural fit with Mosaic&rsquo;s bucket architecture where each column is
+                independently encoded and compressed.
             </p>
 
             <!-- ============================================================ -->
@@ -793,7 +948,7 @@ repeated numColumns times:
             <!-- ============================================================ -->
             <h2>Limitations</h2>
             <ol>
-                <li>Complex types (ARRAY, MAP, MULTISET, ROW) are not supported.</li>
+                <li>Complex types MAP, MULTISET, and ROW are not yet supported. ARRAY is supported with flattened columnar storage.</li>
                 <li>Mosaic format is designed for wide tables and may not be efficient for narrow tables with few columns.</li>
             </ol>
         </div>

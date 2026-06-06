@@ -96,6 +96,14 @@ pa_schema = pa.schema([
                 Nanosecond timestamps are exposed as standard Arrow <code>timestamp("ns")</code>
                 arrays while Mosaic keeps its 12-byte physical encoding internally.
             </p>
+            <p>
+                ARRAY types use PyArrow&rsquo;s <code>pa.list_()</code>. Nested arrays are supported:
+            </p>
+<pre><code>pa_schema = pa.schema([
+    pa.field(<span class="str">"id"</span>, pa.int32()),
+    pa.field(<span class="str">"tags"</span>, pa.list_(pa.int32())),
+    pa.field(<span class="str">"nested"</span>, pa.list_(pa.list_(pa.utf8()))),
+])</code></pre>
 
             <h3>2. Create Writer and Write Batches</h3>
             <p>
@@ -130,6 +138,22 @@ buf = io.BytesIO()
     writer.write(batch)
 
 data = buf.getvalue()</code></pre>
+
+            <h4>Writing ARRAY Columns</h4>
+            <p>Pass native Python lists to <code>pa.array()</code> with <code>pa.list_()</code> type:</p>
+<pre><code>schema = pa.schema([
+    pa.field(<span class="str">"id"</span>, pa.int32()),
+    pa.field(<span class="str">"tags"</span>, pa.list_(pa.int32())),
+])
+
+batch = pa.record_batch([
+    pa.array([<span class="num">1</span>, <span class="num">2</span>, <span class="num">3</span>], type=pa.int32()),
+    pa.array([[<span class="num">10</span>, <span class="num">20</span>], <span class="kw">None</span>, []], type=pa.list_(pa.int32())),
+], names=[<span class="str">"id"</span>, <span class="str">"tags"</span>])
+
+<span class="cmt"># Reading back</span>
+rb = reader.read_row_group(<span class="num">0</span>)
+tags = rb.column(<span class="str">"tags"</span>).to_pylist()  <span class="cmt"># [[10, 20], None, []]</span></code></pre>
 
             <h3>WriterOptions</h3>
             <table>

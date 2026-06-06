@@ -103,6 +103,14 @@ pub fn validate_data_type(dt: &DataType) -> Result<(), String> {
             _ => Err(format!("unsupported Timestamp unit: {:?}", unit)),
         },
         DataType::Struct(fields) if is_timestamp_nanos_struct(fields) => Ok(()),
+        DataType::List(field) => {
+            if let DataType::Struct(fields) = field.data_type() {
+                if is_timestamp_nanos_struct(fields) {
+                    return Err("ARRAY<legacy timestamp nanos struct> is not supported".to_string());
+                }
+            }
+            validate_data_type(field.data_type())
+        }
         _ => Err(format!("unsupported DataType: {:?}", dt)),
     }
 }
@@ -124,6 +132,7 @@ pub fn data_type_to_type_byte(dt: &DataType) -> u8 {
         DataType::Timestamp(_, None) => 16,
         DataType::Timestamp(_, Some(_)) => 17,
         DataType::Struct(fields) if is_timestamp_nanos_struct(fields) => 16,
+        DataType::List(_) => 18,
         _ => panic!("unsupported DataType for serialization: {:?}", dt),
     }
 }
@@ -176,6 +185,12 @@ pub fn serialize_field(field: &Field, buf: &mut Vec<u8>) {
         }
         DataType::Struct(fields) if is_timestamp_nanos_struct(fields) => {
             varint::encode(buf, 9u32);
+        }
+        DataType::List(element_field) => {
+            let name_bytes = element_field.name().as_bytes();
+            varint::encode(buf, name_bytes.len() as u32);
+            buf.extend_from_slice(name_bytes);
+            serialize_field(element_field, buf);
         }
         _ => {}
     }
@@ -257,6 +272,26 @@ pub fn deserialize_field(name: &str, buf: &[u8], pos: &mut usize) -> Result<Fiel
             } else {
                 DataType::Timestamp(TimeUnit::Nanosecond, Some(tz))
             }
+        }
+        18 => {
+            let name_len = varint::decode(buf, pos)? as usize;
+            if *pos + name_len > buf.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "type: not enough bytes for ARRAY element field name",
+                ));
+            }
+            let element_name = std::str::from_utf8(&buf[*pos..*pos + name_len])
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "type: invalid UTF-8 in ARRAY element field name",
+                    )
+                })?
+                .to_string();
+            *pos += name_len;
+            let element_field = deserialize_field(&element_name, buf, pos)?;
+            DataType::List(std::sync::Arc::new(element_field))
         }
         _ => {
             return Err(std::io::Error::new(
