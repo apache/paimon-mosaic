@@ -689,7 +689,9 @@ fn test_multiple_array_columns_in_bucket() {
     )
     .unwrap();
 
-    let result = roundtrip(&schema, &[batch]);
+    let mut opts = WriterOptions::default();
+    opts.num_buckets = 1;
+    let result = roundtrip_with_options(&schema, &[batch], opts);
     let rb = &result[0];
 
     let col_a = rb.column(0).as_any().downcast_ref::<ListArray>().unwrap();
