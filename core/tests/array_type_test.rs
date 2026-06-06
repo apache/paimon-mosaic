@@ -784,3 +784,71 @@ fn test_array_date32_elements() {
         .clone();
     assert_eq!(r2.value(0), 20000);
 }
+
+#[test]
+fn test_project_one_array_from_multi_array_paged() {
+    let elem_i32 = Arc::new(Field::new("item", DataType::Int32, true));
+    let elem_i64 = Arc::new(Field::new("item", DataType::Int64, true));
+    let schema = Schema::new(vec![
+        Field::new("arr_a", DataType::List(elem_i32.clone()), true),
+        Field::new("arr_b", DataType::List(elem_i64.clone()), true),
+    ]);
+
+    let mut builder_a = ListBuilder::new(Int32Builder::new());
+    builder_a.values().append_value(1);
+    builder_a.values().append_value(2);
+    builder_a.append(true);
+    builder_a.values().append_value(3);
+    builder_a.append(true);
+
+    let mut builder_b = ListBuilder::new(Int64Builder::new());
+    builder_b.values().append_value(100);
+    builder_b.append(true);
+    builder_b.values().append_value(200);
+    builder_b.values().append_value(300);
+    builder_b.append(true);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(builder_a.finish()), Arc::new(builder_b.finish())],
+    )
+    .unwrap();
+
+    let out = MemOutputFile::new();
+    let mut options = WriterOptions::default();
+    options.num_buckets = 1;
+    options.page_size_threshold = 1;
+    let mut writer = MosaicWriter::new(out, &schema, options).unwrap();
+    writer.write_batch(&batch).unwrap();
+    writer.close().unwrap();
+
+    let data = writer.output().buf.clone();
+    let input = ByteArrayInputFile { data: data.clone() };
+    let reader = MosaicReader::new(input, data.len() as u64).unwrap();
+
+    // Project only arr_a
+    let arr_a_idx = reader
+        .schema()
+        .columns
+        .iter()
+        .position(|c| c.name == "arr_a")
+        .unwrap();
+    let mut rg = reader.row_group_reader_projected(0, &[arr_a_idx]).unwrap();
+    let projected = rg.read_columns().unwrap();
+    assert_eq!(projected.num_columns(), 1);
+    let col = projected
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(col.len(), 2);
+    let r0 = col
+        .value(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .clone();
+    assert_eq!(r0.len(), 2);
+    assert_eq!(r0.value(0), 1);
+    assert_eq!(r0.value(1), 2);
+}

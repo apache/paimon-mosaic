@@ -1080,29 +1080,42 @@ impl RowGroupReader {
 
             match state {
                 BucketState::Paged { column_readers } => {
-                    // Read all physical columns (N+C)
-                    let mut phys_arrays: Vec<ArrayRef> = Vec::new();
-                    for cr_opt in column_readers {
-                        if let Some(ref cr) = cr_opt {
-                            phys_arrays.push(cr.read_all()?);
-                        } else {
-                            phys_arrays
-                                .push(arrow_array::new_null_array(&DataType::Int32, self.num_rows));
-                        }
-                    }
-
-                    // Get child column metadata for this bucket
                     let col_type_refs: Vec<&DataType> = global_indices
                         .iter()
                         .map(|&gi| &self.schema.columns[gi].data_type)
                         .collect();
-                    let (_, bucket_children) =
+                    let (phys_types, bucket_children) =
                         crate::bucket_writer::expand_col_types(&col_type_refs);
 
-                    // Reassemble list columns
+                    // Read all physical columns (N+C)
+                    let mut phys_arrays: Vec<ArrayRef> = Vec::new();
+                    for (idx, cr_opt) in column_readers.iter().enumerate() {
+                        if let Some(ref cr) = cr_opt {
+                            phys_arrays.push(cr.read_all()?);
+                        } else {
+                            let dt = phys_types.get(idx).unwrap_or(&DataType::Int32);
+                            let rows = if idx < global_indices.len() {
+                                self.num_rows
+                            } else {
+                                0
+                            };
+                            phys_arrays.push(arrow_array::new_null_array(dt, rows));
+                        }
+                    }
+
+                    // Only reassemble projected ARRAY parents
+                    let projected_children: Vec<_> = bucket_children
+                        .iter()
+                        .filter(|c| {
+                            c.parent_logical_col < global_indices.len()
+                                && self.projected_columns[global_indices[c.parent_logical_col]]
+                        })
+                        .cloned()
+                        .collect();
+
                     crate::bucket_reader::reassemble_list_columns_pub(
                         &mut phys_arrays,
-                        &bucket_children,
+                        &projected_children,
                         &col_type_refs,
                         global_indices.len(),
                         self.num_rows,

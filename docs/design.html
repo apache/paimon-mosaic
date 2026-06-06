@@ -739,7 +739,7 @@ repeated numColumns times:
                     <tr><td>15</td><td>TIME</td><td>varint precision</td></tr>
                     <tr><td>16</td><td>TIMESTAMP</td><td>varint precision</td></tr>
                     <tr><td>17</td><td>TIMESTAMP_LTZ</td><td>varint precision, varint timezoneLength, bytes timezone</td></tr>
-                    <tr><td>18</td><td>ARRAY</td><td>TypeDescriptor (recursive element type)</td></tr>
+                    <tr><td>18</td><td>ARRAY</td><td>varint nameLength, bytes name (element field name), TypeDescriptor (recursive element type)</td></tr>
                 </tbody>
             </table>
             <p>MAP, ROW, VARIANT, and BLOB are not yet supported.</p>
@@ -766,7 +766,7 @@ repeated numColumns times:
                     <tr><td>TIMESTAMP (precision &gt; 6)</td><td>8 bytes (epoch millis) + 4 bytes (nanos of millis)</td></tr>
                     <tr><td>CHAR / VARCHAR / STRING</td><td>varint length + UTF-8 bytes</td></tr>
                     <tr><td>BINARY / VARBINARY / BYTES</td><td>varint length + raw bytes</td></tr>
-                    <tr><td>ARRAY</td><td>Flattened columnar: lengths (INT32) + values sub-bucket (see below)</td></tr>
+                    <tr><td>ARRAY</td><td>Flattened columnar: lengths (INT32) + values column (see ARRAY Type Storage below)</td></tr>
                 </tbody>
             </table>
             <p>
@@ -783,8 +783,9 @@ repeated numColumns times:
             <h2>ARRAY Type Storage</h2>
             <p>
                 ARRAY columns use a <strong>flattened columnar</strong> storage layout.
-                Instead of serializing each array value as an opaque blob, the column is decomposed into
-                two independent streams that each benefit from standard column encoding (DICT, CONST, PLAIN).
+                Each ARRAY column is decomposed into physical columns within the same bucket &mdash;
+                a lengths column and a values column &mdash; both first-class columns that benefit from
+                standard column encoding (DICT, CONST, PLAIN).
             </p>
 
             <h3>Decomposition</h3>
