@@ -360,34 +360,197 @@ fn reassemble_list_columns(
     _num_primary: usize,
     num_rows: usize,
 ) {
-    for child in children.iter().rev() {
-        let phys_idx = child.physical_index;
+    let mut processed = vec![false; children.len()];
+
+    // Process innermost children first (highest physical index → lowest)
+    for idx in (0..children.len()).rev() {
+        if processed[idx] {
+            continue;
+        }
+        let child = &children[idx];
         let parent = child.parent_logical_col;
-        let values = arrays[phys_idx].clone();
+        let phys_idx = child.physical_index;
+        let elem_dt = child.element_field.data_type();
 
-        // Find the lengths column for this child:
-        // - If the previous physical column (phys_idx - 1) is a child with the same parent,
-        //   this is a nested child and lengths are at phys_idx - 1.
-        // - Otherwise, this is a first-level child and lengths are at the parent primary column.
-        let is_nested = children
-            .iter()
-            .any(|c| c.physical_index == phys_idx - 1 && c.parent_logical_col == parent);
-        let lengths_idx = if is_nested { phys_idx - 1 } else { parent };
+        // What type is above us (the container that produced this child)?
+        // Look at the element_field of the child that stores lengths for us,
+        // or the logical type at the parent position.
+        // For a first-level child, the lengths are at `parent` (primary column).
+        // For a nested child (e.g., inner values of ARRAY<ARRAY<INT>>),
+        // the lengths are at the previous sibling that was already reassembled.
+        //
+        // Key insight: the container type that produced this child determines
+        // whether it's an ARRAY child (1 child) or MAP child (2 children).
+        // We detect MAP by checking if the NEXT child (idx+1) has the same
+        // "lengths column" — meaning they're siblings of the same MAP.
 
-        let lengths = arrays[lengths_idx].clone();
-        let lengths_rows = lengths.len();
+        // Determine if this child is part of a MAP pair.
+        // MAP produces two consecutive children: keys then values.
+        // Nested ARRAY produces children where the first child's element_field
+        // has a complex data_type (List/Map), indicating a deeper level.
+        //
+        // A "MAP sibling pair" is: two consecutive children with same parent,
+        // where the first child's element_field is NOT itself a complex type
+        // (complex element_field means it's a nested ARRAY/MAP intermediate).
 
-        let element_field = child.element_field.clone();
-        let reassembled = reassemble_list_array(lengths, values, element_field, lengths_rows);
-        arrays[lengths_idx] = reassembled;
+        let prev_is_map_key = idx > 0
+            && children[idx - 1].parent_logical_col == parent
+            && !processed[idx - 1]
+            && !matches!(
+                children[idx - 1].element_field.data_type(),
+                DataType::List(_) | DataType::Map(_, _)
+            );
+
+        if prev_is_map_key {
+            // This child is the VALUES of a MAP (the keys are at idx-1)
+            continue;
+        }
+
+        let next_is_map_value = idx + 1 < children.len()
+            && children[idx + 1].parent_logical_col == parent
+            && !processed[idx + 1]
+            && !matches!(
+                child.element_field.data_type(),
+                DataType::List(_) | DataType::Map(_, _)
+            );
+
+        if next_is_map_value {
+            // MAP: this child is KEYS, next child is VALUES
+            let val_child = &children[idx + 1];
+            let keys = arrays[phys_idx].clone();
+            let values = arrays[val_child.physical_index].clone();
+
+            // Find lengths column: a child with complex element_field at phys_idx-1
+            // stores the MAP lengths (it was produced by expand_element for a Map element).
+            let prev_child_is_lengths = children.iter().any(|c| {
+                c.physical_index == phys_idx - 1
+                    && c.parent_logical_col == parent
+                    && matches!(
+                        c.element_field.data_type(),
+                        DataType::List(_) | DataType::Map(_, _)
+                    )
+            });
+            let lengths_idx = if prev_child_is_lengths {
+                phys_idx - 1
+            } else {
+                parent
+            };
+
+            let lengths = arrays[lengths_idx].clone();
+            let lengths_rows = lengths.len();
+
+            // Reconstruct the MAP type from the element_field
+            // The child at this position has element_field = key Field
+            // We need the full MAP entries_field. Get it from the container.
+            let container_dt = if lengths_idx < logical_types.len() {
+                &logical_types[lengths_idx]
+            } else {
+                // Nested: the reassembled array at lengths_idx should already have
+                // the right type, but we need the MAP descriptor.
+                // Use the child's element_field to reconstruct.
+                elem_dt
+            };
+
+            if let DataType::Map(entries_field, sorted) = container_dt {
+                arrays[lengths_idx] = reassemble_map_array(
+                    lengths,
+                    keys,
+                    values,
+                    entries_field,
+                    *sorted,
+                    lengths_rows,
+                );
+            } else {
+                // Reconstruct MAP from key/value fields
+                let key_field = child.element_field.clone();
+                let val_field = val_child.element_field.clone();
+                let entries_field = Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(arrow_schema::Fields::from(vec![
+                        key_field.as_ref().clone(),
+                        val_field.as_ref().clone(),
+                    ])),
+                    false,
+                ));
+                arrays[lengths_idx] = reassemble_map_array(
+                    lengths,
+                    keys,
+                    values,
+                    &entries_field,
+                    false,
+                    lengths_rows,
+                );
+            }
+            processed[idx] = true;
+            processed[idx + 1] = true;
+        } else {
+            // ARRAY: single child for values
+            let values = arrays[phys_idx].clone();
+            let is_nested = children
+                .iter()
+                .any(|c| c.physical_index == phys_idx - 1 && c.parent_logical_col == parent);
+            let lengths_idx = if is_nested { phys_idx - 1 } else { parent };
+
+            let lengths = arrays[lengths_idx].clone();
+            let lengths_rows = lengths.len();
+            let element_field = child.element_field.clone();
+            arrays[lengths_idx] =
+                reassemble_list_array(lengths, values, element_field, lengths_rows);
+            processed[idx] = true;
+        }
     }
 
-    // Handle ALL_NULL list columns (where no children were created because all null)
+    // Handle ALL_NULL list/map columns
     for (i, lt) in logical_types.iter().enumerate() {
-        if matches!(lt, DataType::List(_)) && !children.iter().any(|c| c.parent_logical_col == i) {
+        if (matches!(lt, DataType::List(_)) || matches!(lt, DataType::Map(_, _)))
+            && !children.iter().any(|c| c.parent_logical_col == i)
+        {
             arrays[i] = arrow_array::new_null_array(lt, num_rows);
         }
     }
+}
+
+fn reassemble_map_array(
+    lengths: ArrayRef,
+    keys: ArrayRef,
+    values: ArrayRef,
+    entries_field: &Arc<Field>,
+    sorted: bool,
+    num_rows: usize,
+) -> ArrayRef {
+    let lengths_arr = lengths
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("map lengths must be Int32Array");
+
+    let mut offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+    offsets.push(0);
+    for i in 0..num_rows {
+        let len = if lengths_arr.is_null(i) {
+            0
+        } else {
+            lengths_arr.value(i)
+        };
+        offsets.push(offsets.last().unwrap() + len);
+    }
+
+    let null_buf = lengths_arr.nulls().cloned();
+    let entries = StructArray::new(
+        match entries_field.data_type() {
+            DataType::Struct(fields) => fields.clone(),
+            _ => unreachable!(),
+        },
+        vec![keys, values],
+        None,
+    );
+
+    Arc::new(MapArray::new(
+        entries_field.clone(),
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        entries,
+        null_buf,
+        sorted,
+    ))
 }
 
 fn reassemble_list_array(

@@ -216,3 +216,91 @@ fn test_v1_with_array_golden_readable() {
         .clone();
     assert_eq!(r3.len(), 0);
 }
+
+/// Generate the deterministic MAP file.
+/// Schema: id(INT32 NOT NULL), props(MAP<INT32, UTF8>)
+/// Data: 3 rows — {1:"a", 2:"b"}, null, {}
+/// Options: num_buckets=1, compression=none
+fn gen_with_map() -> Vec<u8> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "props",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(arrow_schema::Fields::from(vec![
+                        Field::new("keys", DataType::Int32, false),
+                        Field::new("values", DataType::Utf8, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2, 3]);
+    let key_builder = Int32Builder::new();
+    let value_builder = StringBuilder::new();
+    let mut map_builder = MapBuilder::new(None, key_builder, value_builder);
+    // row 0: {1: "a", 2: "b"}
+    map_builder.keys().append_value(1);
+    map_builder.values().append_value("a");
+    map_builder.keys().append_value(2);
+    map_builder.values().append_value("b");
+    map_builder.append(true).unwrap();
+    // row 1: null
+    map_builder.append(false).unwrap();
+    // row 2: {} (empty)
+    map_builder.append(true).unwrap();
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids), Arc::new(map_builder.finish())],
+    )
+    .unwrap();
+
+    let out = MemOutputFile::new();
+    let opts = WriterOptions {
+        num_buckets: 1,
+        compression: 0,
+        ..WriterOptions::default()
+    };
+    let mut writer = MosaicWriter::new(out, &schema, opts).unwrap();
+    writer.write_batch(&batch).unwrap();
+    writer.close().unwrap();
+    writer.output().buf.clone()
+}
+
+#[test]
+fn test_v1_with_map_binary_stable() {
+    let generated = gen_with_map();
+    let golden = std::fs::read(golden_path("v1_with_map.mosaic"))
+        .expect("golden file missing — regenerate with gen_with_map()");
+    assert_eq!(
+        generated, golden,
+        "MAP file differs from golden — format may have changed unintentionally"
+    );
+}
+
+#[test]
+fn test_v1_with_map_golden_readable() {
+    let data = std::fs::read(golden_path("v1_with_map.mosaic")).unwrap();
+    let input = ByteArrayInputFile { data: data.clone() };
+    let reader = MosaicReader::new(input, data.len() as u64).unwrap();
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let rb = rg.read_columns().unwrap();
+    assert_eq!(rb.num_rows(), 3);
+
+    let map_col = rb.column(1).as_any().downcast_ref::<MapArray>().unwrap();
+    assert!(!map_col.is_null(0));
+    assert!(map_col.is_null(1));
+    assert!(!map_col.is_null(2));
+
+    // Row 0: 2 entries
+    assert_eq!(map_col.value_offsets()[1] - map_col.value_offsets()[0], 2);
+    // Row 2: empty
+    assert_eq!(map_col.value_offsets()[3] - map_col.value_offsets()[2], 0);
+}

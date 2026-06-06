@@ -40,6 +40,7 @@ import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.MapVector;
 import org.apache.arrow.vector.complex.impl.UnionListWriter;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.TimeUnit;
@@ -1229,6 +1230,76 @@ public class MosaicRoundtripTest {
 
                 // Row 3: null
                 assertTrue(readTags.isNull(3));
+            }
+        }
+    }
+
+    @Test
+    public void testMapType() {
+        // Use MapVector's writer to avoid schema mismatch with UnionMapWriter
+        Field keyField = new Field("keys", FieldType.notNullable(new ArrowType.Int(32, true)), null);
+        Field valueField = new Field("values", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+        Field entriesField = new Field("entries",
+            new FieldType(false, ArrowType.Struct.INSTANCE, null),
+            Arrays.asList(keyField, valueField));
+        Field mapField = new Field("props",
+            new FieldType(true, new ArrowType.Map(false), null),
+            Arrays.asList(entriesField));
+
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true)),
+                mapField
+        ));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            MapVector mapVec = (MapVector) root.getVector("props");
+
+            ids.allocateNew(3);
+
+            IntVector keyVec = (IntVector) mapVec.getDataVector().getChildrenFromFields().get(0);
+            VarCharVector valVec = (VarCharVector) mapVec.getDataVector().getChildrenFromFields().get(1);
+
+            // Row 0: {1: "a", 2: "b"} -> offsets [0, 2]
+            mapVec.startNewValue(0);
+            keyVec.setSafe(0, 1);
+            valVec.setSafe(0, "a".getBytes());
+            keyVec.setSafe(1, 2);
+            valVec.setSafe(1, "b".getBytes());
+            mapVec.endValue(0, 2);
+
+            // Row 1: null
+            mapVec.setNull(1);
+
+            // Row 2: {} -> offsets [2, 2]
+            mapVec.startNewValue(2);
+            mapVec.endValue(2, 0);
+
+            ids.set(0, 1);
+            ids.set(1, 2);
+            ids.set(2, 3);
+
+            root.setRowCount(3);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            try (VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+                assertEquals(3, batch.getRowCount());
+
+                MapVector readMap = (MapVector) batch.getVector("props");
+                assertFalse(readMap.isNull(0));
+                assertTrue(readMap.isNull(1));
+                assertFalse(readMap.isNull(2));
+
+                // Row 0: 2 entries
+                java.util.List<?> row0 = readMap.getObject(0);
+                assertEquals(2, row0.size());
+
+                // Row 2: empty
+                java.util.List<?> row2 = readMap.getObject(2);
+                assertEquals(0, row2.size());
             }
         }
     }

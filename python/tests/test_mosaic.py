@@ -1058,3 +1058,59 @@ class TestWriter:
             assert nested[0] == [[1, 2], [3]]
             assert nested[1] == [[4]]
             assert nested[2] is None
+
+    def test_map_type(self):
+        pa_schema = pa.schema(
+            [
+                pa.field("id", pa.int32(), nullable=False),
+                pa.field("props", pa.map_(pa.int32(), pa.utf8())),
+            ]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array([1, 2, 3], type=pa.int32()),
+                pa.array(
+                    [[(1, "a"), (2, "b")], None, []],
+                    type=pa.map_(pa.int32(), pa.utf8()),
+                ),
+            ],
+            names=["id", "props"],
+        )
+
+        data = _write_to_bytes(pa_schema, batch)
+
+        with _reader_from_bytes(data) as reader:
+            rb = reader.read_row_group(0)
+            assert rb.num_rows == 3
+
+            ids = rb.column("id").to_pylist()
+            assert ids == [1, 2, 3]
+
+            props = rb.column("props").to_pylist()
+            assert props[0] == [(1, "a"), (2, "b")]
+            assert props[1] is None
+            assert props[2] == []
+
+    def test_map_with_null_values(self):
+        pa_schema = pa.schema(
+            [pa.field("m", pa.map_(pa.utf8(), pa.int64()))]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array(
+                    [[("x", 10), ("y", None)], [("z", 30)]],
+                    type=pa.map_(pa.utf8(), pa.int64()),
+                )
+            ],
+            names=["m"],
+        )
+
+        data = _write_to_bytes(pa_schema, batch)
+
+        with _reader_from_bytes(data) as reader:
+            rb = reader.read_row_group(0)
+            m = rb.column("m").to_pylist()
+            assert m[0] == [("x", 10), ("y", None)]
+            assert m[1] == [("z", 30)]

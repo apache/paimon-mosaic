@@ -104,12 +104,31 @@ pub fn validate_data_type(dt: &DataType) -> Result<(), String> {
         },
         DataType::Struct(fields) if is_timestamp_nanos_struct(fields) => Ok(()),
         DataType::List(field) => {
-            if let DataType::Struct(fields) = field.data_type() {
+            let elem = field.data_type();
+            if let DataType::Struct(fields) = elem {
                 if is_timestamp_nanos_struct(fields) {
                     return Err("ARRAY<legacy timestamp nanos struct> is not supported".to_string());
                 }
             }
-            validate_data_type(field.data_type())
+            validate_data_type(elem)
+        }
+        DataType::Map(entries_field, sorted) => {
+            if *sorted {
+                return Err("sorted MAP is not supported".to_string());
+            }
+            if let DataType::Struct(fields) = entries_field.data_type() {
+                if fields.len() != 2 {
+                    return Err("MAP entries struct must have exactly 2 fields".to_string());
+                }
+                let key_dt = fields[0].data_type();
+                if matches!(key_dt, DataType::List(_) | DataType::Map(_, _)) {
+                    return Err("MAP key type cannot be ARRAY or MAP".to_string());
+                }
+                validate_data_type(key_dt)?;
+                validate_data_type(fields[1].data_type())
+            } else {
+                Err("MAP entries field must be a Struct".to_string())
+            }
         }
         _ => Err(format!("unsupported DataType: {:?}", dt)),
     }
@@ -133,6 +152,7 @@ pub fn data_type_to_type_byte(dt: &DataType) -> u8 {
         DataType::Timestamp(_, Some(_)) => 17,
         DataType::Struct(fields) if is_timestamp_nanos_struct(fields) => 16,
         DataType::List(_) => 18,
+        DataType::Map(_, _) => 19,
         _ => panic!("unsupported DataType for serialization: {:?}", dt),
     }
 }
@@ -192,8 +212,50 @@ pub fn serialize_field(field: &Field, buf: &mut Vec<u8>) {
             buf.extend_from_slice(name_bytes);
             serialize_field(element_field, buf);
         }
+        DataType::Map(entries_field, _sorted) => {
+            // entries field name
+            let entries_name = entries_field.name().as_bytes();
+            varint::encode(buf, entries_name.len() as u32);
+            buf.extend_from_slice(entries_name);
+            if let DataType::Struct(fields) = entries_field.data_type() {
+                // key field name + type
+                let key_name = fields[0].name().as_bytes();
+                varint::encode(buf, key_name.len() as u32);
+                buf.extend_from_slice(key_name);
+                serialize_field(&fields[0], buf);
+                // value field name + type
+                let val_name = fields[1].name().as_bytes();
+                varint::encode(buf, val_name.len() as u32);
+                buf.extend_from_slice(val_name);
+                serialize_field(&fields[1], buf);
+            }
+        }
         _ => {}
     }
+}
+
+fn read_utf8_field_name(
+    buf: &[u8],
+    pos: &mut usize,
+    len: usize,
+    context: &str,
+) -> Result<String, std::io::Error> {
+    if *pos + len > buf.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("type: not enough bytes for {} field name", context),
+        ));
+    }
+    let name = std::str::from_utf8(&buf[*pos..*pos + len])
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("type: invalid UTF-8 in {} field name", context),
+            )
+        })?
+        .to_string();
+    *pos += len;
+    Ok(name)
 }
 
 pub fn deserialize_field(name: &str, buf: &[u8], pos: &mut usize) -> Result<Field, std::io::Error> {
@@ -292,6 +354,25 @@ pub fn deserialize_field(name: &str, buf: &[u8], pos: &mut usize) -> Result<Fiel
             *pos += name_len;
             let element_field = deserialize_field(&element_name, buf, pos)?;
             DataType::List(std::sync::Arc::new(element_field))
+        }
+        19 => {
+            // entries field name
+            let entries_name_len = varint::decode(buf, pos)? as usize;
+            let entries_name = read_utf8_field_name(buf, pos, entries_name_len, "MAP entries")?;
+            // key field name + type
+            let key_name_len = varint::decode(buf, pos)? as usize;
+            let key_name = read_utf8_field_name(buf, pos, key_name_len, "MAP key")?;
+            let key_field = deserialize_field(&key_name, buf, pos)?;
+            // value field name + type
+            let val_name_len = varint::decode(buf, pos)? as usize;
+            let val_name = read_utf8_field_name(buf, pos, val_name_len, "MAP value")?;
+            let value_field = deserialize_field(&val_name, buf, pos)?;
+            let entries_field = Field::new(
+                &entries_name,
+                DataType::Struct(Fields::from(vec![key_field, value_field])),
+                false,
+            );
+            DataType::Map(std::sync::Arc::new(entries_field), false)
         }
         _ => {
             return Err(std::io::Error::new(

@@ -854,3 +854,459 @@ fn test_project_one_array_from_multi_array_paged() {
     assert_eq!(r0.value(0), 1);
     assert_eq!(r0.value(1), 2);
 }
+
+// ======================== MAP Tests ========================
+
+#[test]
+fn test_map_int_string_basic() {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "map",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(arrow_schema::Fields::from(vec![
+                        Field::new("keys", DataType::Int32, false),
+                        Field::new("values", DataType::Utf8, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2, 3, 4]);
+
+    let key_builder = Int32Builder::new();
+    let value_builder = StringBuilder::new();
+    let mut map_builder = MapBuilder::new(None, key_builder, value_builder);
+
+    // row 0: {1: "a", 2: "b"}
+    map_builder.keys().append_value(1);
+    map_builder.values().append_value("a");
+    map_builder.keys().append_value(2);
+    map_builder.values().append_value("b");
+    map_builder.append(true).unwrap();
+
+    // row 1: null
+    map_builder.append(false).unwrap();
+
+    // row 2: {3: null}
+    map_builder.keys().append_value(3);
+    map_builder.values().append_null();
+    map_builder.append(true).unwrap();
+
+    // row 3: {} (empty)
+    map_builder.append(true).unwrap();
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids), Arc::new(map_builder.finish())],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    assert_eq!(rb.num_rows(), 4);
+
+    let map_col = rb.column(1).as_any().downcast_ref::<MapArray>().unwrap();
+    assert_eq!(map_col.len(), 4);
+    assert!(!map_col.is_null(0));
+    assert!(map_col.is_null(1));
+    assert!(!map_col.is_null(2));
+    assert!(!map_col.is_null(3));
+
+    // row 0: {1: "a", 2: "b"}
+    let keys0 = map_col
+        .keys()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let vals0 = map_col
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(map_col.value_offsets()[0], 0);
+    assert_eq!(map_col.value_offsets()[1], 2);
+    assert_eq!(keys0.value(0), 1);
+    assert_eq!(keys0.value(1), 2);
+    assert_eq!(vals0.value(0), "a");
+    assert_eq!(vals0.value(1), "b");
+
+    // row 2: {3: null}
+    assert_eq!(map_col.value_offsets()[3] - map_col.value_offsets()[2], 1);
+
+    // row 3: empty
+    assert_eq!(map_col.value_offsets()[4] - map_col.value_offsets()[3], 0);
+}
+
+#[test]
+fn test_map_all_null() {
+    let entries_field = Field::new(
+        "entries",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("keys", DataType::Utf8, false),
+            Field::new("values", DataType::Int64, true),
+        ])),
+        false,
+    );
+    let schema = Schema::new(vec![Field::new(
+        "m",
+        DataType::Map(Arc::new(entries_field), false),
+        true,
+    )]);
+
+    let key_builder = StringBuilder::new();
+    let value_builder = Int64Builder::new();
+    let mut map_builder = MapBuilder::new(None, key_builder, value_builder);
+    map_builder.append(false).unwrap();
+    map_builder.append(false).unwrap();
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(map_builder.finish())],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .unwrap();
+    assert_eq!(col.len(), 2);
+    assert!(col.is_null(0));
+    assert!(col.is_null(1));
+}
+
+#[test]
+fn test_map_with_other_columns() {
+    let entries_field = Field::new(
+        "entries",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("keys", DataType::Utf8, false),
+            Field::new("values", DataType::Float64, true),
+        ])),
+        false,
+    );
+    let element_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("tags", DataType::List(element_field.clone()), true),
+        Field::new("props", DataType::Map(Arc::new(entries_field), false), true),
+    ]);
+
+    let ids = Int64Array::from(vec![1, 2]);
+
+    let mut list_builder = ListBuilder::new(Int32Builder::new());
+    list_builder.values().append_value(10);
+    list_builder.append(true);
+    list_builder.append(false);
+
+    let key_builder = StringBuilder::new();
+    let value_builder = Float64Builder::new();
+    let mut map_builder = MapBuilder::new(None, key_builder, value_builder);
+    map_builder.keys().append_value("x");
+    map_builder.values().append_value(1.5);
+    map_builder.append(true).unwrap();
+    map_builder.keys().append_value("y");
+    map_builder.values().append_value(2.5);
+    map_builder.keys().append_value("z");
+    map_builder.values().append_value(3.5);
+    map_builder.append(true).unwrap();
+
+    let mut opts = WriterOptions::default();
+    opts.num_buckets = 1;
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(ids),
+            Arc::new(list_builder.finish()),
+            Arc::new(map_builder.finish()),
+        ],
+    )
+    .unwrap();
+
+    let result = roundtrip_with_options(&schema, &[batch], opts);
+    let rb = &result[0];
+    assert_eq!(rb.num_rows(), 2);
+
+    let result_ids = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(result_ids.value(0), 1);
+
+    let result_tags = rb.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    assert!(!result_tags.is_null(0));
+    assert!(result_tags.is_null(1));
+
+    let result_props = rb.column(2).as_any().downcast_ref::<MapArray>().unwrap();
+    assert_eq!(result_props.len(), 2);
+    assert_eq!(
+        result_props.value_offsets()[1] - result_props.value_offsets()[0],
+        1
+    );
+    assert_eq!(
+        result_props.value_offsets()[2] - result_props.value_offsets()[1],
+        2
+    );
+}
+
+// ======================== Nested ARRAY/MAP Tests ========================
+
+#[test]
+fn test_array_of_map() {
+    // ARRAY<MAP<INT32, UTF8>>
+    let map_type = DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("keys", DataType::Int32, false),
+                Field::new("values", DataType::Utf8, true),
+            ])),
+            false,
+        )),
+        false,
+    );
+    let schema = Schema::new(vec![Field::new(
+        "col",
+        DataType::List(Arc::new(Field::new("item", map_type.clone(), true))),
+        true,
+    )]);
+
+    // Build: row 0 = [{1:"a"}, {2:"b", 3:"c"}], row 1 = null
+    let key_builder = Int32Builder::new();
+    let val_builder = StringBuilder::new();
+    let map_builder = MapBuilder::new(None, key_builder, val_builder);
+    let mut list_builder = ListBuilder::new(map_builder);
+
+    // row 0: [{1:"a"}, {2:"b", 3:"c"}]
+    list_builder.values().keys().append_value(1);
+    list_builder.values().values().append_value("a");
+    list_builder.values().append(true).unwrap();
+    list_builder.values().keys().append_value(2);
+    list_builder.values().values().append_value("b");
+    list_builder.values().keys().append_value(3);
+    list_builder.values().values().append_value("c");
+    list_builder.values().append(true).unwrap();
+    list_builder.append(true);
+
+    // row 1: null
+    list_builder.append(false);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(list_builder.finish())],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(col.len(), 2);
+    assert!(!col.is_null(0));
+    assert!(col.is_null(1));
+
+    let row0 = col.value(0);
+    let maps = row0.as_any().downcast_ref::<MapArray>().unwrap();
+    assert_eq!(maps.len(), 2);
+    assert_eq!(maps.value_length(0), 1); // {1:"a"}
+    assert_eq!(maps.value_length(1), 2); // {2:"b", 3:"c"}
+}
+
+#[test]
+fn test_map_with_array_value() {
+    // MAP<UTF8, ARRAY<INT32>>
+    let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+    let schema = Schema::new(vec![Field::new(
+        "col",
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(arrow_schema::Fields::from(vec![
+                    Field::new("keys", DataType::Utf8, false),
+                    Field::new("values", list_type.clone(), true),
+                ])),
+                false,
+            )),
+            false,
+        ),
+        true,
+    )]);
+
+    // Build: row 0 = {"x": [1,2], "y": [3]}, row 1 = {}
+    let key_builder = StringBuilder::new();
+    let val_builder = ListBuilder::new(Int32Builder::new());
+    let mut map_builder = MapBuilder::new(None, key_builder, val_builder);
+
+    // row 0
+    map_builder.keys().append_value("x");
+    map_builder.values().values().append_value(1);
+    map_builder.values().values().append_value(2);
+    map_builder.values().append(true);
+    map_builder.keys().append_value("y");
+    map_builder.values().values().append_value(3);
+    map_builder.values().append(true);
+    map_builder.append(true).unwrap();
+
+    // row 1: empty
+    map_builder.append(true).unwrap();
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(map_builder.finish())],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .unwrap();
+    assert_eq!(col.len(), 2);
+    assert_eq!(col.value_length(0), 2); // 2 entries
+    assert_eq!(col.value_length(1), 0); // empty
+
+    let keys = col.keys().as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(keys.value(0), "x");
+    assert_eq!(keys.value(1), "y");
+
+    let vals = col.values().as_any().downcast_ref::<ListArray>().unwrap();
+    let v0 = vals
+        .value(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .clone();
+    assert_eq!(v0.len(), 2);
+    assert_eq!(v0.value(0), 1);
+    assert_eq!(v0.value(1), 2);
+    let v1 = vals
+        .value(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .clone();
+    assert_eq!(v1.len(), 1);
+    assert_eq!(v1.value(0), 3);
+}
+
+// ======================== MAP Schema Validation Tests ========================
+
+#[test]
+fn test_map_custom_field_names_roundtrip() {
+    let schema = Schema::new(vec![Field::new(
+        "m",
+        DataType::Map(
+            Arc::new(Field::new(
+                "my_entries",
+                DataType::Struct(arrow_schema::Fields::from(vec![
+                    Field::new("k_custom", DataType::Int32, false),
+                    Field::new("v_custom", DataType::Utf8, true),
+                ])),
+                false,
+            )),
+            false,
+        ),
+        true,
+    )]);
+
+    let key_builder = Int32Builder::new();
+    let value_builder = StringBuilder::new();
+    let field_names = arrow_array::builder::MapFieldNames {
+        entry: "my_entries".to_string(),
+        key: "k_custom".to_string(),
+        value: "v_custom".to_string(),
+    };
+    let mut map_builder = MapBuilder::new(Some(field_names), key_builder, value_builder);
+    map_builder.keys().append_value(1);
+    map_builder.values().append_value("a");
+    map_builder.append(true).unwrap();
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(map_builder.finish())],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let map_type = result[0].schema().field(0).data_type().clone();
+    match map_type {
+        DataType::Map(entries, sorted) => {
+            assert!(!sorted);
+            assert_eq!(entries.name(), "my_entries");
+            if let DataType::Struct(fields) = entries.data_type() {
+                assert_eq!(fields[0].name(), "k_custom");
+                assert_eq!(fields[1].name(), "v_custom");
+            } else {
+                panic!("entries should be struct");
+            }
+        }
+        other => panic!("expected map, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_sorted_map_rejected() {
+    let schema = Schema::new(vec![Field::new(
+        "m",
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(arrow_schema::Fields::from(vec![
+                    Field::new("keys", DataType::Int32, false),
+                    Field::new("values", DataType::Utf8, true),
+                ])),
+                false,
+            )),
+            true, // sorted = true
+        ),
+        true,
+    )]);
+
+    let out = MemOutputFile::new();
+    match MosaicWriter::new(out, &schema, WriterOptions::default()) {
+        Ok(_) => panic!("sorted MAP should be rejected"),
+        Err(e) => assert!(
+            e.to_string().contains("sorted"),
+            "error should mention sorted: {}",
+            e
+        ),
+    }
+}
+
+#[test]
+fn test_complex_map_key_rejected() {
+    let key_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+    let schema = Schema::new(vec![Field::new(
+        "m",
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(arrow_schema::Fields::from(vec![
+                    Field::new("keys", key_type, false),
+                    Field::new("values", DataType::Utf8, true),
+                ])),
+                false,
+            )),
+            false,
+        ),
+        true,
+    )]);
+
+    let out = MemOutputFile::new();
+    match MosaicWriter::new(out, &schema, WriterOptions::default()) {
+        Ok(_) => panic!("complex MAP key should be rejected"),
+        Err(e) => assert!(
+            e.to_string().contains("MAP key"),
+            "error should mention MAP key: {}",
+            e
+        ),
+    }
+}

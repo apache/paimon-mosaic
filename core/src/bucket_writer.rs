@@ -153,43 +153,81 @@ impl BucketWriter {
         let start_row = self.num_rows;
         let mut total_size = 0;
 
-        // Split List arrays into lengths + values, collect child writes
-        let mut list_splits: Vec<(usize, Int32Array, ArrayRef)> = Vec::new();
+        // Split List/Map arrays into lengths + child values
+        struct ColSplit {
+            col: usize,
+            lengths: Int32Array,
+            child_arrays: Vec<ArrayRef>, // 1 for List, 2 for Map (keys + values)
+        }
+        let mut splits: Vec<ColSplit> = Vec::new();
+        let mut seen_cols = Vec::new();
         for child in &self.children {
             let col = child.parent_logical_col;
-            if list_splits.iter().any(|(c, _, _)| *c == col) {
-                continue; // already split this column (nested lists share parent)
+            if seen_cols.contains(&col) {
+                continue;
             }
-            let list_array = arrays[col]
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected ListArray"))?;
-            let lengths = extract_list_lengths(list_array);
-            let values = flatten_list_values(list_array);
-            list_splits.push((col, lengths, values));
+            seen_cols.push(col);
+
+            match data_types[col] {
+                DataType::List(_) => {
+                    let list_array = arrays[col]
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "expected ListArray")
+                        })?;
+                    let lengths = extract_list_lengths(list_array);
+                    let values = flatten_list_values(list_array);
+                    splits.push(ColSplit {
+                        col,
+                        lengths,
+                        child_arrays: vec![values],
+                    });
+                }
+                DataType::Map(_, _) => {
+                    let map_array =
+                        arrays[col]
+                            .as_any()
+                            .downcast_ref::<MapArray>()
+                            .ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidInput, "expected MapArray")
+                            })?;
+                    let lengths = extract_map_lengths(map_array);
+                    let (keys, values) = flatten_map_entries(map_array);
+                    splits.push(ColSplit {
+                        col,
+                        lengths,
+                        child_arrays: vec![keys, values],
+                    });
+                }
+                _ => {}
+            }
         }
 
-        // Write primary columns (lengths for ARRAY cols, regular data for others)
+        // Write primary columns (lengths for ARRAY/MAP cols, regular data for others)
         let int32_dt = DataType::Int32;
         for i in 0..self.num_primary {
-            if let Some(split) = list_splits.iter().find(|(col, _, _)| *col == i) {
-                total_size += self.append_array_column(i, &split.1, &int32_dt, start_row)?;
+            if let Some(split) = splits.iter().find(|s| s.col == i) {
+                total_size += self.append_array_column(i, &split.lengths, &int32_dt, start_row)?;
             } else {
                 total_size += self.append_array_column(i, arrays[i], data_types[i], start_row)?;
             }
         }
 
-        // Recursively flatten all list levels and write to child columns
-        let mut pending: Vec<(usize, ArrayRef)> = Vec::new(); // (child_index, values)
-        for split in &list_splits {
-            let parent = split.0;
-            // Find the first child for this parent
-            if let Some(child_idx) = self
+        // Write child columns — for List: 1 child (values), for Map: 2 children (keys, values)
+        let mut pending: Vec<(usize, ArrayRef)> = Vec::new();
+        for split in &splits {
+            let parent_children: Vec<usize> = self
                 .children
                 .iter()
-                .position(|c| c.parent_logical_col == parent)
-            {
-                pending.push((child_idx, split.2.clone()));
+                .enumerate()
+                .filter(|(_, c)| c.parent_logical_col == split.col)
+                .map(|(idx, _)| idx)
+                .collect();
+            for (i, child_arr) in split.child_arrays.iter().enumerate() {
+                if i < parent_children.len() {
+                    pending.push((parent_children[i], child_arr.clone()));
+                }
             }
         }
 
@@ -200,24 +238,45 @@ impl BucketWriter {
             let phys_idx = self.children[child_idx].physical_index;
             let child_start = self.children[child_idx].num_elements;
 
-            if let DataType::List(_) = values.data_type() {
-                let inner_list = values.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "expected ListArray")
-                })?;
-                let inner_lengths = extract_list_lengths(inner_list);
-                let inner_values = flatten_list_values(inner_list);
-                total_size +=
-                    self.append_array_column(phys_idx, &inner_lengths, &int32_dt, child_start)?;
-                self.children[child_idx].num_elements += inner_lengths.len();
-                // Queue the inner values for the next child
-                if child_idx + 1 < self.children.len() {
-                    pending.push((child_idx + 1, inner_values));
+            match values.data_type() {
+                DataType::List(_) => {
+                    let inner_list =
+                        values.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "expected ListArray")
+                        })?;
+                    let inner_lengths = extract_list_lengths(inner_list);
+                    let inner_values = flatten_list_values(inner_list);
+                    total_size +=
+                        self.append_array_column(phys_idx, &inner_lengths, &int32_dt, child_start)?;
+                    self.children[child_idx].num_elements += inner_lengths.len();
+                    if child_idx + 1 < self.children.len() {
+                        pending.push((child_idx + 1, inner_values));
+                    }
                 }
-            } else {
-                let elem_dt = self.children[child_idx].element_field.data_type().clone();
-                total_size +=
-                    self.append_array_column(phys_idx, values.as_ref(), &elem_dt, child_start)?;
-                self.children[child_idx].num_elements += values.len();
+                DataType::Map(_, _) => {
+                    let inner_map =
+                        values.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "expected MapArray")
+                        })?;
+                    let inner_lengths = extract_map_lengths(inner_map);
+                    let (inner_keys, inner_values) = flatten_map_entries(inner_map);
+                    total_size +=
+                        self.append_array_column(phys_idx, &inner_lengths, &int32_dt, child_start)?;
+                    self.children[child_idx].num_elements += inner_lengths.len();
+                    // Queue keys and values for the next children
+                    if child_idx + 2 < self.children.len() {
+                        pending.push((child_idx + 2, inner_values));
+                    }
+                    if child_idx + 1 < self.children.len() {
+                        pending.push((child_idx + 1, inner_keys));
+                    }
+                }
+                _ => {
+                    let elem_dt = self.children[child_idx].element_field.data_type().clone();
+                    total_size +=
+                        self.append_array_column(phys_idx, values.as_ref(), &elem_dt, child_start)?;
+                    self.children[child_idx].num_elements += values.len();
+                }
             }
         }
 
@@ -1044,6 +1103,58 @@ fn i128_to_biginteger_bytes(val: i128) -> Vec<u8> {
     bytes[start..].to_vec()
 }
 
+fn extract_map_lengths(map_array: &MapArray) -> Int32Array {
+    let offsets = map_array.value_offsets();
+    let num_rows = map_array.len();
+    let mut lengths = Vec::with_capacity(num_rows);
+    for i in 0..num_rows {
+        if map_array.is_null(i) {
+            lengths.push(0);
+        } else {
+            lengths.push(offsets[i + 1] - offsets[i]);
+        }
+    }
+    let null_buf = map_array.nulls().cloned();
+    Int32Array::new(ScalarBuffer::from(lengths), null_buf)
+}
+
+fn flatten_map_entries(map_array: &MapArray) -> (ArrayRef, ArrayRef) {
+    let offsets = map_array.value_offsets();
+    let num_rows = map_array.len();
+    let keys = map_array.keys();
+    let values = map_array.values();
+
+    if map_array.null_count() == 0 {
+        let start = offsets[0] as usize;
+        let end = offsets[num_rows] as usize;
+        return (
+            keys.slice(start, end - start),
+            values.slice(start, end - start),
+        );
+    }
+
+    let mut indices: Vec<u32> = Vec::new();
+    for i in 0..num_rows {
+        if !map_array.is_null(i) {
+            let start = offsets[i] as u32;
+            let end = offsets[i + 1] as u32;
+            for idx in start..end {
+                indices.push(idx);
+            }
+        }
+    }
+
+    if indices.is_empty() {
+        return (keys.slice(0, 0), values.slice(0, 0));
+    }
+
+    let idx_array = UInt32Array::from(indices);
+    (
+        take_array(keys.as_ref(), &idx_array),
+        take_array(values.as_ref(), &idx_array),
+    )
+}
+
 fn extract_list_lengths(list_array: &ListArray) -> Int32Array {
     let offsets = list_array.value_offsets();
     let num_rows = list_array.len();
@@ -1268,6 +1379,58 @@ fn take_array(array: &dyn Array, indices: &UInt32Array) -> ArrayRef {
                 null_buf,
             ))
         }
+        DataType::Map(entries_field, sorted) => {
+            let src = array.as_any().downcast_ref::<MapArray>().unwrap();
+            let mut offsets_builder = vec![0i32];
+            let mut child_indices: Vec<u32> = Vec::new();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                let start = src.value_offsets()[idx] as u32;
+                let end = src.value_offsets()[idx + 1] as u32;
+                for ci in start..end {
+                    child_indices.push(ci);
+                }
+                offsets_builder.push(child_indices.len() as i32);
+            }
+            let child_idx_arr = UInt32Array::from(child_indices);
+            let new_keys = take_array(src.keys().as_ref(), &child_idx_arr);
+            let new_values = take_array(src.values().as_ref(), &child_idx_arr);
+            let null_buf = if !indices.is_empty() {
+                let mut bm = vec![0u8; indices.len().div_ceil(8)];
+                for i in 0..indices.len() {
+                    let idx = indices.value(i) as usize;
+                    if !src.is_null(idx) {
+                        bm[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                if bm.iter().all(|&b| b == 0xFF) || indices.is_empty() {
+                    None
+                } else {
+                    Some(NullBuffer::new(BooleanBuffer::new(
+                        Buffer::from_vec(bm),
+                        0,
+                        indices.len(),
+                    )))
+                }
+            } else {
+                None
+            };
+            let entries_struct = StructArray::new(
+                match entries_field.data_type() {
+                    DataType::Struct(fields) => fields.clone(),
+                    _ => unreachable!(),
+                },
+                vec![new_keys, new_values],
+                None,
+            );
+            Arc::new(MapArray::new(
+                entries_field.clone(),
+                OffsetBuffer::new(ScalarBuffer::from(offsets_builder)),
+                entries_struct,
+                null_buf,
+                *sorted,
+            ))
+        }
         other => panic!("take_array: unsupported DataType {:?}", other),
     }
 }
@@ -1276,7 +1439,7 @@ pub(crate) fn expand_col_types(col_types: &[&DataType]) -> (Vec<DataType>, Vec<C
     let mut physical_types: Vec<DataType> = col_types
         .iter()
         .map(|t| {
-            if matches!(t, DataType::List(_)) {
+            if matches!(t, DataType::List(_) | DataType::Map(_, _)) {
                 DataType::Int32
             } else {
                 (*t).clone()
@@ -1286,14 +1449,34 @@ pub(crate) fn expand_col_types(col_types: &[&DataType]) -> (Vec<DataType>, Vec<C
     let mut children = Vec::new();
 
     for (i, t) in col_types.iter().enumerate() {
-        if let DataType::List(element_field) = t {
-            expand_child(i, element_field, &mut physical_types, &mut children);
-        }
+        expand_type(i, t, &mut physical_types, &mut children);
     }
     (physical_types, children)
 }
 
-fn expand_child(
+fn expand_type(
+    parent_logical: usize,
+    dt: &DataType,
+    physical_types: &mut Vec<DataType>,
+    children: &mut Vec<ChildColumnMeta>,
+) {
+    match dt {
+        DataType::List(element_field) => {
+            expand_element(parent_logical, element_field, physical_types, children);
+        }
+        DataType::Map(entries_field, _) => {
+            if let DataType::Struct(fields) = entries_field.data_type() {
+                // Keys child — recurse if key is complex
+                expand_element(parent_logical, &fields[0], physical_types, children);
+                // Values child — recurse if value is complex
+                expand_element(parent_logical, &fields[1], physical_types, children);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn expand_element(
     parent_logical: usize,
     element_field: &Arc<Field>,
     physical_types: &mut Vec<DataType>,
@@ -1302,23 +1485,28 @@ fn expand_child(
     let elem_dt = element_field.data_type();
     let child_phys_idx = physical_types.len();
 
-    if let DataType::List(inner_field) = elem_dt {
-        physical_types.push(DataType::Int32);
-        children.push(ChildColumnMeta {
-            parent_logical_col: parent_logical,
-            physical_index: child_phys_idx,
-            element_field: element_field.clone(),
-            num_elements: 0,
-        });
-        expand_child(parent_logical, inner_field, physical_types, children);
-    } else {
-        physical_types.push(elem_dt.clone());
-        children.push(ChildColumnMeta {
-            parent_logical_col: parent_logical,
-            physical_index: child_phys_idx,
-            element_field: element_field.clone(),
-            num_elements: 0,
-        });
+    match elem_dt {
+        DataType::List(_) | DataType::Map(_, _) => {
+            // Complex element: this child stores lengths (INT32), recurse for deeper levels
+            physical_types.push(DataType::Int32);
+            children.push(ChildColumnMeta {
+                parent_logical_col: parent_logical,
+                physical_index: child_phys_idx,
+                element_field: element_field.clone(),
+                num_elements: 0,
+            });
+            expand_type(parent_logical, elem_dt, physical_types, children);
+        }
+        _ => {
+            // Primitive element: direct leaf column
+            physical_types.push(elem_dt.clone());
+            children.push(ChildColumnMeta {
+                parent_logical_col: parent_logical,
+                physical_index: child_phys_idx,
+                element_field: element_field.clone(),
+                num_elements: 0,
+            });
+        }
     }
 }
 

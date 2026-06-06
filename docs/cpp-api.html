@@ -182,7 +182,15 @@ list_b.Append();
 <span class="cmt">// Reading back</span>
 <span class="kw">auto</span> tags = std::static_pointer_cast&lt;arrow::ListArray&gt;(rb-&gt;GetColumnByName(<span class="str">"tags"</span>));
 <span class="kw">auto</span> row0 = std::static_pointer_cast&lt;arrow::Int32Array&gt;(tags-&gt;value_slice(<span class="num">0</span>));
-<span class="cmt">// row0: [10, 20]</span></code></pre>
+<span class="cmt">// row0: [10, 20]</span>
+
+<span class="cmt">// MAP columns use MapBuilder</span>
+<span class="kw">auto</span> key_b = std::make_shared&lt;arrow::Int32Builder&gt;();
+<span class="kw">auto</span> val_b = std::make_shared&lt;arrow::StringBuilder&gt;();
+arrow::MapBuilder map_b(arrow::default_memory_pool(), key_b, val_b);
+map_b.Append();
+key_b-&gt;Append(<span class="num">1</span>);
+val_b-&gt;Append(<span class="str">"a"</span>);</code></pre>
 
             <h2>C++ API Reference</h2>
 

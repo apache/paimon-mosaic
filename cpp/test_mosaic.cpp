@@ -1005,6 +1005,60 @@ static void test_array_string_elements() {
     printf("  PASS test_array_string_elements\n");
 }
 
+static void test_map_type() {
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::int32(), false),
+        arrow::field("props", arrow::map(arrow::int32(), arrow::utf8())),
+    });
+
+    arrow::Int32Builder id_b;
+    assert(id_b.Append(1).ok());
+    assert(id_b.Append(2).ok());
+    assert(id_b.Append(3).ok());
+
+    auto key_builder = std::make_shared<arrow::Int32Builder>();
+    auto val_builder = std::make_shared<arrow::StringBuilder>();
+    arrow::MapBuilder map_b(arrow::default_memory_pool(), key_builder, val_builder);
+
+    // Row 0: {1: "a", 2: "b"}
+    assert(map_b.Append().ok());
+    assert(key_builder->Append(1).ok());
+    assert(val_builder->Append("a").ok());
+    assert(key_builder->Append(2).ok());
+    assert(val_builder->Append("b").ok());
+
+    // Row 1: null
+    assert(map_b.AppendNull().ok());
+
+    // Row 2: {} (empty)
+    assert(map_b.Append().ok());
+
+    auto batch = arrow::RecordBatch::Make(schema, 3, {
+        id_b.Finish().ValueUnsafe(),
+        map_b.Finish().ValueUnsafe(),
+    });
+
+    auto data_vec = write_and_get(schema, batch);
+
+    MemBuffer buf;
+    buf.data = data_vec;
+    auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
+    auto rb = read_row_group(reader, 0);
+    ASSERT_EQ(rb->num_rows(), 3);
+
+    auto props = std::static_pointer_cast<arrow::MapArray>(rb->GetColumnByName("props"));
+    ASSERT_TRUE(!props->IsNull(0));
+    ASSERT_TRUE(props->IsNull(1));
+    ASSERT_TRUE(!props->IsNull(2));
+
+    // Row 0: 2 entries
+    ASSERT_EQ(props->value_length(0), 2);
+    // Row 2: empty
+    ASSERT_EQ(props->value_length(2), 0);
+
+    printf("  PASS test_map_type\n");
+}
+
 int main() {
     printf("Running Mosaic C++ tests...\n");
     test_basic_roundtrip();
@@ -1025,6 +1079,7 @@ int main() {
     test_array_type();
     test_array_with_null_elements();
     test_array_string_elements();
-    printf("All %d tests passed.\n", 18);
+    test_map_type();
+    printf("All %d tests passed.\n", 19);
     return 0;
 }

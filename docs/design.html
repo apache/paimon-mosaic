@@ -740,9 +740,10 @@ repeated numColumns times:
                     <tr><td>16</td><td>TIMESTAMP</td><td>varint precision</td></tr>
                     <tr><td>17</td><td>TIMESTAMP_LTZ</td><td>varint precision, varint timezoneLength, bytes timezone</td></tr>
                     <tr><td>18</td><td>ARRAY</td><td>varint nameLength, bytes name (element field name), TypeDescriptor (recursive element type)</td></tr>
+                    <tr><td>19</td><td>MAP</td><td>varint entriesNameLen + bytes entriesName, varint keyNameLen + bytes keyName + TypeDescriptor (key), varint valNameLen + bytes valName + TypeDescriptor (value). Sorted MAP is not supported; always unsorted.</td></tr>
                 </tbody>
             </table>
-            <p>MAP, ROW, VARIANT, and BLOB are not yet supported.</p>
+            <p>ROW, VARIANT, and BLOB are not yet supported.</p>
 
             <!-- ============================================================ -->
             <h2>Value Serialization</h2>
@@ -767,6 +768,7 @@ repeated numColumns times:
                     <tr><td>CHAR / VARCHAR / STRING</td><td>varint length + UTF-8 bytes</td></tr>
                     <tr><td>BINARY / VARBINARY / BYTES</td><td>varint length + raw bytes</td></tr>
                     <tr><td>ARRAY</td><td>Flattened columnar: lengths (INT32) + values column (see ARRAY Type Storage below)</td></tr>
+                    <tr><td>MAP</td><td>Flattened columnar: lengths (INT32) + keys column + values column (see MAP Type Storage below)</td></tr>
                 </tbody>
             </table>
             <p>
@@ -857,7 +859,31 @@ repeated numChildren times:
 [column slots: each independently compressed, including child columns]</code></pre>
 
             <h3>Statistics</h3>
-            <p>ARRAY columns do not support min/max statistics (no meaningful ordering).</p>
+            <p>ARRAY and MAP columns do not support min/max statistics (no meaningful ordering).</p>
+
+            <!-- ============================================================ -->
+            <h2>MAP Type Storage</h2>
+            <p>
+                MAP columns use the same flattened columnar approach as ARRAY.
+                A <code>MAP&lt;K, V&gt;</code> column is decomposed into three physical columns
+                within the same bucket:
+            </p>
+            <ol>
+                <li><strong>Lengths column</strong> (INT32, N entries): the number of key-value pairs in each map.</li>
+                <li><strong>Keys column</strong> (type K, M entries): all keys flattened across all rows.</li>
+                <li><strong>Values column</strong> (type V, M entries): all values flattened across all rows.</li>
+            </ol>
+            <p>
+                All three columns independently benefit from standard column encoding (DICT, CONST, PLAIN, ALL_NULL).
+                Null maps are represented by a null in the lengths column. Empty maps have length 0.
+            </p>
+
+            <h4>Example</h4>
+<pre><code>MAP&lt;INT, UTF8&gt; with rows:  {1:"a", 2:"b"},  null,  {3:"c"}
+
+Lengths column (INT32):  2, null, 1
+Keys column    (INT32):  1, 2, 3       &larr; shared DICT across all maps
+Values column  (UTF8):   "a", "b", "c" &larr; shared DICT across all maps</code></pre>
 
             <h3>Design Rationale: Comparison with Parquet and ORC</h3>
             <p>
@@ -906,10 +932,12 @@ repeated numChildren times:
 
             <h4>Why Not Parquet&rsquo;s Repetition/Definition Levels?</h4>
             <p>
-                Parquet uses the Dremel encoding: regardless of nesting depth, each ARRAY column
-                produces a single physical column with repetition and definition level arrays attached
-                to every leaf value. This has the advantage of constant physical column count
-                (always 1 per ARRAY column), but significant disadvantages:
+                Parquet uses the Dremel encoding: each leaf column carries repetition and definition
+                level arrays that encode the full nesting structure. For <code>ARRAY&lt;primitive&gt;</code>,
+                this means one physical leaf column; for nested types like <code>ARRAY&lt;MAP&lt;K,V&gt;&gt;</code>,
+                each leaf (K and V) gets its own column with deeper rep/def levels. The physical column
+                count equals the number of leaf fields, not the number of ARRAY/MAP columns.
+                This approach has some advantages but significant disadvantages:
             </p>
             <ul>
                 <li><strong>Implementation complexity</strong>: The shredding (decomposition) and assembly
@@ -948,7 +976,7 @@ repeated numChildren times:
             <!-- ============================================================ -->
             <h2>Limitations</h2>
             <ol>
-                <li>Complex types MAP, MULTISET, and ROW are not yet supported. ARRAY is supported with flattened columnar storage.</li>
+                <li>Complex types MULTISET and ROW are not yet supported. ARRAY and MAP are supported with flattened columnar storage.</li>
                 <li>Mosaic format is designed for wide tables and may not be efficient for narrow tables with few columns.</li>
             </ol>
         </div>

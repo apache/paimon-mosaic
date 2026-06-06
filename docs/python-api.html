@@ -103,6 +103,7 @@ pa_schema = pa.schema([
     pa.field(<span class="str">"id"</span>, pa.int32()),
     pa.field(<span class="str">"tags"</span>, pa.list_(pa.int32())),
     pa.field(<span class="str">"nested"</span>, pa.list_(pa.list_(pa.utf8()))),
+    pa.field(<span class="str">"props"</span>, pa.map_(pa.utf8(), pa.int64())),
 ])</code></pre>
 
             <h3>2. Create Writer and Write Batches</h3>
@@ -153,7 +154,10 @@ batch = pa.record_batch([
 
 <span class="cmt"># Reading back</span>
 rb = reader.read_row_group(<span class="num">0</span>)
-tags = rb.column(<span class="str">"tags"</span>).to_pylist()  <span class="cmt"># [[10, 20], None, []]</span></code></pre>
+tags = rb.column(<span class="str">"tags"</span>).to_pylist()  <span class="cmt"># [[10, 20], None, []]</span>
+
+<span class="cmt"># MAP columns</span>
+pa.array([{<span class="str">"x"</span>: <span class="num">1</span>, <span class="str">"y"</span>: <span class="num">2</span>}, <span class="kw">None</span>, {}], type=pa.map_(pa.utf8(), pa.int64()))</code></pre>
 
             <h3>WriterOptions</h3>
             <table>

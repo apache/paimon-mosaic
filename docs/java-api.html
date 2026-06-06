@@ -159,6 +159,18 @@ listWriter.endList();</code></pre>
 <span class="ty">List</span>&lt;?&gt; row0 = readTags.getObject(<span class="num">0</span>);  <span class="cmt">// [10, 20, 30]</span>
 <span class="kw">boolean</span> isNull = readTags.isNull(<span class="num">1</span>);    <span class="cmt">// true</span>
 <span class="ty">List</span>&lt;?&gt; row2 = readTags.getObject(<span class="num">2</span>);  <span class="cmt">// [] (empty)</span></code></pre>
+            <p>
+                MAP types use Arrow&rsquo;s <code>MapVector</code> and <code>UnionMapWriter</code>:
+            </p>
+<pre><code><span class="ty">MapVector</span> mapVec = (<span class="ty">MapVector</span>) root.getVector(<span class="str">"props"</span>);
+<span class="ty">UnionMapWriter</span> w = mapVec.getWriter();
+w.setPosition(<span class="num">0</span>);
+w.startMap();
+w.startEntry();
+w.key().integer().writeInt(<span class="num">1</span>);
+w.value().varChar().writeVarChar(<span class="kw">new</span> <span class="ty">Text</span>(<span class="str">"a"</span>));
+w.endEntry();
+w.endMap();</code></pre>
 
             <h3>2. Create Writer and Write Batches</h3>
             <p>
