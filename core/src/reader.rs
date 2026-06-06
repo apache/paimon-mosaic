@@ -716,8 +716,20 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                     let num_columns = phys_types.len();
 
                     // Parse fixed-size child header: u16(num_children) + u32(elem_count) * num_children
+                    if buf.len() < 2 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "paged bucket: too short for child header",
+                        ));
+                    }
                     let nc = u16::from_le_bytes([buf[0], buf[1]]) as usize;
                     let hdr_len = 2 + nc * 4;
+                    if buf.len() < hdr_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "paged bucket: truncated child header",
+                        ));
+                    }
                     let mut child_element_counts = Vec::with_capacity(nc);
                     for ci in 0..nc {
                         let off = 2 + ci * 4;
@@ -727,6 +739,12 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                     }
 
                     // Parse directory (after header)
+                    if buf.len() < hdr_len + num_columns * 4 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "paged bucket: truncated directory",
+                        ));
+                    }
                     let mut slot_sizes = Vec::with_capacity(num_columns);
                     for i in 0..num_columns {
                         let off = hdr_len + i * 4;
