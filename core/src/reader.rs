@@ -674,7 +674,9 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
         let mut r2_group_infos: Vec<Vec<PagedSlotInfo>> = Vec::new();
 
         // Per-bucket directory parse results (slot_sizes, slot_file_offsets) for paged buckets
-        let mut paged_dir_info: Vec<Option<(Vec<usize>, Vec<u64>)>> = vec![None; self.num_buckets];
+        // (slot_sizes, slot_file_offsets, child_element_counts)
+        type PagedDirInfo = (Vec<usize>, Vec<u64>, Vec<usize>);
+        let mut paged_dir_info: Vec<Option<PagedDirInfo>> = vec![None; self.num_buckets];
         let mut partial_paged_buckets: Vec<usize> = Vec::new();
 
         for (ri, &b) in r1_bucket_ids.iter().enumerate() {
@@ -709,7 +711,7 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                         .iter()
                         .map(|&gi| &self.schema.columns[gi].data_type)
                         .collect();
-                    let (phys_types, _bucket_children) =
+                    let (phys_types, bucket_children) =
                         crate::bucket_writer::expand_col_types(&col_type_refs);
                     let num_columns = phys_types.len();
 
@@ -788,11 +790,26 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                             foff += size as u64;
                         }
 
+                        let num_primary_in_bucket = global_indices.len();
                         let mut projected_cols: Vec<usize> = Vec::new();
                         for i in 0..num_columns {
-                            let gi = global_indices[i];
-                            if projected[gi] && slot_sizes[i] > 0 {
-                                projected_cols.push(i);
+                            if i < num_primary_in_bucket {
+                                let gi = global_indices[i];
+                                if projected[gi] && slot_sizes[i] > 0 {
+                                    projected_cols.push(i);
+                                }
+                            } else {
+                                // Child column: project if parent is projected
+                                let child_idx = i - num_primary_in_bucket;
+                                if child_idx < bucket_children.len() {
+                                    let parent = bucket_children[child_idx].parent_logical_col;
+                                    if parent < num_primary_in_bucket {
+                                        let gi = global_indices[parent];
+                                        if projected[gi] && slot_sizes[i] > 0 {
+                                            projected_cols.push(i);
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -818,7 +835,8 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                             }]);
                         }
 
-                        paged_dir_info[b] = Some((slot_sizes, slot_file_offsets));
+                        paged_dir_info[b] =
+                            Some((slot_sizes, slot_file_offsets, child_element_counts.clone()));
                         partial_paged_buckets.push(b);
                     }
                 }
@@ -843,15 +861,19 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
             let mut slot_locations: Vec<Vec<Option<SlotLocation>>> =
                 Vec::with_capacity(self.num_buckets);
             for b in 0..self.num_buckets {
-                let n = self.schema.bucket_to_global[b].len();
-                slot_locations.push((0..n).map(|_| None).collect());
+                let col_refs: Vec<&DataType> = self.schema.bucket_to_global[b]
+                    .iter()
+                    .map(|&gi| &self.schema.columns[gi].data_type)
+                    .collect();
+                let (phys, _) = crate::bucket_writer::expand_col_types(&col_refs);
+                slot_locations.push((0..phys.len()).map(|_| None).collect());
             }
 
             for (group_idx, group) in r2_group_infos.iter().enumerate() {
                 let buf = r2_buffers[group_idx].as_slice();
                 let group_base = r2_ranges[group_idx].0;
                 for info in group {
-                    let (slot_sizes, slot_file_offsets) =
+                    let (slot_sizes, slot_file_offsets, _) =
                         paged_dir_info[info.bucket_id].as_ref().unwrap();
                     let rel_start = (slot_file_offsets[info.col_idx] - group_base) as usize;
                     let slot_len = slot_sizes[info.col_idx];
@@ -879,19 +901,46 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
             // need round 2 IO, but still need readers when projected.
             for &b in &partial_paged_buckets {
                 let global_indices = &self.schema.bucket_to_global[b];
-                let num_columns = global_indices.len();
-                let (slot_sizes, _) = paged_dir_info[b].as_ref().unwrap();
+                let col_refs: Vec<&DataType> = global_indices
+                    .iter()
+                    .map(|&gi| &self.schema.columns[gi].data_type)
+                    .collect();
+                let (phys_types_b, children_b) = crate::bucket_writer::expand_col_types(&col_refs);
+                let num_columns = phys_types_b.len();
+                let num_primary_b = global_indices.len();
+                let (slot_sizes, _, child_elem_counts) = paged_dir_info[b].as_ref().unwrap();
+                // DEBUG removed
 
                 let mut column_readers: Vec<Option<ColumnPageReader>> =
                     Vec::with_capacity(num_columns);
                 for i in 0..num_columns {
-                    let gi = global_indices[i];
-                    if !projected[gi] {
+                    let is_projected = if i < num_primary_b {
+                        let gi = global_indices[i];
+                        projected[gi]
+                    } else {
+                        let child_idx = i - num_primary_b;
+                        if child_idx < children_b.len() {
+                            let parent = children_b[child_idx].parent_logical_col;
+                            parent < num_primary_b && projected[global_indices[parent]]
+                        } else {
+                            false
+                        }
+                    };
+
+                    if !is_projected {
                         column_readers.push(None);
                         continue;
                     }
 
-                    let col_type = self.schema.columns[gi].data_type.clone();
+                    let col_type = phys_types_b[i].clone();
+                    let col_rows = if i < num_primary_b {
+                        meta.num_rows
+                    } else {
+                        child_elem_counts
+                            .get(i - num_primary_b)
+                            .copied()
+                            .unwrap_or(0)
+                    };
 
                     if slot_sizes[i] == 0 {
                         column_readers.push(Some(ColumnPageReader::new(
@@ -900,7 +949,7 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                             false,
                             Value::Null,
                             Vec::new(),
-                            meta.num_rows,
+                            col_rows,
                         )?));
                         continue;
                     }
@@ -913,8 +962,7 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                     })?;
                     let group_buffer = r2_buffers[location.group_idx].as_slice();
                     let slot_data = &group_buffer[location.start..location.start + location.len];
-                    let column_reader =
-                        Self::parse_column_slot(slot_data, &col_type, meta.num_rows)?;
+                    let column_reader = Self::parse_column_slot(slot_data, &col_type, col_rows)?;
                     column_readers.push(Some(column_reader));
                 }
                 bucket_states[b] = Some(BucketState::Paged { column_readers });

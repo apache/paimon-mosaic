@@ -20,7 +20,7 @@ use std::io;
 use std::sync::Arc;
 
 use arrow_array::*;
-use arrow_buffer::ScalarBuffer;
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
 
 use crate::spec::*;
@@ -1044,7 +1044,11 @@ fn extract_list_lengths(list_array: &ListArray) -> Int32Array {
     let num_rows = list_array.len();
     let mut lengths = Vec::with_capacity(num_rows);
     for i in 0..num_rows {
-        lengths.push(offsets[i + 1] - offsets[i]);
+        if list_array.is_null(i) {
+            lengths.push(0);
+        } else {
+            lengths.push(offsets[i + 1] - offsets[i]);
+        }
     }
     let null_buf = list_array.nulls().cloned();
     Int32Array::new(ScalarBuffer::from(lengths), null_buf)
@@ -1052,21 +1056,153 @@ fn extract_list_lengths(list_array: &ListArray) -> Int32Array {
 
 fn flatten_list_values(list_array: &ListArray) -> ArrayRef {
     let offsets = list_array.value_offsets();
-    let start = offsets[0] as usize;
-    let end = offsets[list_array.len()] as usize;
-    list_array.values().slice(start, end - start)
+    let values = list_array.values();
+    let num_rows = list_array.len();
+
+    if list_array.null_count() == 0 {
+        let start = offsets[0] as usize;
+        let end = offsets[num_rows] as usize;
+        return values.slice(start, end - start);
+    }
+
+    // Skip child values for null rows — collect only non-null row ranges
+    let mut indices: Vec<u32> = Vec::new();
+    for i in 0..num_rows {
+        if !list_array.is_null(i) {
+            let start = offsets[i] as u32;
+            let end = offsets[i + 1] as u32;
+            for idx in start..end {
+                indices.push(idx);
+            }
+        }
+    }
+
+    if indices.is_empty() {
+        return values.slice(0, 0);
+    }
+
+    let idx_array = UInt32Array::from(indices);
+    take_array(values.as_ref(), &idx_array)
+}
+
+fn take_array(array: &dyn Array, indices: &UInt32Array) -> ArrayRef {
+    use arrow_array::builder::*;
+    macro_rules! take_prim {
+        ($arr_ty:ty, $bld_ty:ty) => {{
+            let src = array.as_any().downcast_ref::<$arr_ty>().unwrap();
+            let mut b = <$bld_ty>::with_capacity(indices.len());
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                if src.is_null(idx) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(idx));
+                }
+            }
+            Arc::new(b.finish()) as ArrayRef
+        }};
+    }
+    match array.data_type() {
+        DataType::Boolean => take_prim!(BooleanArray, BooleanBuilder),
+        DataType::Int8 => take_prim!(Int8Array, Int8Builder),
+        DataType::Int16 => take_prim!(Int16Array, Int16Builder),
+        DataType::Int32 => take_prim!(Int32Array, Int32Builder),
+        DataType::Int64 => take_prim!(Int64Array, Int64Builder),
+        DataType::Float32 => take_prim!(Float32Array, Float32Builder),
+        DataType::Float64 => take_prim!(Float64Array, Float64Builder),
+        DataType::Utf8 => {
+            let src = array.as_any().downcast_ref::<StringArray>().unwrap();
+            let mut b = StringBuilder::new();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                if src.is_null(idx) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(idx));
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::Binary => {
+            let src = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            let mut b = BinaryBuilder::new();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                if src.is_null(idx) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(idx));
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::List(_) => {
+            // For nested arrays, rebuild by collecting slices
+            let src = array.as_any().downcast_ref::<ListArray>().unwrap();
+            let mut offsets_builder = vec![0i32];
+            let mut child_indices: Vec<u32> = Vec::new();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                let start = src.value_offsets()[idx] as u32;
+                let end = src.value_offsets()[idx + 1] as u32;
+                for ci in start..end {
+                    child_indices.push(ci);
+                }
+                offsets_builder.push(child_indices.len() as i32);
+            }
+            let child_idx_arr = UInt32Array::from(child_indices);
+            let new_values = take_array(src.values().as_ref(), &child_idx_arr);
+            let field = match array.data_type() {
+                DataType::List(f) => f.clone(),
+                _ => unreachable!(),
+            };
+            let null_buf = if !indices.is_empty() {
+                let mut bm = vec![0u8; indices.len().div_ceil(8)];
+                for i in 0..indices.len() {
+                    let idx = indices.value(i) as usize;
+                    if !src.is_null(idx) {
+                        bm[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                if bm.iter().all(|&b| b == 0xFF) || indices.is_empty() {
+                    None
+                } else {
+                    Some(NullBuffer::new(BooleanBuffer::new(
+                        Buffer::from_vec(bm),
+                        0,
+                        indices.len(),
+                    )))
+                }
+            } else {
+                None
+            };
+            Arc::new(ListArray::new(
+                field,
+                OffsetBuffer::new(ScalarBuffer::from(offsets_builder)),
+                new_values,
+                null_buf,
+            ))
+        }
+        _ => array.slice(0, 0),
+    }
 }
 
 pub(crate) fn expand_col_types(col_types: &[&DataType]) -> (Vec<DataType>, Vec<ChildColumnMeta>) {
-    let mut physical_types = Vec::new();
+    let mut physical_types: Vec<DataType> = col_types
+        .iter()
+        .map(|t| {
+            if matches!(t, DataType::List(_)) {
+                DataType::Int32
+            } else {
+                (*t).clone()
+            }
+        })
+        .collect();
     let mut children = Vec::new();
 
     for (i, t) in col_types.iter().enumerate() {
         if let DataType::List(element_field) = t {
-            physical_types.push(DataType::Int32);
             expand_child(i, element_field, &mut physical_types, &mut children);
-        } else {
-            physical_types.push((*t).clone());
         }
     }
     (physical_types, children)

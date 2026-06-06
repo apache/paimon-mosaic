@@ -24,6 +24,8 @@
 use std::io;
 use std::sync::Arc;
 
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+
 use arrow_array::builder::*;
 use arrow_array::*;
 use arrow_schema::{DataType, Field, Schema};
@@ -515,4 +517,109 @@ fn test_array_paged_layout() {
             assert!(!result_arr.is_null(i), "row {} should not be null", i);
         }
     }
+}
+
+#[test]
+fn test_array_null_row_preserves_child_offsets() {
+    let element_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let schema = Schema::new(vec![Field::new(
+        "arr",
+        DataType::List(element_field.clone()),
+        true,
+    )]);
+
+    // Manually construct: row 0 = [1, 2], row 1 = null (but owns child slots 99, 100), row 2 = [5]
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 4, 5]));
+    let values = Arc::new(Int32Array::from(vec![1, 2, 99, 100, 5])) as ArrayRef;
+    let nulls = Some(NullBuffer::new(BooleanBuffer::new(
+        Buffer::from(vec![0b0000_0101]),
+        0,
+        3,
+    )));
+    let array = ListArray::new(element_field, offsets, values, nulls);
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array.clone())]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let result_col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+
+    assert_eq!(result_col.len(), 3);
+    assert!(!result_col.is_null(0));
+    assert!(result_col.is_null(1));
+    assert!(!result_col.is_null(2));
+
+    let row0 = result_col.value(0);
+    let row0_arr = row0.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(row0_arr.len(), 2);
+    assert_eq!(row0_arr.value(0), 1);
+    assert_eq!(row0_arr.value(1), 2);
+
+    let row2 = result_col.value(2);
+    let row2_arr = row2.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(row2_arr.len(), 1);
+    assert_eq!(row2_arr.value(0), 5);
+}
+
+#[test]
+fn test_project_array_from_paged_bucket() {
+    let element_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("arr", DataType::List(element_field.clone()), true),
+    ]);
+
+    let ids = Int64Array::from(vec![1, 2, 3]);
+    let mut list_builder = ListBuilder::new(Int32Builder::new());
+    list_builder.values().append_value(10);
+    list_builder.values().append_value(20);
+    list_builder.append(true);
+    list_builder.values().append_value(30);
+    list_builder.append(true);
+    list_builder.values().append_value(40);
+    list_builder.append(true);
+    let arr = list_builder.finish();
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(ids), Arc::new(arr)]).unwrap();
+
+    let out = MemOutputFile::new();
+    let mut options = WriterOptions::default();
+    options.num_buckets = 1;
+    options.page_size_threshold = 1;
+    let mut writer = MosaicWriter::new(out, &schema, options).unwrap();
+    writer.write_batch(&batch).unwrap();
+    writer.close().unwrap();
+
+    let data = writer.output().buf.clone();
+    let input = ByteArrayInputFile { data: data.clone() };
+    let reader = MosaicReader::new(input, data.len() as u64).unwrap();
+
+    // Project only the "arr" column
+    let sorted_arr_idx = reader
+        .schema()
+        .columns
+        .iter()
+        .position(|c| c.name == "arr")
+        .unwrap();
+    let mut rg_reader = reader
+        .row_group_reader_projected(0, &[sorted_arr_idx])
+        .unwrap();
+    let projected = rg_reader.read_columns().unwrap();
+    assert_eq!(projected.num_columns(), 1);
+
+    let result_arr = projected
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(result_arr.len(), 3);
+
+    let r0 = result_arr.value(0);
+    let r0a = r0.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(r0a.len(), 2);
+    assert_eq!(r0a.value(0), 10);
+    assert_eq!(r0a.value(1), 20);
 }
