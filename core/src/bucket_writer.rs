@@ -723,7 +723,7 @@ impl BucketWriter {
         let mut bit_offset = 0usize;
         let mut val_pos = 0usize;
 
-        for r in 0..self.num_rows {
+        for r in 0..self.col_num_rows(col) {
             let is_null = (self.null_bitmaps[col][r / 8] & (1 << (r % 8))) != 0;
             if !is_null {
                 let idx = if let Some(ref dict) = self.long_dict_maps[col] {
@@ -1110,6 +1110,86 @@ fn take_array(array: &dyn Array, indices: &UInt32Array) -> ArrayRef {
         DataType::Int64 => take_prim!(Int64Array, Int64Builder),
         DataType::Float32 => take_prim!(Float32Array, Float32Builder),
         DataType::Float64 => take_prim!(Float64Array, Float64Builder),
+        DataType::Date32 => take_prim!(Date32Array, Date32Builder),
+        DataType::Time32(_) => take_prim!(Time32MillisecondArray, Time32MillisecondBuilder),
+        DataType::Decimal128(p, s) => {
+            let src = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let mut b = Decimal128Builder::new()
+                .with_precision_and_scale(*p, *s)
+                .unwrap();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                if src.is_null(idx) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(idx));
+                }
+            }
+            Arc::new(b.finish()) as ArrayRef
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, tz) => {
+            let src = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            let mut b = TimestampMillisecondBuilder::new();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                if src.is_null(idx) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(idx));
+                }
+            }
+            let arr = b.finish();
+            Arc::new(if let Some(tz) = tz {
+                arr.with_timezone(tz.clone())
+            } else {
+                arr
+            })
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, tz) => {
+            let src = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            let mut b = TimestampMicrosecondBuilder::new();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                if src.is_null(idx) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(idx));
+                }
+            }
+            let arr = b.finish();
+            Arc::new(if let Some(tz) = tz {
+                arr.with_timezone(tz.clone())
+            } else {
+                arr
+            })
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, tz) => {
+            let src = array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            let mut b = TimestampNanosecondBuilder::new();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                if src.is_null(idx) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(idx));
+                }
+            }
+            let arr = b.finish();
+            Arc::new(if let Some(tz) = tz {
+                arr.with_timezone(tz.clone())
+            } else {
+                arr
+            })
+        }
         DataType::Utf8 => {
             let src = array.as_any().downcast_ref::<StringArray>().unwrap();
             let mut b = StringBuilder::new();
@@ -1183,7 +1263,7 @@ fn take_array(array: &dyn Array, indices: &UInt32Array) -> ArrayRef {
                 null_buf,
             ))
         }
-        _ => array.slice(0, 0),
+        other => panic!("take_array: unsupported DataType {:?}", other),
     }
 }
 

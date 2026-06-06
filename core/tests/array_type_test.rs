@@ -623,3 +623,164 @@ fn test_project_array_from_paged_bucket() {
     assert_eq!(r0a.value(0), 10);
     assert_eq!(r0a.value(1), 20);
 }
+
+#[test]
+fn test_array_child_dict_encoding() {
+    let element_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let schema = Schema::new(vec![Field::new(
+        "arr",
+        DataType::List(element_field.clone()),
+        true,
+    )]);
+
+    let mut builder = ListBuilder::new(Int32Builder::new());
+    for _ in 0..10 {
+        for j in 0..20 {
+            builder.values().append_value((j % 3) as i32);
+        }
+        builder.append(true);
+    }
+    let array = builder.finish();
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array.clone())]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let result_col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(result_col.len(), 10);
+    for i in 0..10 {
+        let expected = array.value(i);
+        let actual = result_col.value(i);
+        assert_eq!(&expected, &actual, "mismatch at row {}", i);
+    }
+}
+
+#[test]
+fn test_multiple_array_columns_in_bucket() {
+    let elem_i32 = Arc::new(Field::new("item", DataType::Int32, true));
+    let elem_i64 = Arc::new(Field::new("item", DataType::Int64, true));
+    let schema = Schema::new(vec![
+        Field::new("arr_a", DataType::List(elem_i32.clone()), true),
+        Field::new("arr_b", DataType::List(elem_i64.clone()), true),
+    ]);
+
+    let mut builder_a = ListBuilder::new(Int32Builder::new());
+    builder_a.values().append_value(1);
+    builder_a.values().append_value(2);
+    builder_a.append(true);
+    builder_a.append(false); // null
+    builder_a.values().append_value(3);
+    builder_a.append(true);
+
+    let mut builder_b = ListBuilder::new(Int64Builder::new());
+    builder_b.values().append_value(100);
+    builder_b.append(true);
+    builder_b.values().append_value(200);
+    builder_b.values().append_value(300);
+    builder_b.append(true);
+    builder_b.append(true); // empty
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(builder_a.finish()), Arc::new(builder_b.finish())],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+
+    let col_a = rb.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(col_a.len(), 3);
+    assert!(!col_a.is_null(0));
+    assert!(col_a.is_null(1));
+    assert!(!col_a.is_null(2));
+    let a0 = col_a
+        .value(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .clone();
+    assert_eq!(a0.len(), 2);
+    assert_eq!(a0.value(0), 1);
+    assert_eq!(a0.value(1), 2);
+    let a2 = col_a
+        .value(2)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .clone();
+    assert_eq!(a2.value(0), 3);
+
+    let col_b = rb.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(col_b.len(), 3);
+    let b0 = col_b
+        .value(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .clone();
+    assert_eq!(b0.value(0), 100);
+    let b1 = col_b
+        .value(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .clone();
+    assert_eq!(b1.len(), 2);
+    assert_eq!(b1.value(0), 200);
+    assert_eq!(b1.value(1), 300);
+    let b2 = col_b
+        .value(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .clone();
+    assert_eq!(b2.len(), 0);
+}
+
+#[test]
+fn test_array_date32_elements() {
+    let element_field = Arc::new(Field::new("item", DataType::Date32, true));
+    let schema = Schema::new(vec![Field::new(
+        "arr",
+        DataType::List(element_field.clone()),
+        true,
+    )]);
+
+    let mut builder = ListBuilder::new(Date32Builder::new());
+    builder.values().append_value(18000);
+    builder.values().append_value(19000);
+    builder.append(true);
+    builder.append(false); // null row with potential child slots
+    builder.values().append_value(20000);
+    builder.append(true);
+
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(builder.finish())]).unwrap();
+    let result = roundtrip(&schema, &[batch]);
+    let col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(col.len(), 3);
+    assert!(col.is_null(1));
+    let r0 = col
+        .value(0)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .unwrap()
+        .clone();
+    assert_eq!(r0.value(0), 18000);
+    assert_eq!(r0.value(1), 19000);
+    let r2 = col
+        .value(2)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .unwrap()
+        .clone();
+    assert_eq!(r2.value(0), 20000);
+}

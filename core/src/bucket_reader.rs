@@ -357,23 +357,22 @@ fn reassemble_list_columns(
     arrays: &mut [ArrayRef],
     children: &[ChildColumnMeta],
     logical_types: &[DataType],
-    num_primary: usize,
+    _num_primary: usize,
     num_rows: usize,
 ) {
-    // Process children in reverse order (innermost first for nested arrays)
     for child in children.iter().rev() {
         let phys_idx = child.physical_index;
         let parent = child.parent_logical_col;
         let values = arrays[phys_idx].clone();
 
-        // Find the lengths column: for the first child of a logical col, it's at parent index.
-        // For nested children (inner values), the lengths column is the previous child's physical index.
-        let lengths_idx = if phys_idx > num_primary {
-            // The lengths for this child are at phys_idx - 1 (a child column that stores inner lengths)
-            phys_idx - 1
-        } else {
-            parent
-        };
+        // Find the lengths column for this child:
+        // - If the previous physical column (phys_idx - 1) is a child with the same parent,
+        //   this is a nested child and lengths are at phys_idx - 1.
+        // - Otherwise, this is a first-level child and lengths are at the parent primary column.
+        let is_nested = children
+            .iter()
+            .any(|c| c.physical_index == phys_idx - 1 && c.parent_logical_col == parent);
+        let lengths_idx = if is_nested { phys_idx - 1 } else { parent };
 
         let lengths = arrays[lengths_idx].clone();
         let lengths_rows = lengths.len();
