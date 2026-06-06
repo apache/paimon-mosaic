@@ -103,7 +103,14 @@ pub fn validate_data_type(dt: &DataType) -> Result<(), String> {
             _ => Err(format!("unsupported Timestamp unit: {:?}", unit)),
         },
         DataType::Struct(fields) if is_timestamp_nanos_struct(fields) => Ok(()),
-        DataType::List(field) => validate_data_type(field.data_type()),
+        DataType::List(field) => {
+            if let DataType::Struct(fields) = field.data_type() {
+                if is_timestamp_nanos_struct(fields) {
+                    return Err("ARRAY<legacy timestamp nanos struct> is not supported".to_string());
+                }
+            }
+            validate_data_type(field.data_type())
+        }
         _ => Err(format!("unsupported DataType: {:?}", dt)),
     }
 }
