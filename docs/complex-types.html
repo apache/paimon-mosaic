@@ -1,0 +1,434 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Complex Types - Paimon Mosaic</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="js/main.js"></script>
+</head>
+<body>
+    <button class="menu-toggle" aria-label="Menu">&#9776;</button>
+    <div class="overlay"></div>
+
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <h2>Paimon Mosaic</h2>
+            <p>Columnar-bucket hybrid format</p>
+        </div>
+        <nav>
+            <ul>
+                <li><a href="index.html">Home</a></li>
+                <li><a href="design.html">Design</a></li>
+                <li><a href="complex-types.html" class="active">Complex Types</a></li>
+                <li><a href="java-api.html">Java API</a></li>
+                <li><a href="python-api.html">Python API</a></li>
+                <li><a href="cpp-api.html">C++ API</a></li>
+                <li><a href="releases.html">Releases</a></li>
+            </ul>
+        </nav>
+        <div class="sidebar-footer">
+            <button class="theme-toggle">Dark Mode</button>
+        </div>
+    </aside>
+
+    <main class="main">
+        <div class="content">
+            <h1>Complex Types</h1>
+            <p class="subtitle">
+                Storage design for ARRAY, MAP, and STRUCT types in Mosaic.
+            </p>
+
+            <!-- ============================================================ -->
+            <h2>Overview</h2>
+            <p>
+                Mosaic supports three complex types: <strong>ARRAY</strong>, <strong>MAP</strong>,
+                and <strong>STRUCT</strong>. Each uses a different expansion strategy that fits
+                Mosaic&rsquo;s columnar-bucket architecture:
+            </p>
+            <table>
+                <thead>
+                    <tr><th>Type</th><th>Expansion Level</th><th>Projection Granularity</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>ARRAY</td>
+                        <td>Bucket-internal (physical columns within the same bucket)</td>
+                        <td>Entire ARRAY column</td>
+                    </tr>
+                    <tr>
+                        <td>MAP</td>
+                        <td>Bucket-internal (physical columns within the same bucket)</td>
+                        <td>Entire MAP column</td>
+                    </tr>
+                    <tr>
+                        <td>STRUCT</td>
+                        <td>Schema-level (independent top-level columns across buckets)</td>
+                        <td>Individual STRUCT fields</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <!-- ============================================================ -->
+            <h2>TypeDescriptor Serialization</h2>
+            <table>
+                <thead>
+                    <tr><th>Type Byte</th><th>Name</th><th>Additional Bytes</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>18</td><td>ARRAY</td>
+                        <td>varint nameLength, bytes name (element field name), TypeDescriptor (recursive element type)</td>
+                    </tr>
+                    <tr>
+                        <td>19</td><td>MAP</td>
+                        <td>varint entriesNameLen + bytes entriesName, varint keyNameLen + bytes keyName + TypeDescriptor (key),
+                            varint valNameLen + bytes valName + TypeDescriptor (value). Sorted MAP is not supported.</td>
+                    </tr>
+                    <tr>
+                        <td>20</td><td>STRUCT</td>
+                        <td>varint numFields, repeated: varint fieldNameLen + bytes fieldName + TypeDescriptor (recursive).
+                            Top-level STRUCT columns are serialized with type byte 20 in the schema;
+                            the reader expands them into independent physical columns on deserialization.</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <!-- ============================================================ -->
+            <h2>ARRAY Type Storage</h2>
+            <p>
+                ARRAY columns use a <strong>flattened columnar</strong> storage layout.
+                Each ARRAY column is decomposed into physical columns within the same bucket &mdash;
+                a lengths column and a values column &mdash; both first-class columns that benefit from
+                standard column encoding (DICT, CONST, PLAIN).
+            </p>
+
+            <h3>Decomposition</h3>
+            <p>An <code>ARRAY&lt;T&gt;</code> column with N rows is stored as:</p>
+            <ol>
+                <li><strong>Lengths column</strong> (INT32, N entries): the number of elements in each array.
+                    Null arrays are represented by a null in the lengths column (contributing 0 elements).
+                    Empty arrays (<code>[]</code>) have length 0 and are non-null.</li>
+                <li><strong>Values column</strong> (type T, M entries): all elements from all rows flattened
+                    into a single contiguous column, where M = sum of all non-null lengths.
+                    Element-level nulls are tracked by this column&rsquo;s own null bitmap.</li>
+            </ol>
+            <p>
+                Both columns independently go through the standard encoding selection (DICT, CONST, PLAIN, ALL_NULL),
+                enabling dictionary compression of element values across all arrays in the column.
+            </p>
+
+            <h4>Example</h4>
+<pre><code>Input rows:  [1, 2, 3],  null,  [1, 2],  []
+
+Lengths column (INT32):    3, null, 2, 0    &larr; standard INT32 encoding
+Values column  (INT32):    1, 2, 3, 1, 2    &larr; shared DICT across all arrays</code></pre>
+
+            <h3>Nested Arrays</h3>
+            <p>
+                <code>ARRAY&lt;ARRAY&lt;INT&gt;&gt;</code> is stored recursively. The outer values column
+                is itself an <code>ARRAY&lt;INT&gt;</code>, which decomposes into its own lengths + values pair.
+                All leaf INT values across all nesting levels end up in a single column,
+                sharing one dictionary.
+            </p>
+<pre><code>ARRAY&lt;ARRAY&lt;INT&gt;&gt; with rows:  [[1,2], [3]],  [[1,2]]
+
+Outer lengths (INT32):   2, 1              &larr; 2 inner arrays, 1 inner array
+Inner lengths (INT32):   2, 1, 2           &larr; element counts of inner arrays
+Leaf values   (INT32):   1, 2, 3, 1, 2     &larr; all INTs in one column</code></pre>
+
+            <h3>ARRAY&lt;STRUCT&gt;</h3>
+            <p>
+                When the element type is a STRUCT, each STRUCT field becomes a child column
+                within the same bucket, preceded by a <code>__struct_null__</code> Boolean column
+                that tracks element-level STRUCT nullability.
+            </p>
+<pre><code>ARRAY&lt;STRUCT&lt;x INT, y UTF8&gt;&gt; physical columns:
+
+Primary:        lengths (INT32, N rows)
+Child 0:        __struct_null__ (Boolean, M elements)
+Child 1:        x (INT32, M elements)
+Child 2:        y (UTF8, M elements)</code></pre>
+
+            <h3>MAP&lt;K, STRUCT&gt;</h3>
+            <p>
+                MAP values that are STRUCTs expand similarly. The <code>__struct_null__</code>
+                column and struct field columns follow the key column:
+            </p>
+<pre><code>MAP&lt;UTF8, STRUCT&lt;x INT, y UTF8&gt;&gt; physical columns:
+
+Primary:        lengths (INT32, N rows)
+Child 0:        keys (UTF8, M elements)
+Child 1:        __struct_null__ (Boolean, M elements)
+Child 2:        x (INT32, M elements)
+Child 3:        y (UTF8, M elements)</code></pre>
+
+            <h3>Bucket Internal Format</h3>
+            <p>
+                ARRAY and MAP columns are expanded into <strong>physical columns</strong> within the same bucket.
+                The bucket header records the child column count and element counts:
+            </p>
+
+            <h4>Monolithic Bucket</h4>
+<pre><code>varint   numPrimary             (N logical columns)
+varint   numChildren            (C child columns; 0 if no ARRAY/MAP)
+repeated C times:
+    varint  childElementCount   (total element count for each child)
+
+[encoding flags: 2 bits &times; (N + C) columns]
+[has-nulls flags: 1 bit &times; (N + C) columns]
+[CONST/DICT metadata for all N + C columns]
+[null bitmaps: primary=ceil(numRows/8), child=ceil(elementCount/8)]
+[column data for all N + C columns]</code></pre>
+
+            <h4>Paged Bucket</h4>
+<pre><code>u16     numChildren (LE)
+repeated numChildren times:
+    u32  childElementCount (LE)
+[directory: (N + C) &times; u32 LE slot sizes]
+[column slots: each independently compressed]</code></pre>
+
+            <h3>Statistics</h3>
+            <p>ARRAY and MAP columns do not support min/max statistics (no meaningful ordering).</p>
+
+            <!-- ============================================================ -->
+            <h2>MAP Type Storage</h2>
+            <p>
+                MAP columns use the same flattened columnar approach as ARRAY.
+                A <code>MAP&lt;K, V&gt;</code> column is decomposed into three physical columns
+                within the same bucket:
+            </p>
+            <ol>
+                <li><strong>Lengths column</strong> (INT32, N entries): the number of key-value pairs in each map.</li>
+                <li><strong>Keys column</strong> (type K, M entries): all keys flattened across all rows.</li>
+                <li><strong>Values column</strong> (type V, M entries): all values flattened across all rows.</li>
+            </ol>
+            <p>
+                All three columns benefit from standard column encoding.
+                Null maps are represented by a null in the lengths column. Empty maps have length 0.
+            </p>
+
+            <h4>Example</h4>
+<pre><code>MAP&lt;INT, UTF8&gt; with rows:  {1:"a", 2:"b"},  null,  {3:"c"}
+
+Lengths column (INT32):  2, null, 1
+Keys column    (INT32):  1, 2, 3       &larr; shared DICT across all maps
+Values column  (UTF8):   "a", "b", "c" &larr; shared DICT across all maps</code></pre>
+
+            <h3>Recursive Nesting</h3>
+            <p>
+                MAP values and keys can themselves be ARRAY or MAP types, which expand recursively.
+                Complex MAP keys (ARRAY or MAP as key type) are rejected at validation.
+            </p>
+<pre><code>MAP&lt;UTF8, ARRAY&lt;INT&gt;&gt; physical columns:
+
+Primary:        lengths (INT32, N rows)         &larr; MAP lengths
+Child 0:        keys (UTF8, M entries)
+Child 1:        array_lengths (INT32, M entries) &larr; inner ARRAY lengths
+Child 2:        array_values (INT32, P entries)  &larr; inner ARRAY leaf values</code></pre>
+
+            <!-- ============================================================ -->
+            <h2>STRUCT Type Storage</h2>
+            <p>
+                Unlike ARRAY and MAP which expand within a bucket, STRUCT fields are
+                <strong>expanded into independent top-level columns</strong> that participate
+                in global name sorting and bucket assignment. This maximizes projection
+                pushdown for wide nested schemas &mdash; projecting a single STRUCT field
+                reads only the bucket(s) containing that field.
+            </p>
+
+            <h3>Column Naming</h3>
+            <p>Column names use dot-separated notation:</p>
+<pre><code>STRUCT(name UTF8, age INT) as "info" (nullable) expands to:
+  info.__null__    (Boolean, STRUCT null bitmap)
+  info.age         (INT32)
+  info.name        (UTF8)
+&rarr; 3 independent columns, sorted and distributed across buckets</code></pre>
+            <p>
+                Column names containing <code>.</code> and names ending with <code>__null__</code>
+                are reserved and rejected at validation to prevent conflicts with expanded names.
+            </p>
+
+            <h3>Nested STRUCT</h3>
+            <p>
+                Nested STRUCT fields expand recursively with dot-separated paths.
+                Each nullable STRUCT level gets its own <code>__null__</code> column:
+            </p>
+<pre><code>STRUCT(name UTF8, addr STRUCT(city UTF8, zip INT) NULLABLE) as "info" (nullable):
+
+  info.__null__          (Boolean)   &larr; info-level null
+  info.addr.__null__     (Boolean)   &larr; addr-level null
+  info.addr.city         (UTF8)
+  info.addr.zip          (INT32)
+  info.name              (UTF8)
+&rarr; 5 independent columns</code></pre>
+            <p>
+                Per-level <code>__null__</code> columns preserve Arrow STRUCT null semantics:
+                <code>addr = null</code> is distinguishable from <code>addr = {city: null, zip: null}</code>.
+            </p>
+
+            <h3>STRUCT Fields with Complex Types</h3>
+            <p>
+                STRUCT fields can be ARRAY or MAP types. These become independent top-level columns
+                that expand within their own bucket using the standard flattened columnar mechanism:
+            </p>
+<pre><code>STRUCT(id INT, tags ARRAY&lt;INT&gt;) as "info":
+  info.id    &rarr; ordinary INT32 column
+  info.tags  &rarr; independent ARRAY column, expands in its bucket as lengths + values</code></pre>
+
+            <h3>Schema Serialization</h3>
+            <p>
+                Top-level STRUCT columns are serialized with <strong>type byte 20</strong> and the
+                full field hierarchy in the schema section. On deserialization, the reader expands
+                the STRUCT type into physical leaf columns internally. This is self-describing &mdash;
+                no dot-naming heuristic is needed to recover the nesting structure.
+            </p>
+            <p>
+                Original field order is preserved through serialization: the STRUCT type descriptor
+                records fields in their original order, and the reader reconstructs the StructArray
+                with the same field order after roundtrip.
+            </p>
+
+            <h3>Projection</h3>
+            <p>
+                The reader supports three projection modes for STRUCT columns:
+            </p>
+            <ul>
+                <li><strong>Whole STRUCT</strong>: <code>project(&amp;["info"])</code> reads all expanded
+                    sub-columns and reconstructs the full StructArray.</li>
+                <li><strong>Leaf projection</strong>: <code>project(&amp;["info.name"])</code> reads only
+                    the <code>info.name</code> column and the <code>info.__null__</code> column
+                    (auto-included to preserve parent null semantics), returning a partial StructArray
+                    with only the projected fields.</li>
+                <li><strong>Mixed projection</strong>: <code>project(&amp;["info.age", "id"])</code> returns
+                    columns in the user-requested order: <code>[info(age), id]</code>.</li>
+            </ul>
+            <p>
+                Ancestor <code>__null__</code> columns at every STRUCT nesting level are automatically
+                included in the physical read set when any descendant leaf is projected.
+                These internal columns participate in reading but do not appear in the output.
+            </p>
+
+            <h3>Statistics</h3>
+            <p>
+                Expanded STRUCT leaf columns (e.g. <code>info.age</code>) support min/max statistics.
+                Stats are collected from the expanded physical arrays after STRUCT null propagation,
+                so null counts and min/max values correctly reflect the combined STRUCT-level and
+                field-level null semantics.
+            </p>
+
+            <!-- ============================================================ -->
+            <h2>Comparison with ORC and Parquet</h2>
+
+            <h3>Top-level STRUCT</h3>
+            <table>
+                <thead>
+                    <tr><th>Aspect</th><th>Mosaic</th><th>ORC</th><th>Parquet</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Storage</td>
+                        <td>Fields expanded to independent top-level columns across buckets</td>
+                        <td>Fields as child streams within the same stripe</td>
+                        <td>Fields as leaf columns with rep/def levels</td>
+                    </tr>
+                    <tr>
+                        <td>Field projection</td>
+                        <td>Read only the bucket(s) containing the field</td>
+                        <td>Skip child streams within the stripe</td>
+                        <td>Read only the leaf column group</td>
+                    </tr>
+                    <tr>
+                        <td>Null tracking</td>
+                        <td><code>__null__</code> Boolean column per nullable STRUCT level</td>
+                        <td>PRESENT stream per STRUCT node</td>
+                        <td>Definition level encodes null at each level</td>
+                    </tr>
+                    <tr>
+                        <td>Field order</td>
+                        <td>Preserved via STRUCT type descriptor in schema</td>
+                        <td>Preserved via stripe column ordering</td>
+                        <td>Preserved via schema metadata</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>ARRAY and MAP</h3>
+            <table>
+                <thead>
+                    <tr><th>Aspect</th><th>Mosaic</th><th>ORC</th><th>Parquet</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Structure encoding</td>
+                        <td>Lengths column (INT32)</td>
+                        <td>Lengths stream (RLE)</td>
+                        <td>Repetition/definition levels per leaf</td>
+                    </tr>
+                    <tr>
+                        <td>Lengths encoding</td>
+                        <td>DICT / CONST / PLAIN</td>
+                        <td>Run-Length Encoding</td>
+                        <td>N/A (rep/def levels encode structure)</td>
+                    </tr>
+                    <tr>
+                        <td>Child column encoding</td>
+                        <td>DICT / CONST / PLAIN (shared across all arrays)</td>
+                        <td>DICT / DIRECT / RLE (same sharing)</td>
+                        <td>DICT / PLAIN per leaf column group</td>
+                    </tr>
+                    <tr>
+                        <td>STRUCT inside ARRAY/MAP</td>
+                        <td><code>__struct_null__</code> Boolean + child columns in same bucket</td>
+                        <td>PRESENT stream + child streams in same stripe</td>
+                        <td>Additional definition level per nesting</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>Why ORC-style over Parquet-style?</h3>
+            <ul>
+                <li><strong>Simplicity</strong>: The lengths + child approach maps naturally to
+                    Mosaic&rsquo;s bucket architecture where each column is independently encoded
+                    and compressed. No rep/def level encoding/decoding needed.</li>
+                <li><strong>Common-case efficiency</strong>: CONST encoding for lengths achieves
+                    near-zero bytes when all arrays have the same length (feature vectors, embeddings).
+                    Parquet&rsquo;s rep/def adds per-value overhead that only pays off at deep nesting (&ge; 3 levels).</li>
+                <li><strong>Debuggability</strong>: Each physical column is a standard column with
+                    its own encoding flags, null bitmap, and data section. No special reconstruction
+                    algorithm needed beyond reading lengths and slicing values.</li>
+            </ul>
+
+            <!-- ============================================================ -->
+            <h2>Validation Rules</h2>
+            <ul>
+                <li>Column names must not contain <code>.</code> (reserved for STRUCT expansion).</li>
+                <li>Column names must not end with <code>__null__</code> (reserved for STRUCT null tracking).</li>
+                <li>STRUCT field names must not contain <code>.</code> or end with <code>__null__</code>.</li>
+                <li>STRUCT must have at least one field.</li>
+                <li>MAP key type cannot be ARRAY, MAP, or STRUCT (complex keys rejected).</li>
+                <li>Sorted MAP is not supported.</li>
+            </ul>
+        </div>
+    </main>
+</body>
+</html>
