@@ -1270,8 +1270,6 @@ impl RowGroupReader {
             // Map the first projected expanded index of each STRUCT to its reassembled array.
             // This ensures the STRUCT appears at the right position in output_order
             // even when only some sub-fields are projected.
-            let output_set: std::collections::HashSet<usize> =
-                self.output_order.iter().copied().collect();
             let mut struct_emit_idx: std::collections::HashMap<usize, (ArrayRef, Field)> =
                 std::collections::HashMap::new();
             for (_, arr, field) in &struct_arrays {
@@ -1281,12 +1279,12 @@ impl RowGroupReader {
                     .iter()
                     .find(|m| m.original_field.name() == field.name())
                 {
-                    if let Some(&first_projected) = mapping
-                        .expanded_col_indices
+                    if let Some(&first_in_output) = self
+                        .output_order
                         .iter()
-                        .find(|idx| output_set.contains(idx))
+                        .find(|idx| mapping.expanded_col_indices.contains(idx))
                     {
-                        struct_emit_idx.insert(first_projected, (arr.clone(), field.clone()));
+                        struct_emit_idx.insert(first_in_output, (arr.clone(), field.clone()));
                     }
                 }
             }

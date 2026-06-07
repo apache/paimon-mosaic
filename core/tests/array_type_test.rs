@@ -2174,3 +2174,56 @@ fn test_struct_leaf_projection_preserves_parent_null() {
     assert!(!info_out.is_null(0));
     assert!(info_out.is_null(1)); // parent null must be preserved
 }
+
+#[test]
+fn test_struct_mixed_projection_order() {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int32, true),
+            ])),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2]);
+    let names = StringArray::from(vec![Some("alice"), Some("bob")]);
+    let ages = Int32Array::from(vec![Some(30), Some(25)]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(ages) as ArrayRef],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids) as ArrayRef, Arc::new(info) as ArrayRef],
+    )
+    .unwrap();
+
+    // Project in non-alphabetical order: info.age first, then id, then info.name
+    let result = roundtrip_projected(&schema, &[batch], &["info.age", "id", "info.name"]);
+    let rb = &result[0];
+    // Output should be: info (with age+name), id — info appears first because info.age was first
+    assert_eq!(rb.num_columns(), 2);
+    assert_eq!(rb.schema().field(0).name(), "info");
+    assert_eq!(rb.schema().field(1).name(), "id");
+
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    let age_out = info_out
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(age_out.value(0), 30);
+
+    let id_out = rb.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(id_out.value(0), 1);
+    assert_eq!(id_out.value(1), 2);
+}
