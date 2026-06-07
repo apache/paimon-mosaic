@@ -2276,8 +2276,6 @@ fn test_struct_leaf_stats() {
     let stats = reader.row_group_stats(0).unwrap();
     assert!(!stats.is_empty());
     let age_stats = &stats[0];
-    // age values: 30, 25, null (struct null at row 2 propagates)
-    assert_eq!(age_stats.null_count, 1);
     // age values after STRUCT null propagation: 30, 25, null (row 2 info is null)
     assert_eq!(age_stats.null_count, 1);
     match &age_stats.min {
