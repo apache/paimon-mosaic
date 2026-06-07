@@ -379,3 +379,11 @@ fn test_v1_with_struct_golden_readable() {
     assert!(info.is_null(1));
     assert!(!info.is_null(2));
 }
+
+#[test]
+#[ignore]
+fn regen_struct_golden() {
+    let data = gen_with_struct();
+    std::fs::write(golden_path("v1_with_struct.mosaic"), &data).unwrap();
+    eprintln!("Regenerated v1_with_struct.mosaic ({} bytes)", data.len());
+}

@@ -110,7 +110,7 @@ impl<S: OutputFile> MosaicWriter<S> {
     /// Expand a RecordBatch into the flat column list matching MosaicSchema.columns.
     /// STRUCT columns are split into sub-field arrays + null bitmap.
     fn expand_batch_arrays(&self, batch: &RecordBatch) -> io::Result<Vec<ArrayRef>> {
-        use arrow_array::{BooleanArray, StructArray};
+        use arrow_array::StructArray;
 
         if self.schema.struct_mappings.is_empty() {
             // No STRUCT columns — fast path
@@ -145,32 +145,17 @@ impl<S: OutputFile> MosaicWriter<S> {
                     io::Error::new(io::ErrorKind::InvalidInput, "expected StructArray")
                 })?;
 
-            // Extract sub-field arrays with null propagation
-            let mut field_arrays = Vec::new();
-            Self::extract_struct_fields(struct_arr, &mut field_arrays);
+            // Extract all expanded arrays (including __null__ for each nullable STRUCT level)
+            let mut flat_arrays = Vec::new();
+            Self::extract_struct_expanded(
+                struct_arr,
+                mapping.null_col_name.is_some(),
+                &mut flat_arrays,
+            );
 
-            // __null__ column if present
-            let mut field_idx = 0;
-            for &sorted_idx in &mapping.expanded_col_indices {
-                let col_name = &self.schema.columns[sorted_idx].name;
-                if col_name.ends_with(".__null__") {
-                    // Generate null bitmap as BooleanArray (true = non-null)
-                    let num_rows = struct_arr.len();
-                    let bool_values: Vec<bool> =
-                        (0..num_rows).map(|i| !struct_arr.is_null(i)).collect();
-                    expanded[sorted_idx] = Some(Arc::new(BooleanArray::from(bool_values)));
-                } else {
-                    if field_idx < field_arrays.len() {
-                        // Apply STRUCT null propagation: if struct row is null, field is null too
-                        let field_arr = &field_arrays[field_idx];
-                        let propagated = if struct_arr.null_count() > 0 {
-                            Self::propagate_struct_nulls(struct_arr, field_arr)
-                        } else {
-                            field_arr.clone()
-                        };
-                        expanded[sorted_idx] = Some(propagated);
-                    }
-                    field_idx += 1;
+            for (i, &sorted_idx) in mapping.expanded_col_indices.iter().enumerate() {
+                if i < flat_arrays.len() {
+                    expanded[sorted_idx] = Some(flat_arrays[i].clone());
                 }
             }
         }
@@ -185,19 +170,42 @@ impl<S: OutputFile> MosaicWriter<S> {
         Ok(expanded.into_iter().map(|opt| opt.unwrap()).collect())
     }
 
-    /// Recursively extract leaf field arrays from a StructArray, flattening nested STRUCTs.
-    fn extract_struct_fields(struct_arr: &arrow_array::StructArray, out: &mut Vec<ArrayRef>) {
-        for col in struct_arr.columns() {
-            if let Some(inner) = col.as_any().downcast_ref::<arrow_array::StructArray>() {
-                if !crate::types::is_timestamp_nanos_struct(&match col.data_type() {
-                    DataType::Struct(f) => f.clone(),
-                    _ => unreachable!(),
-                }) {
-                    Self::extract_struct_fields(inner, out);
-                    continue;
+    /// Recursively extract expanded arrays from a StructArray.
+    /// For each nullable nested STRUCT, emits a __null__ BooleanArray before its fields.
+    /// Propagates parent null to all children.
+    fn extract_struct_expanded(
+        struct_arr: &arrow_array::StructArray,
+        emit_null_col: bool,
+        out: &mut Vec<ArrayRef>,
+    ) {
+        use arrow_array::BooleanArray;
+
+        if emit_null_col {
+            let num_rows = struct_arr.len();
+            let bool_values: Vec<bool> = (0..num_rows).map(|i| !struct_arr.is_null(i)).collect();
+            out.push(Arc::new(BooleanArray::from(bool_values)));
+        }
+
+        for (fi, col) in struct_arr.columns().iter().enumerate() {
+            let field = struct_arr.fields().get(fi).unwrap();
+            let propagated = if struct_arr.null_count() > 0 {
+                Self::propagate_struct_nulls(struct_arr, col)
+            } else {
+                col.clone()
+            };
+
+            if let Some(inner) = propagated
+                .as_any()
+                .downcast_ref::<arrow_array::StructArray>()
+            {
+                if let DataType::Struct(f) = col.data_type() {
+                    if !crate::types::is_timestamp_nanos_struct(f) {
+                        Self::extract_struct_expanded(inner, field.is_nullable(), out);
+                        continue;
+                    }
                 }
             }
-            out.push(col.clone());
+            out.push(propagated);
         }
     }
 

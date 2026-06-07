@@ -69,6 +69,18 @@ impl MosaicSchema {
             if !seen.insert(name.as_str()) {
                 return Err(format!("duplicate column name: {}", name));
             }
+            if name.contains('.') {
+                return Err(format!(
+                    "column name '{}' must not contain '.' (reserved for STRUCT field expansion)",
+                    name
+                ));
+            }
+            if name.ends_with("__null__") {
+                return Err(format!(
+                    "column name '{}' must not end with '__null__' (reserved for STRUCT null tracking)",
+                    name
+                ));
+            }
             types::validate_data_type(data_type)?;
         }
         Ok(())
@@ -166,13 +178,14 @@ impl MosaicSchema {
             let dt = field.data_type();
             if let DataType::Struct(inner_fields) = dt {
                 if !types::is_timestamp_nanos_struct(inner_fields) {
-                    // Nested STRUCT: recurse
+                    if field.is_nullable() {
+                        let null_name = format!("{}.__null__", full_name);
+                        out.push((null_name, DataType::Boolean, false));
+                    }
                     Self::expand_struct_fields_recursive(&full_name, inner_fields, out);
                     continue;
                 }
             }
-            // Leaf field (primitive, ARRAY, MAP, or timestamp_nanos_struct)
-            // Force nullable since STRUCT null propagates
             out.push((full_name, dt.clone(), true));
         }
     }
@@ -343,102 +356,111 @@ impl MosaicSchema {
             seen[idx] = true;
         }
 
-        let mut schema = MosaicSchema {
-            num_buckets,
-            columns,
-            bucket_to_global,
-            original_order,
-            struct_mappings: Vec::new(),
-            original_columns: None,
-        };
-
-        // Check if any columns are STRUCT and need expansion
-        let _has_structs = schema.columns.iter().any(
+        // Check if any deserialized columns are STRUCT types that need expansion
+        let has_structs = columns.iter().any(
             |c| matches!(&c.data_type, DataType::Struct(f) if !types::is_timestamp_nanos_struct(f)),
         );
-        // Detect STRUCT columns from dot-separated naming convention
-        // and populate struct_mappings for reader reassembly.
-        schema.detect_struct_mappings();
 
+        if !has_structs {
+            let schema = MosaicSchema {
+                num_buckets,
+                columns,
+                bucket_to_global,
+                original_order,
+                struct_mappings: Vec::new(),
+                original_columns: None,
+            };
+            return Ok(schema);
+        }
+
+        // Reconstruct original column order from sorted columns + original_order
+        // original_order[input_idx] = sorted_pos
+        let mut input_columns: Vec<(String, DataType, bool)> =
+            vec![(String::new(), DataType::Boolean, false); num_columns];
+        for (input_idx, &sorted_pos) in original_order.iter().enumerate() {
+            let col = &columns[sorted_pos];
+            input_columns[input_idx] = (col.name.clone(), col.data_type.clone(), col.nullable);
+        }
+
+        // Expand STRUCTs using the same logic as from_arrow
+        let mut expanded: Vec<(String, DataType, bool)> = Vec::new();
+        let mut struct_mappings: Vec<StructMapping> = Vec::new();
+
+        for (orig_idx, (name, dt, nullable)) in input_columns.iter().enumerate() {
+            if let DataType::Struct(fields) = dt {
+                if !types::is_timestamp_nanos_struct(fields) {
+                    let start = expanded.len();
+                    let null_col_name = if *nullable {
+                        let null_name = format!("{}.__null__", name);
+                        expanded.push((null_name.clone(), DataType::Boolean, false));
+                        Some(null_name)
+                    } else {
+                        None
+                    };
+                    Self::expand_struct_fields_recursive(name, fields, &mut expanded);
+
+                    let end = expanded.len();
+                    let expanded_indices: Vec<usize> = (start..end).collect();
+
+                    let original_field = Field::new(name, dt.clone(), *nullable);
+                    struct_mappings.push(StructMapping {
+                        original_col_index: orig_idx,
+                        original_field,
+                        expanded_col_indices: expanded_indices,
+                        null_col_name,
+                    });
+                    continue;
+                }
+            }
+            expanded.push((name.clone(), dt.clone(), *nullable));
+        }
+
+        let mut schema = Self::new(expanded, num_buckets);
+        schema.struct_mappings = struct_mappings;
+
+        // Fix struct_mappings expanded_col_indices to point to sorted positions
+        for mapping in &mut schema.struct_mappings {
+            mapping.expanded_col_indices = mapping
+                .expanded_col_indices
+                .iter()
+                .map(|&input_idx| schema.original_order[input_idx])
+                .collect();
+        }
+
+        schema.original_columns = Some(input_columns);
         Ok(schema)
     }
 
-    /// Detect STRUCT columns from dot-separated naming convention and __null__ suffix.
-    /// Populates struct_mappings for reader reassembly.
-    fn detect_struct_mappings(&mut self) {
-        use std::collections::BTreeMap;
-
-        // Group columns by their root prefix (before first dot)
-        let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for (sorted_idx, col) in self.columns.iter().enumerate() {
-            if let Some(dot_pos) = col.name.find('.') {
-                let root = col.name[..dot_pos].to_string();
-                groups.entry(root).or_default().push(sorted_idx);
-            }
-        }
-
-        // For each group, build a StructMapping
-        let mut orig_col_idx = 0;
-        let mut mappings = Vec::new();
-
-        // Determine original column positions: iterate in original_order
-        // For now, assign original_col_index based on discovery order
-        for (root_name, indices) in &groups {
-            // Collect field names and types (excluding __null__)
-            let mut field_entries: Vec<(String, DataType, bool)> = Vec::new();
-            let mut null_col_name = None;
-
-            for &idx in indices {
-                let col_name = &self.columns[idx].name;
-                let suffix = &col_name[root_name.len() + 1..]; // after "root."
-                if suffix == "__null__" {
-                    null_col_name = Some(col_name.clone());
-                } else {
-                    field_entries.push((
-                        suffix.to_string(),
-                        self.columns[idx].data_type.clone(),
-                        self.columns[idx].nullable,
-                    ));
-                }
-            }
-
-            if field_entries.is_empty() {
-                continue;
-            }
-
-            // Build the original STRUCT Field
-            let struct_fields: Vec<Field> = field_entries
-                .iter()
-                .map(|(name, dt, nullable)| Field::new(name, dt.clone(), *nullable))
-                .collect();
-            let original_field = Field::new(
-                root_name,
-                DataType::Struct(arrow_schema::Fields::from(struct_fields)),
-                null_col_name.is_some(),
-            );
-
-            // Find original_col_index: the position in the un-expanded schema
-            // Since we don't have the original schema here, use a counter
-            let mapping = StructMapping {
-                original_col_index: orig_col_idx,
-                original_field,
-                expanded_col_indices: indices.clone(),
-                null_col_name,
-            };
-            mappings.push(mapping);
-            orig_col_idx += 1; // This isn't perfectly accurate but works for single-level
-        }
-
-        self.struct_mappings = mappings;
-    }
-
     pub fn serialize(&self) -> Vec<u8> {
-        // Always serialize the expanded columns (including STRUCT sub-fields).
-        // The reader reconstructs STRUCT types from the dot-separated naming convention.
-        let num_columns = self.columns.len();
+        // When original_columns exists (schema has STRUCTs), serialize the original
+        // pre-expansion columns with STRUCT type byte 20. The reader will expand
+        // STRUCTs on deserialize using the type metadata — no dot-heuristic needed.
+        let serialize_cols: Vec<ColumnMeta> = if let Some(ref orig) = self.original_columns {
+            let mut sorted_indices: Vec<usize> = (0..orig.len()).collect();
+            sorted_indices.sort_by(|&a, &b| orig[a].0.cmp(&orig[b].0));
+            sorted_indices
+                .iter()
+                .map(|&i| {
+                    let bucket_id = spec::assign_bucket(
+                        sorted_indices.iter().position(|&x| x == i).unwrap(),
+                        orig.len(),
+                        self.num_buckets.min(orig.len()).max(1),
+                    );
+                    ColumnMeta {
+                        name: orig[i].0.clone(),
+                        data_type: orig[i].1.clone(),
+                        nullable: orig[i].2,
+                        bucket_id,
+                    }
+                })
+                .collect()
+        } else {
+            self.columns.clone()
+        };
 
-        let raw_names: Vec<Vec<u8>> = self
-            .columns
+        let num_columns = serialize_cols.len();
+
+        let raw_names: Vec<Vec<u8>> = serialize_cols
             .iter()
             .map(|c| c.name.as_bytes().to_vec())
             .collect();
@@ -476,15 +498,28 @@ impl MosaicSchema {
                 buf.push(rule[1]);
             }
             let bpe_refs: Vec<&[u8]> = bpe_names.iter().map(|v| v.as_slice()).collect();
-            write_front_coded(&mut buf, &bpe_refs, &self.columns);
+            write_front_coded(&mut buf, &bpe_refs, &serialize_cols);
         } else {
             buf.push(0); // NAME_ENCODING_FRONT_CODE
-            write_front_coded(&mut buf, &raw_refs, &self.columns);
+            write_front_coded(&mut buf, &raw_refs, &serialize_cols);
         }
 
         // Append original column order as delta + zigzag encoded permutation
+        // When original_columns exists, write the original column order (pre-expansion)
+        let order = if let Some(ref orig) = self.original_columns {
+            let mut sorted_indices: Vec<usize> = (0..orig.len()).collect();
+            sorted_indices.sort_by(|&a, &b| orig[a].0.cmp(&orig[b].0));
+            let mut order = vec![0usize; orig.len()];
+            for (sorted_pos, &input_idx) in sorted_indices.iter().enumerate() {
+                order[input_idx] = sorted_pos;
+            }
+            order
+        } else {
+            self.original_order.clone()
+        };
+
         let mut prev = 0i64;
-        for &pos in &self.original_order {
+        for &pos in &order {
             let delta = pos as i64 - prev;
             varint::encode_zigzag(&mut buf, delta);
             prev = pos as i64;

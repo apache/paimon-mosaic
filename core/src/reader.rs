@@ -426,18 +426,21 @@ impl<I: InputFile> MosaicReader<I> {
     pub fn project(&mut self, column_names: &[&str]) -> io::Result<()> {
         let mut indices = Vec::with_capacity(column_names.len());
         for name in column_names {
-            let idx = self
+            if let Some(idx) = self.schema.columns.iter().position(|c| c.name == *name) {
+                indices.push(idx);
+            } else if let Some(mapping) = self
                 .schema
-                .columns
+                .struct_mappings
                 .iter()
-                .position(|c| c.name == *name)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("column '{}' not found in schema", name),
-                    )
-                })?;
-            indices.push(idx);
+                .find(|m| m.original_field.name() == *name)
+            {
+                indices.extend_from_slice(&mapping.expanded_col_indices);
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("column '{}' not found in schema", name),
+                ));
+            }
         }
         self.projected_columns = Some(indices);
         Ok(())
@@ -1079,6 +1082,78 @@ impl RowGroupReader {
         self.num_rows
     }
 
+    fn reassemble_struct_recursive(
+        struct_fields: &arrow_schema::Fields,
+        named_arrays: &[(String, ArrayRef)],
+        null_buf: Option<arrow_buffer::NullBuffer>,
+        name: &str,
+        nullable: bool,
+    ) -> Option<(ArrayRef, Field)> {
+        let mut ordered_fields: Vec<Arc<Field>> = Vec::new();
+        let mut ordered_children: Vec<ArrayRef> = Vec::new();
+
+        for field in struct_fields.iter() {
+            if let Some(pos) = named_arrays.iter().position(|(n, _)| n == field.name()) {
+                ordered_fields.push(field.clone());
+                ordered_children.push(named_arrays[pos].1.clone());
+            } else if let DataType::Struct(inner_fields) = field.data_type() {
+                let prefix = format!("{}.", field.name());
+                let mut inner_null_buf = None;
+                let sub_arrays: Vec<(String, ArrayRef)> = named_arrays
+                    .iter()
+                    .filter_map(|(n, arr)| {
+                        if let Some(suffix) = n.strip_prefix(&prefix) {
+                            if suffix == "__null__" {
+                                inner_null_buf =
+                                    arr.as_any().downcast_ref::<BooleanArray>().map(|ba| {
+                                        let num = ba.len();
+                                        let mut bm = vec![0u8; num.div_ceil(8)];
+                                        for i in 0..num {
+                                            if ba.value(i) {
+                                                bm[i / 8] |= 1 << (i % 8);
+                                            }
+                                        }
+                                        arrow_buffer::NullBuffer::new(
+                                            arrow_buffer::BooleanBuffer::new(
+                                                arrow_buffer::Buffer::from_vec(bm),
+                                                0,
+                                                num,
+                                            ),
+                                        )
+                                    });
+                                return None;
+                            }
+                            Some((suffix.to_string(), arr.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !sub_arrays.is_empty() {
+                    if let Some((arr, child_field)) = Self::reassemble_struct_recursive(
+                        inner_fields,
+                        &sub_arrays,
+                        inner_null_buf,
+                        field.name(),
+                        field.is_nullable(),
+                    ) {
+                        ordered_fields.push(Arc::new(child_field));
+                        ordered_children.push(arr);
+                    }
+                }
+            }
+        }
+
+        if ordered_children.is_empty() {
+            return None;
+        }
+
+        let projected_fields = arrow_schema::Fields::from(ordered_fields);
+        let struct_arr = StructArray::new(projected_fields.clone(), ordered_children, null_buf);
+        let field = Field::new(name, DataType::Struct(projected_fields), nullable);
+        Some((Arc::new(struct_arr) as ArrayRef, field))
+    }
+
     pub fn read_columns(&mut self) -> io::Result<RecordBatch> {
         let num_cols = self.num_columns;
         let mut arrays: Vec<Option<ArrayRef>> = vec![None; num_cols];
@@ -1157,14 +1232,14 @@ impl RowGroupReader {
         // Reassemble STRUCT columns from expanded sub-field arrays
         let mut struct_arrays: Vec<(usize, ArrayRef, Field)> = Vec::new();
         for mapping in &self.schema.struct_mappings {
-            // Collect expanded arrays keyed by their suffix (field name after "prefix.")
             let prefix = mapping.original_field.name();
             let mut named_arrays: Vec<(String, ArrayRef)> = Vec::new();
             let mut null_bitmap: Option<ArrayRef> = None;
 
+            let root_null_name = mapping.null_col_name.as_deref();
             for &sorted_idx in &mapping.expanded_col_indices {
                 let col_name = &self.schema.columns[sorted_idx].name;
-                if col_name.ends_with(".__null__") {
+                if root_null_name == Some(col_name.as_str()) {
                     null_bitmap = arrays[sorted_idx].take();
                 } else if let Some(arr) = arrays[sorted_idx].take() {
                     let suffix = &col_name[prefix.len() + 1..];
@@ -1190,29 +1265,14 @@ impl RowGroupReader {
                     ))
                 });
 
-                // Build child arrays and fields in the order they appear in named_arrays
-                // (which matches the original STRUCT field order from struct_mappings)
-                let mut ordered_fields: Vec<Arc<Field>> = Vec::new();
-                let mut ordered_children: Vec<ArrayRef> = Vec::new();
-                for field in struct_fields.iter() {
-                    if let Some(pos) = named_arrays
-                        .iter()
-                        .position(|(name, _)| name == field.name())
-                    {
-                        ordered_fields.push(field.clone());
-                        ordered_children.push(named_arrays[pos].1.clone());
-                    }
-                }
-
-                if ordered_children.len() == struct_fields.len() {
-                    // Use the original field order from mapping
-                    let struct_arr =
-                        StructArray::new(struct_fields.clone(), ordered_children, null_buf);
-                    struct_arrays.push((
-                        mapping.original_col_index,
-                        Arc::new(struct_arr) as ArrayRef,
-                        mapping.original_field.clone(),
-                    ));
+                if let Some((arr, field)) = Self::reassemble_struct_recursive(
+                    struct_fields,
+                    &named_arrays,
+                    null_buf,
+                    mapping.original_field.name(),
+                    mapping.original_field.is_nullable(),
+                ) {
+                    struct_arrays.push((mapping.original_col_index, arr, field));
                 }
             }
         }
@@ -1230,8 +1290,12 @@ impl RowGroupReader {
                 .flat_map(|m| m.expanded_col_indices.iter().copied())
                 .collect();
 
-            // Map first expanded index → reassembled struct
-            let mut struct_first_idx: std::collections::HashMap<usize, (ArrayRef, Field)> =
+            // Map the first projected expanded index of each STRUCT to its reassembled array.
+            // This ensures the STRUCT appears at the right position in output_order
+            // even when only some sub-fields are projected.
+            let output_set: std::collections::HashSet<usize> =
+                self.output_order.iter().copied().collect();
+            let mut struct_emit_idx: std::collections::HashMap<usize, (ArrayRef, Field)> =
                 std::collections::HashMap::new();
             for (_, arr, field) in &struct_arrays {
                 if let Some(mapping) = self
@@ -1240,15 +1304,19 @@ impl RowGroupReader {
                     .iter()
                     .find(|m| m.original_field.name() == field.name())
                 {
-                    if let Some(&first) = mapping.expanded_col_indices.first() {
-                        struct_first_idx.insert(first, (arr.clone(), field.clone()));
+                    if let Some(&first_projected) = mapping
+                        .expanded_col_indices
+                        .iter()
+                        .find(|idx| output_set.contains(idx))
+                    {
+                        struct_emit_idx.insert(first_projected, (arr.clone(), field.clone()));
                     }
                 }
             }
 
             for &i in &self.output_order {
                 if struct_expanded.contains(&i) {
-                    if let Some((arr, field)) = struct_first_idx.remove(&i) {
+                    if let Some((arr, field)) = struct_emit_idx.remove(&i) {
                         fields.push(field);
                         batch_arrays.push(arr);
                     }
