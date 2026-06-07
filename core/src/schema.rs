@@ -190,6 +190,69 @@ impl MosaicSchema {
         }
     }
 
+    /// Resolve column names to expanded column indices.
+    /// Supports expanded leaf names (e.g. `info.name`), original STRUCT names (e.g. `info`),
+    /// and automatically includes ancestor `__null__` columns for any projected STRUCT leaf.
+    pub fn resolve_projection(&self, column_names: &[&str]) -> io::Result<Vec<usize>> {
+        let mut indices = Vec::with_capacity(column_names.len());
+        for name in column_names {
+            if let Some(idx) = self.columns.iter().position(|c| c.name == *name) {
+                indices.push(idx);
+            } else if let Some(mapping) = self
+                .struct_mappings
+                .iter()
+                .find(|m| m.original_field.name() == *name)
+            {
+                indices.extend_from_slice(&mapping.expanded_col_indices);
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("column '{}' not found in schema", name),
+                ));
+            }
+        }
+
+        // Add ancestor __null__ columns for any projected STRUCT leaf
+        let mut extra = Vec::new();
+        for mapping in &self.struct_mappings {
+            let has_projected_leaf = mapping.expanded_col_indices.iter().any(|idx| {
+                indices.contains(idx)
+                    && mapping.null_col_name.as_ref().is_none_or(|nc| {
+                        self.columns.iter().position(|c| c.name == *nc) != Some(*idx)
+                    })
+            });
+            if has_projected_leaf {
+                if let Some(ref null_col) = mapping.null_col_name {
+                    if let Some(null_idx) = self.columns.iter().position(|c| c.name == *null_col) {
+                        if !indices.contains(&null_idx) {
+                            extra.push(null_idx);
+                        }
+                    }
+                }
+            }
+        }
+        // Also add nested __null__ columns: any __null__ col whose prefix matches a projected leaf
+        for (col_idx, col) in self.columns.iter().enumerate() {
+            if col.name.ends_with(".__null__")
+                && !indices.contains(&col_idx)
+                && !extra.contains(&col_idx)
+            {
+                let prefix = &col.name[..col.name.len() - ".__null__".len()];
+                let needed = indices.iter().any(|&idx| {
+                    self.columns[idx].name.starts_with(prefix)
+                        && self.columns[idx].name.len() > prefix.len()
+                        && self.columns[idx].name.as_bytes()[prefix.len()] == b'.'
+                });
+                if needed {
+                    extra.push(col_idx);
+                }
+            }
+        }
+
+        indices.extend(extra);
+        Ok(indices)
+    }
+
     pub fn new(columns: Vec<(String, DataType, bool)>, num_buckets: usize) -> Self {
         let num_columns = columns.len();
         let actual_buckets = num_buckets.min(num_columns).max(1);

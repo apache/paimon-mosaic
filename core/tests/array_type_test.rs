@@ -2138,3 +2138,39 @@ fn test_struct_field_order_preserved() {
         .unwrap();
     assert_eq!(z.value(0), 1);
 }
+
+#[test]
+fn test_struct_leaf_projection_preserves_parent_null() {
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ])),
+        true,
+    )]);
+
+    // Row 0: {name: "alice", age: 30}
+    // Row 1: null (entire info is null)
+    let names = StringArray::from(vec![Some("alice"), None::<&str>]);
+    let ages = Int32Array::from(vec![Some(30), None]);
+    let null_buf = NullBuffer::new(BooleanBuffer::new(Buffer::from(vec![0b0000_0001]), 0, 2));
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(ages) as ArrayRef],
+        Some(null_buf),
+    );
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(info) as ArrayRef]).unwrap();
+
+    // Leaf projection: only info.name — must still preserve info null at row 1
+    let result = roundtrip_projected(&schema, &[batch], &["info.name"]);
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 1);
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(!info_out.is_null(0));
+    assert!(info_out.is_null(1)); // parent null must be preserved
+}

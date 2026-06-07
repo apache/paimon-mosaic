@@ -200,21 +200,7 @@ pub trait ReaderAccess {
         rg_index: usize,
         column_names: &[&str],
     ) -> io::Result<RowGroupReader> {
-        let schema = self.schema();
-        let mut indices = Vec::with_capacity(column_names.len());
-        for name in column_names {
-            let idx = schema
-                .columns
-                .iter()
-                .position(|c| c.name == *name)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("column '{}' not found in schema", name),
-                    )
-                })?;
-            indices.push(idx);
-        }
+        let indices = self.schema().resolve_projection(column_names)?;
         self.row_group_reader_projected(rg_index, &indices)
     }
     fn project(&mut self, column_names: &[&str]) -> io::Result<()>;
@@ -424,24 +410,7 @@ impl<I: InputFile> MosaicReader<I> {
     }
 
     pub fn project(&mut self, column_names: &[&str]) -> io::Result<()> {
-        let mut indices = Vec::with_capacity(column_names.len());
-        for name in column_names {
-            if let Some(idx) = self.schema.columns.iter().position(|c| c.name == *name) {
-                indices.push(idx);
-            } else if let Some(mapping) = self
-                .schema
-                .struct_mappings
-                .iter()
-                .find(|m| m.original_field.name() == *name)
-            {
-                indices.extend_from_slice(&mapping.expanded_col_indices);
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("column '{}' not found in schema", name),
-                ));
-            }
-        }
+        let indices = self.schema.resolve_projection(column_names)?;
         self.projected_columns = Some(indices);
         Ok(())
     }
