@@ -1114,3 +1114,47 @@ class TestWriter:
             m = rb.column("m").to_pylist()
             assert m[0] == [("x", 10), ("y", None)]
             assert m[1] == [("z", 30)]
+
+    def test_struct_type(self):
+        pa_schema = pa.schema(
+            [
+                pa.field("id", pa.int32(), nullable=False),
+                pa.field(
+                    "info",
+                    pa.struct(
+                        [
+                            pa.field("name", pa.utf8()),
+                            pa.field("age", pa.int32()),
+                        ]
+                    ),
+                ),
+            ]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array([1, 2, 3], type=pa.int32()),
+                pa.array(
+                    [{"name": "alice", "age": 30}, None, {"name": "charlie", "age": 25}],
+                    type=pa.struct(
+                        [pa.field("name", pa.utf8()), pa.field("age", pa.int32())]
+                    ),
+                ),
+            ],
+            names=["id", "info"],
+        )
+
+        data = _write_to_bytes(pa_schema, batch)
+
+        with _reader_from_bytes(data) as reader:
+            rb = reader.read_row_group(0)
+            assert rb.num_rows == 3
+
+            ids = rb.column("id").to_pylist()
+            assert ids == [1, 2, 3]
+
+            info = rb.column("info").to_pylist()
+            assert info[0]["name"] == "alice"
+            assert info[0]["age"] == 30
+            assert info[1] is None
+            assert info[2]["name"] == "charlie"

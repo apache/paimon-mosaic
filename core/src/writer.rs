@@ -16,9 +16,10 @@
 // under the License.
 
 use std::io;
+use std::sync::Arc;
 
 use arrow_array::*;
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 
 use crate::bucket_writer::{BucketWriter, PagedBucketOutput};
 use crate::schema::MosaicSchema;
@@ -100,12 +101,163 @@ impl<S: OutputFile> MosaicWriter<S> {
     pub fn new(out: S, schema: &Schema, options: WriterOptions) -> io::Result<Self> {
         let mosaic_schema = MosaicSchema::from_arrow(schema, options.num_buckets)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let batch_col_map: Vec<usize> = mosaic_schema
-            .columns
-            .iter()
-            .map(|col| schema.index_of(&col.name).unwrap())
-            .collect();
+
+        // Build column source map for expanded columns
+        let batch_col_map = Self::build_batch_col_map(schema, &mosaic_schema);
         Self::from_mosaic_schema_with_map(out, mosaic_schema, options, batch_col_map)
+    }
+
+    /// Expand a RecordBatch into the flat column list matching MosaicSchema.columns.
+    /// STRUCT columns are split into sub-field arrays + null bitmap.
+    fn expand_batch_arrays(&self, batch: &RecordBatch) -> io::Result<Vec<ArrayRef>> {
+        use arrow_array::{BooleanArray, StructArray};
+
+        if self.schema.struct_mappings.is_empty() {
+            // No STRUCT columns — fast path
+            let num_cols = self.schema.columns.len();
+            if batch.num_columns() != num_cols {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "column count mismatch: schema has {} but batch has {}",
+                        num_cols,
+                        batch.num_columns()
+                    ),
+                ));
+            }
+            let arrays: Vec<ArrayRef> = (0..num_cols)
+                .map(|i| batch.column(self.batch_col_map[i]).clone())
+                .collect();
+            return Ok(arrays);
+        }
+
+        // Has STRUCT columns — expand
+        let num_expanded = self.schema.columns.len();
+        let mut expanded: Vec<Option<ArrayRef>> = vec![None; num_expanded];
+
+        // Fill STRUCT-expanded columns
+        for mapping in &self.schema.struct_mappings {
+            let struct_col = batch.column(mapping.original_col_index);
+            let struct_arr = struct_col
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "expected StructArray")
+                })?;
+
+            // Extract sub-field arrays with null propagation
+            let mut field_arrays = Vec::new();
+            Self::extract_struct_fields(struct_arr, &mut field_arrays);
+
+            // __null__ column if present
+            let mut field_idx = 0;
+            for &sorted_idx in &mapping.expanded_col_indices {
+                let col_name = &self.schema.columns[sorted_idx].name;
+                if col_name.ends_with(".__null__") {
+                    // Generate null bitmap as BooleanArray (true = non-null)
+                    let num_rows = struct_arr.len();
+                    let bool_values: Vec<bool> =
+                        (0..num_rows).map(|i| !struct_arr.is_null(i)).collect();
+                    expanded[sorted_idx] = Some(Arc::new(BooleanArray::from(bool_values)));
+                } else {
+                    if field_idx < field_arrays.len() {
+                        // Apply STRUCT null propagation: if struct row is null, field is null too
+                        let field_arr = &field_arrays[field_idx];
+                        let propagated = if struct_arr.null_count() > 0 {
+                            Self::propagate_struct_nulls(struct_arr, field_arr)
+                        } else {
+                            field_arr.clone()
+                        };
+                        expanded[sorted_idx] = Some(propagated);
+                    }
+                    field_idx += 1;
+                }
+            }
+        }
+
+        // Fill non-STRUCT columns from batch_col_map
+        for (sorted_idx, _col) in self.schema.columns.iter().enumerate() {
+            if expanded[sorted_idx].is_none() {
+                expanded[sorted_idx] = Some(batch.column(self.batch_col_map[sorted_idx]).clone());
+            }
+        }
+
+        Ok(expanded.into_iter().map(|opt| opt.unwrap()).collect())
+    }
+
+    /// Recursively extract leaf field arrays from a StructArray, flattening nested STRUCTs.
+    fn extract_struct_fields(struct_arr: &arrow_array::StructArray, out: &mut Vec<ArrayRef>) {
+        for col in struct_arr.columns() {
+            if let Some(inner) = col.as_any().downcast_ref::<arrow_array::StructArray>() {
+                if !crate::types::is_timestamp_nanos_struct(&match col.data_type() {
+                    DataType::Struct(f) => f.clone(),
+                    _ => unreachable!(),
+                }) {
+                    Self::extract_struct_fields(inner, out);
+                    continue;
+                }
+            }
+            out.push(col.clone());
+        }
+    }
+
+    /// Propagate STRUCT nulls to a child array: where struct is null, child becomes null.
+    fn propagate_struct_nulls(struct_arr: &arrow_array::StructArray, child: &ArrayRef) -> ArrayRef {
+        use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
+        let num_rows = struct_arr.len();
+        let mut null_bm = vec![0xFFu8; num_rows.div_ceil(8)];
+
+        // Start with child's existing null bitmap
+        if let Some(child_nulls) = child.nulls() {
+            let child_buf = child_nulls.inner().inner();
+            for i in 0..null_bm.len().min(child_buf.len()) {
+                null_bm[i] = child_buf[i];
+            }
+        }
+
+        // Mask out struct-null positions
+        if let Some(struct_nulls) = struct_arr.nulls() {
+            let struct_buf = struct_nulls.inner().inner();
+            for i in 0..null_bm.len().min(struct_buf.len()) {
+                null_bm[i] &= struct_buf[i];
+            }
+        }
+
+        let new_null_buf =
+            NullBuffer::new(BooleanBuffer::new(Buffer::from_vec(null_bm), 0, num_rows));
+        arrow_array::make_array(
+            child
+                .to_data()
+                .into_builder()
+                .null_bit_buffer(Some(new_null_buf.into_inner().into_inner()))
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn build_batch_col_map(schema: &Schema, mosaic: &MosaicSchema) -> Vec<usize> {
+        // For non-STRUCT schemas, this is the simple name-based mapping.
+        // For STRUCT schemas, expanded columns can't be found by name in the Arrow schema.
+        // We use a dummy identity mapping here — the actual extraction happens in write_batch.
+        // batch_col_map[expanded_sorted_idx] = original_arrow_col_idx
+        let mut map = Vec::with_capacity(mosaic.columns.len());
+        for col in &mosaic.columns {
+            // Try direct name lookup first
+            if let Ok(idx) = schema.index_of(&col.name) {
+                map.push(idx);
+            } else {
+                // Expanded STRUCT field: find the original STRUCT column
+                let root_name = col.name.split('.').next().unwrap_or(&col.name);
+                if let Ok(idx) = schema.index_of(root_name) {
+                    map.push(idx);
+                } else {
+                    // __null__ column: strip suffix
+                    let base = col.name.strip_suffix(".__null__").unwrap_or(&col.name);
+                    map.push(schema.index_of(base).unwrap_or(0));
+                }
+            }
+        }
+        map
     }
 
     pub fn from_mosaic_schema(
@@ -242,26 +394,18 @@ impl<S: OutputFile> MosaicWriter<S> {
                 "writer is already closed",
             ));
         }
-        let num_cols = self.schema.columns.len();
-        if batch.num_columns() != num_cols {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "column count mismatch: schema has {} but batch has {}",
-                    num_cols,
-                    batch.num_columns()
-                ),
-            ));
-        }
+        // Build expanded arrays from batch (handles STRUCT splitting)
+        let expanded_arrays = self.expand_batch_arrays(batch)?;
 
+        // Check non-nullable columns
         for (i, col) in self.schema.columns.iter().enumerate() {
-            if !col.nullable && batch.column(self.batch_col_map[i]).null_count() > 0 {
+            if !col.nullable && expanded_arrays[i].null_count() > 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
                         "non-nullable column '{}' has {} nulls in batch",
                         col.name,
-                        batch.column(self.batch_col_map[i]).null_count()
+                        expanded_arrays[i].null_count()
                     ),
                 ));
             }
@@ -272,7 +416,7 @@ impl<S: OutputFile> MosaicWriter<S> {
             let global_indices = &self.schema.bucket_to_global[b];
             let arrays: Vec<&dyn Array> = global_indices
                 .iter()
-                .map(|&gi| batch.column(self.batch_col_map[gi]).as_ref())
+                .map(|&gi| expanded_arrays[gi].as_ref())
                 .collect();
             let data_types: Vec<&arrow_schema::DataType> = global_indices
                 .iter()

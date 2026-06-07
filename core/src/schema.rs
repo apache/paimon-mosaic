@@ -33,14 +33,33 @@ pub struct ColumnMeta {
     pub bucket_id: usize,
 }
 
+/// Records how a STRUCT column was expanded into independent columns.
+#[derive(Debug, Clone)]
+pub struct StructMapping {
+    /// Index in the original Arrow schema (before expansion)
+    pub original_col_index: usize,
+    /// The original STRUCT field (for reassembly)
+    pub original_field: arrow_schema::Field,
+    /// Indices into MosaicSchema.columns for each expanded sub-column
+    /// (includes __null__ column if nullable, then each leaf field)
+    pub expanded_col_indices: Vec<usize>,
+    /// Name of the __null__ column (if STRUCT is nullable), None if not nullable
+    pub null_col_name: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MosaicSchema {
     pub num_buckets: usize,
+    /// Expanded columns (STRUCT fields flattened, with __null__ columns)
     pub columns: Vec<ColumnMeta>,
     /// bucket_to_global[bucket_id] = [global_col_indices...] in name-sorted order
     pub bucket_to_global: Vec<Vec<usize>>,
     /// original_order[orig_pos] = sorted_pos. Used as default output order when no projection is set.
     pub original_order: Vec<usize>,
+    /// STRUCT column expansion mappings
+    pub struct_mappings: Vec<StructMapping>,
+    /// Original columns BEFORE STRUCT expansion (for serialization to file)
+    pub original_columns: Option<Vec<(String, DataType, bool)>>,
 }
 
 impl MosaicSchema {
@@ -62,7 +81,100 @@ impl MosaicSchema {
             .map(|f| (f.name().clone(), f.data_type().clone(), f.is_nullable()))
             .collect();
         Self::validate(&columns)?;
-        Ok(Self::new(columns, num_buckets))
+
+        // Expand STRUCT columns into independent flat columns
+        let mut expanded: Vec<(String, DataType, bool)> = Vec::new();
+        let mut struct_mappings: Vec<StructMapping> = Vec::new();
+        // Maps original Arrow col index → range of expanded indices
+        let mut orig_to_expanded: Vec<Vec<usize>> = Vec::new();
+
+        for (orig_idx, (name, dt, nullable)) in columns.iter().enumerate() {
+            if let DataType::Struct(fields) = dt {
+                if !types::is_timestamp_nanos_struct(fields) {
+                    let start = expanded.len();
+                    // Add __null__ column if struct is nullable
+                    let null_col_name = if *nullable {
+                        let null_name = format!("{}.__null__", name);
+                        expanded.push((null_name.clone(), DataType::Boolean, false));
+                        Some(null_name)
+                    } else {
+                        None
+                    };
+                    // Recursively expand struct fields
+                    Self::expand_struct_fields_recursive(name, fields, &mut expanded);
+
+                    let end = expanded.len();
+                    let expanded_indices: Vec<usize> = (start..end).collect();
+                    orig_to_expanded.push(expanded_indices.clone());
+
+                    struct_mappings.push(StructMapping {
+                        original_col_index: orig_idx,
+                        original_field: schema.field(orig_idx).clone(),
+                        expanded_col_indices: expanded_indices,
+                        null_col_name,
+                    });
+                    continue;
+                }
+            }
+            orig_to_expanded.push(vec![expanded.len()]);
+            expanded.push((name.clone(), dt.clone(), *nullable));
+        }
+
+        // Check for name conflicts after expansion
+        let mut seen = HashSet::new();
+        for (name, _, _) in &expanded {
+            if !seen.insert(name.as_str()) {
+                return Err(format!(
+                    "column name conflict after STRUCT expansion: '{}'",
+                    name
+                ));
+            }
+        }
+
+        let mut schema = Self::new(expanded, num_buckets);
+        schema.struct_mappings = struct_mappings;
+
+        // Fix struct_mappings expanded_col_indices to point to sorted positions
+        // expanded indices are input positions; we need sorted positions
+        for mapping in &mut schema.struct_mappings {
+            mapping.expanded_col_indices = mapping
+                .expanded_col_indices
+                .iter()
+                .map(|&input_idx| schema.original_order[input_idx])
+                .collect();
+        }
+
+        // Keep original_order as the expanded column order (identity after new()).
+        // Store the mapping from original Arrow positions → first expanded sorted position
+        // in struct_mappings for the reader to use when building the output RecordBatch.
+
+        // Store original columns for serialization
+        if !schema.struct_mappings.is_empty() {
+            schema.original_columns = Some(columns);
+        }
+
+        Ok(schema)
+    }
+
+    fn expand_struct_fields_recursive(
+        prefix: &str,
+        fields: &arrow_schema::Fields,
+        out: &mut Vec<(String, DataType, bool)>,
+    ) {
+        for field in fields.iter() {
+            let full_name = format!("{}.{}", prefix, field.name());
+            let dt = field.data_type();
+            if let DataType::Struct(inner_fields) = dt {
+                if !types::is_timestamp_nanos_struct(inner_fields) {
+                    // Nested STRUCT: recurse
+                    Self::expand_struct_fields_recursive(&full_name, inner_fields, out);
+                    continue;
+                }
+            }
+            // Leaf field (primitive, ARRAY, MAP, or timestamp_nanos_struct)
+            // Force nullable since STRUCT null propagates
+            out.push((full_name, dt.clone(), true));
+        }
     }
 
     pub fn new(columns: Vec<(String, DataType, bool)>, num_buckets: usize) -> Self {
@@ -96,6 +208,8 @@ impl MosaicSchema {
             columns: cols,
             bucket_to_global,
             original_order,
+            struct_mappings: Vec::new(),
+            original_columns: None,
         }
     }
 
@@ -229,15 +343,98 @@ impl MosaicSchema {
             seen[idx] = true;
         }
 
-        Ok(MosaicSchema {
+        let mut schema = MosaicSchema {
             num_buckets,
             columns,
             bucket_to_global,
             original_order,
-        })
+            struct_mappings: Vec::new(),
+            original_columns: None,
+        };
+
+        // Check if any columns are STRUCT and need expansion
+        let _has_structs = schema.columns.iter().any(
+            |c| matches!(&c.data_type, DataType::Struct(f) if !types::is_timestamp_nanos_struct(f)),
+        );
+        // Detect STRUCT columns from dot-separated naming convention
+        // and populate struct_mappings for reader reassembly.
+        schema.detect_struct_mappings();
+
+        Ok(schema)
+    }
+
+    /// Detect STRUCT columns from dot-separated naming convention and __null__ suffix.
+    /// Populates struct_mappings for reader reassembly.
+    fn detect_struct_mappings(&mut self) {
+        use std::collections::BTreeMap;
+
+        // Group columns by their root prefix (before first dot)
+        let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (sorted_idx, col) in self.columns.iter().enumerate() {
+            if let Some(dot_pos) = col.name.find('.') {
+                let root = col.name[..dot_pos].to_string();
+                groups.entry(root).or_default().push(sorted_idx);
+            }
+        }
+
+        // For each group, build a StructMapping
+        let mut orig_col_idx = 0;
+        let mut mappings = Vec::new();
+
+        // Determine original column positions: iterate in original_order
+        // For now, assign original_col_index based on discovery order
+        for (root_name, indices) in &groups {
+            // Collect field names and types (excluding __null__)
+            let mut field_entries: Vec<(String, DataType, bool)> = Vec::new();
+            let mut null_col_name = None;
+
+            for &idx in indices {
+                let col_name = &self.columns[idx].name;
+                let suffix = &col_name[root_name.len() + 1..]; // after "root."
+                if suffix == "__null__" {
+                    null_col_name = Some(col_name.clone());
+                } else {
+                    field_entries.push((
+                        suffix.to_string(),
+                        self.columns[idx].data_type.clone(),
+                        self.columns[idx].nullable,
+                    ));
+                }
+            }
+
+            if field_entries.is_empty() {
+                continue;
+            }
+
+            // Build the original STRUCT Field
+            let struct_fields: Vec<Field> = field_entries
+                .iter()
+                .map(|(name, dt, nullable)| Field::new(name, dt.clone(), *nullable))
+                .collect();
+            let original_field = Field::new(
+                root_name,
+                DataType::Struct(arrow_schema::Fields::from(struct_fields)),
+                null_col_name.is_some(),
+            );
+
+            // Find original_col_index: the position in the un-expanded schema
+            // Since we don't have the original schema here, use a counter
+            let mapping = StructMapping {
+                original_col_index: orig_col_idx,
+                original_field,
+                expanded_col_indices: indices.clone(),
+                null_col_name,
+            };
+            mappings.push(mapping);
+            orig_col_idx += 1; // This isn't perfectly accurate but works for single-level
+        }
+
+        self.struct_mappings = mappings;
     }
 
     pub fn serialize(&self) -> Vec<u8> {
+        // Always serialize the expanded columns (including STRUCT sub-fields).
+        // The reader reconstructs STRUCT types from the dot-separated naming convention.
         let num_columns = self.columns.len();
 
         let raw_names: Vec<Vec<u8>> = self

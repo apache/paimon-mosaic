@@ -741,9 +741,10 @@ repeated numColumns times:
                     <tr><td>17</td><td>TIMESTAMP_LTZ</td><td>varint precision, varint timezoneLength, bytes timezone</td></tr>
                     <tr><td>18</td><td>ARRAY</td><td>varint nameLength, bytes name (element field name), TypeDescriptor (recursive element type)</td></tr>
                     <tr><td>19</td><td>MAP</td><td>varint entriesNameLen + bytes entriesName, varint keyNameLen + bytes keyName + TypeDescriptor (key), varint valNameLen + bytes valName + TypeDescriptor (value). Sorted MAP is not supported; always unsorted.</td></tr>
+                    <tr><td>20</td><td>STRUCT</td><td>varint numFields, repeated: varint fieldNameLen + bytes fieldName + TypeDescriptor (recursive). Used for STRUCT elements in ARRAY/MAP. Top-level STRUCT columns are expanded into independent columns (see STRUCT Type Storage).</td></tr>
                 </tbody>
             </table>
-            <p>ROW, VARIANT, and BLOB are not yet supported.</p>
+            <p>VARIANT and BLOB are not yet supported.</p>
 
             <!-- ============================================================ -->
             <h2>Value Serialization</h2>
@@ -885,6 +886,38 @@ Lengths column (INT32):  2, null, 1
 Keys column    (INT32):  1, 2, 3       &larr; shared DICT across all maps
 Values column  (UTF8):   "a", "b", "c" &larr; shared DICT across all maps</code></pre>
 
+            <!-- ============================================================ -->
+            <h2>STRUCT Type Storage</h2>
+            <p>
+                Unlike ARRAY and MAP which expand within a bucket, STRUCT fields are
+                <strong>expanded into independent top-level columns</strong> that participate
+                in global name sorting and bucket assignment. This maximizes projection
+                pushdown for wide nested schemas &mdash; projecting a single STRUCT field
+                reads only the bucket(s) containing that field.
+            </p>
+            <p>Column names use dot-separated notation:</p>
+<pre><code>STRUCT(name UTF8, age INT) as "info" expands to:
+  info.__null__    (Boolean, STRUCT null bitmap)
+  info.age         (INT32)
+  info.name        (UTF8)
+&rarr; 3 independent columns, sorted and distributed across buckets</code></pre>
+            <p>
+                Nested STRUCT fields expand recursively: <code>ROW(a INT, b ROW(c INT, d UTF8))</code>
+                becomes <code>a</code>, <code>b.c</code>, <code>b.d</code>.
+                STRUCT fields can be ARRAY or MAP types, which then expand within their bucket
+                using the standard flattened columnar mechanism.
+            </p>
+            <p>
+                The <code>__null__</code> column is only added when the STRUCT is nullable.
+                It stores a Boolean value per row: <code>true</code> = STRUCT is non-null,
+                <code>false</code> = entire STRUCT is null (all fields are treated as null).
+            </p>
+            <p>
+                STRUCT type byte (20) is only serialized when STRUCT appears as an element
+                type inside ARRAY or MAP. Top-level STRUCT columns are stored as their
+                expanded leaf columns directly.
+            </p>
+
             <h3>Design Rationale: Comparison with Parquet and ORC</h3>
             <p>
                 There are two mainstream approaches to storing nested ARRAY types in columnar formats.
@@ -976,7 +1009,6 @@ Values column  (UTF8):   "a", "b", "c" &larr; shared DICT across all maps</code>
             <!-- ============================================================ -->
             <h2>Limitations</h2>
             <ol>
-                <li>Complex types MULTISET and ROW are not yet supported. ARRAY and MAP are supported with flattened columnar storage.</li>
                 <li>Mosaic format is designed for wide tables and may not be efficient for narrow tables with few columns.</li>
             </ol>
         </div>

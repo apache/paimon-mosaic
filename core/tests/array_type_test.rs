@@ -1310,3 +1310,209 @@ fn test_complex_map_key_rejected() {
         ),
     }
 }
+
+// ======================== STRUCT Tests ========================
+
+#[test]
+fn test_struct_basic() {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int32, true),
+            ])),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2, 3]);
+
+    let names = StringArray::from(vec![Some("alice"), Some("bob"), None]);
+    let ages = Int32Array::from(vec![Some(30), None, Some(25)]);
+    let info = StructArray::from(vec![
+        (
+            Arc::new(Field::new("name", DataType::Utf8, true)),
+            Arc::new(names) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("age", DataType::Int32, true)),
+            Arc::new(ages) as ArrayRef,
+        ),
+    ]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids), Arc::new(info)],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    assert_eq!(rb.num_rows(), 3);
+    assert_eq!(rb.num_columns(), 2);
+
+    let result_ids = rb.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(result_ids.value(0), 1);
+    assert_eq!(result_ids.value(1), 2);
+    assert_eq!(result_ids.value(2), 3);
+
+    let result_info = rb.column(1).as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(result_info.len(), 3);
+
+    // Fields may be in alphabetical order after roundtrip (age, name)
+    let age_col = result_info
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(age_col.value(0), 30);
+    assert!(age_col.is_null(1));
+    assert_eq!(age_col.value(2), 25);
+
+    let name_col = result_info
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(name_col.value(0), "alice");
+    assert_eq!(name_col.value(1), "bob");
+    assert!(name_col.is_null(2));
+}
+
+#[test]
+fn test_struct_nullable() {
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Float64, true),
+        ])),
+        true,
+    )]);
+
+    let xs = Int32Array::from(vec![Some(1), Some(2), Some(3)]);
+    let ys = Float64Array::from(vec![Some(1.5), Some(2.5), Some(3.5)]);
+    let struct_null_buf = arrow_buffer::NullBuffer::new(arrow_buffer::BooleanBuffer::new(
+        arrow_buffer::Buffer::from(vec![0b0000_0101]), // row 0 valid, row 1 null, row 2 valid
+        0,
+        3,
+    ));
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Float64, true),
+        ]),
+        vec![Arc::new(xs) as ArrayRef, Arc::new(ys) as ArrayRef],
+        Some(struct_null_buf),
+    );
+
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(info)]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    assert_eq!(rb.num_rows(), 3);
+    assert_eq!(rb.num_columns(), 1);
+
+    let result_info = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(!result_info.is_null(0));
+    assert!(result_info.is_null(1));
+    assert!(!result_info.is_null(2));
+
+    let x_col = result_info
+        .column_by_name("x")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(x_col.value(0), 1);
+    assert_eq!(x_col.value(2), 3);
+}
+
+#[test]
+fn test_struct_with_array_field() {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "data",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("label", DataType::Utf8, true),
+                Field::new(
+                    "values",
+                    DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                    true,
+                ),
+            ])),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2]);
+
+    let labels = StringArray::from(vec![Some("a"), Some("b")]);
+    let mut list_builder = ListBuilder::new(Int32Builder::new());
+    list_builder.values().append_value(10);
+    list_builder.values().append_value(20);
+    list_builder.append(true);
+    list_builder.values().append_value(30);
+    list_builder.append(true);
+    let values_arr = list_builder.finish();
+
+    let data_struct = StructArray::from(vec![
+        (
+            Arc::new(Field::new("label", DataType::Utf8, true)),
+            Arc::new(labels) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new(
+                "values",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            )),
+            Arc::new(values_arr) as ArrayRef,
+        ),
+    ]);
+
+    let mut opts = WriterOptions::default();
+    opts.num_buckets = 1;
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids), Arc::new(data_struct)],
+    )
+    .unwrap();
+
+    let result = roundtrip_with_options(&schema, &[batch], opts);
+    let rb = &result[0];
+    assert_eq!(rb.num_rows(), 2);
+    assert_eq!(rb.num_columns(), 2);
+
+    let result_data = rb.column(1).as_any().downcast_ref::<StructArray>().unwrap();
+    let result_label = result_data
+        .column_by_name("label")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(result_label.value(0), "a");
+    assert_eq!(result_label.value(1), "b");
+
+    let result_values = result_data
+        .column_by_name("values")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(result_values.len(), 2);
+    let v0 = result_values
+        .value(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .clone();
+    assert_eq!(v0.len(), 2);
+    assert_eq!(v0.value(0), 10);
+    assert_eq!(v0.value(1), 20);
+}

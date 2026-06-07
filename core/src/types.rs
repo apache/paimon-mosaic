@@ -130,6 +130,15 @@ pub fn validate_data_type(dt: &DataType) -> Result<(), String> {
                 Err("MAP entries field must be a Struct".to_string())
             }
         }
+        DataType::Struct(fields) => {
+            if fields.is_empty() {
+                return Err("STRUCT must have at least one field".to_string());
+            }
+            for field in fields.iter() {
+                validate_data_type(field.data_type())?;
+            }
+            Ok(())
+        }
         _ => Err(format!("unsupported DataType: {:?}", dt)),
     }
 }
@@ -153,6 +162,7 @@ pub fn data_type_to_type_byte(dt: &DataType) -> u8 {
         DataType::Struct(fields) if is_timestamp_nanos_struct(fields) => 16,
         DataType::List(_) => 18,
         DataType::Map(_, _) => 19,
+        DataType::Struct(_) => 20,
         _ => panic!("unsupported DataType for serialization: {:?}", dt),
     }
 }
@@ -228,6 +238,15 @@ pub fn serialize_field(field: &Field, buf: &mut Vec<u8>) {
                 varint::encode(buf, val_name.len() as u32);
                 buf.extend_from_slice(val_name);
                 serialize_field(&fields[1], buf);
+            }
+        }
+        DataType::Struct(fields) if !is_timestamp_nanos_struct(fields) => {
+            varint::encode(buf, fields.len() as u32);
+            for field in fields.iter() {
+                let name_bytes = field.name().as_bytes();
+                varint::encode(buf, name_bytes.len() as u32);
+                buf.extend_from_slice(name_bytes);
+                serialize_field(field, buf);
             }
         }
         _ => {}
@@ -373,6 +392,17 @@ pub fn deserialize_field(name: &str, buf: &[u8], pos: &mut usize) -> Result<Fiel
                 false,
             );
             DataType::Map(std::sync::Arc::new(entries_field), false)
+        }
+        20 => {
+            let num_fields = varint::decode(buf, pos)? as usize;
+            let mut struct_fields = Vec::with_capacity(num_fields);
+            for _ in 0..num_fields {
+                let field_name_len = varint::decode(buf, pos)? as usize;
+                let field_name = read_utf8_field_name(buf, pos, field_name_len, "STRUCT field")?;
+                let field = deserialize_field(&field_name, buf, pos)?;
+                struct_fields.push(field);
+            }
+            DataType::Struct(Fields::from(struct_fields))
         }
         _ => {
             return Err(std::io::Error::new(

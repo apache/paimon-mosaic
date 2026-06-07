@@ -304,3 +304,78 @@ fn test_v1_with_map_golden_readable() {
     // Row 2: empty
     assert_eq!(map_col.value_offsets()[3] - map_col.value_offsets()[2], 0);
 }
+
+/// Generate deterministic STRUCT file.
+/// Schema: id(INT32 NOT NULL), info(STRUCT{name UTF8, age INT32} NULLABLE)
+/// Data: 3 rows — {name:"alice", age:30}, null, {name:"charlie", age:25}
+fn gen_with_struct() -> Vec<u8> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int32, true),
+            ])),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2, 3]);
+    let names = StringArray::from(vec![Some("alice"), Some("bob"), None]);
+    let ages = Int32Array::from(vec![Some(30), None, Some(25)]);
+    let null_buf = arrow_buffer::NullBuffer::new(arrow_buffer::BooleanBuffer::new(
+        arrow_buffer::Buffer::from(vec![0b0000_0101]),
+        0,
+        3,
+    ));
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(ages) as ArrayRef],
+        Some(null_buf),
+    );
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids), Arc::new(info)],
+    )
+    .unwrap();
+
+    let out = MemOutputFile::new();
+    let opts = WriterOptions {
+        num_buckets: 1,
+        compression: 0,
+        ..WriterOptions::default()
+    };
+    let mut writer = MosaicWriter::new(out, &schema, opts).unwrap();
+    writer.write_batch(&batch).unwrap();
+    writer.close().unwrap();
+    writer.output().buf.clone()
+}
+
+#[test]
+fn test_v1_with_struct_binary_stable() {
+    let generated = gen_with_struct();
+    let golden = std::fs::read(golden_path("v1_with_struct.mosaic"))
+        .expect("golden file missing — regenerate");
+    assert_eq!(generated, golden, "STRUCT file differs from golden");
+}
+
+#[test]
+fn test_v1_with_struct_golden_readable() {
+    let data = std::fs::read(golden_path("v1_with_struct.mosaic")).unwrap();
+    let input = ByteArrayInputFile { data: data.clone() };
+    let reader = MosaicReader::new(input, data.len() as u64).unwrap();
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let rb = rg.read_columns().unwrap();
+    assert_eq!(rb.num_rows(), 3);
+    assert_eq!(rb.num_columns(), 2);
+
+    let info = rb.column(1).as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(!info.is_null(0));
+    assert!(info.is_null(1));
+    assert!(!info.is_null(2));
+}

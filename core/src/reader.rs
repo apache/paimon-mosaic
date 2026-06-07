@@ -18,7 +18,7 @@
 use std::io;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, StructArray};
 use arrow_schema::{DataType, Field, Schema};
 
 use crate::bucket_reader::{read_typed_value, read_variable_value, BucketReader, ColumnPageReader};
@@ -1154,17 +1154,125 @@ impl RowGroupReader {
             }
         }
 
+        // Reassemble STRUCT columns from expanded sub-field arrays
+        let mut struct_arrays: Vec<(usize, ArrayRef, Field)> = Vec::new();
+        for mapping in &self.schema.struct_mappings {
+            // Collect expanded arrays keyed by their suffix (field name after "prefix.")
+            let prefix = mapping.original_field.name();
+            let mut named_arrays: Vec<(String, ArrayRef)> = Vec::new();
+            let mut null_bitmap: Option<ArrayRef> = None;
+
+            for &sorted_idx in &mapping.expanded_col_indices {
+                let col_name = &self.schema.columns[sorted_idx].name;
+                if col_name.ends_with(".__null__") {
+                    null_bitmap = arrays[sorted_idx].take();
+                } else if let Some(arr) = arrays[sorted_idx].take() {
+                    let suffix = &col_name[prefix.len() + 1..];
+                    named_arrays.push((suffix.to_string(), arr));
+                }
+            }
+
+            if let DataType::Struct(struct_fields) = mapping.original_field.data_type() {
+                let null_buf = null_bitmap.and_then(|nb| {
+                    let bool_arr = nb.as_any().downcast_ref::<BooleanArray>()?;
+                    let mut bm = vec![0u8; bool_arr.len().div_ceil(8)];
+                    for i in 0..bool_arr.len() {
+                        if bool_arr.value(i) {
+                            bm[i / 8] |= 1 << (i % 8);
+                        }
+                    }
+                    Some(arrow_buffer::NullBuffer::new(
+                        arrow_buffer::BooleanBuffer::new(
+                            arrow_buffer::Buffer::from_vec(bm),
+                            0,
+                            bool_arr.len(),
+                        ),
+                    ))
+                });
+
+                // Build child arrays and fields in the order they appear in named_arrays
+                // (which matches the original STRUCT field order from struct_mappings)
+                let mut ordered_fields: Vec<Arc<Field>> = Vec::new();
+                let mut ordered_children: Vec<ArrayRef> = Vec::new();
+                for field in struct_fields.iter() {
+                    if let Some(pos) = named_arrays
+                        .iter()
+                        .position(|(name, _)| name == field.name())
+                    {
+                        ordered_fields.push(field.clone());
+                        ordered_children.push(named_arrays[pos].1.clone());
+                    }
+                }
+
+                if ordered_children.len() == struct_fields.len() {
+                    // Use the original field order from mapping
+                    let struct_arr =
+                        StructArray::new(struct_fields.clone(), ordered_children, null_buf);
+                    struct_arrays.push((
+                        mapping.original_col_index,
+                        Arc::new(struct_arr) as ArrayRef,
+                        mapping.original_field.clone(),
+                    ));
+                }
+            }
+        }
+
+        // Build output RecordBatch
         let mut fields = Vec::new();
         let mut batch_arrays = Vec::new();
-        for &i in &self.output_order {
-            if let Some(arr) = arrays[i].take() {
-                let col_meta = &self.schema.columns[i];
-                fields.push(Field::new(
-                    &col_meta.name,
-                    col_meta.data_type.clone(),
-                    col_meta.nullable,
-                ));
-                batch_arrays.push(arr);
+
+        if !self.schema.struct_mappings.is_empty() {
+            // Track which expanded indices are consumed by STRUCTs
+            let struct_expanded: std::collections::HashSet<usize> = self
+                .schema
+                .struct_mappings
+                .iter()
+                .flat_map(|m| m.expanded_col_indices.iter().copied())
+                .collect();
+
+            // Map first expanded index → reassembled struct
+            let mut struct_first_idx: std::collections::HashMap<usize, (ArrayRef, Field)> =
+                std::collections::HashMap::new();
+            for (_, arr, field) in &struct_arrays {
+                if let Some(mapping) = self
+                    .schema
+                    .struct_mappings
+                    .iter()
+                    .find(|m| m.original_field.name() == field.name())
+                {
+                    if let Some(&first) = mapping.expanded_col_indices.first() {
+                        struct_first_idx.insert(first, (arr.clone(), field.clone()));
+                    }
+                }
+            }
+
+            for &i in &self.output_order {
+                if struct_expanded.contains(&i) {
+                    if let Some((arr, field)) = struct_first_idx.remove(&i) {
+                        fields.push(field);
+                        batch_arrays.push(arr);
+                    }
+                } else if let Some(arr) = arrays[i].take() {
+                    let col_meta = &self.schema.columns[i];
+                    fields.push(Field::new(
+                        &col_meta.name,
+                        col_meta.data_type.clone(),
+                        col_meta.nullable,
+                    ));
+                    batch_arrays.push(arr);
+                }
+            }
+        } else {
+            for &i in &self.output_order {
+                if let Some(arr) = arrays[i].take() {
+                    let col_meta = &self.schema.columns[i];
+                    fields.push(Field::new(
+                        &col_meta.name,
+                        col_meta.data_type.clone(),
+                        col_meta.nullable,
+                    ));
+                    batch_arrays.push(arr);
+                }
             }
         }
 
