@@ -1516,3 +1516,270 @@ fn test_struct_with_array_field() {
     assert_eq!(v0.value(0), 10);
     assert_eq!(v0.value(1), 20);
 }
+
+#[test]
+fn test_array_of_struct() {
+    // ARRAY<STRUCT<a INT, b UTF8>>
+    let struct_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Utf8, true),
+    ]));
+    let schema = Schema::new(vec![Field::new(
+        "col",
+        DataType::List(Arc::new(Field::new("item", struct_type.clone(), true))),
+        true,
+    )]);
+
+    // Row 0: [{a:1, b:"x"}, {a:2, b:"y"}]
+    // Row 1: null
+    // Row 2: [{a:3, b:null}]
+    let fields = arrow_schema::Fields::from(vec![
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Utf8, true),
+    ]);
+    let struct_builder = StructBuilder::from_fields(fields, 4);
+    let mut list_builder = ListBuilder::new(struct_builder);
+
+    // Row 0
+    list_builder
+        .values()
+        .field_builder::<Int32Builder>(0)
+        .unwrap()
+        .append_value(1);
+    list_builder
+        .values()
+        .field_builder::<StringBuilder>(1)
+        .unwrap()
+        .append_value("x");
+    list_builder.values().append(true);
+    list_builder
+        .values()
+        .field_builder::<Int32Builder>(0)
+        .unwrap()
+        .append_value(2);
+    list_builder
+        .values()
+        .field_builder::<StringBuilder>(1)
+        .unwrap()
+        .append_value("y");
+    list_builder.values().append(true);
+    list_builder.append(true);
+
+    // Row 1: null
+    list_builder.append(false);
+
+    // Row 2: [{a:3, b:null}]
+    list_builder
+        .values()
+        .field_builder::<Int32Builder>(0)
+        .unwrap()
+        .append_value(3);
+    list_builder
+        .values()
+        .field_builder::<StringBuilder>(1)
+        .unwrap()
+        .append_null();
+    list_builder.values().append(true);
+    list_builder.append(true);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(list_builder.finish())],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(col.len(), 3);
+    assert!(!col.is_null(0));
+    assert!(col.is_null(1));
+    assert!(!col.is_null(2));
+
+    // Row 0: [{a:1, b:"x"}, {a:2, b:"y"}]
+    let row0 = col.value(0);
+    let structs0 = row0.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(structs0.len(), 2);
+    let a0 = structs0
+        .column_by_name("a")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(a0.value(0), 1);
+    assert_eq!(a0.value(1), 2);
+    let b0 = structs0
+        .column_by_name("b")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(b0.value(0), "x");
+    assert_eq!(b0.value(1), "y");
+
+    // Row 2: [{a:3, b:null}]
+    let row2 = col.value(2);
+    let structs2 = row2.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(structs2.len(), 1);
+    let a2 = structs2
+        .column_by_name("a")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(a2.value(0), 3);
+    let b2 = structs2
+        .column_by_name("b")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(b2.is_null(0));
+}
+
+#[test]
+fn test_map_of_struct_value() {
+    // MAP<UTF8, STRUCT<x INT, y UTF8>>
+    let struct_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("x", DataType::Int32, true),
+        Field::new("y", DataType::Utf8, true),
+    ]));
+    let map_field = Field::new(
+        "entries",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("keys", DataType::Utf8, false),
+            Field::new("values", struct_type.clone(), true),
+        ])),
+        false,
+    );
+    let schema = Schema::new(vec![Field::new(
+        "col",
+        DataType::Map(Arc::new(map_field), false),
+        true,
+    )]);
+
+    // Row 0: {"k1": {x:10, y:"hello"}}
+    // Row 1: {"k2": {x:20, y:null}, "k3": {x:30, y:"world"}}
+    let key_builder = StringBuilder::new();
+    let value_fields = arrow_schema::Fields::from(vec![
+        Field::new("x", DataType::Int32, true),
+        Field::new("y", DataType::Utf8, true),
+    ]);
+    let value_builder = StructBuilder::from_fields(value_fields, 3);
+    let mut map_builder = MapBuilder::new(None, key_builder, value_builder);
+
+    // Row 0
+    map_builder.keys().append_value("k1");
+    map_builder
+        .values()
+        .field_builder::<Int32Builder>(0)
+        .unwrap()
+        .append_value(10);
+    map_builder
+        .values()
+        .field_builder::<StringBuilder>(1)
+        .unwrap()
+        .append_value("hello");
+    map_builder.values().append(true);
+    map_builder.append(true).unwrap();
+
+    // Row 1
+    map_builder.keys().append_value("k2");
+    map_builder
+        .values()
+        .field_builder::<Int32Builder>(0)
+        .unwrap()
+        .append_value(20);
+    map_builder
+        .values()
+        .field_builder::<StringBuilder>(1)
+        .unwrap()
+        .append_null();
+    map_builder.values().append(true);
+    map_builder.keys().append_value("k3");
+    map_builder
+        .values()
+        .field_builder::<Int32Builder>(0)
+        .unwrap()
+        .append_value(30);
+    map_builder
+        .values()
+        .field_builder::<StringBuilder>(1)
+        .unwrap()
+        .append_value("world");
+    map_builder.values().append(true);
+    map_builder.append(true).unwrap();
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(map_builder.finish())],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .unwrap();
+    assert_eq!(col.len(), 2);
+
+    // Row 0: {"k1": {x:10, y:"hello"}}
+    let row0 = col.value(0);
+    let entries0 = row0.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(entries0.len(), 1);
+    let keys0 = entries0
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(keys0.value(0), "k1");
+    let vals0 = entries0
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let x0 = vals0
+        .column_by_name("x")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(x0.value(0), 10);
+    let y0 = vals0
+        .column_by_name("y")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(y0.value(0), "hello");
+
+    // Row 1: 2 entries
+    let row1 = col.value(1);
+    let entries1 = row1.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(entries1.len(), 2);
+    let vals1 = entries1
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let x1 = vals1
+        .column_by_name("x")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(x1.value(0), 20);
+    assert_eq!(x1.value(1), 30);
+    let y1 = vals1
+        .column_by_name("y")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(y1.is_null(0));
+    assert_eq!(y1.value(1), "world");
+}

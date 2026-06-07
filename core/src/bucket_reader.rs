@@ -393,16 +393,184 @@ fn reassemble_list_columns(
         // where the first child's element_field is NOT itself a complex type
         // (complex element_field means it's a nested ARRAY/MAP intermediate).
 
+        // Skip children that are part of a STRUCT group (handled when we reach the __struct_null__ child)
+        let is_struct_field_child = idx > 0
+            && children.iter().any(|c| {
+                c.parent_logical_col == parent
+                    && c.physical_index < phys_idx
+                    && c.element_field.name() == "__struct_null__"
+                    && !processed[children
+                        .iter()
+                        .position(|x| std::ptr::eq(x, c))
+                        .unwrap_or(usize::MAX)]
+            });
+        if is_struct_field_child {
+            continue;
+        }
+
+        // Check if this is a __struct_null__ child — if so, reassemble the STRUCT
+        if child.element_field.name() == "__struct_null__" {
+            // Collect all subsequent children with same parent that aren't processed
+            let mut struct_field_indices: Vec<usize> = Vec::new();
+            for si in (idx + 1)..children.len() {
+                if children[si].parent_logical_col == parent && !processed[si] {
+                    struct_field_indices.push(si);
+                } else {
+                    break;
+                }
+            }
+
+            // Read null bitmap
+            let null_bitmap = arrays[phys_idx].clone();
+
+            // Read field arrays
+            let mut field_arrays: Vec<ArrayRef> = Vec::new();
+            let mut field_defs: Vec<Arc<Field>> = Vec::new();
+            for &si in &struct_field_indices {
+                field_arrays.push(arrays[children[si].physical_index].clone());
+                field_defs.push(children[si].element_field.clone());
+            }
+
+            // Build null buffer from BooleanArray
+            let null_buf = null_bitmap
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .and_then(|ba| {
+                    let num = ba.len();
+                    let mut bm = vec![0u8; num.div_ceil(8)];
+                    for i in 0..num {
+                        if ba.value(i) {
+                            bm[i / 8] |= 1 << (i % 8);
+                        }
+                    }
+                    if bm.iter().all(|&b| b == 0xFF) {
+                        None
+                    } else {
+                        Some(NullBuffer::new(BooleanBuffer::new(
+                            Buffer::from_vec(bm),
+                            0,
+                            num,
+                        )))
+                    }
+                });
+
+            let struct_fields = arrow_schema::Fields::from(
+                field_defs
+                    .iter()
+                    .map(|f| f.as_ref().clone())
+                    .collect::<Vec<_>>(),
+            );
+            let struct_arr = StructArray::new(struct_fields, field_arrays, null_buf);
+
+            // Check if this STRUCT is the value part of a MAP (key child precedes __struct_null__)
+            let map_key_child_idx = if idx > 0 {
+                let prev = idx - 1;
+                if children[prev].parent_logical_col == parent
+                    && !processed[prev]
+                    && children[prev].element_field.name() != "__struct_null__"
+                    && !matches!(
+                        children[prev].element_field.data_type(),
+                        DataType::List(_) | DataType::Map(_, _)
+                    )
+                {
+                    Some(prev)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(key_idx) = map_key_child_idx {
+                // MAP<K, STRUCT<...>>: key child + struct value
+                let key_child = &children[key_idx];
+                let keys = arrays[key_child.physical_index].clone();
+
+                let prev_child_is_lengths = children.iter().any(|c| {
+                    c.physical_index == key_child.physical_index.wrapping_sub(1)
+                        && c.parent_logical_col == parent
+                        && matches!(
+                            c.element_field.data_type(),
+                            DataType::List(_) | DataType::Map(_, _)
+                        )
+                });
+                let lengths_idx = if prev_child_is_lengths {
+                    key_child.physical_index - 1
+                } else {
+                    parent
+                };
+
+                let lengths = arrays[lengths_idx].clone();
+                let lengths_rows = lengths.len();
+
+                let key_field = key_child.element_field.as_ref().clone();
+                let val_field = Field::new(
+                    "values",
+                    DataType::Struct(struct_arr.fields().clone()),
+                    true,
+                );
+                let entries_field = Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(arrow_schema::Fields::from(vec![key_field, val_field])),
+                    false,
+                ));
+                arrays[lengths_idx] = reassemble_map_array(
+                    lengths,
+                    keys,
+                    Arc::new(struct_arr),
+                    &entries_field,
+                    false,
+                    lengths_rows,
+                );
+                processed[key_idx] = true;
+            } else {
+                // ARRAY<STRUCT<...>>: struct values inside a list
+                let prev_child_is_lengths = children.iter().any(|c| {
+                    c.physical_index == phys_idx - 1
+                        && c.parent_logical_col == parent
+                        && matches!(
+                            c.element_field.data_type(),
+                            DataType::List(_) | DataType::Map(_, _)
+                        )
+                });
+                let lengths_idx = if prev_child_is_lengths {
+                    phys_idx - 1
+                } else {
+                    parent
+                };
+
+                let lengths = arrays[lengths_idx].clone();
+                let lengths_rows = lengths.len();
+                let element_field = Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(struct_arr.fields().clone()),
+                    true,
+                ));
+                arrays[lengths_idx] = reassemble_list_array(
+                    lengths,
+                    Arc::new(struct_arr),
+                    element_field,
+                    lengths_rows,
+                );
+            }
+
+            processed[idx] = true;
+            for &si in &struct_field_indices {
+                processed[si] = true;
+            }
+            continue;
+        }
+
         let prev_is_map_key = idx > 0
             && children[idx - 1].parent_logical_col == parent
             && !processed[idx - 1]
             && !matches!(
                 children[idx - 1].element_field.data_type(),
                 DataType::List(_) | DataType::Map(_, _)
-            );
+            )
+            && children[idx - 1].element_field.name() != "__struct_null__";
 
         if prev_is_map_key {
-            // This child is the VALUES of a MAP (the keys are at idx-1)
             continue;
         }
 
@@ -412,7 +580,9 @@ fn reassemble_list_columns(
             && !matches!(
                 child.element_field.data_type(),
                 DataType::List(_) | DataType::Map(_, _)
-            );
+            )
+            && child.element_field.name() != "__struct_null__"
+            && children[idx + 1].element_field.name() != "__struct_null__";
 
         if next_is_map_value {
             // MAP: this child is KEYS, next child is VALUES

@@ -202,7 +202,10 @@ impl<S: OutputFile> MosaicWriter<S> {
     }
 
     /// Propagate STRUCT nulls to a child array: where struct is null, child becomes null.
-    fn propagate_struct_nulls(struct_arr: &arrow_array::StructArray, child: &ArrayRef) -> ArrayRef {
+    pub(crate) fn propagate_struct_nulls(
+        struct_arr: &arrow_array::StructArray,
+        child: &ArrayRef,
+    ) -> ArrayRef {
         use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
         let num_rows = struct_arr.len();
         let mut null_bm = vec![0xFFu8; num_rows.div_ceil(8)];
