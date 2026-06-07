@@ -2227,3 +2227,65 @@ fn test_struct_mixed_projection_order() {
     assert_eq!(id_out.value(0), 1);
     assert_eq!(id_out.value(1), 2);
 }
+
+#[test]
+fn test_struct_leaf_stats() {
+    use paimon_mosaic_core::values::Value;
+
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int32, true),
+            ])),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2, 3]);
+    let names = StringArray::from(vec![Some("alice"), Some("bob"), None::<&str>]);
+    let ages = Int32Array::from(vec![Some(30), Some(25), Some(40)]);
+    let null_buf = NullBuffer::new(BooleanBuffer::new(Buffer::from(vec![0b0000_0011]), 0, 3));
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(ages) as ArrayRef],
+        Some(null_buf),
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids) as ArrayRef, Arc::new(info) as ArrayRef],
+    )
+    .unwrap();
+
+    let out = MemOutputFile::new();
+    let mut opts = WriterOptions::default();
+    opts.stats_columns = vec!["info.age".to_string()];
+    let mut writer = MosaicWriter::new(out, &schema, opts).unwrap();
+    writer.write_batch(&batch).unwrap();
+    writer.close().unwrap();
+
+    let data = writer.output().buf.clone();
+    let input = ByteArrayInputFile { data: data.clone() };
+    let reader = MosaicReader::new(input, data.len() as u64).unwrap();
+
+    let stats = reader.row_group_stats(0).unwrap();
+    assert!(!stats.is_empty());
+    let age_stats = &stats[0];
+    // age values: 30, 25, null (struct null at row 2 propagates)
+    assert_eq!(age_stats.null_count, 1);
+    // age values after STRUCT null propagation: 30, 25, null (row 2 info is null)
+    assert_eq!(age_stats.null_count, 1);
+    match &age_stats.min {
+        Some(Value::Integer(v)) => assert_eq!(*v, 25),
+        other => panic!("expected Some(Integer(25)), got {:?}", other),
+    }
+    match &age_stats.max {
+        Some(Value::Integer(v)) => assert_eq!(*v, 30),
+        other => panic!("expected Some(Integer(30)), got {:?}", other),
+    }
+}

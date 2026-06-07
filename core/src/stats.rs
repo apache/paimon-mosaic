@@ -145,6 +145,25 @@ impl StatsCollector {
         }
     }
 
+    pub fn update_expanded(&mut self, expanded: &[ArrayRef]) {
+        for tracker in &mut self.trackers {
+            let array = &expanded[tracker.column_index];
+            tracker.null_count += array.null_count();
+            if !supports_stats(&tracker.data_type) {
+                continue;
+            }
+            for row in 0..array.len() {
+                if array.is_null(row) {
+                    continue;
+                }
+                if let Some(val) = extract_value_for_stats(array.as_ref(), row, &tracker.data_type)
+                {
+                    update_min_max(tracker, val);
+                }
+            }
+        }
+    }
+
     pub fn finish(&mut self) -> Vec<ColumnStats> {
         let stats = self
             .trackers

@@ -438,7 +438,7 @@ impl<S: OutputFile> MosaicWriter<S> {
         }
 
         if let Some(ref mut collector) = self.stats_collector {
-            collector.update_batch(batch);
+            collector.update_expanded(&expanded_arrays);
         }
 
         self.current_row_group_rows += batch.num_rows();
