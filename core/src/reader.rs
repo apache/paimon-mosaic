@@ -200,9 +200,15 @@ pub trait ReaderAccess {
         rg_index: usize,
         column_names: &[&str],
     ) -> io::Result<RowGroupReader> {
-        let indices = self.schema().resolve_projection(column_names)?;
-        self.row_group_reader_projected(rg_index, &indices)
+        let (output, read) = self.schema().resolve_projection(column_names)?;
+        self.row_group_reader_projected_with_output(rg_index, &read, &output)
     }
+    fn row_group_reader_projected_with_output(
+        &self,
+        rg_index: usize,
+        read_indices: &[usize],
+        output_order: &[usize],
+    ) -> io::Result<RowGroupReader>;
     fn project(&mut self, column_names: &[&str]) -> io::Result<()>;
     fn row_group_stats(&self, rg_index: usize) -> io::Result<&[ColumnStats]>;
     fn row_group_num_rows(&self, rg_index: usize) -> io::Result<usize>;
@@ -214,7 +220,9 @@ pub struct MosaicReader<I: InputFile> {
     row_group_metas: Vec<RowGroupMeta>,
     compression: u8,
     num_buckets: usize,
-    projected_columns: Option<Vec<usize>>,
+    /// (output_order, read_indices) — output_order is user-requested columns for output ordering;
+    /// read_indices includes auto-added __null__ columns needed for STRUCT reassembly.
+    projected_columns: Option<(Vec<usize>, Vec<usize>)>,
 }
 
 fn read_range(input: &dyn InputFile, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -410,8 +418,8 @@ impl<I: InputFile> MosaicReader<I> {
     }
 
     pub fn project(&mut self, column_names: &[&str]) -> io::Result<()> {
-        let indices = self.schema.resolve_projection(column_names)?;
-        self.projected_columns = Some(indices);
+        let (output, read) = self.schema.resolve_projection(column_names)?;
+        self.projected_columns = Some((output, read));
         Ok(())
     }
 
@@ -519,16 +527,30 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
 
     fn row_group_reader(&self, rg_index: usize) -> io::Result<RowGroupReader> {
         match &self.projected_columns {
-            Some(cols) => self.row_group_reader_projected(rg_index, cols),
-            None => self.row_group_reader_projected(rg_index, &self.schema.original_order),
+            Some((output, read)) => {
+                self.row_group_reader_projected_with_output(rg_index, read, output)
+            }
+            None => {
+                let order = &self.schema.original_order;
+                self.row_group_reader_projected_with_output(rg_index, order, order)
+            }
         }
     }
 
-    #[allow(clippy::needless_range_loop)]
     fn row_group_reader_projected(
         &self,
         rg_index: usize,
         columns: &[usize],
+    ) -> io::Result<RowGroupReader> {
+        self.row_group_reader_projected_with_output(rg_index, columns, columns)
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn row_group_reader_projected_with_output(
+        &self,
+        rg_index: usize,
+        columns: &[usize],
+        output_order: &[usize],
     ) -> io::Result<RowGroupReader> {
         if rg_index >= self.row_group_metas.len() {
             return Err(io::Error::new(
@@ -975,27 +997,13 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
             num_cols,
             meta.num_rows,
             projected,
-            columns.to_vec(),
+            output_order.to_vec(),
         ))
     }
 
     fn project(&mut self, column_names: &[&str]) -> io::Result<()> {
-        let mut indices = Vec::with_capacity(column_names.len());
-        for name in column_names {
-            let idx = self
-                .schema
-                .columns
-                .iter()
-                .position(|c| c.name == *name)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("column '{}' not found in schema", name),
-                    )
-                })?;
-            indices.push(idx);
-        }
-        self.projected_columns = Some(indices);
+        let (output, read) = self.schema.resolve_projection(column_names)?;
+        self.projected_columns = Some((output, read));
         Ok(())
     }
 }
