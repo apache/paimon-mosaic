@@ -378,11 +378,17 @@ impl<S: OutputFile> MosaicWriter<S> {
             let mut cols: Vec<(usize, usize, arrow_schema::DataType)> = Vec::new();
             for idx in stat_indices {
                 let dt = &schema.columns[idx].data_type;
-                if dt == &DataType::Boolean && schema.columns[idx].name.starts_with("__null__(") {
+                if schema.columns[idx].name.starts_with("__null__(") {
                     continue;
                 }
                 if !stats::supports_stats(dt) {
-                    continue;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "stats_columns: column '{}' has unsupported type {:?} for statistics",
+                            schema.columns[idx].name, dt
+                        ),
+                    ));
                 }
                 cols.push((idx, batch_col_map[idx], dt.clone()));
             }
