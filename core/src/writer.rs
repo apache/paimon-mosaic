@@ -294,19 +294,10 @@ impl<S: OutputFile> MosaicWriter<S> {
         let num_rows = struct_arr.len();
         let mut null_bm = vec![0xFFu8; num_rows.div_ceil(8)];
 
-        // Start with child's existing null bitmap
-        if let Some(child_nulls) = child.nulls() {
-            let child_buf = child_nulls.inner().inner();
-            for i in 0..null_bm.len().min(child_buf.len()) {
-                null_bm[i] = child_buf[i];
-            }
-        }
-
-        // Mask out struct-null positions
-        if let Some(struct_nulls) = struct_arr.nulls() {
-            let struct_buf = struct_nulls.inner().inner();
-            for i in 0..null_bm.len().min(struct_buf.len()) {
-                null_bm[i] &= struct_buf[i];
+        for i in 0..num_rows {
+            let valid = !child.is_null(i) && !struct_arr.is_null(i);
+            if !valid {
+                null_bm[i / 8] &= !(1 << (i % 8));
             }
         }
 

@@ -2364,3 +2364,56 @@ fn test_non_nullable_struct_parent_rejects_nulls() {
     let err = result.unwrap_err().to_string();
     assert!(err.contains("non-nullable STRUCT column"), "got: {}", err);
 }
+
+#[test]
+fn test_struct_sliced_null_propagation() {
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ])),
+        true,
+    )]);
+
+    // Build 4 rows, then slice to rows 1..3
+    // Row 0: {name: "a", age: 10}
+    // Row 1: null
+    // Row 2: {name: "c", age: 30}
+    // Row 3: {name: "d", age: 40}
+    let names = StringArray::from(vec![Some("a"), Some("b"), Some("c"), Some("d")]);
+    let ages = Int32Array::from(vec![Some(10), Some(20), Some(30), Some(40)]);
+    let null_buf = NullBuffer::new(BooleanBuffer::new(
+        Buffer::from(vec![0b0000_1101]), // rows 0,2,3 valid; row 1 null
+        0,
+        4,
+    ));
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(ages) as ArrayRef],
+        Some(null_buf),
+    );
+
+    // Slice: keep rows 1..3 (row 1=null, row 2=valid)
+    let sliced: ArrayRef = Arc::new(info.slice(1, 2));
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![sliced]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(info_out.len(), 2);
+    assert!(info_out.is_null(0)); // was row 1 (null)
+    assert!(!info_out.is_null(1)); // was row 2 (valid)
+
+    let age_out = info_out
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert!(age_out.is_null(0)); // propagated from struct null
+    assert_eq!(age_out.value(1), 30); // valid value, not corrupted
+}
