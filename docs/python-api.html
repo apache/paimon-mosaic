@@ -223,7 +223,7 @@ reader = MosaicReader.from_input_file(read_at, len(data))</code></pre>
                     <tr><td><code>schema</code></td><td><code>pa.Schema</code></td><td>Arrow Schema for the file (columns in original input order)</td></tr>
                     <tr><td><code>num_row_groups</code></td><td><code>int</code></td><td>Row group count</td></tr>
                     <tr><td><code>row_group_num_rows(rg)</code></td><td><code>int</code></td><td>Number of rows in a specific row group</td></tr>
-                    <tr><td><code>project(columns)</code></td><td><code>None</code></td><td>Set projection: subsequent reads return only the named columns in the specified order</td></tr>
+                    <tr><td><code>project(schema)</code></td><td><code>None</code></td><td>Set projection with a <code>pa.Schema</code> subset: subsequent reads return only the specified columns. Supports partial STRUCTs for field-level projection.</td></tr>
                     <tr><td><code>read_row_group(rg)</code></td><td><code>pa.RecordBatch</code></td><td>Read a row group (all columns or projected columns if project() was called)</td></tr>
                     <tr><td><code>read_all()</code></td><td><code>pa.Table</code></td><td>Read entire file as a Table</td></tr>
                     <tr><td><code>get_row_group_statistics(rg)</code></td><td><code>dict[str, ColumnStatistics]</code></td><td>Column statistics for a row group, keyed by column name</td></tr>
@@ -242,17 +242,18 @@ reader = MosaicReader.from_input_file(read_at, len(data))</code></pre>
 
             <h3>Projection Pushdown</h3>
             <p>
-                Use <code>project()</code> to select and reorder columns by name.
-                Only the buckets containing the projected columns are decompressed, significantly
-                reducing I/O and memory for wide tables. The output preserves the order you specify:
+                Use <code>project()</code> with a <code>pa.Schema</code> to select columns.
+                Only the buckets containing the projected columns are decompressed.
+                For STRUCT columns, pass a partial schema to project individual fields:
             </p>
-<pre><code><span class="cmt"># Only read "name" and "score" columns, in that order</span>
-reader.project([<span class="str">"name"</span>, <span class="str">"score"</span>])
-batch = reader.read_row_group(rg)
-<span class="cmt"># batch contains only "name" and "score", in that order</span>
+<pre><code><span class="cmt"># Top-level column projection</span>
+reader.project(pa.schema([pa.field(<span class="str">"name"</span>, pa.utf8()), pa.field(<span class="str">"score"</span>, pa.float64())]))
 
-<span class="cmt"># Empty projection: count-only read (0 columns, row count preserved)</span>
-reader.project([])
+<span class="cmt"># STRUCT leaf projection</span>
+reader.project(pa.schema([pa.field(<span class="str">"info"</span>, pa.struct([pa.field(<span class="str">"name"</span>, pa.utf8())]))]))
+
+<span class="cmt"># Empty projection: count-only read</span>
+reader.project(pa.schema([]))
 num_rows = reader.row_group_num_rows(rg)</code></pre>
 
             <h3>Column Statistics (Filter Pushdown)</h3>
@@ -328,7 +329,7 @@ table = mosaic.read_table(
                 </thead>
                 <tbody>
                     <tr><td><code>write_table(table, stream, options=None)</code></td><td>Write a <code>pa.Table</code> via an OutputFile (file-like object)</td></tr>
-                    <tr><td><code>read_table(read_at_fn, file_length, columns=None)</code></td><td>Read a <code>pa.Table</code> via an InputFile; <code>columns</code> is a list of column names to project</td></tr>
+                    <tr><td><code>read_table(read_at_fn, file_length, columns=None)</code></td><td>Read a <code>pa.Table</code> via an InputFile; <code>columns</code> is a <code>pa.Schema</code> to project</td></tr>
                 </tbody>
             </table>
 

@@ -365,17 +365,29 @@ impl<S: OutputFile> MosaicWriter<S> {
         } else {
             let mut stat_indices = Vec::new();
             for name in &options.stats_columns {
-                let idx = schema
+                let matches: Vec<usize> = schema
                     .columns
                     .iter()
-                    .position(|c| c.name == *name)
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("stats_columns: column '{}' not found in schema", name),
-                        )
-                    })?;
-                stat_indices.push(idx);
+                    .enumerate()
+                    .filter(|(_, c)| c.name == *name)
+                    .map(|(i, _)| i)
+                    .collect();
+                if matches.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("stats_columns: column '{}' not found in schema", name),
+                    ));
+                }
+                if matches.len() > 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "stats_columns: column '{}' is ambiguous ({} physical columns share this name)",
+                            name, matches.len()
+                        ),
+                    ));
+                }
+                stat_indices.push(matches[0]);
             }
             let mut cols: Vec<(usize, usize, arrow_schema::DataType)> = Vec::new();
             for idx in stat_indices {
@@ -396,20 +408,6 @@ impl<S: OutputFile> MosaicWriter<S> {
             }
             cols.sort_by_key(|(idx, _, _)| *idx);
             cols.dedup_by_key(|(idx, _, _)| *idx);
-            // Reject ambiguous stats selections (duplicate physical names)
-            let mut seen_names = std::collections::HashSet::new();
-            for &(idx, _, _) in &cols {
-                let name = &schema.columns[idx].name;
-                if !seen_names.insert(name.as_str()) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "stats_columns: ambiguous column name '{}' (multiple columns share this name)",
-                            name
-                        ),
-                    ));
-                }
-            }
             Some(StatsCollector::new(&cols))
         };
 

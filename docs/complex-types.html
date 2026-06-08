@@ -327,41 +327,55 @@ DFS IDs:
                 with the same field order after roundtrip.
             </p>
 
-            <h3>Projection</h3>
+            <h3>Projection (Schema-based)</h3>
             <p>
-                Projection uses dot-separated paths (like ORC and Parquet) with an
-                <strong>exact-match-first</strong> strategy:
+                Projection accepts an <strong>Arrow Schema subset</strong> (like Lance&rsquo;s
+                <code>ProjectionRequest::Schema</code>). Partial STRUCTs are expressed naturally
+                as Schema subsets &mdash; no dot-path parsing needed.
             </p>
-            <ol>
-                <li>First, exact-match against original top-level column names
-                    (including names containing <code>.</code>, e.g. <code>"a.b"</code>).</li>
-                <li>If no match, split on <code>.</code> and resolve as a path in the STRUCT schema tree
-                    using column IDs.</li>
-            </ol>
+<pre><code>// Rust
+reader.project_schema(&amp;Schema::new(vec![
+    Field::new("info", DataType::Struct(Fields::from(vec![
+        Field::new("name", DataType::Utf8, true),
+    ])), true),
+]))?;
+
+# Python
+reader.project(pa.schema([pa.field("info", pa.struct([pa.field("name", pa.utf8())]))]))</code></pre>
             <p>Supported projection modes:</p>
             <ul>
-                <li><strong>Whole STRUCT</strong>: <code>project(&amp;["info"])</code> &mdash; reads all
-                    sub-columns, reconstructs full StructArray.</li>
-                <li><strong>Leaf projection</strong>: <code>project(&amp;["info.name"])</code> &mdash;
-                    reads only that field plus ancestor <code>__null__</code> columns
-                    (auto-included), returns partial StructArray.</li>
-                <li><strong>Nested STRUCT path</strong>: <code>project(&amp;["info.addr"])</code> &mdash;
-                    reads all fields under <code>addr</code>.</li>
-                <li><strong>Mixed</strong>: <code>project(&amp;["info.age", "id"])</code> &mdash;
-                    output in user-requested order.</li>
+                <li><strong>Whole STRUCT</strong>: include the full STRUCT field in the projected schema.</li>
+                <li><strong>Leaf projection</strong>: include a partial STRUCT with only the desired fields.
+                    Ancestor <code>__null__</code> columns are auto-included.</li>
+                <li><strong>Mixed</strong>: any combination of top-level columns and partial STRUCTs,
+                    output in the projected schema&rsquo;s field order.</li>
             </ul>
             <p>
-                This allows column names containing <code>.</code> (e.g. <code>"user.name"</code>
-                as a top-level INT column) to coexist with STRUCT field paths without ambiguity.
+                Projected fields are validated: non-existent fields or type mismatches
+                (e.g. projecting a STRUCT field as a primitive) produce errors.
+            </p>
+            <p>
+                Column names and STRUCT field names can contain any characters including
+                <code>.</code>. The Schema-based API avoids all dot-path ambiguity.
+                Java retains a <code>project(String[])</code> convenience for top-level columns
+                (STRUCT leaf projection requires the Schema-based API).
+            </p>
+
+            <h3>Column Ordering</h3>
+            <p>
+                Physical columns are sorted by <code>(name, column_id)</code> for deterministic
+                bucket assignment. The <code>column_id</code> tie-breaker ensures a total order
+                even when duplicate physical names exist (e.g. top-level <code>"info.age"</code>
+                and STRUCT leaf <code>"info.age"</code>).
             </p>
 
             <h3>Statistics</h3>
             <p>
-                Expanded STRUCT leaf columns support min/max statistics via dot-path
+                Expanded STRUCT leaf columns support min/max statistics via physical column name
                 (e.g. <code>stats_columns: ["info.age"]</code>).
-                Stats are collected from expanded physical arrays after STRUCT null propagation,
-                so null counts and min/max correctly reflect combined STRUCT-level and field-level
-                null semantics.
+                If a stats column name matches multiple physical columns, the writer rejects
+                the ambiguous selection. Stats are collected from expanded physical arrays
+                after STRUCT null propagation.
             </p>
 
             <!-- ============================================================ -->
@@ -455,16 +469,17 @@ DFS IDs:
             <!-- ============================================================ -->
             <h2>Validation Rules</h2>
             <ul>
-                <li>Top-level column names may contain any characters including <code>.</code>.
-                    Ambiguity with STRUCT paths is resolved by exact-match-first projection.</li>
-                <li>STRUCT field names must not contain <code>.</code> (reserved for projection
-                    path separator).</li>
+                <li>Column names and STRUCT field names may contain any characters.</li>
+                <li>Physical columns are sorted by <code>(name, column_id)</code> for deterministic ordering.</li>
                 <li>STRUCT must have at least one field.</li>
                 <li>MAP key type cannot be ARRAY, MAP, or STRUCT (complex keys rejected).</li>
                 <li>Sorted MAP is not supported.</li>
                 <li>Non-nullable STRUCT fields are validated on write: null values under
                     non-null ancestor rows are rejected.</li>
-                <li>Stats column selections must not be ambiguous (no duplicate physical names).</li>
+                <li>Projection validates field existence and type matching; missing fields
+                    or STRUCT/non-STRUCT type mismatches produce errors.</li>
+                <li>Stats column selections must not be ambiguous (reject if multiple
+                    physical columns share the same name).</li>
             </ul>
         </div>
     </main>

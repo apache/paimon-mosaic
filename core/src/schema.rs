@@ -233,7 +233,8 @@ impl MosaicSchema {
                         mapping.original_field.data_type(),
                         &DataType::Struct(proj_fields.clone()),
                         &mut local_ids,
-                    );
+                        mapping.original_field.name(),
+                    )?;
                     let base = mapping.struct_id + 1;
                     for lid in local_ids {
                         let abs_id = base + lid;
@@ -330,37 +331,61 @@ impl MosaicSchema {
 
     /// Collect local (0-based within parent STRUCT) column IDs for fields present
     /// in `projected_dt` that match fields in `original_dt`.
-    fn collect_projected_ids(original_dt: &DataType, projected_dt: &DataType, out: &mut Vec<u32>) {
+    /// Returns an error if a projected field does not exist in the original type
+    /// or if a projected STRUCT field targets a non-STRUCT original field.
+    fn collect_projected_ids(
+        original_dt: &DataType,
+        projected_dt: &DataType,
+        out: &mut Vec<u32>,
+        path: &str,
+    ) -> io::Result<()> {
         if let (DataType::Struct(orig_fields), DataType::Struct(proj_fields)) =
             (original_dt, projected_dt)
         {
             for proj_field in proj_fields.iter() {
+                let child_path = if path.is_empty() {
+                    proj_field.name().to_string()
+                } else {
+                    format!("{}.{}", path, proj_field.name())
+                };
                 let mut id = 0u32;
+                let mut found = false;
                 for orig_field in orig_fields.iter() {
                     let field_id = id;
                     id += 1;
                     if orig_field.name() == proj_field.name() {
-                        if let (DataType::Struct(orig_inner), DataType::Struct(proj_inner)) =
-                            (orig_field.data_type(), proj_field.data_type())
-                        {
-                            if !types::is_timestamp_nanos_struct(orig_inner) {
-                                // Nested STRUCT: include __null__ if nullable, then recurse
-                                if orig_field.is_nullable() {
-                                    out.push(field_id);
+                        if let DataType::Struct(proj_inner) = proj_field.data_type() {
+                            // Projected field is a STRUCT — original must also be a STRUCT
+                            if let DataType::Struct(orig_inner) = orig_field.data_type() {
+                                if !types::is_timestamp_nanos_struct(orig_inner) {
+                                    if orig_field.is_nullable() {
+                                        out.push(field_id);
+                                    }
+                                    let mut sub_ids = Vec::new();
+                                    Self::collect_projected_ids(
+                                        orig_field.data_type(),
+                                        &DataType::Struct(proj_inner.clone()),
+                                        &mut sub_ids,
+                                        &child_path,
+                                    )?;
+                                    for sid in sub_ids {
+                                        out.push(field_id + 1 + sid);
+                                    }
+                                    found = true;
+                                    break;
                                 }
-                                let mut sub_ids = Vec::new();
-                                Self::collect_projected_ids(
-                                    orig_field.data_type(),
-                                    &DataType::Struct(proj_inner.clone()),
-                                    &mut sub_ids,
-                                );
-                                for sid in sub_ids {
-                                    out.push(field_id + 1 + sid);
-                                }
-                                break;
                             }
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!(
+                                    "projected field '{}' is a STRUCT but original field is {:?}",
+                                    child_path,
+                                    orig_field.data_type()
+                                ),
+                            ));
                         }
                         out.push(field_id);
+                        found = true;
                         break;
                     }
                     if let DataType::Struct(inner) = orig_field.data_type() {
@@ -369,8 +394,18 @@ impl MosaicSchema {
                         }
                     }
                 }
+                if !found {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "projected field '{}' not found in original STRUCT",
+                            child_path
+                        ),
+                    ));
+                }
             }
         }
+        Ok(())
     }
 
     fn count_tree_nodes_by_id(&self, struct_id: u32) -> u32 {
@@ -443,7 +478,12 @@ impl MosaicSchema {
         let actual_buckets = num_buckets.min(num_columns).max(1);
 
         let mut sorted_indices: Vec<usize> = (0..num_columns).collect();
-        sorted_indices.sort_by(|&a, &b| columns[a].0.cmp(&columns[b].0));
+        sorted_indices.sort_by(|&a, &b| {
+            columns[a]
+                .0
+                .cmp(&columns[b].0)
+                .then(columns[a].1.cmp(&columns[b].1))
+        });
 
         let mut bucket_to_global = vec![Vec::new(); actual_buckets];
         let mut cols: Vec<ColumnMeta> = Vec::with_capacity(num_columns);
