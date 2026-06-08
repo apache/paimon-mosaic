@@ -29,7 +29,8 @@ use crate::varint;
 pub struct ColumnMeta {
     /// Physical column name for sorting and bucket assignment.
     /// STRUCT fields use dot-prefixed names (e.g. "info.name").
-    /// Not unique — a top-level column and a STRUCT field can share the same name.
+    /// Not unique — e.g. top-level column "info.name" and STRUCT "info" field "name"
+    /// both produce "info.name".
     pub name: String,
     /// DFS-incremented column ID, unique across the schema. Used for all internal matching.
     pub column_id: u32,
@@ -59,9 +60,9 @@ pub struct StructMapping {
 pub struct MosaicSchema {
     pub num_buckets: usize,
     /// Expanded columns (STRUCT fields flattened, with __null__ columns).
-    /// Names may be duplicated (e.g. top-level "name" and STRUCT field "info.name"
-    /// both exist). Names are only used for sorting and bucket assignment;
-    /// all internal matching uses column_id.
+    /// Names may be duplicated (e.g. top-level column "info.name" and STRUCT "info"
+    /// field "name" both expand to "info.name"). Names are only used for sorting
+    /// and bucket assignment; all internal matching uses column_id.
     pub columns: Vec<ColumnMeta>,
     /// bucket_to_global[bucket_id] = [global_col_indices...] in name-sorted order
     pub bucket_to_global: Vec<Vec<usize>>,
