@@ -322,8 +322,15 @@ static void test_projection() {
     buf.data = data_vec;
     auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
 
-    const char* cols[] = {"c", "a", "b"};
-    reader.set_projection(cols, 3);
+    auto proj_schema = arrow::schema({
+        arrow::field("c", arrow::float64()),
+        arrow::field("a", arrow::int32()),
+        arrow::field("b", arrow::utf8()),
+    });
+    struct ArrowSchema c_schema;
+    auto export_status = arrow::ExportSchema(*proj_schema, &c_schema);
+    assert(export_status.ok());
+    reader.set_projection(&c_schema);
     auto rb = read_row_group(reader, 0);
     ASSERT_EQ(rb->num_columns(), 3);
     ASSERT_EQ(rb->num_rows(), 20);
@@ -355,7 +362,11 @@ static void test_projection_empty() {
     buf.data = data_vec;
     auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
 
-    reader.set_projection(nullptr, 0);
+    auto empty_schema = arrow::schema({});
+    struct ArrowSchema c_schema;
+    auto export_status = arrow::ExportSchema(*empty_schema, &c_schema);
+    assert(export_status.ok());
+    reader.set_projection(&c_schema);
     auto rb = read_row_group(reader, 0);
     ASSERT_EQ(rb->num_columns(), 0);
     ASSERT_EQ(rb->num_rows(), 5);
