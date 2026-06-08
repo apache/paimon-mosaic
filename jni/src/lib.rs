@@ -771,8 +771,35 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderSetPr
             }
             _ => Vec::new(),
         };
-        let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-        if let Err(e) = rh.reader.project(&col_refs) {
+        let schema = rh.reader.schema();
+        let mut fields = Vec::with_capacity(col_names.len());
+        for name in &col_names {
+            if let Some(mapping) = schema
+                .struct_mappings
+                .iter()
+                .find(|m| m.original_field.name() == name.as_str())
+            {
+                fields.push(mapping.original_field.clone());
+            } else if let Some(cols) = schema.original_columns.as_deref() {
+                if let Some((_, dt, nullable)) = cols.iter().find(|(n, _, _)| n == name) {
+                    fields.push(arrow_schema::Field::new(name, dt.clone(), *nullable));
+                } else {
+                    throw(&mut env, &format!("column '{}' not found", name));
+                    return;
+                }
+            } else if let Some(col) = schema.columns.iter().find(|c| c.name == *name) {
+                fields.push(arrow_schema::Field::new(
+                    name,
+                    col.data_type.clone(),
+                    col.nullable,
+                ));
+            } else {
+                throw(&mut env, &format!("column '{}' not found", name));
+                return;
+            }
+        }
+        let projected = arrow_schema::Schema::new(fields);
+        if let Err(e) = rh.reader.project_schema(&projected) {
             throw(&mut env, &format!("set projection failed: {}", e));
         }
     }));
