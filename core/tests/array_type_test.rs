@@ -1197,6 +1197,121 @@ fn test_map_with_array_value() {
     assert_eq!(v1.value(0), 3);
 }
 
+#[test]
+fn test_array_of_map_with_array_value() {
+    // ARRAY<MAP<INT32, ARRAY<UTF8>>>
+    let list_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+    let map_type = DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("keys", DataType::Int32, false),
+                Field::new("values", list_type.clone(), true),
+            ])),
+            false,
+        )),
+        false,
+    );
+    let schema = Schema::new(vec![Field::new(
+        "col",
+        DataType::List(Arc::new(Field::new("item", map_type.clone(), true))),
+        true,
+    )]);
+
+    let key_builder = Int32Builder::new();
+    let value_builder = ListBuilder::new(StringBuilder::new());
+    let map_builder = MapBuilder::new(None, key_builder, value_builder);
+    let mut list_builder = ListBuilder::new(map_builder);
+
+    // row 0: [{1:["a","b"], 2:["c"]}, {3:[]}]
+    list_builder.values().keys().append_value(1);
+    list_builder.values().values().values().append_value("a");
+    list_builder.values().values().values().append_value("b");
+    list_builder.values().values().append(true);
+    list_builder.values().keys().append_value(2);
+    list_builder.values().values().values().append_value("c");
+    list_builder.values().values().append(true);
+    list_builder.values().append(true).unwrap();
+
+    list_builder.values().keys().append_value(3);
+    list_builder.values().values().append(true);
+    list_builder.values().append(true).unwrap();
+    list_builder.append(true);
+
+    // row 1: null
+    list_builder.append(false);
+
+    // row 2: [{4:null}]
+    list_builder.values().keys().append_value(4);
+    list_builder.values().values().append(false);
+    list_builder.values().append(true).unwrap();
+    list_builder.append(true);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(list_builder.finish())],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(col.len(), 3);
+    assert!(!col.is_null(0));
+    assert!(col.is_null(1));
+    assert!(!col.is_null(2));
+
+    let row0 = col.value(0);
+    let maps0 = row0.as_any().downcast_ref::<MapArray>().unwrap();
+    assert_eq!(maps0.len(), 2);
+    assert_eq!(maps0.value_length(0), 2);
+    assert_eq!(maps0.value_length(1), 1);
+    let base0 = maps0.value_offsets()[0] as usize;
+    let keys0 = maps0.keys().as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(keys0.value(base0), 1);
+    assert_eq!(keys0.value(base0 + 1), 2);
+    assert_eq!(keys0.value(base0 + 2), 3);
+
+    let values0 = maps0.values().as_any().downcast_ref::<ListArray>().unwrap();
+    let v0 = values0
+        .value(base0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .clone();
+    assert_eq!(v0.len(), 2);
+    assert_eq!(v0.value(0), "a");
+    assert_eq!(v0.value(1), "b");
+    let v1 = values0
+        .value(base0 + 1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .clone();
+    assert_eq!(v1.len(), 1);
+    assert_eq!(v1.value(0), "c");
+    let v2 = values0
+        .value(base0 + 2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .clone();
+    assert_eq!(v2.len(), 0);
+
+    let row2 = col.value(2);
+    let maps2 = row2.as_any().downcast_ref::<MapArray>().unwrap();
+    assert_eq!(maps2.len(), 1);
+    assert_eq!(maps2.value_length(0), 1);
+    let base2 = maps2.value_offsets()[0] as usize;
+    let keys2 = maps2.keys().as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(keys2.value(base2), 4);
+    let values2 = maps2.values().as_any().downcast_ref::<ListArray>().unwrap();
+    assert!(values2.is_null(base2));
+}
+
 // ======================== MAP Schema Validation Tests ========================
 
 #[test]
