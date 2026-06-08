@@ -256,30 +256,48 @@ Child 2:        array_values (INT32, P entries)  &larr; inner ARRAY leaf values<
                 reads only the bucket(s) containing that field.
             </p>
 
-            <h3>Column Naming</h3>
-            <p>Column names use dot-separated notation:</p>
-<pre><code>STRUCT(name UTF8, age INT) as "info" (nullable) expands to:
-  info.__null__    (Boolean, STRUCT null bitmap)
-  info.age         (INT32)
-  info.name        (UTF8)
-&rarr; 3 independent columns, sorted and distributed across buckets</code></pre>
+            <h3>Column ID</h3>
             <p>
-                Column names containing <code>.</code> and names ending with <code>__null__</code>
-                are reserved and rejected at validation to prevent conflicts with expanded names.
+                Each node in the schema tree is assigned a <strong>DFS-incremented column ID</strong>
+                (like ORC). IDs are deterministically generated from the schema structure and are not
+                persisted to the file format. STRUCT nodes, their fields, and nested STRUCTs all
+                receive IDs:
             </p>
+<pre><code>schema: a.b INT, info STRUCT&lt;name UTF8, addr STRUCT&lt;city UTF8, zip INT&gt;&gt;
+DFS IDs:
+  0: a.b      (INT &mdash; column name can contain '.')
+  1: info     (STRUCT)
+  2: name     (info.name)
+  3: addr     (STRUCT)
+  4: city     (addr.city)
+  5: zip      (addr.zip)</code></pre>
+            <p>
+                Expanded physical columns use the original field name (not dot-separated paths).
+                Internal <code>__null__</code> columns are named <code>__null__(&lt;struct_id&gt;)</code>
+                to associate them with their STRUCT node. All internal column matching &mdash;
+                projection resolution, STRUCT reassembly, null bitmap lookup &mdash; uses column IDs,
+                not names.
+            </p>
+
+            <h3>Physical Column Expansion</h3>
+<pre><code>STRUCT(name UTF8, age INT) as "info" (nullable) expands to:
+  __null__(1)    (Boolean, STRUCT null bitmap, struct_id=1)
+  age            (INT32, column_id=3)
+  name           (UTF8, column_id=2)
+&rarr; 3 independent columns, sorted by name and distributed across buckets</code></pre>
 
             <h3>Nested STRUCT</h3>
             <p>
-                Nested STRUCT fields expand recursively with dot-separated paths.
-                Each nullable STRUCT level gets its own <code>__null__</code> column:
+                Nested STRUCT fields expand recursively.
+                Each nullable STRUCT level gets its own <code>__null__</code> column keyed by struct_id:
             </p>
 <pre><code>STRUCT(name UTF8, addr STRUCT(city UTF8, zip INT) NULLABLE) as "info" (nullable):
 
-  info.__null__          (Boolean)   &larr; info-level null
-  info.addr.__null__     (Boolean)   &larr; addr-level null
-  info.addr.city         (UTF8)
-  info.addr.zip          (INT32)
-  info.name              (UTF8)
+  __null__(1)          (Boolean)   &larr; info-level null (struct_id=1)
+  __null__(3)          (Boolean)   &larr; addr-level null (struct_id=3)
+  city                 (UTF8, column_id=4)
+  name                 (UTF8, column_id=2)
+  zip                  (INT32, column_id=5)
 &rarr; 5 independent columns</code></pre>
             <p>
                 Per-level <code>__null__</code> columns preserve Arrow STRUCT null semantics:
@@ -292,8 +310,8 @@ Child 2:        array_values (INT32, P entries)  &larr; inner ARRAY leaf values<
                 that expand within their own bucket using the standard flattened columnar mechanism:
             </p>
 <pre><code>STRUCT(id INT, tags ARRAY&lt;INT&gt;) as "info":
-  info.id    &rarr; ordinary INT32 column
-  info.tags  &rarr; independent ARRAY column, expands in its bucket as lengths + values</code></pre>
+  id    &rarr; ordinary INT32 column
+  tags  &rarr; independent ARRAY column, expands in its bucket as lengths + values</code></pre>
 
             <h3>Schema Serialization</h3>
             <p>
@@ -310,30 +328,39 @@ Child 2:        array_values (INT32, P entries)  &larr; inner ARRAY leaf values<
 
             <h3>Projection</h3>
             <p>
-                The reader supports three projection modes for STRUCT columns:
+                Projection uses dot-separated paths (like ORC and Parquet) with an
+                <strong>exact-match-first</strong> strategy:
             </p>
+            <ol>
+                <li>First, exact-match against original top-level column names
+                    (including names containing <code>.</code>, e.g. <code>"a.b"</code>).</li>
+                <li>If no match, split on <code>.</code> and resolve as a path in the STRUCT schema tree
+                    using column IDs.</li>
+            </ol>
+            <p>Supported projection modes:</p>
             <ul>
-                <li><strong>Whole STRUCT</strong>: <code>project(&amp;["info"])</code> reads all expanded
-                    sub-columns and reconstructs the full StructArray.</li>
-                <li><strong>Leaf projection</strong>: <code>project(&amp;["info.name"])</code> reads only
-                    the <code>info.name</code> column and the <code>info.__null__</code> column
-                    (auto-included to preserve parent null semantics), returning a partial StructArray
-                    with only the projected fields.</li>
-                <li><strong>Mixed projection</strong>: <code>project(&amp;["info.age", "id"])</code> returns
-                    columns in the user-requested order: <code>[info(age), id]</code>.</li>
+                <li><strong>Whole STRUCT</strong>: <code>project(&amp;["info"])</code> &mdash; reads all
+                    sub-columns, reconstructs full StructArray.</li>
+                <li><strong>Leaf projection</strong>: <code>project(&amp;["info.name"])</code> &mdash;
+                    reads only that field plus ancestor <code>__null__</code> columns
+                    (auto-included), returns partial StructArray.</li>
+                <li><strong>Nested STRUCT path</strong>: <code>project(&amp;["info.addr"])</code> &mdash;
+                    reads all fields under <code>addr</code>.</li>
+                <li><strong>Mixed</strong>: <code>project(&amp;["info.age", "id"])</code> &mdash;
+                    output in user-requested order.</li>
             </ul>
             <p>
-                Ancestor <code>__null__</code> columns at every STRUCT nesting level are automatically
-                included in the physical read set when any descendant leaf is projected.
-                These internal columns participate in reading but do not appear in the output.
+                This allows column names containing <code>.</code> (e.g. <code>"user.name"</code>
+                as a top-level INT column) to coexist with STRUCT field paths without ambiguity.
             </p>
 
             <h3>Statistics</h3>
             <p>
-                Expanded STRUCT leaf columns (e.g. <code>info.age</code>) support min/max statistics.
-                Stats are collected from the expanded physical arrays after STRUCT null propagation,
-                so null counts and min/max values correctly reflect the combined STRUCT-level and
-                field-level null semantics.
+                Expanded STRUCT leaf columns support min/max statistics via dot-path
+                (e.g. <code>stats_columns: ["info.age"]</code>).
+                Stats are collected from expanded physical arrays after STRUCT null propagation,
+                so null counts and min/max correctly reflect combined STRUCT-level and field-level
+                null semantics.
             </p>
 
             <!-- ============================================================ -->
@@ -359,9 +386,15 @@ Child 2:        array_values (INT32, P entries)  &larr; inner ARRAY leaf values<
                     </tr>
                     <tr>
                         <td>Null tracking</td>
-                        <td><code>__null__</code> Boolean column per nullable STRUCT level</td>
+                        <td><code>__null__(&lt;id&gt;)</code> Boolean column per nullable STRUCT level</td>
                         <td>PRESENT stream per STRUCT node</td>
                         <td>Definition level encodes null at each level</td>
+                    </tr>
+                    <tr>
+                        <td>Column identity</td>
+                        <td>DFS-incremented column ID (like ORC), not persisted</td>
+                        <td>DFS column ID persisted in footer</td>
+                        <td>Schema path + rep/def levels</td>
                     </tr>
                     <tr>
                         <td>Field order</td>
@@ -421,12 +454,13 @@ Child 2:        array_values (INT32, P entries)  &larr; inner ARRAY leaf values<
             <!-- ============================================================ -->
             <h2>Validation Rules</h2>
             <ul>
-                <li>Column names must not contain <code>.</code> (reserved for STRUCT expansion).</li>
-                <li>Column names must not end with <code>__null__</code> (reserved for STRUCT null tracking).</li>
-                <li>STRUCT field names must not contain <code>.</code> or end with <code>__null__</code>.</li>
+                <li>Column names and STRUCT field names may contain any characters
+                    (including <code>.</code>). Ambiguity with STRUCT paths is resolved by
+                    exact-match-first projection strategy.</li>
                 <li>STRUCT must have at least one field.</li>
                 <li>MAP key type cannot be ARRAY, MAP, or STRUCT (complex keys rejected).</li>
                 <li>Sorted MAP is not supported.</li>
+                <li>Non-nullable STRUCT fields are validated on write: null values are rejected.</li>
             </ul>
         </div>
     </main>
