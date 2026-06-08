@@ -2501,3 +2501,134 @@ fn test_struct_nested_path_projection() {
     assert_eq!(city_out.value(0), "NYC");
     assert_eq!(city_out.value(1), "LA");
 }
+
+#[test]
+fn test_dot_column_coexists_with_struct() {
+    // Top-level column "a.b" coexists with STRUCT "a" containing field "b"
+    let schema = Schema::new(vec![
+        Field::new("a.b", DataType::Int32, false),
+        Field::new(
+            "a",
+            DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                "b",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        ),
+    ]);
+
+    let col_ab = Int32Array::from(vec![10, 20]);
+    let b_vals = StringArray::from(vec![Some("x"), Some("y")]);
+    let struct_a = StructArray::new(
+        arrow_schema::Fields::from(vec![Field::new("b", DataType::Utf8, true)]),
+        vec![Arc::new(b_vals) as ArrayRef],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(col_ab) as ArrayRef, Arc::new(struct_a) as ArrayRef],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch.clone()]);
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 2);
+
+    // project("a.b") should match the top-level column (exact match first)
+    let result2 = roundtrip_projected(&schema, &[batch.clone()], &["a.b"]);
+    let rb2 = &result2[0];
+    assert_eq!(rb2.num_columns(), 1);
+    let col = rb2.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(col.value(0), 10);
+    assert_eq!(col.value(1), 20);
+
+    // project("a") should return the STRUCT
+    let result3 = roundtrip_projected(&schema, &[batch.clone()], &["a"]);
+    let rb3 = &result3[0];
+    assert_eq!(rb3.num_columns(), 1);
+    let struct_out = rb3
+        .column(0)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let b_out = struct_out
+        .column_by_name("b")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(b_out.value(0), "x");
+
+    // project("a.b") should NOT resolve to STRUCT a's field b — it matches the top-level column
+    let result4 = roundtrip_projected(&schema, &[batch], &["a.b", "a"]);
+    let rb4 = &result4[0];
+    assert_eq!(rb4.num_columns(), 2);
+}
+
+#[test]
+fn test_dot_column_name_projection() {
+    let schema = Schema::new(vec![
+        Field::new("x.y.z", DataType::Int32, false),
+        Field::new("id", DataType::Int32, false),
+    ]);
+    let col_xyz = Int32Array::from(vec![100, 200]);
+    let col_id = Int32Array::from(vec![1, 2]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(col_xyz) as ArrayRef, Arc::new(col_id) as ArrayRef],
+    )
+    .unwrap();
+
+    let result = roundtrip_projected(&schema, &[batch], &["x.y.z"]);
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 1);
+    let col = rb.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(col.value(0), 100);
+    assert_eq!(col.value(1), 200);
+}
+
+#[test]
+fn test_struct_field_name_with_dot() {
+    // STRUCT field name itself contains '.'
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("user.name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ])),
+        false,
+    )]);
+
+    let names = StringArray::from(vec![Some("alice"), Some("bob")]);
+    let ages = Int32Array::from(vec![Some(30), Some(25)]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("user.name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(ages) as ArrayRef],
+        None,
+    );
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(info) as ArrayRef]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    let name_out = info_out
+        .column_by_name("user.name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(name_out.value(0), "alice");
+    assert_eq!(name_out.value(1), "bob");
+}
+
+#[test]
+fn test_null_suffix_column_name_allowed() {
+    use paimon_mosaic_core::schema::MosaicSchema;
+    let result = MosaicSchema::validate(&[("info__null__".to_string(), DataType::Utf8, false)]);
+    assert!(result.is_ok());
+}
