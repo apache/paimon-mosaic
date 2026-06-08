@@ -342,6 +342,93 @@ fn build_array(
     })
 }
 
+/// Recursively consume children to build a StructArray from expanded child columns.
+/// The `struct_type` provides the original STRUCT field names and types.
+/// Returns (StructArray without null buffer, number of children consumed).
+fn reassemble_struct_element(
+    children: &[ChildColumnMeta],
+    arrays: &mut [ArrayRef],
+    processed: &mut [bool],
+    parent: usize,
+    cursor: &mut usize,
+    struct_type: &DataType,
+) -> (StructArray, usize) {
+    let orig_fields = match struct_type {
+        DataType::Struct(f) => f,
+        _ => unreachable!("reassemble_struct_element called with non-STRUCT type"),
+    };
+
+    let mut field_arrays: Vec<ArrayRef> = Vec::new();
+    let mut field_defs: Vec<Field> = Vec::new();
+    let start = *cursor;
+
+    for orig_field in orig_fields.iter() {
+        if *cursor >= children.len()
+            || children[*cursor].parent_logical_col != parent
+            || processed[*cursor]
+        {
+            break;
+        }
+
+        let ci = *cursor;
+        if children[ci].element_field.name() == "__struct_null__" {
+            // Nested STRUCT: the __struct_null__ child carries the STRUCT's data type
+            let inner_null_bitmap = arrays[children[ci].physical_index].clone();
+            let inner_struct_type = children[ci].element_field.data_type();
+            processed[ci] = true;
+            *cursor += 1;
+            let (inner_struct, _consumed) = reassemble_struct_element(
+                children,
+                arrays,
+                processed,
+                parent,
+                cursor,
+                inner_struct_type,
+            );
+
+            let inner_null_buf = inner_null_bitmap
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .and_then(|ba| {
+                    let num = ba.len();
+                    let mut bm = vec![0u8; num.div_ceil(8)];
+                    for i in 0..num {
+                        if ba.value(i) {
+                            bm[i / 8] |= 1 << (i % 8);
+                        }
+                    }
+                    if bm.iter().all(|&b| b == 0xFF) {
+                        None
+                    } else {
+                        Some(NullBuffer::new(BooleanBuffer::new(
+                            Buffer::from_vec(bm),
+                            0,
+                            num,
+                        )))
+                    }
+                });
+
+            let nested = StructArray::new(
+                inner_struct.fields().clone(),
+                inner_struct.columns().to_vec(),
+                inner_null_buf,
+            );
+            field_defs.push(orig_field.as_ref().clone());
+            field_arrays.push(Arc::new(nested));
+        } else {
+            // Leaf field
+            field_arrays.push(arrays[children[ci].physical_index].clone());
+            field_defs.push(orig_field.as_ref().clone());
+            processed[ci] = true;
+            *cursor += 1;
+        }
+    }
+
+    let consumed = *cursor - start;
+    let fields = arrow_schema::Fields::from(field_defs);
+    (StructArray::new(fields, field_arrays, None), consumed)
+}
+
 pub fn reassemble_list_columns_pub(
     arrays: &mut [ArrayRef],
     children: &[ChildColumnMeta],
@@ -393,43 +480,31 @@ fn reassemble_list_columns(
         // where the first child's element_field is NOT itself a complex type
         // (complex element_field means it's a nested ARRAY/MAP intermediate).
 
-        // Skip children that are part of a STRUCT group (handled when we reach the __struct_null__ child)
-        let is_struct_field_child = idx > 0
-            && children.iter().any(|c| {
-                c.parent_logical_col == parent
-                    && c.physical_index < phys_idx
-                    && c.element_field.name() == "__struct_null__"
-                    && !processed[children
-                        .iter()
-                        .position(|x| std::ptr::eq(x, c))
-                        .unwrap_or(usize::MAX)]
-            });
-        if is_struct_field_child {
+        // Skip children that belong to a STRUCT group (will be consumed by __struct_null__ processing)
+        let is_struct_field = children.iter().enumerate().any(|(ci, c)| {
+            c.parent_logical_col == parent
+                && c.physical_index < phys_idx
+                && c.element_field.name() == "__struct_null__"
+                && !processed[ci]
+        });
+        if is_struct_field {
             continue;
         }
 
         // Check if this is a __struct_null__ child — if so, reassemble the STRUCT
         if child.element_field.name() == "__struct_null__" {
-            // Collect all subsequent children with same parent that aren't processed
-            let mut struct_field_indices: Vec<usize> = Vec::new();
-            for si in (idx + 1)..children.len() {
-                if children[si].parent_logical_col == parent && !processed[si] {
-                    struct_field_indices.push(si);
-                } else {
-                    break;
-                }
-            }
-
-            // Read null bitmap
+            // Recursively consume STRUCT children (handles nested STRUCTs)
             let null_bitmap = arrays[phys_idx].clone();
-
-            // Read field arrays
-            let mut field_arrays: Vec<ArrayRef> = Vec::new();
-            let mut field_defs: Vec<Arc<Field>> = Vec::new();
-            for &si in &struct_field_indices {
-                field_arrays.push(arrays[children[si].physical_index].clone());
-                field_defs.push(children[si].element_field.clone());
-            }
+            let mut cursor = idx + 1;
+            let struct_type = child.element_field.data_type();
+            let (struct_arr, _consumed) = reassemble_struct_element(
+                children,
+                arrays,
+                &mut processed,
+                parent,
+                &mut cursor,
+                struct_type,
+            );
 
             // Build null buffer from BooleanArray
             let null_buf = null_bitmap
@@ -454,13 +529,11 @@ fn reassemble_list_columns(
                     }
                 });
 
-            let struct_fields = arrow_schema::Fields::from(
-                field_defs
-                    .iter()
-                    .map(|f| f.as_ref().clone())
-                    .collect::<Vec<_>>(),
+            let struct_arr = StructArray::new(
+                struct_arr.fields().clone(),
+                struct_arr.columns().to_vec(),
+                null_buf,
             );
-            let struct_arr = StructArray::new(struct_fields, field_arrays, null_buf);
 
             // Check if this STRUCT is the value part of a MAP (key child precedes __struct_null__)
             let map_key_child_idx = if idx > 0 {
@@ -555,9 +628,6 @@ fn reassemble_list_columns(
             }
 
             processed[idx] = true;
-            for &si in &struct_field_indices {
-                processed[si] = true;
-            }
             continue;
         }
 

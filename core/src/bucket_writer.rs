@@ -1564,7 +1564,12 @@ fn expand_element(
         }
         DataType::Struct(fields) if !types::is_timestamp_nanos_struct(fields) => {
             // STRUCT element: null bitmap + each field as a child column
-            let null_field = Arc::new(Field::new("__struct_null__", DataType::Boolean, false));
+            // Store the original element_field so the reader knows the STRUCT's field names
+            let null_field = Arc::new(Field::new(
+                "__struct_null__",
+                element_field.data_type().clone(),
+                element_field.is_nullable(),
+            ));
             physical_types.push(DataType::Boolean);
             children.push(ChildColumnMeta {
                 parent_logical_col: parent_logical,

@@ -2936,3 +2936,88 @@ fn test_nested_struct_null_preserved_in_leaf_projection() {
         .unwrap();
     assert_eq!(city_out.value(0), "NYC");
 }
+
+#[test]
+fn test_array_of_nested_struct() {
+    // ARRAY<STRUCT<name UTF8, addr STRUCT<city UTF8, zip INT>>>
+    let addr_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("city", DataType::Utf8, true),
+        Field::new("zip", DataType::Int32, true),
+    ]));
+    let struct_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("name", DataType::Utf8, true),
+        Field::new("addr", addr_type.clone(), true),
+    ]));
+    let schema = Schema::new(vec![Field::new(
+        "col",
+        DataType::List(Arc::new(Field::new("item", struct_type.clone(), true))),
+        true,
+    )]);
+
+    // Row 0: [{name: "a", addr: {city: "NYC", zip: 10001}}]
+    let cities = StringArray::from(vec![Some("NYC")]);
+    let zips = Int32Array::from(vec![Some(10001)]);
+    let addr = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("city", DataType::Utf8, true),
+            Field::new("zip", DataType::Int32, true),
+        ]),
+        vec![Arc::new(cities) as ArrayRef, Arc::new(zips) as ArrayRef],
+        None,
+    );
+    let names = StringArray::from(vec![Some("a")]);
+    let inner = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("addr", addr_type.clone(), true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(addr) as ArrayRef],
+        None,
+    );
+
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1]));
+    let list = ListArray::new(
+        Arc::new(Field::new("item", struct_type.clone(), true)),
+        offsets,
+        Arc::new(inner),
+        None,
+    );
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(list) as ArrayRef]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let row0 = col.value(0);
+    let structs = row0.as_any().downcast_ref::<StructArray>().unwrap();
+    let name_out = structs
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(name_out.value(0), "a");
+    let addr_out = structs
+        .column_by_name("addr")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let city_out = addr_out
+        .column_by_name("city")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(city_out.value(0), "NYC");
+    let zip_out = addr_out
+        .column_by_name("zip")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(zip_out.value(0), 10001);
+}
