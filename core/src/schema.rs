@@ -246,23 +246,44 @@ impl MosaicSchema {
                     output.extend_from_slice(&mapping.expanded_col_indices);
                 }
             } else {
-                // Non-STRUCT column: find by name in original schema
-                let orig = self.original_columns.as_deref();
-                let found =
-                    orig.is_some_and(|cols| cols.iter().any(|(n, _, _)| n == proj_field.name()));
-                if found || self.struct_mappings.is_empty() {
-                    if let Some(idx) = self
-                        .columns
-                        .iter()
-                        .position(|c| c.name == *proj_field.name())
-                    {
-                        output.push(idx);
+                // Non-STRUCT column: find by column_id derived from original schema position
+                if let Some(orig) = self.original_columns.as_deref() {
+                    let mut target_id: Option<u32> = None;
+                    let mut id = 0u32;
+                    for (n, dt, _) in orig {
+                        if let DataType::Struct(f) = dt {
+                            if !types::is_timestamp_nanos_struct(f) {
+                                id += 1 + Self::count_tree_nodes(dt);
+                                continue;
+                            }
+                        }
+                        if n == proj_field.name() {
+                            target_id = Some(id);
+                            break;
+                        }
+                        id += 1;
+                    }
+                    if let Some(tid) = target_id {
+                        if let Some(idx) = self.columns.iter().position(|c| c.column_id == tid) {
+                            output.push(idx);
+                        } else {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("column '{}' not found in schema", proj_field.name()),
+                            ));
+                        }
                     } else {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
                             format!("column '{}' not found in schema", proj_field.name()),
                         ));
                     }
+                } else if let Some(idx) = self
+                    .columns
+                    .iter()
+                    .position(|c| c.name == *proj_field.name())
+                {
+                    output.push(idx);
                 } else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,

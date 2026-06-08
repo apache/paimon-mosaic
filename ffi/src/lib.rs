@@ -580,15 +580,23 @@ pub unsafe extern "C" fn mosaic_reader_export_schema(
         }
         let h = &*handle;
         let schema = h.reader.schema();
-        let fields: Vec<Field> = schema
-            .original_order
-            .iter()
-            .map(|&i| {
-                let c = &schema.columns[i];
-                Field::new(&c.name, c.data_type.clone(), c.nullable)
-            })
-            .collect();
-        let arrow_schema = Schema::new(fields);
+        let arrow_schema = if let Some(ref orig) = schema.original_columns {
+            let fields: Vec<Field> = orig
+                .iter()
+                .map(|(name, dt, nullable)| Field::new(name, dt.clone(), *nullable))
+                .collect();
+            Schema::new(fields)
+        } else {
+            let fields: Vec<Field> = schema
+                .original_order
+                .iter()
+                .map(|&i| {
+                    let c = &schema.columns[i];
+                    Field::new(&c.name, c.data_type.clone(), c.nullable)
+                })
+                .collect();
+            Schema::new(fields)
+        };
         match FFI_ArrowSchema::try_from(&arrow_schema) {
             Ok(ffi_schema) => {
                 ptr::write(out_schema, ffi_schema);

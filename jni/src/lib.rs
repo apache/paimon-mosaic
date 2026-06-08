@@ -661,15 +661,23 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderExpor
         let rh = unsafe { &*(handle as *const ReaderHandle) };
         let reader = &*rh.reader;
         let schema = reader.schema();
-        let fields: Vec<arrow_schema::Field> = schema
-            .original_order
-            .iter()
-            .map(|&i| {
-                let c = &schema.columns[i];
-                arrow_schema::Field::new(&c.name, c.data_type.clone(), c.nullable)
-            })
-            .collect();
-        let arrow_schema = Schema::new(fields);
+        let arrow_schema = if let Some(ref orig) = schema.original_columns {
+            let fields: Vec<arrow_schema::Field> = orig
+                .iter()
+                .map(|(name, dt, nullable)| arrow_schema::Field::new(name, dt.clone(), *nullable))
+                .collect();
+            Schema::new(fields)
+        } else {
+            let fields: Vec<arrow_schema::Field> = schema
+                .original_order
+                .iter()
+                .map(|&i| {
+                    let c = &schema.columns[i];
+                    arrow_schema::Field::new(&c.name, c.data_type.clone(), c.nullable)
+                })
+                .collect();
+            Schema::new(fields)
+        };
         match FFI_ArrowSchema::try_from(&arrow_schema) {
             Ok(ffi_schema) => {
                 unsafe {
