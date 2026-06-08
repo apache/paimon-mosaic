@@ -2632,3 +2632,101 @@ fn test_null_suffix_column_name_allowed() {
     let result = MosaicSchema::validate(&[("info__null__".to_string(), DataType::Utf8, false)]);
     assert!(result.is_ok());
 }
+
+#[test]
+fn test_top_level_and_struct_field_same_name() {
+    // Top-level column "name" and STRUCT "info" with field "name"
+    // Both expand to physical columns named "name" — column IDs distinguish them
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::Utf8, true),
+        Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int32, true),
+            ])),
+            true,
+        ),
+    ]);
+
+    let top_names = StringArray::from(vec![Some("top_alice"), Some("top_bob")]);
+    let struct_names = StringArray::from(vec![Some("inner_alice"), Some("inner_bob")]);
+    let ages = Int32Array::from(vec![Some(30), Some(25)]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]),
+        vec![
+            Arc::new(struct_names) as ArrayRef,
+            Arc::new(ages) as ArrayRef,
+        ],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(top_names) as ArrayRef, Arc::new(info) as ArrayRef],
+    )
+    .unwrap();
+
+    // Full roundtrip
+    let result = roundtrip(&schema, &[batch.clone()]);
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 2);
+
+    let top_out = rb
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(top_out.value(0), "top_alice");
+
+    let info_out = rb
+        .column_by_name("info")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let inner_name = info_out
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(inner_name.value(0), "inner_alice");
+
+    // Project top-level "name" only
+    let result2 = roundtrip_projected(&schema, &[batch.clone()], &["name"]);
+    let rb2 = &result2[0];
+    assert_eq!(rb2.num_columns(), 1);
+    let name_out = rb2
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(name_out.value(0), "top_alice");
+    assert_eq!(name_out.value(1), "top_bob");
+
+    // Project "info.name" — resolves to STRUCT field, not top-level column
+    let result3 = roundtrip_projected(&schema, &[batch.clone()], &["info.name"]);
+    let rb3 = &result3[0];
+    assert_eq!(rb3.num_columns(), 1);
+    let info_out3 = rb3
+        .column(0)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let inner_name3 = info_out3
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(inner_name3.value(0), "inner_alice");
+
+    // Project both
+    let result4 = roundtrip_projected(&schema, &[batch], &["name", "info"]);
+    let rb4 = &result4[0];
+    assert_eq!(rb4.num_columns(), 2);
+}
