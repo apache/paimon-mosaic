@@ -455,13 +455,16 @@ DFS IDs:
             <!-- ============================================================ -->
             <h2>Validation Rules</h2>
             <ul>
-                <li>Column names and STRUCT field names may contain any characters
-                    (including <code>.</code>). Ambiguity with STRUCT paths is resolved by
-                    exact-match-first projection strategy.</li>
+                <li>Top-level column names may contain any characters including <code>.</code>.
+                    Ambiguity with STRUCT paths is resolved by exact-match-first projection.</li>
+                <li>STRUCT field names must not contain <code>.</code> (reserved for projection
+                    path separator).</li>
                 <li>STRUCT must have at least one field.</li>
                 <li>MAP key type cannot be ARRAY, MAP, or STRUCT (complex keys rejected).</li>
                 <li>Sorted MAP is not supported.</li>
-                <li>Non-nullable STRUCT fields are validated on write: null values are rejected.</li>
+                <li>Non-nullable STRUCT fields are validated on write: null values under
+                    non-null ancestor rows are rejected.</li>
+                <li>Stats column selections must not be ambiguous (no duplicate physical names).</li>
             </ul>
         </div>
     </main>

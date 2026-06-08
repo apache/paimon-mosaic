@@ -152,8 +152,11 @@ impl MosaicSchema {
                 .iter()
                 .map(|&input_idx| schema.original_order[input_idx])
                 .collect();
-            let null_name = format!("{}.__null__", mapping.original_field.name());
-            mapping.null_col_sorted_idx = schema.columns.iter().position(|c| c.name == null_name);
+            if mapping.original_field.is_nullable() {
+                mapping.null_col_sorted_idx = schema.columns.iter().position(|c| {
+                    c.column_id == mapping.struct_id && c.data_type == DataType::Boolean
+                });
+            }
         }
 
         if !schema.struct_mappings.is_empty() {
@@ -645,8 +648,11 @@ impl MosaicSchema {
                 .iter()
                 .map(|&input_idx| schema.original_order[input_idx])
                 .collect();
-            let null_name = format!("{}.__null__", mapping.original_field.name());
-            mapping.null_col_sorted_idx = schema.columns.iter().position(|c| c.name == null_name);
+            if mapping.original_field.is_nullable() {
+                mapping.null_col_sorted_idx = schema.columns.iter().position(|c| {
+                    c.column_id == mapping.struct_id && c.data_type == DataType::Boolean
+                });
+            }
         }
 
         schema.original_columns = Some(input_columns);

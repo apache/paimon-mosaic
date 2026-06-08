@@ -124,6 +124,11 @@ pub fn validate_data_type(dt: &DataType) -> Result<(), String> {
                 if matches!(key_dt, DataType::List(_) | DataType::Map(_, _)) {
                     return Err("MAP key type cannot be ARRAY or MAP".to_string());
                 }
+                if let DataType::Struct(kf) = key_dt {
+                    if !is_timestamp_nanos_struct(kf) {
+                        return Err("MAP key type cannot be STRUCT".to_string());
+                    }
+                }
                 validate_data_type(key_dt)?;
                 validate_data_type(fields[1].data_type())
             } else {
@@ -135,6 +140,12 @@ pub fn validate_data_type(dt: &DataType) -> Result<(), String> {
                 return Err("STRUCT must have at least one field".to_string());
             }
             for field in fields.iter() {
+                if field.name().contains('.') {
+                    return Err(format!(
+                        "STRUCT field name '{}' must not contain '.' (reserved for projection path separator)",
+                        field.name()
+                    ));
+                }
                 validate_data_type(field.data_type())?;
             }
             Ok(())

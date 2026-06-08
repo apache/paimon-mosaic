@@ -2589,41 +2589,19 @@ fn test_dot_column_name_projection() {
 }
 
 #[test]
-fn test_struct_field_name_with_dot() {
-    // STRUCT field name itself contains '.'
-    let schema = Schema::new(vec![Field::new(
-        "info",
-        DataType::Struct(arrow_schema::Fields::from(vec![
-            Field::new("user.name", DataType::Utf8, true),
-            Field::new("age", DataType::Int32, true),
-        ])),
+fn test_struct_field_name_with_dot_rejected() {
+    use paimon_mosaic_core::schema::MosaicSchema;
+    let result = MosaicSchema::validate(&[(
+        "info".to_string(),
+        DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+            "user.name",
+            DataType::Utf8,
+            true,
+        )])),
         false,
     )]);
-
-    let names = StringArray::from(vec![Some("alice"), Some("bob")]);
-    let ages = Int32Array::from(vec![Some(30), Some(25)]);
-    let info = StructArray::new(
-        arrow_schema::Fields::from(vec![
-            Field::new("user.name", DataType::Utf8, true),
-            Field::new("age", DataType::Int32, true),
-        ]),
-        vec![Arc::new(names) as ArrayRef, Arc::new(ages) as ArrayRef],
-        None,
-    );
-    let batch =
-        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(info) as ArrayRef]).unwrap();
-
-    let result = roundtrip(&schema, &[batch]);
-    let rb = &result[0];
-    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
-    let name_out = info_out
-        .column_by_name("user.name")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert_eq!(name_out.value(0), "alice");
-    assert_eq!(name_out.value(1), "bob");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("must not contain '.'"));
 }
 
 #[test]

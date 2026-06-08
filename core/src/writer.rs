@@ -197,19 +197,30 @@ impl<S: OutputFile> MosaicWriter<S> {
         declared_type: &DataType,
         path: &str,
     ) -> io::Result<()> {
+        Self::validate_struct_nullability_inner(struct_arr, declared_type, path, None)
+    }
+
+    fn validate_struct_nullability_inner(
+        struct_arr: &arrow_array::StructArray,
+        declared_type: &DataType,
+        path: &str,
+        ancestor_nulls: Option<&[bool]>,
+    ) -> io::Result<()> {
+        let num_rows = struct_arr.len();
+        // Build combined validity: a row is "active" if all ancestors and this struct are non-null
+        let active: Vec<bool> = (0..num_rows)
+            .map(|i| !struct_arr.is_null(i) && ancestor_nulls.is_none_or(|an| an[i]))
+            .collect();
+
         if let DataType::Struct(fields) = declared_type {
             for (fi, field) in fields.iter().enumerate() {
                 let child = struct_arr.column(fi);
                 let child_path = format!("{}.{}", path, field.name());
 
                 if !field.is_nullable() {
-                    let effective_nulls = if struct_arr.null_count() > 0 {
-                        (0..struct_arr.len())
-                            .filter(|&i| !struct_arr.is_null(i) && child.is_null(i))
-                            .count()
-                    } else {
-                        child.null_count()
-                    };
+                    let effective_nulls = (0..num_rows)
+                        .filter(|&i| active[i] && child.is_null(i))
+                        .count();
                     if effective_nulls > 0 {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
@@ -226,20 +237,25 @@ impl<S: OutputFile> MosaicWriter<S> {
                         if let Some(inner) =
                             child.as_any().downcast_ref::<arrow_array::StructArray>()
                         {
-                            if !field.is_nullable() && inner.null_count() > 0 {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    format!(
-                                        "non-nullable STRUCT column '{}' has {} null rows in batch",
-                                        child_path,
-                                        inner.null_count()
-                                    ),
-                                ));
+                            if !field.is_nullable() {
+                                let effective_nulls = (0..num_rows)
+                                    .filter(|&i| active[i] && inner.is_null(i))
+                                    .count();
+                                if effective_nulls > 0 {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        format!(
+                                            "non-nullable STRUCT column '{}' has {} null rows in batch",
+                                            child_path, effective_nulls
+                                        ),
+                                    ));
+                                }
                             }
-                            Self::validate_struct_nullability(
+                            Self::validate_struct_nullability_inner(
                                 inner,
                                 field.data_type(),
                                 &child_path,
+                                Some(&active),
                             )?;
                         }
                     }
@@ -370,6 +386,20 @@ impl<S: OutputFile> MosaicWriter<S> {
             }
             cols.sort_by_key(|(idx, _, _)| *idx);
             cols.dedup_by_key(|(idx, _, _)| *idx);
+            // Reject ambiguous stats selections (duplicate physical names)
+            let mut seen_names = std::collections::HashSet::new();
+            for &(idx, _, _) in &cols {
+                let name = &schema.columns[idx].name;
+                if !seen_names.insert(name.as_str()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "stats_columns: ambiguous column name '{}' (multiple columns share this name)",
+                            name
+                        ),
+                    ));
+                }
+            }
             Some(StatsCollector::new(&cols))
         };
 
