@@ -247,10 +247,18 @@ pub fn serialize_field(field: &Field, buf: &mut Vec<u8>) {
         }
         DataType::Struct(fields) if !is_timestamp_nanos_struct(fields) => {
             varint::encode(buf, fields.len() as u32);
+            let mut prev_name: &[u8] = &[];
             for field in fields.iter() {
                 let name_bytes = field.name().as_bytes();
-                varint::encode(buf, name_bytes.len() as u32);
-                buf.extend_from_slice(name_bytes);
+                let shared = prev_name
+                    .iter()
+                    .zip(name_bytes.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                varint::encode(buf, shared as u32);
+                varint::encode(buf, (name_bytes.len() - shared) as u32);
+                buf.extend_from_slice(&name_bytes[shared..]);
+                prev_name = name_bytes;
                 serialize_field(field, buf);
             }
         }
@@ -401,9 +409,27 @@ pub fn deserialize_field(name: &str, buf: &[u8], pos: &mut usize) -> Result<Fiel
         20 => {
             let num_fields = varint::decode(buf, pos)? as usize;
             let mut struct_fields = Vec::with_capacity(num_fields);
+            let mut prev_name_bytes: Vec<u8> = Vec::new();
             for _ in 0..num_fields {
-                let field_name_len = varint::decode(buf, pos)? as usize;
-                let field_name = read_utf8_field_name(buf, pos, field_name_len, "STRUCT field")?;
+                let shared = varint::decode(buf, pos)? as usize;
+                let suffix_len = varint::decode(buf, pos)? as usize;
+                if shared > prev_name_bytes.len() || *pos + suffix_len > buf.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "STRUCT field: corrupted front-coded name",
+                    ));
+                }
+                let mut name_bytes = Vec::with_capacity(shared + suffix_len);
+                name_bytes.extend_from_slice(&prev_name_bytes[..shared]);
+                name_bytes.extend_from_slice(&buf[*pos..*pos + suffix_len]);
+                *pos += suffix_len;
+                let field_name = String::from_utf8(name_bytes.clone()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "STRUCT field: invalid UTF-8 in field name",
+                    )
+                })?;
+                prev_name_bytes = name_bytes;
                 let field = deserialize_field(&field_name, buf, pos)?;
                 struct_fields.push(field);
             }
