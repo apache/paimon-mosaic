@@ -1240,3 +1240,60 @@ class TestWriter:
             info = rb.column("info").to_pylist()
             assert info[0]["name"] == "alice"
             assert info[1]["age"] == 25
+
+    def test_struct_nested_multi_leaf_projection(self):
+        pa_schema = pa.schema(
+            [
+                pa.field(
+                    "info",
+                    pa.struct(
+                        [
+                            pa.field("name", pa.utf8()),
+                            pa.field(
+                                "addr",
+                                pa.struct(
+                                    [
+                                        pa.field("city", pa.utf8()),
+                                        pa.field("zip", pa.int32()),
+                                    ]
+                                ),
+                            ),
+                        ]
+                    ),
+                ),
+            ]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array(
+                    [
+                        {"name": "alice", "addr": {"city": "NYC", "zip": 10001}},
+                        {"name": "bob", "addr": {"city": "LA", "zip": 90001}},
+                    ],
+                    type=pa_schema.field("info").type,
+                ),
+            ],
+            names=["info"],
+        )
+
+        data = _write_to_bytes(pa_schema, batch)
+
+        with _reader_from_bytes(data) as reader:
+            reader.project(["info.addr.zip", "info.addr.city"])
+            rb = reader.read_row_group(0)
+            assert rb.num_rows == 2
+            info = rb.column("info")
+            addr = info.field("addr")
+            cities = addr.field("city").to_pylist()
+            zips = addr.field("zip").to_pylist()
+            assert cities == ["NYC", "LA"]
+            assert zips == [10001, 90001]
+
+        # Verify _projected_schema also has both fields
+        from mosaic.mosaic import _build_projected_schema
+
+        ps = _build_projected_schema(pa_schema, ["info.addr.zip", "info.addr.city"])
+        info_type = ps.field("info").type
+        addr_type = info_type.field("addr").type
+        assert addr_type.num_fields == 2

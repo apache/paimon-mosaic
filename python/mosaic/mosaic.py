@@ -273,45 +273,20 @@ class ColumnStatistics:
         return self.min is not None
 
 
-def _resolve_field(schema_or_type, path_parts):
-    """Resolve a dotted path against a schema or struct type, returning a pa.Field."""
-    name = path_parts[0]
-    rest = path_parts[1:]
-
-    if isinstance(schema_or_type, pa.Schema):
-        field = schema_or_type.field(name)
-    elif isinstance(schema_or_type, pa.StructType):
-        idx = schema_or_type.get_field_index(name)
-        if idx < 0:
-            raise KeyError(f"field '{name}' not found")
-        field = schema_or_type.field(idx)
-    else:
-        raise KeyError(f"cannot resolve '{name}' in non-struct type")
-
-    if not rest:
-        return field
-
-    if not isinstance(field.type, pa.StructType):
-        raise KeyError(f"field '{name}' is not a struct, cannot resolve '{'.'.join(rest)}'")
-
-    child = _resolve_field(field.type, rest)
-    return pa.field(
-        name,
-        pa.struct([child]),
-        nullable=field.nullable,
-    )
-
-
 def _build_projected_schema(original_schema, column_names):
-    """Build a projected PyArrow schema from dotted column paths."""
-    seen = {}
+    """Build a projected PyArrow schema from dotted column paths.
+
+    Merges multiple leaves under the same nested STRUCT parent recursively.
+    For example, ["info.addr.city", "info.addr.zip"] produces
+    info: struct<addr: struct<city, zip>>.
+    """
+    seen_roots = set()
     output_fields = []
 
     for col in column_names:
         parts = col.split(".")
         root = parts[0]
-
-        if root in seen:
+        if root in seen_roots:
             continue
 
         try:
@@ -319,37 +294,56 @@ def _build_projected_schema(original_schema, column_names):
         except KeyError:
             continue
 
-        if len(parts) == 1:
-            seen[root] = True
+        if len(parts) == 1 or not isinstance(top_field.type, pa.StructType):
+            seen_roots.add(root)
             output_fields.append(top_field)
             continue
 
-        if not isinstance(top_field.type, pa.StructType):
-            seen[root] = True
-            output_fields.append(top_field)
-            continue
-
-        if root not in seen:
-            seen[root] = []
-
-        same_root = [c for c in column_names if c.startswith(root + ".")]
-        child_fields = []
-        child_names_seen = set()
-        for leaf in same_root:
-            leaf_parts = leaf.split(".")[1:]
-            child_name = leaf_parts[0]
-            if child_name in child_names_seen:
-                continue
-            child_names_seen.add(child_name)
-            child = _resolve_field(top_field.type, leaf_parts)
-            child_fields.append(child)
-
-        output_fields.append(
-            pa.field(root, pa.struct(child_fields), nullable=top_field.nullable)
-        )
-        seen[root] = True
+        seen_roots.add(root)
+        same_root = [c.split(".")[1:] for c in column_names if c.startswith(root + ".")]
+        projected = _project_struct_type(top_field.type, same_root)
+        output_fields.append(pa.field(root, projected, nullable=top_field.nullable))
 
     return pa.schema(output_fields, metadata=original_schema.metadata)
+
+
+def _project_struct_type(struct_type, sub_paths):
+    """Build a partial struct type from a list of relative sub-paths.
+
+    Each sub_path is a list of path segments, e.g. ["addr", "city"].
+    Paths referring to the same nested struct are merged recursively.
+    """
+    children = {}
+    child_order = []
+
+    for path in sub_paths:
+        name = path[0]
+        rest = path[1:]
+
+        if name not in children:
+            idx = struct_type.get_field_index(name)
+            if idx < 0:
+                continue
+            field = struct_type.field(idx)
+            children[name] = {"field": field, "sub_paths": []}
+            child_order.append(name)
+
+        if rest:
+            children[name]["sub_paths"].append(rest)
+
+    result_fields = []
+    for name in child_order:
+        entry = children[name]
+        field = entry["field"]
+        subs = entry["sub_paths"]
+
+        if not subs or not isinstance(field.type, pa.StructType):
+            result_fields.append(field)
+        else:
+            projected = _project_struct_type(field.type, subs)
+            result_fields.append(pa.field(name, projected, nullable=field.nullable))
+
+    return pa.struct(result_fields)
 
 
 class MosaicReader:
