@@ -27,7 +27,11 @@ use crate::varint;
 
 #[derive(Debug, Clone)]
 pub struct ColumnMeta {
+    /// Physical column name for sorting and bucket assignment.
+    /// STRUCT fields use dot-prefixed names (e.g. "info.name").
+    /// Not unique — a top-level column and a STRUCT field can share the same name.
     pub name: String,
+    /// DFS-incremented column ID, unique across the schema. Used for all internal matching.
     pub column_id: u32,
     pub data_type: DataType,
     pub nullable: bool,
@@ -54,7 +58,10 @@ pub struct StructMapping {
 #[derive(Debug, Clone)]
 pub struct MosaicSchema {
     pub num_buckets: usize,
-    /// Expanded columns (STRUCT fields flattened, with __null__ columns)
+    /// Expanded columns (STRUCT fields flattened, with __null__ columns).
+    /// Names may be duplicated (e.g. top-level "name" and STRUCT field "info.name"
+    /// both exist). Names are only used for sorting and bucket assignment;
+    /// all internal matching uses column_id.
     pub columns: Vec<ColumnMeta>,
     /// bucket_to_global[bucket_id] = [global_col_indices...] in name-sorted order
     pub bucket_to_global: Vec<Vec<usize>>,
@@ -99,7 +106,7 @@ impl MosaicSchema {
                     let start = expanded.len();
                     let has_null_col = *nullable;
                     if has_null_col {
-                        let null_name = format!("__null__({})", struct_id);
+                        let null_name = format!("{}.__null__", name);
                         expanded.push((null_name, struct_id, DataType::Boolean, false));
                     }
                     let field_start = expanded.len();
@@ -114,7 +121,7 @@ impl MosaicSchema {
                     let expanded_indices: Vec<usize> = (start..end).collect();
                     let field_ids: Vec<u32> = expanded[field_start..end]
                         .iter()
-                        .filter(|(n, _, _, _)| !n.starts_with("__null__("))
+                        .filter(|(n, _, _, _)| !n.ends_with(".__null__"))
                         .map(|(_, id, _, _)| *id)
                         .collect();
 
@@ -144,8 +151,7 @@ impl MosaicSchema {
                 .iter()
                 .map(|&input_idx| schema.original_order[input_idx])
                 .collect();
-            // Find null_col_sorted_idx by struct_id
-            let null_name = format!("__null__({})", mapping.struct_id);
+            let null_name = format!("{}.__null__", mapping.original_field.name());
             mapping.null_col_sorted_idx = schema.columns.iter().position(|c| c.name == null_name);
         }
 
@@ -170,7 +176,7 @@ impl MosaicSchema {
             if let DataType::Struct(inner_fields) = dt {
                 if !types::is_timestamp_nanos_struct(inner_fields) {
                     if field.is_nullable() {
-                        let null_name = format!("__null__({})", field_id);
+                        let null_name = format!("{}.__null__", full_name);
                         out.push((null_name, field_id, DataType::Boolean, false));
                     }
                     Self::expand_struct_fields_recursive(&full_name, inner_fields, id_counter, out);
@@ -593,7 +599,7 @@ impl MosaicSchema {
                     let start = expanded.len();
                     let has_null_col = *nullable;
                     if has_null_col {
-                        let null_name = format!("__null__({})", struct_id);
+                        let null_name = format!("{}.__null__", name);
                         expanded.push((null_name, struct_id, DataType::Boolean, false));
                     }
                     let field_start = expanded.len();
@@ -608,7 +614,7 @@ impl MosaicSchema {
                     let expanded_indices: Vec<usize> = (start..end).collect();
                     let field_ids: Vec<u32> = expanded[field_start..end]
                         .iter()
-                        .filter(|(n, _, _, _)| !n.starts_with("__null__("))
+                        .filter(|(n, _, _, _)| !n.ends_with(".__null__"))
                         .map(|(_, id, _, _)| *id)
                         .collect();
 
@@ -638,7 +644,7 @@ impl MosaicSchema {
                 .iter()
                 .map(|&input_idx| schema.original_order[input_idx])
                 .collect();
-            let null_name = format!("__null__({})", mapping.struct_id);
+            let null_name = format!("{}.__null__", mapping.original_field.name());
             mapping.null_col_sorted_idx = schema.columns.iter().position(|c| c.name == null_name);
         }
 

@@ -378,7 +378,7 @@ impl<S: OutputFile> MosaicWriter<S> {
             let mut cols: Vec<(usize, usize, arrow_schema::DataType)> = Vec::new();
             for idx in stat_indices {
                 let dt = &schema.columns[idx].data_type;
-                if schema.columns[idx].name.starts_with("__null__(") {
+                if schema.columns[idx].name.ends_with(".__null__") {
                     continue;
                 }
                 if !stats::supports_stats(dt) {
