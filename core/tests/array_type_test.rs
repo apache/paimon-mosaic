@@ -1811,19 +1811,37 @@ fn roundtrip_projected(
 }
 
 #[test]
-fn test_dot_in_column_name_rejected() {
+fn test_dot_in_column_name_allowed() {
     use paimon_mosaic_core::schema::MosaicSchema;
     let result = MosaicSchema::validate(&[("user.name".to_string(), DataType::Utf8, false)]);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("must not contain '.'"));
+    assert!(result.is_ok());
 }
 
 #[test]
-fn test_null_suffix_in_column_name_rejected() {
-    use paimon_mosaic_core::schema::MosaicSchema;
-    let result = MosaicSchema::validate(&[("info__null__".to_string(), DataType::Utf8, false)]);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("__null__"));
+fn test_dot_column_name_roundtrip() {
+    let schema = Schema::new(vec![
+        Field::new("a.b", DataType::Int32, false),
+        Field::new("c", DataType::Utf8, true),
+    ]);
+    let col_ab = Int32Array::from(vec![1, 2, 3]);
+    let col_c = StringArray::from(vec![Some("x"), Some("y"), Some("z")]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(col_ab) as ArrayRef, Arc::new(col_c) as ArrayRef],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 2);
+    let ab = rb
+        .column_by_name("a.b")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ab.value(0), 1);
+    assert_eq!(ab.value(2), 3);
 }
 
 #[test]

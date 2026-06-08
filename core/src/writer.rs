@@ -168,7 +168,7 @@ impl<S: OutputFile> MosaicWriter<S> {
             let mut flat_arrays = Vec::new();
             Self::extract_struct_expanded(
                 struct_arr,
-                mapping.null_col_name.is_some(),
+                mapping.null_col_sorted_idx.is_some(),
                 &mut flat_arrays,
             );
 
@@ -314,27 +314,22 @@ impl<S: OutputFile> MosaicWriter<S> {
     }
 
     fn build_batch_col_map(schema: &Schema, mosaic: &MosaicSchema) -> Vec<usize> {
-        // For non-STRUCT schemas, this is the simple name-based mapping.
-        // For STRUCT schemas, expanded columns can't be found by name in the Arrow schema.
-        // We use a dummy identity mapping here — the actual extraction happens in write_batch.
-        // batch_col_map[expanded_sorted_idx] = original_arrow_col_idx
-        let mut map = Vec::with_capacity(mosaic.columns.len());
-        for col in &mosaic.columns {
-            // Try direct name lookup first
+        let mut map = vec![0usize; mosaic.columns.len()];
+
+        // Map non-STRUCT columns by name
+        for (sorted_idx, col) in mosaic.columns.iter().enumerate() {
             if let Ok(idx) = schema.index_of(&col.name) {
-                map.push(idx);
-            } else {
-                // Expanded STRUCT field: find the original STRUCT column
-                let root_name = col.name.split('.').next().unwrap_or(&col.name);
-                if let Ok(idx) = schema.index_of(root_name) {
-                    map.push(idx);
-                } else {
-                    // __null__ column: strip suffix
-                    let base = col.name.strip_suffix(".__null__").unwrap_or(&col.name);
-                    map.push(schema.index_of(base).unwrap_or(0));
-                }
+                map[sorted_idx] = idx;
             }
         }
+
+        // Map STRUCT expanded columns to their original STRUCT column index
+        for mapping in &mosaic.struct_mappings {
+            for &sorted_idx in &mapping.expanded_col_indices {
+                map[sorted_idx] = mapping.original_col_index;
+            }
+        }
+
         map
     }
 
@@ -376,32 +371,23 @@ impl<S: OutputFile> MosaicWriter<S> {
         let stats_collector = if options.stats_columns.is_empty() {
             None
         } else {
-            let mut cols: Vec<(usize, usize, arrow_schema::DataType)> =
-                Vec::with_capacity(options.stats_columns.len());
-            for name in &options.stats_columns {
-                let idx = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name == *name)
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("stats_columns: column '{}' not found in schema", name),
-                        )
-                    })?;
+            let stat_names: Vec<&str> = options.stats_columns.iter().map(|s| s.as_str()).collect();
+            let (_, stat_indices) = schema.resolve_projection(&stat_names).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("stats_columns: {}", e))
+            })?;
+            let mut cols: Vec<(usize, usize, arrow_schema::DataType)> = Vec::new();
+            for idx in stat_indices {
                 let dt = &schema.columns[idx].data_type;
+                if dt == &DataType::Boolean && schema.columns[idx].name.starts_with("__null__(") {
+                    continue;
+                }
                 if !stats::supports_stats(dt) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "stats_columns: column '{}' has unsupported type {:?} for statistics",
-                            name, dt
-                        ),
-                    ));
+                    continue;
                 }
                 cols.push((idx, batch_col_map[idx], dt.clone()));
             }
             cols.sort_by_key(|(idx, _, _)| *idx);
+            cols.dedup_by_key(|(idx, _, _)| *idx);
             Some(StatsCollector::new(&cols))
         };
 

@@ -593,12 +593,14 @@ mod tests {
         let schema_columns = vec![
             ColumnMeta {
                 name: "a".to_string(),
+                column_id: 0,
                 data_type: DataType::Int32,
                 nullable: true,
                 bucket_id: 0,
             },
             ColumnMeta {
                 name: "b".to_string(),
+                column_id: 1,
                 data_type: DataType::Utf8,
                 nullable: true,
                 bucket_id: 0,
@@ -653,6 +655,7 @@ mod tests {
     fn test_serialize_all_null_stats() {
         let schema_columns = vec![ColumnMeta {
             name: "x".to_string(),
+            column_id: 0,
             data_type: DataType::Int32,
             nullable: true,
             bucket_id: 0,

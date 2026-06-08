@@ -135,18 +135,6 @@ pub fn validate_data_type(dt: &DataType) -> Result<(), String> {
                 return Err("STRUCT must have at least one field".to_string());
             }
             for field in fields.iter() {
-                if field.name().contains('.') {
-                    return Err(format!(
-                        "STRUCT field name '{}' must not contain '.'",
-                        field.name()
-                    ));
-                }
-                if field.name().ends_with("__null__") {
-                    return Err(format!(
-                        "STRUCT field name '{}' must not end with '__null__'",
-                        field.name()
-                    ));
-                }
                 validate_data_type(field.data_type())?;
             }
             Ok(())

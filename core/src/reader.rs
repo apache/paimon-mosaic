@@ -1061,63 +1061,66 @@ impl RowGroupReader {
 
     fn reassemble_struct_recursive(
         struct_fields: &arrow_schema::Fields,
-        named_arrays: &[(String, ArrayRef)],
+        id_arrays: &[(u32, ArrayRef)],
         null_buf: Option<arrow_buffer::NullBuffer>,
         name: &str,
         nullable: bool,
+        base_id: u32,
     ) -> Option<(ArrayRef, Field)> {
         let mut ordered_fields: Vec<Arc<Field>> = Vec::new();
         let mut ordered_children: Vec<ArrayRef> = Vec::new();
 
+        let mut field_id = base_id + 1; // first child ID = parent + 1
         for field in struct_fields.iter() {
-            if let Some(pos) = named_arrays.iter().position(|(n, _)| n == field.name()) {
-                ordered_fields.push(field.clone());
-                ordered_children.push(named_arrays[pos].1.clone());
-            } else if let DataType::Struct(inner_fields) = field.data_type() {
-                let prefix = format!("{}.", field.name());
-                let mut inner_null_buf = None;
-                let sub_arrays: Vec<(String, ArrayRef)> = named_arrays
-                    .iter()
-                    .filter_map(|(n, arr)| {
-                        if let Some(suffix) = n.strip_prefix(&prefix) {
-                            if suffix == "__null__" {
-                                inner_null_buf =
-                                    arr.as_any().downcast_ref::<BooleanArray>().map(|ba| {
-                                        let num = ba.len();
-                                        let mut bm = vec![0u8; num.div_ceil(8)];
-                                        for i in 0..num {
-                                            if ba.value(i) {
-                                                bm[i / 8] |= 1 << (i % 8);
-                                            }
+            let cur_id = field_id;
+            field_id += 1;
+
+            if let DataType::Struct(inner_fields) = field.data_type() {
+                if !crate::types::is_timestamp_nanos_struct(inner_fields) {
+                    // Nested STRUCT: look for __null__ by cur_id, then recurse
+                    let inner_null_buf =
+                        id_arrays
+                            .iter()
+                            .find(|(id, _)| *id == cur_id)
+                            .and_then(|(_, arr)| {
+                                arr.as_any().downcast_ref::<BooleanArray>().map(|ba| {
+                                    let num = ba.len();
+                                    let mut bm = vec![0u8; num.div_ceil(8)];
+                                    for i in 0..num {
+                                        if ba.value(i) {
+                                            bm[i / 8] |= 1 << (i % 8);
                                         }
-                                        arrow_buffer::NullBuffer::new(
-                                            arrow_buffer::BooleanBuffer::new(
-                                                arrow_buffer::Buffer::from_vec(bm),
-                                                0,
-                                                num,
-                                            ),
-                                        )
-                                    });
-                                return None;
-                            }
-                            Some((suffix.to_string(), arr.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if !sub_arrays.is_empty() {
+                                    }
+                                    arrow_buffer::NullBuffer::new(arrow_buffer::BooleanBuffer::new(
+                                        arrow_buffer::Buffer::from_vec(bm),
+                                        0,
+                                        num,
+                                    ))
+                                })
+                            });
+
                     if let Some((arr, child_field)) = Self::reassemble_struct_recursive(
                         inner_fields,
-                        &sub_arrays,
+                        id_arrays,
                         inner_null_buf,
                         field.name(),
                         field.is_nullable(),
+                        cur_id,
                     ) {
                         ordered_fields.push(Arc::new(child_field));
                         ordered_children.push(arr);
                     }
+
+                    // Skip past the subtree IDs
+                    field_id += crate::schema::MosaicSchema::count_tree_nodes(field.data_type());
+                    continue;
                 }
+            }
+
+            // Leaf field: find by column_id
+            if let Some(pos) = id_arrays.iter().position(|(id, _)| *id == cur_id) {
+                ordered_fields.push(field.clone());
+                ordered_children.push(id_arrays[pos].1.clone());
             }
         }
 
@@ -1209,18 +1212,15 @@ impl RowGroupReader {
         // Reassemble STRUCT columns from expanded sub-field arrays
         let mut struct_arrays: Vec<(usize, ArrayRef, Field)> = Vec::new();
         for mapping in &self.schema.struct_mappings {
-            let prefix = mapping.original_field.name();
-            let mut named_arrays: Vec<(String, ArrayRef)> = Vec::new();
+            let mut id_arrays: Vec<(u32, ArrayRef)> = Vec::new();
             let mut null_bitmap: Option<ArrayRef> = None;
 
-            let root_null_name = mapping.null_col_name.as_deref();
             for &sorted_idx in &mapping.expanded_col_indices {
-                let col_name = &self.schema.columns[sorted_idx].name;
-                if root_null_name == Some(col_name.as_str()) {
+                if mapping.null_col_sorted_idx == Some(sorted_idx) {
                     null_bitmap = arrays[sorted_idx].take();
                 } else if let Some(arr) = arrays[sorted_idx].take() {
-                    let suffix = &col_name[prefix.len() + 1..];
-                    named_arrays.push((suffix.to_string(), arr));
+                    let col_id = self.schema.columns[sorted_idx].column_id;
+                    id_arrays.push((col_id, arr));
                 }
             }
 
@@ -1244,10 +1244,11 @@ impl RowGroupReader {
 
                 if let Some((arr, field)) = Self::reassemble_struct_recursive(
                     struct_fields,
-                    &named_arrays,
+                    &id_arrays,
                     null_buf,
                     mapping.original_field.name(),
                     mapping.original_field.is_nullable(),
+                    mapping.struct_id,
                 ) {
                     struct_arrays.push((mapping.original_col_index, arr, field));
                 }
