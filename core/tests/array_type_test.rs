@@ -2730,3 +2730,66 @@ fn test_top_level_and_struct_field_same_name() {
     let rb4 = &result4[0];
     assert_eq!(rb4.num_columns(), 2);
 }
+
+#[test]
+fn test_nested_struct_null_preserved_in_leaf_projection() {
+    // Verify that projecting a nested STRUCT's leaf preserves the nested STRUCT null
+    let addr_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("city", DataType::Utf8, true),
+        Field::new("zip", DataType::Int32, true),
+    ]));
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("addr", addr_type.clone(), true),
+        ])),
+        true,
+    )]);
+
+    // Row 0: {name: "a", addr: {city: "NYC", zip: 10001}}
+    // Row 1: {name: "b", addr: null}
+    let cities = StringArray::from(vec![Some("NYC"), Some("")]);
+    let zips = Int32Array::from(vec![Some(10001), Some(0)]);
+    let addr_null = NullBuffer::new(BooleanBuffer::new(Buffer::from(vec![0b0000_0001]), 0, 2));
+    let addr = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("city", DataType::Utf8, true),
+            Field::new("zip", DataType::Int32, true),
+        ]),
+        vec![Arc::new(cities) as ArrayRef, Arc::new(zips) as ArrayRef],
+        Some(addr_null),
+    );
+    let names = StringArray::from(vec![Some("a"), Some("b")]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("addr", addr_type.clone(), true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(addr) as ArrayRef],
+        None,
+    );
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(info) as ArrayRef]).unwrap();
+
+    // Project only "info.addr.city" — must still preserve addr null at row 1
+    let result = roundtrip_projected(&schema, &[batch], &["info.addr.city"]);
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 1);
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    let addr_out = info_out
+        .column_by_name("addr")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert!(!addr_out.is_null(0));
+    assert!(addr_out.is_null(1)); // addr null must be preserved
+    let city_out = addr_out
+        .column_by_name("city")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(city_out.value(0), "NYC");
+}

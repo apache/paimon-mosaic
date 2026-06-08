@@ -263,7 +263,8 @@ impl MosaicSchema {
             }
         }
 
-        // Auto-add ancestor __null__ columns for any projected STRUCT leaves
+        // Auto-add top-level STRUCT __null__ columns when any descendant is projected.
+        // Nested __null__ columns are already included by resolve_struct_path.
         let mut read = output.clone();
         for mapping in &self.struct_mappings {
             let has_leaf = mapping
@@ -283,8 +284,7 @@ impl MosaicSchema {
     }
 
     /// Resolve a dotted path within a STRUCT type tree, returning matching column IDs.
-    /// For leaf fields, returns that field's ID. For intermediate STRUCTs, returns all
-    /// descendant leaf IDs plus nested __null__ IDs.
+    /// Includes intermediate nullable STRUCT node IDs (for __null__ columns).
     fn resolve_struct_path(dt: &DataType, path: &[&str]) -> Vec<u32> {
         if let DataType::Struct(fields) = dt {
             if path.is_empty() {
@@ -299,20 +299,30 @@ impl MosaicSchema {
                     if path.len() == 1 {
                         if let DataType::Struct(inner) = field.data_type() {
                             if !types::is_timestamp_nanos_struct(inner) {
-                                return Self::collect_all_leaf_ids(field.data_type(), &mut 0)
-                                    .into_iter()
-                                    .map(|offset| field_id + 1 + offset)
-                                    .collect();
+                                let mut ids: Vec<u32> =
+                                    Self::collect_all_leaf_ids(field.data_type(), &mut 0)
+                                        .into_iter()
+                                        .map(|offset| field_id + 1 + offset)
+                                        .collect();
+                                if field.is_nullable() {
+                                    ids.push(field_id);
+                                }
+                                return ids;
                             }
                         }
                         return vec![field_id];
                     }
                     if let DataType::Struct(inner) = field.data_type() {
                         if !types::is_timestamp_nanos_struct(inner) {
-                            return Self::resolve_struct_path(field.data_type(), &path[1..])
-                                .into_iter()
-                                .map(|offset| field_id + 1 + offset)
-                                .collect();
+                            let mut ids: Vec<u32> =
+                                Self::resolve_struct_path(field.data_type(), &path[1..])
+                                    .into_iter()
+                                    .map(|offset| field_id + 1 + offset)
+                                    .collect();
+                            if field.is_nullable() && !ids.is_empty() {
+                                ids.push(field_id);
+                            }
+                            return ids;
                         }
                     }
                     return vec![];
