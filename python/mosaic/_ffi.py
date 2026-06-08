@@ -182,7 +182,7 @@ lib.mosaic_reader_open_row_group.argtypes = [c_void_p, c_uint32]
 lib.mosaic_reader_open_row_group.restype = c_void_p
 
 lib.mosaic_reader_set_projection.argtypes = [
-    c_void_p, POINTER(c_char_p), c_uint32,
+    c_void_p, c_void_p,
 ]
 lib.mosaic_reader_set_projection.restype = c_int32
 

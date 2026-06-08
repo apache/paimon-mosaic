@@ -124,11 +124,25 @@ pub fn validate_data_type(dt: &DataType) -> Result<(), String> {
                 if matches!(key_dt, DataType::List(_) | DataType::Map(_, _)) {
                     return Err("MAP key type cannot be ARRAY or MAP".to_string());
                 }
+                if let DataType::Struct(kf) = key_dt {
+                    if !is_timestamp_nanos_struct(kf) {
+                        return Err("MAP key type cannot be STRUCT".to_string());
+                    }
+                }
                 validate_data_type(key_dt)?;
                 validate_data_type(fields[1].data_type())
             } else {
                 Err("MAP entries field must be a Struct".to_string())
             }
+        }
+        DataType::Struct(fields) => {
+            if fields.is_empty() {
+                return Err("STRUCT must have at least one field".to_string());
+            }
+            for field in fields.iter() {
+                validate_data_type(field.data_type())?;
+            }
+            Ok(())
         }
         _ => Err(format!("unsupported DataType: {:?}", dt)),
     }
@@ -153,6 +167,7 @@ pub fn data_type_to_type_byte(dt: &DataType) -> u8 {
         DataType::Struct(fields) if is_timestamp_nanos_struct(fields) => 16,
         DataType::List(_) => 18,
         DataType::Map(_, _) => 19,
+        DataType::Struct(_) => 20,
         _ => panic!("unsupported DataType for serialization: {:?}", dt),
     }
 }
@@ -228,6 +243,23 @@ pub fn serialize_field(field: &Field, buf: &mut Vec<u8>) {
                 varint::encode(buf, val_name.len() as u32);
                 buf.extend_from_slice(val_name);
                 serialize_field(&fields[1], buf);
+            }
+        }
+        DataType::Struct(fields) if !is_timestamp_nanos_struct(fields) => {
+            varint::encode(buf, fields.len() as u32);
+            let mut prev_name: &[u8] = &[];
+            for field in fields.iter() {
+                let name_bytes = field.name().as_bytes();
+                let shared = prev_name
+                    .iter()
+                    .zip(name_bytes.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                varint::encode(buf, shared as u32);
+                varint::encode(buf, (name_bytes.len() - shared) as u32);
+                buf.extend_from_slice(&name_bytes[shared..]);
+                prev_name = name_bytes;
+                serialize_field(field, buf);
             }
         }
         _ => {}
@@ -373,6 +405,35 @@ pub fn deserialize_field(name: &str, buf: &[u8], pos: &mut usize) -> Result<Fiel
                 false,
             );
             DataType::Map(std::sync::Arc::new(entries_field), false)
+        }
+        20 => {
+            let num_fields = varint::decode(buf, pos)? as usize;
+            let mut struct_fields = Vec::with_capacity(num_fields);
+            let mut prev_name_bytes: Vec<u8> = Vec::new();
+            for _ in 0..num_fields {
+                let shared = varint::decode(buf, pos)? as usize;
+                let suffix_len = varint::decode(buf, pos)? as usize;
+                if shared > prev_name_bytes.len() || *pos + suffix_len > buf.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "STRUCT field: corrupted front-coded name",
+                    ));
+                }
+                let mut name_bytes = Vec::with_capacity(shared + suffix_len);
+                name_bytes.extend_from_slice(&prev_name_bytes[..shared]);
+                name_bytes.extend_from_slice(&buf[*pos..*pos + suffix_len]);
+                *pos += suffix_len;
+                let field_name = String::from_utf8(name_bytes.clone()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "STRUCT field: invalid UTF-8 in field name",
+                    )
+                })?;
+                prev_name_bytes = name_bytes;
+                let field = deserialize_field(&field_name, buf, pos)?;
+                struct_fields.push(field);
+            }
+            DataType::Struct(Fields::from(struct_fields))
         }
         _ => {
             return Err(std::io::Error::new(

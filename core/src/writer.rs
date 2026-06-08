@@ -16,9 +16,10 @@
 // under the License.
 
 use std::io;
+use std::sync::Arc;
 
 use arrow_array::*;
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 
 use crate::bucket_writer::{BucketWriter, PagedBucketOutput};
 use crate::schema::MosaicSchema;
@@ -100,12 +101,228 @@ impl<S: OutputFile> MosaicWriter<S> {
     pub fn new(out: S, schema: &Schema, options: WriterOptions) -> io::Result<Self> {
         let mosaic_schema = MosaicSchema::from_arrow(schema, options.num_buckets)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let batch_col_map: Vec<usize> = mosaic_schema
-            .columns
-            .iter()
-            .map(|col| schema.index_of(&col.name).unwrap())
-            .collect();
+
+        // Build column source map for expanded columns
+        let batch_col_map = Self::build_batch_col_map(schema, &mosaic_schema);
         Self::from_mosaic_schema_with_map(out, mosaic_schema, options, batch_col_map)
+    }
+
+    /// Expand a RecordBatch into the flat column list matching MosaicSchema.columns.
+    /// STRUCT columns are split into sub-field arrays + null bitmap.
+    fn expand_batch_arrays(&self, batch: &RecordBatch) -> io::Result<Vec<ArrayRef>> {
+        use arrow_array::StructArray;
+
+        if self.schema.struct_mappings.is_empty() {
+            // No STRUCT columns — fast path
+            let num_cols = self.schema.columns.len();
+            if batch.num_columns() != num_cols {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "column count mismatch: schema has {} but batch has {}",
+                        num_cols,
+                        batch.num_columns()
+                    ),
+                ));
+            }
+            let arrays: Vec<ArrayRef> = (0..num_cols)
+                .map(|i| batch.column(self.batch_col_map[i]).clone())
+                .collect();
+            return Ok(arrays);
+        }
+
+        // Has STRUCT columns — expand
+        let num_expanded = self.schema.columns.len();
+        let mut expanded: Vec<Option<ArrayRef>> = vec![None; num_expanded];
+
+        // Fill STRUCT-expanded columns
+        for mapping in &self.schema.struct_mappings {
+            let struct_col = batch.column(mapping.original_col_index);
+            let struct_arr = struct_col
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "expected StructArray")
+                })?;
+
+            // Validate non-nullable STRUCT parent
+            if !mapping.original_field.is_nullable() && struct_arr.null_count() > 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "non-nullable STRUCT column '{}' has {} null rows in batch",
+                        mapping.original_field.name(),
+                        struct_arr.null_count()
+                    ),
+                ));
+            }
+
+            // Validate non-nullable fields and nested STRUCTs
+            Self::validate_struct_nullability(
+                struct_arr,
+                mapping.original_field.data_type(),
+                mapping.original_field.name(),
+            )?;
+
+            // Extract all expanded arrays (including __null__ for each nullable STRUCT level)
+            let mut flat_arrays = Vec::new();
+            Self::extract_struct_expanded(
+                struct_arr,
+                mapping.null_col_sorted_idx.is_some(),
+                &mut flat_arrays,
+            );
+
+            for (i, &sorted_idx) in mapping.expanded_col_indices.iter().enumerate() {
+                if i < flat_arrays.len() {
+                    expanded[sorted_idx] = Some(flat_arrays[i].clone());
+                }
+            }
+        }
+
+        // Fill non-STRUCT columns from batch_col_map
+        for (sorted_idx, _col) in self.schema.columns.iter().enumerate() {
+            if expanded[sorted_idx].is_none() {
+                expanded[sorted_idx] = Some(batch.column(self.batch_col_map[sorted_idx]).clone());
+            }
+        }
+
+        Ok(expanded.into_iter().map(|opt| opt.unwrap()).collect())
+    }
+
+    /// Recursively extract expanded arrays from a StructArray.
+    /// For each nullable nested STRUCT, emits a __null__ BooleanArray before its fields.
+    /// Propagates parent null to all children.
+    fn validate_struct_nullability(
+        struct_arr: &arrow_array::StructArray,
+        declared_type: &DataType,
+        path: &str,
+    ) -> io::Result<()> {
+        Self::validate_struct_nullability_inner(struct_arr, declared_type, path, None)
+    }
+
+    fn validate_struct_nullability_inner(
+        struct_arr: &arrow_array::StructArray,
+        declared_type: &DataType,
+        path: &str,
+        ancestor_nulls: Option<&[bool]>,
+    ) -> io::Result<()> {
+        let num_rows = struct_arr.len();
+        // Build combined validity: a row is "active" if all ancestors and this struct are non-null
+        let active: Vec<bool> = (0..num_rows)
+            .map(|i| !struct_arr.is_null(i) && ancestor_nulls.is_none_or(|an| an[i]))
+            .collect();
+
+        if let DataType::Struct(fields) = declared_type {
+            for (fi, field) in fields.iter().enumerate() {
+                let child = struct_arr.column(fi);
+                let child_path = format!("{}.{}", path, field.name());
+
+                if !field.is_nullable() {
+                    let effective_nulls = (0..num_rows)
+                        .filter(|&i| active[i] && child.is_null(i))
+                        .count();
+                    if effective_nulls > 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "non-nullable STRUCT field '{}' has {} null values in batch",
+                                child_path, effective_nulls
+                            ),
+                        ));
+                    }
+                }
+
+                if let DataType::Struct(inner_fields) = field.data_type() {
+                    if !crate::types::is_timestamp_nanos_struct(inner_fields) {
+                        if let Some(inner) =
+                            child.as_any().downcast_ref::<arrow_array::StructArray>()
+                        {
+                            if !field.is_nullable() {
+                                let effective_nulls = (0..num_rows)
+                                    .filter(|&i| active[i] && inner.is_null(i))
+                                    .count();
+                                if effective_nulls > 0 {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        format!(
+                                            "non-nullable STRUCT column '{}' has {} null rows in batch",
+                                            child_path, effective_nulls
+                                        ),
+                                    ));
+                                }
+                            }
+                            Self::validate_struct_nullability_inner(
+                                inner,
+                                field.data_type(),
+                                &child_path,
+                                Some(&active),
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn extract_struct_expanded(
+        struct_arr: &arrow_array::StructArray,
+        emit_null_col: bool,
+        out: &mut Vec<ArrayRef>,
+    ) {
+        use arrow_array::BooleanArray;
+
+        if emit_null_col {
+            let num_rows = struct_arr.len();
+            let bool_values: Vec<bool> = (0..num_rows).map(|i| !struct_arr.is_null(i)).collect();
+            out.push(Arc::new(BooleanArray::from(bool_values)));
+        }
+
+        for (fi, col) in struct_arr.columns().iter().enumerate() {
+            let field = struct_arr.fields().get(fi).unwrap();
+            let propagated = if struct_arr.null_count() > 0 {
+                Self::propagate_struct_nulls(struct_arr, col)
+            } else {
+                col.clone()
+            };
+
+            if let Some(inner) = propagated
+                .as_any()
+                .downcast_ref::<arrow_array::StructArray>()
+            {
+                if let DataType::Struct(f) = col.data_type() {
+                    if !crate::types::is_timestamp_nanos_struct(f) {
+                        Self::extract_struct_expanded(inner, field.is_nullable(), out);
+                        continue;
+                    }
+                }
+            }
+            out.push(propagated);
+        }
+    }
+
+    fn propagate_struct_nulls(struct_arr: &arrow_array::StructArray, child: &ArrayRef) -> ArrayRef {
+        crate::propagate_struct_nulls(struct_arr, child)
+    }
+
+    fn build_batch_col_map(schema: &Schema, mosaic: &MosaicSchema) -> Vec<usize> {
+        let mut map = vec![0usize; mosaic.columns.len()];
+
+        // Map non-STRUCT columns by name
+        for (sorted_idx, col) in mosaic.columns.iter().enumerate() {
+            if let Ok(idx) = schema.index_of(&col.name) {
+                map[sorted_idx] = idx;
+            }
+        }
+
+        // Map STRUCT expanded columns to their original STRUCT column index
+        for mapping in &mosaic.struct_mappings {
+            for &sorted_idx in &mapping.expanded_col_indices {
+                map[sorted_idx] = mapping.original_col_index;
+            }
+        }
+
+        map
     }
 
     pub fn from_mosaic_schema(
@@ -146,32 +363,51 @@ impl<S: OutputFile> MosaicWriter<S> {
         let stats_collector = if options.stats_columns.is_empty() {
             None
         } else {
-            let mut cols: Vec<(usize, usize, arrow_schema::DataType)> =
-                Vec::with_capacity(options.stats_columns.len());
+            let mut stat_indices = Vec::new();
             for name in &options.stats_columns {
-                let idx = schema
+                let matches: Vec<usize> = schema
                     .columns
                     .iter()
-                    .position(|c| c.name == *name)
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("stats_columns: column '{}' not found in schema", name),
-                        )
-                    })?;
+                    .enumerate()
+                    .filter(|(_, c)| c.name == *name)
+                    .map(|(i, _)| i)
+                    .collect();
+                if matches.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("stats_columns: column '{}' not found in schema", name),
+                    ));
+                }
+                if matches.len() > 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "stats_columns: column '{}' is ambiguous ({} physical columns share this name)",
+                            name, matches.len()
+                        ),
+                    ));
+                }
+                stat_indices.push(matches[0]);
+            }
+            let mut cols: Vec<(usize, usize, arrow_schema::DataType)> = Vec::new();
+            for idx in stat_indices {
                 let dt = &schema.columns[idx].data_type;
+                if schema.null_col_ids.contains(&schema.columns[idx].column_id) {
+                    continue;
+                }
                 if !stats::supports_stats(dt) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
                             "stats_columns: column '{}' has unsupported type {:?} for statistics",
-                            name, dt
+                            schema.columns[idx].name, dt
                         ),
                     ));
                 }
                 cols.push((idx, batch_col_map[idx], dt.clone()));
             }
             cols.sort_by_key(|(idx, _, _)| *idx);
+            cols.dedup_by_key(|(idx, _, _)| *idx);
             Some(StatsCollector::new(&cols))
         };
 
@@ -242,26 +478,18 @@ impl<S: OutputFile> MosaicWriter<S> {
                 "writer is already closed",
             ));
         }
-        let num_cols = self.schema.columns.len();
-        if batch.num_columns() != num_cols {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "column count mismatch: schema has {} but batch has {}",
-                    num_cols,
-                    batch.num_columns()
-                ),
-            ));
-        }
+        // Build expanded arrays from batch (handles STRUCT splitting)
+        let expanded_arrays = self.expand_batch_arrays(batch)?;
 
+        // Check non-nullable columns
         for (i, col) in self.schema.columns.iter().enumerate() {
-            if !col.nullable && batch.column(self.batch_col_map[i]).null_count() > 0 {
+            if !col.nullable && expanded_arrays[i].null_count() > 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
                         "non-nullable column '{}' has {} nulls in batch",
                         col.name,
-                        batch.column(self.batch_col_map[i]).null_count()
+                        expanded_arrays[i].null_count()
                     ),
                 ));
             }
@@ -272,7 +500,7 @@ impl<S: OutputFile> MosaicWriter<S> {
             let global_indices = &self.schema.bucket_to_global[b];
             let arrays: Vec<&dyn Array> = global_indices
                 .iter()
-                .map(|&gi| batch.column(self.batch_col_map[gi]).as_ref())
+                .map(|&gi| expanded_arrays[gi].as_ref())
                 .collect();
             let data_types: Vec<&arrow_schema::DataType> = global_indices
                 .iter()
@@ -283,7 +511,7 @@ impl<S: OutputFile> MosaicWriter<S> {
         }
 
         if let Some(ref mut collector) = self.stats_collector {
-            collector.update_batch(batch);
+            collector.update_expanded(&expanded_arrays);
         }
 
         self.current_row_group_rows += batch.num_rows();

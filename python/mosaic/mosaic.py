@@ -331,19 +331,23 @@ class MosaicReader:
             _check_error("num_row_groups failed")
         return out.value
 
-    def project(self, columns):
-        """Set projection on the reader. Subsequent reads only return the named columns."""
-        column_names = list(columns)
-        c_strs = [c.encode("utf-8") for c in column_names]
-        arr = (ctypes.c_char_p * len(column_names))(*c_strs)
-        rc = lib.mosaic_reader_set_projection(self._handle, arr, len(column_names))
+    def project(self, projected_schema):
+        """Set projection on the reader using an Arrow Schema.
+
+        The projected schema should be a subset of the original schema.
+        STRUCT fields can be partial (containing only a subset of fields)
+        for field-level projection.
+
+        Args:
+            projected_schema: A ``pyarrow.Schema`` describing the columns to read.
+        """
+        c_schema = _ArrowSchema()
+        schema_ptr = ctypes.addressof(c_schema)
+        projected_schema._export_to_c(schema_ptr)
+        rc = lib.mosaic_reader_set_projection(self._handle, ctypes.c_void_p(schema_ptr))
         if rc != 0:
             _check_error("set_projection failed")
-        projected_field_names = list(dict.fromkeys(column_names))
-        self._projected_schema = pa.schema(
-            [self._schema.field(name) for name in projected_field_names],
-            metadata=self._schema.metadata,
-        )
+        self._projected_schema = projected_schema
 
     def read_row_group(self, rg_index):
         rg_handle = lib.mosaic_reader_open_row_group(self._handle, rg_index)

@@ -1310,3 +1310,1714 @@ fn test_complex_map_key_rejected() {
         ),
     }
 }
+
+// ======================== STRUCT Tests ========================
+
+#[test]
+fn test_struct_basic() {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int32, true),
+            ])),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2, 3]);
+
+    let names = StringArray::from(vec![Some("alice"), Some("bob"), None]);
+    let ages = Int32Array::from(vec![Some(30), None, Some(25)]);
+    let info = StructArray::from(vec![
+        (
+            Arc::new(Field::new("name", DataType::Utf8, true)),
+            Arc::new(names) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("age", DataType::Int32, true)),
+            Arc::new(ages) as ArrayRef,
+        ),
+    ]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids), Arc::new(info)],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    assert_eq!(rb.num_rows(), 3);
+    assert_eq!(rb.num_columns(), 2);
+
+    let result_ids = rb.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(result_ids.value(0), 1);
+    assert_eq!(result_ids.value(1), 2);
+    assert_eq!(result_ids.value(2), 3);
+
+    let result_info = rb.column(1).as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(result_info.len(), 3);
+
+    // Fields may be in alphabetical order after roundtrip (age, name)
+    let age_col = result_info
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(age_col.value(0), 30);
+    assert!(age_col.is_null(1));
+    assert_eq!(age_col.value(2), 25);
+
+    let name_col = result_info
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(name_col.value(0), "alice");
+    assert_eq!(name_col.value(1), "bob");
+    assert!(name_col.is_null(2));
+}
+
+#[test]
+fn test_struct_nullable() {
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Float64, true),
+        ])),
+        true,
+    )]);
+
+    let xs = Int32Array::from(vec![Some(1), Some(2), Some(3)]);
+    let ys = Float64Array::from(vec![Some(1.5), Some(2.5), Some(3.5)]);
+    let struct_null_buf = arrow_buffer::NullBuffer::new(arrow_buffer::BooleanBuffer::new(
+        arrow_buffer::Buffer::from(vec![0b0000_0101]), // row 0 valid, row 1 null, row 2 valid
+        0,
+        3,
+    ));
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Float64, true),
+        ]),
+        vec![Arc::new(xs) as ArrayRef, Arc::new(ys) as ArrayRef],
+        Some(struct_null_buf),
+    );
+
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(info)]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    assert_eq!(rb.num_rows(), 3);
+    assert_eq!(rb.num_columns(), 1);
+
+    let result_info = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(!result_info.is_null(0));
+    assert!(result_info.is_null(1));
+    assert!(!result_info.is_null(2));
+
+    let x_col = result_info
+        .column_by_name("x")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(x_col.value(0), 1);
+    assert_eq!(x_col.value(2), 3);
+}
+
+#[test]
+fn test_struct_with_array_field() {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "data",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("label", DataType::Utf8, true),
+                Field::new(
+                    "values",
+                    DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                    true,
+                ),
+            ])),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2]);
+
+    let labels = StringArray::from(vec![Some("a"), Some("b")]);
+    let mut list_builder = ListBuilder::new(Int32Builder::new());
+    list_builder.values().append_value(10);
+    list_builder.values().append_value(20);
+    list_builder.append(true);
+    list_builder.values().append_value(30);
+    list_builder.append(true);
+    let values_arr = list_builder.finish();
+
+    let data_struct = StructArray::from(vec![
+        (
+            Arc::new(Field::new("label", DataType::Utf8, true)),
+            Arc::new(labels) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new(
+                "values",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            )),
+            Arc::new(values_arr) as ArrayRef,
+        ),
+    ]);
+
+    let mut opts = WriterOptions::default();
+    opts.num_buckets = 1;
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids), Arc::new(data_struct)],
+    )
+    .unwrap();
+
+    let result = roundtrip_with_options(&schema, &[batch], opts);
+    let rb = &result[0];
+    assert_eq!(rb.num_rows(), 2);
+    assert_eq!(rb.num_columns(), 2);
+
+    let result_data = rb.column(1).as_any().downcast_ref::<StructArray>().unwrap();
+    let result_label = result_data
+        .column_by_name("label")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(result_label.value(0), "a");
+    assert_eq!(result_label.value(1), "b");
+
+    let result_values = result_data
+        .column_by_name("values")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(result_values.len(), 2);
+    let v0 = result_values
+        .value(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .clone();
+    assert_eq!(v0.len(), 2);
+    assert_eq!(v0.value(0), 10);
+    assert_eq!(v0.value(1), 20);
+}
+
+#[test]
+fn test_array_of_struct() {
+    // ARRAY<STRUCT<a INT, b UTF8>>
+    let struct_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Utf8, true),
+    ]));
+    let schema = Schema::new(vec![Field::new(
+        "col",
+        DataType::List(Arc::new(Field::new("item", struct_type.clone(), true))),
+        true,
+    )]);
+
+    // Row 0: [{a:1, b:"x"}, {a:2, b:"y"}]
+    // Row 1: null
+    // Row 2: [{a:3, b:null}]
+    let fields = arrow_schema::Fields::from(vec![
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Utf8, true),
+    ]);
+    let struct_builder = StructBuilder::from_fields(fields, 4);
+    let mut list_builder = ListBuilder::new(struct_builder);
+
+    // Row 0
+    list_builder
+        .values()
+        .field_builder::<Int32Builder>(0)
+        .unwrap()
+        .append_value(1);
+    list_builder
+        .values()
+        .field_builder::<StringBuilder>(1)
+        .unwrap()
+        .append_value("x");
+    list_builder.values().append(true);
+    list_builder
+        .values()
+        .field_builder::<Int32Builder>(0)
+        .unwrap()
+        .append_value(2);
+    list_builder
+        .values()
+        .field_builder::<StringBuilder>(1)
+        .unwrap()
+        .append_value("y");
+    list_builder.values().append(true);
+    list_builder.append(true);
+
+    // Row 1: null
+    list_builder.append(false);
+
+    // Row 2: [{a:3, b:null}]
+    list_builder
+        .values()
+        .field_builder::<Int32Builder>(0)
+        .unwrap()
+        .append_value(3);
+    list_builder
+        .values()
+        .field_builder::<StringBuilder>(1)
+        .unwrap()
+        .append_null();
+    list_builder.values().append(true);
+    list_builder.append(true);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(list_builder.finish())],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(col.len(), 3);
+    assert!(!col.is_null(0));
+    assert!(col.is_null(1));
+    assert!(!col.is_null(2));
+
+    // Row 0: [{a:1, b:"x"}, {a:2, b:"y"}]
+    let row0 = col.value(0);
+    let structs0 = row0.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(structs0.len(), 2);
+    let a0 = structs0
+        .column_by_name("a")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(a0.value(0), 1);
+    assert_eq!(a0.value(1), 2);
+    let b0 = structs0
+        .column_by_name("b")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(b0.value(0), "x");
+    assert_eq!(b0.value(1), "y");
+
+    // Row 2: [{a:3, b:null}]
+    let row2 = col.value(2);
+    let structs2 = row2.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(structs2.len(), 1);
+    let a2 = structs2
+        .column_by_name("a")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(a2.value(0), 3);
+    let b2 = structs2
+        .column_by_name("b")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(b2.is_null(0));
+}
+
+#[test]
+fn test_map_of_struct_value() {
+    // MAP<UTF8, STRUCT<x INT, y UTF8>>
+    let struct_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("x", DataType::Int32, true),
+        Field::new("y", DataType::Utf8, true),
+    ]));
+    let map_field = Field::new(
+        "entries",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("keys", DataType::Utf8, false),
+            Field::new("values", struct_type.clone(), true),
+        ])),
+        false,
+    );
+    let schema = Schema::new(vec![Field::new(
+        "col",
+        DataType::Map(Arc::new(map_field), false),
+        true,
+    )]);
+
+    // Row 0: {"k1": {x:10, y:"hello"}}
+    // Row 1: {"k2": {x:20, y:null}, "k3": {x:30, y:"world"}}
+    let key_builder = StringBuilder::new();
+    let value_fields = arrow_schema::Fields::from(vec![
+        Field::new("x", DataType::Int32, true),
+        Field::new("y", DataType::Utf8, true),
+    ]);
+    let value_builder = StructBuilder::from_fields(value_fields, 3);
+    let mut map_builder = MapBuilder::new(None, key_builder, value_builder);
+
+    // Row 0
+    map_builder.keys().append_value("k1");
+    map_builder
+        .values()
+        .field_builder::<Int32Builder>(0)
+        .unwrap()
+        .append_value(10);
+    map_builder
+        .values()
+        .field_builder::<StringBuilder>(1)
+        .unwrap()
+        .append_value("hello");
+    map_builder.values().append(true);
+    map_builder.append(true).unwrap();
+
+    // Row 1
+    map_builder.keys().append_value("k2");
+    map_builder
+        .values()
+        .field_builder::<Int32Builder>(0)
+        .unwrap()
+        .append_value(20);
+    map_builder
+        .values()
+        .field_builder::<StringBuilder>(1)
+        .unwrap()
+        .append_null();
+    map_builder.values().append(true);
+    map_builder.keys().append_value("k3");
+    map_builder
+        .values()
+        .field_builder::<Int32Builder>(0)
+        .unwrap()
+        .append_value(30);
+    map_builder
+        .values()
+        .field_builder::<StringBuilder>(1)
+        .unwrap()
+        .append_value("world");
+    map_builder.values().append(true);
+    map_builder.append(true).unwrap();
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(map_builder.finish())],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .unwrap();
+    assert_eq!(col.len(), 2);
+
+    // Row 0: {"k1": {x:10, y:"hello"}}
+    let row0 = col.value(0);
+    let entries0 = row0.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(entries0.len(), 1);
+    let keys0 = entries0
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(keys0.value(0), "k1");
+    let vals0 = entries0
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let x0 = vals0
+        .column_by_name("x")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(x0.value(0), 10);
+    let y0 = vals0
+        .column_by_name("y")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(y0.value(0), "hello");
+
+    // Row 1: 2 entries
+    let row1 = col.value(1);
+    let entries1 = row1.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(entries1.len(), 2);
+    let vals1 = entries1
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let x1 = vals1
+        .column_by_name("x")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(x1.value(0), 20);
+    assert_eq!(x1.value(1), 30);
+    let y1 = vals1
+        .column_by_name("y")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(y1.is_null(0));
+    assert_eq!(y1.value(1), "world");
+}
+
+fn roundtrip_projected(
+    schema: &Schema,
+    batches: &[RecordBatch],
+    projected: &Schema,
+) -> Vec<RecordBatch> {
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(out, schema, WriterOptions::default()).unwrap();
+    for batch in batches {
+        writer.write_batch(batch).unwrap();
+    }
+    writer.close().unwrap();
+
+    let data = writer.output().buf.clone();
+    let file_len = data.len() as u64;
+    let input = ByteArrayInputFile { data };
+    let mut reader = MosaicReader::new(input, file_len).unwrap();
+    reader.project_schema(projected).unwrap();
+
+    let mut result = Vec::new();
+    for rg in 0..reader.num_row_groups() {
+        let mut rg_reader = reader.row_group_reader(rg).unwrap();
+        result.push(rg_reader.read_columns().unwrap());
+    }
+    result
+}
+
+#[test]
+fn test_dot_in_column_name_allowed() {
+    use paimon_mosaic_core::schema::MosaicSchema;
+    let result = MosaicSchema::validate(&[("user.name".to_string(), DataType::Utf8, false)]);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_dot_column_name_roundtrip() {
+    let schema = Schema::new(vec![
+        Field::new("a.b", DataType::Int32, false),
+        Field::new("c", DataType::Utf8, true),
+    ]);
+    let col_ab = Int32Array::from(vec![1, 2, 3]);
+    let col_c = StringArray::from(vec![Some("x"), Some("y"), Some("z")]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(col_ab) as ArrayRef, Arc::new(col_c) as ArrayRef],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 2);
+    let ab = rb
+        .column_by_name("a.b")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ab.value(0), 1);
+    assert_eq!(ab.value(2), 3);
+}
+
+#[test]
+fn test_struct_nested_roundtrip() {
+    // STRUCT<name UTF8, addr STRUCT<city UTF8, zip INT>>
+    let addr_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("city", DataType::Utf8, true),
+        Field::new("zip", DataType::Int32, true),
+    ]));
+    let info_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("name", DataType::Utf8, true),
+        Field::new("addr", addr_type.clone(), true),
+    ]));
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("info", info_type.clone(), true),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2]);
+
+    let cities = StringArray::from(vec![Some("NYC"), Some("LA")]);
+    let zips = Int32Array::from(vec![Some(10001), Some(90001)]);
+    let addr = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("city", DataType::Utf8, true),
+            Field::new("zip", DataType::Int32, true),
+        ]),
+        vec![Arc::new(cities) as ArrayRef, Arc::new(zips) as ArrayRef],
+        None,
+    );
+
+    let names = StringArray::from(vec![Some("alice"), Some("bob")]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("addr", addr_type.clone(), true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(addr) as ArrayRef],
+        None,
+    );
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids) as ArrayRef, Arc::new(info) as ArrayRef],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 2);
+
+    let info_out = rb
+        .column_by_name("info")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+
+    let name_out = info_out
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(name_out.value(0), "alice");
+    assert_eq!(name_out.value(1), "bob");
+
+    let addr_out = info_out
+        .column_by_name("addr")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let city_out = addr_out
+        .column_by_name("city")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(city_out.value(0), "NYC");
+    assert_eq!(city_out.value(1), "LA");
+    let zip_out = addr_out
+        .column_by_name("zip")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(zip_out.value(0), 10001);
+    assert_eq!(zip_out.value(1), 90001);
+}
+
+#[test]
+fn test_struct_leaf_projection() {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int32, true),
+            ])),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2]);
+    let names = StringArray::from(vec![Some("alice"), Some("bob")]);
+    let ages = Int32Array::from(vec![Some(30), Some(25)]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(ages) as ArrayRef],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids) as ArrayRef, Arc::new(info) as ArrayRef],
+    )
+    .unwrap();
+
+    // Project only info.name (leaf projection)
+    let result = roundtrip_projected(
+        &schema,
+        &[batch.clone()],
+        &Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                "name",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        )]),
+    );
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 1);
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(info_out.num_columns(), 1);
+    let name_out = info_out
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(name_out.value(0), "alice");
+    assert_eq!(name_out.value(1), "bob");
+}
+
+#[test]
+fn test_struct_whole_column_projection() {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int32, true),
+            ])),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2]);
+    let names = StringArray::from(vec![Some("alice"), Some("bob")]);
+    let ages = Int32Array::from(vec![Some(30), Some(25)]);
+    let null_buf = NullBuffer::new(BooleanBuffer::new(Buffer::from(vec![0b0000_0011]), 0, 2));
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(ages) as ArrayRef],
+        Some(null_buf),
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids) as ArrayRef, Arc::new(info) as ArrayRef],
+    )
+    .unwrap();
+
+    // Project using original STRUCT name "info"
+    let result = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int32, true),
+            ])),
+            true,
+        )]),
+    );
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 1);
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(info_out.num_columns(), 2);
+    let name_out = info_out
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(name_out.value(0), "alice");
+    assert_eq!(name_out.value(1), "bob");
+    let age_out = info_out
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(age_out.value(0), 30);
+    assert_eq!(age_out.value(1), 25);
+}
+
+#[test]
+fn test_struct_nested_nullable_null_semantics() {
+    // Verify that addr=null is distinguishable from addr={city:null, zip:null}
+    let addr_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("city", DataType::Utf8, true),
+        Field::new("zip", DataType::Int32, true),
+    ]));
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("addr", addr_type.clone(), true),
+        ])),
+        true,
+    )]);
+
+    // Row 0: {name: "a", addr: {city: null, zip: null}} — addr is non-null, fields are null
+    // Row 1: {name: "b", addr: null}                     — addr itself is null
+    // Row 2: null                                        — entire info is null
+    let cities = StringArray::from(vec![None::<&str>, Some(""), None]);
+    let zips = Int32Array::from(vec![None::<i32>, Some(0), None]);
+    let addr_null = NullBuffer::new(BooleanBuffer::new(
+        Buffer::from(vec![0b0000_0001]), // row 0 valid, row 1 null, row 2 null
+        0,
+        3,
+    ));
+    let addr = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("city", DataType::Utf8, true),
+            Field::new("zip", DataType::Int32, true),
+        ]),
+        vec![Arc::new(cities) as ArrayRef, Arc::new(zips) as ArrayRef],
+        Some(addr_null),
+    );
+
+    let names = StringArray::from(vec![Some("a"), Some("b"), None::<&str>]);
+    let info_null = NullBuffer::new(BooleanBuffer::new(
+        Buffer::from(vec![0b0000_0011]), // rows 0,1 valid, row 2 null
+        0,
+        3,
+    ));
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("addr", addr_type.clone(), true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(addr) as ArrayRef],
+        Some(info_null),
+    );
+
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(info)]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(!info_out.is_null(0));
+    assert!(!info_out.is_null(1));
+    assert!(info_out.is_null(2)); // entire info is null
+
+    let addr_out = info_out
+        .column_by_name("addr")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert!(!addr_out.is_null(0)); // addr non-null, but fields are null
+    assert!(addr_out.is_null(1)); // addr itself is null
+    assert!(addr_out.is_null(2)); // propagated from info null
+
+    // Row 0: addr is non-null but city/zip are null
+    let city_out = addr_out
+        .column_by_name("city")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(city_out.is_null(0));
+}
+
+#[test]
+fn test_struct_field_order_preserved() {
+    // Verify that struct field order is preserved after roundtrip (by index, not by name)
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("zebra", DataType::Int32, true),
+            Field::new("alpha", DataType::Utf8, true),
+        ])),
+        false,
+    )]);
+
+    let zebras = Int32Array::from(vec![Some(1), Some(2)]);
+    let alphas = StringArray::from(vec![Some("a"), Some("b")]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("zebra", DataType::Int32, true),
+            Field::new("alpha", DataType::Utf8, true),
+        ]),
+        vec![Arc::new(zebras) as ArrayRef, Arc::new(alphas) as ArrayRef],
+        None,
+    );
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(info) as ArrayRef]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let info_out = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    // Fields should be in original order: zebra first, alpha second
+    assert_eq!(info_out.fields().first().unwrap().name(), "zebra");
+    assert_eq!(info_out.fields().get(1).unwrap().name(), "alpha");
+    let z = info_out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(z.value(0), 1);
+}
+
+#[test]
+fn test_struct_leaf_projection_preserves_parent_null() {
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ])),
+        true,
+    )]);
+
+    // Row 0: {name: "alice", age: 30}
+    // Row 1: null (entire info is null)
+    let names = StringArray::from(vec![Some("alice"), None::<&str>]);
+    let ages = Int32Array::from(vec![Some(30), None]);
+    let null_buf = NullBuffer::new(BooleanBuffer::new(Buffer::from(vec![0b0000_0001]), 0, 2));
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(ages) as ArrayRef],
+        Some(null_buf),
+    );
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(info) as ArrayRef]).unwrap();
+
+    // Leaf projection: only info.name — must still preserve info null at row 1
+    let result = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                "name",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        )]),
+    );
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 1);
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(!info_out.is_null(0));
+    assert!(info_out.is_null(1)); // parent null must be preserved
+}
+
+#[test]
+fn test_struct_mixed_projection_order() {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int32, true),
+            ])),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2]);
+    let names = StringArray::from(vec![Some("alice"), Some("bob")]);
+    let ages = Int32Array::from(vec![Some(30), Some(25)]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(ages) as ArrayRef],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids) as ArrayRef, Arc::new(info) as ArrayRef],
+    )
+    .unwrap();
+
+    // Project in non-alphabetical order: info.age first, then id, then info.name
+    let result = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![
+            Field::new(
+                "info",
+                DataType::Struct(arrow_schema::Fields::from(vec![
+                    Field::new("age", DataType::Int32, true),
+                    Field::new("name", DataType::Utf8, true),
+                ])),
+                true,
+            ),
+            Field::new("id", DataType::Int32, false),
+        ]),
+    );
+    let rb = &result[0];
+    // Output should be: info (with age+name), id — info appears first because info.age was first
+    assert_eq!(rb.num_columns(), 2);
+    assert_eq!(rb.schema().field(0).name(), "info");
+    assert_eq!(rb.schema().field(1).name(), "id");
+
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    let age_out = info_out
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(age_out.value(0), 30);
+
+    let id_out = rb.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(id_out.value(0), 1);
+    assert_eq!(id_out.value(1), 2);
+}
+
+#[test]
+fn test_struct_leaf_stats() {
+    use paimon_mosaic_core::values::Value;
+
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int32, true),
+            ])),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2, 3]);
+    let names = StringArray::from(vec![Some("alice"), Some("bob"), None::<&str>]);
+    let ages = Int32Array::from(vec![Some(30), Some(25), Some(40)]);
+    let null_buf = NullBuffer::new(BooleanBuffer::new(Buffer::from(vec![0b0000_0011]), 0, 3));
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(ages) as ArrayRef],
+        Some(null_buf),
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids) as ArrayRef, Arc::new(info) as ArrayRef],
+    )
+    .unwrap();
+
+    let out = MemOutputFile::new();
+    let mut opts = WriterOptions::default();
+    opts.stats_columns = vec!["info.age".to_string()];
+    let mut writer = MosaicWriter::new(out, &schema, opts).unwrap();
+    writer.write_batch(&batch).unwrap();
+    writer.close().unwrap();
+
+    let data = writer.output().buf.clone();
+    let input = ByteArrayInputFile { data: data.clone() };
+    let reader = MosaicReader::new(input, data.len() as u64).unwrap();
+
+    let stats = reader.row_group_stats(0).unwrap();
+    assert!(!stats.is_empty());
+    let age_stats = &stats[0];
+    // age values after STRUCT null propagation: 30, 25, null (row 2 info is null)
+    assert_eq!(age_stats.null_count, 1);
+    match &age_stats.min {
+        Some(Value::Integer(v)) => assert_eq!(*v, 25),
+        other => panic!("expected Some(Integer(25)), got {:?}", other),
+    }
+    match &age_stats.max {
+        Some(Value::Integer(v)) => assert_eq!(*v, 30),
+        other => panic!("expected Some(Integer(30)), got {:?}", other),
+    }
+}
+
+#[test]
+fn test_non_nullable_struct_leaf_rejects_nulls() {
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+            "age",
+            DataType::Int32,
+            false,
+        )])),
+        true,
+    )]);
+
+    let ages = Int32Array::from(vec![Some(1), None]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![Field::new("age", DataType::Int32, true)]),
+        vec![Arc::new(ages) as ArrayRef],
+        None,
+    );
+    let batch_schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+            "age",
+            DataType::Int32,
+            true,
+        )])),
+        true,
+    )]);
+    let batch =
+        RecordBatch::try_new(Arc::new(batch_schema), vec![Arc::new(info) as ArrayRef]).unwrap();
+
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(out, &schema, WriterOptions::default()).unwrap();
+    let result = writer.write_batch(&batch);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("non-nullable STRUCT field"), "got: {}", err);
+}
+
+#[test]
+fn test_non_nullable_struct_parent_rejects_nulls() {
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+            "age",
+            DataType::Int32,
+            true,
+        )])),
+        false, // non-nullable STRUCT
+    )]);
+
+    let ages = Int32Array::from(vec![Some(1), Some(2)]);
+    let null_buf = NullBuffer::new(BooleanBuffer::new(Buffer::from(vec![0b0000_0001]), 0, 2));
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![Field::new("age", DataType::Int32, true)]),
+        vec![Arc::new(ages) as ArrayRef],
+        Some(null_buf),
+    );
+    let batch_schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+            "age",
+            DataType::Int32,
+            true,
+        )])),
+        true,
+    )]);
+    let batch =
+        RecordBatch::try_new(Arc::new(batch_schema), vec![Arc::new(info) as ArrayRef]).unwrap();
+
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(out, &schema, WriterOptions::default()).unwrap();
+    let result = writer.write_batch(&batch);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("non-nullable STRUCT column"), "got: {}", err);
+}
+
+#[test]
+fn test_struct_sliced_null_propagation() {
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ])),
+        true,
+    )]);
+
+    // Build 4 rows, then slice to rows 1..3
+    // Row 0: {name: "a", age: 10}
+    // Row 1: null
+    // Row 2: {name: "c", age: 30}
+    // Row 3: {name: "d", age: 40}
+    let names = StringArray::from(vec![Some("a"), Some("b"), Some("c"), Some("d")]);
+    let ages = Int32Array::from(vec![Some(10), Some(20), Some(30), Some(40)]);
+    let null_buf = NullBuffer::new(BooleanBuffer::new(
+        Buffer::from(vec![0b0000_1101]), // rows 0,2,3 valid; row 1 null
+        0,
+        4,
+    ));
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(ages) as ArrayRef],
+        Some(null_buf),
+    );
+
+    // Slice: keep rows 1..3 (row 1=null, row 2=valid)
+    let sliced: ArrayRef = Arc::new(info.slice(1, 2));
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![sliced]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(info_out.len(), 2);
+    assert!(info_out.is_null(0)); // was row 1 (null)
+    assert!(!info_out.is_null(1)); // was row 2 (valid)
+
+    let age_out = info_out
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert!(age_out.is_null(0)); // propagated from struct null
+    assert_eq!(age_out.value(1), 30); // valid value, not corrupted
+}
+
+#[test]
+fn test_struct_nested_path_projection() {
+    // Project "info.addr" as a nested STRUCT path (not a leaf)
+    let addr_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("city", DataType::Utf8, true),
+        Field::new("zip", DataType::Int32, true),
+    ]));
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("addr", addr_type.clone(), true),
+            ])),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2]);
+    let cities = StringArray::from(vec![Some("NYC"), Some("LA")]);
+    let zips = Int32Array::from(vec![Some(10001), Some(90001)]);
+    let addr = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("city", DataType::Utf8, true),
+            Field::new("zip", DataType::Int32, true),
+        ]),
+        vec![Arc::new(cities) as ArrayRef, Arc::new(zips) as ArrayRef],
+        None,
+    );
+    let names = StringArray::from(vec![Some("alice"), Some("bob")]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("addr", addr_type.clone(), true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(addr) as ArrayRef],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids) as ArrayRef, Arc::new(info) as ArrayRef],
+    )
+    .unwrap();
+
+    // Project only "info.addr" — a nested STRUCT, not a leaf
+    let result = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                "addr",
+                DataType::Struct(arrow_schema::Fields::from(vec![
+                    Field::new("city", DataType::Utf8, true),
+                    Field::new("zip", DataType::Int32, true),
+                ])),
+                true,
+            )])),
+            true,
+        )]),
+    );
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 1);
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    let addr_out = info_out
+        .column_by_name("addr")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let city_out = addr_out
+        .column_by_name("city")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(city_out.value(0), "NYC");
+    assert_eq!(city_out.value(1), "LA");
+}
+
+#[test]
+fn test_dot_column_coexists_with_struct() {
+    // Top-level column "a.b" coexists with STRUCT "a" containing field "b"
+    let schema = Schema::new(vec![
+        Field::new("a.b", DataType::Int32, false),
+        Field::new(
+            "a",
+            DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                "b",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        ),
+    ]);
+
+    let col_ab = Int32Array::from(vec![10, 20]);
+    let b_vals = StringArray::from(vec![Some("x"), Some("y")]);
+    let struct_a = StructArray::new(
+        arrow_schema::Fields::from(vec![Field::new("b", DataType::Utf8, true)]),
+        vec![Arc::new(b_vals) as ArrayRef],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(col_ab) as ArrayRef, Arc::new(struct_a) as ArrayRef],
+    )
+    .unwrap();
+
+    let result = roundtrip(&schema, &[batch.clone()]);
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 2);
+
+    // project("a.b") should match the top-level column (exact match first)
+    let result2 = roundtrip_projected(
+        &schema,
+        &[batch.clone()],
+        &Schema::new(vec![Field::new("a.b", DataType::Int32, false)]),
+    );
+    let rb2 = &result2[0];
+    assert_eq!(rb2.num_columns(), 1);
+    let col = rb2.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(col.value(0), 10);
+    assert_eq!(col.value(1), 20);
+
+    // project("a") should return the STRUCT
+    let result3 = roundtrip_projected(
+        &schema,
+        &[batch.clone()],
+        &Schema::new(vec![Field::new(
+            "a",
+            DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                "b",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        )]),
+    );
+    let rb3 = &result3[0];
+    assert_eq!(rb3.num_columns(), 1);
+    let struct_out = rb3
+        .column(0)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let b_out = struct_out
+        .column_by_name("b")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(b_out.value(0), "x");
+
+    // project("a.b") should NOT resolve to STRUCT a's field b — it matches the top-level column
+    let result4 = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![
+            Field::new("a.b", DataType::Int32, false),
+            Field::new(
+                "a",
+                DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                    "b",
+                    DataType::Utf8,
+                    true,
+                )])),
+                true,
+            ),
+        ]),
+    );
+    let rb4 = &result4[0];
+    assert_eq!(rb4.num_columns(), 2);
+}
+
+#[test]
+fn test_dot_column_name_projection() {
+    let schema = Schema::new(vec![
+        Field::new("x.y.z", DataType::Int32, false),
+        Field::new("id", DataType::Int32, false),
+    ]);
+    let col_xyz = Int32Array::from(vec![100, 200]);
+    let col_id = Int32Array::from(vec![1, 2]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(col_xyz) as ArrayRef, Arc::new(col_id) as ArrayRef],
+    )
+    .unwrap();
+
+    let result = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![Field::new("x.y.z", DataType::Int32, false)]),
+    );
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 1);
+    let col = rb.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(col.value(0), 100);
+    assert_eq!(col.value(1), 200);
+}
+
+#[test]
+fn test_struct_field_name_with_dot() {
+    // STRUCT fields with dots in their names are now allowed with Schema-based projection
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+            "user.name",
+            DataType::Utf8,
+            true,
+        )])),
+        false,
+    )]);
+
+    let user_names = StringArray::from(vec![Some("alice"), Some("bob")]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![Field::new("user.name", DataType::Utf8, true)]),
+        vec![Arc::new(user_names) as ArrayRef],
+        None,
+    );
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(info) as ArrayRef]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 1);
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    let name_out = info_out
+        .column_by_name("user.name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(name_out.value(0), "alice");
+    assert_eq!(name_out.value(1), "bob");
+}
+
+#[test]
+fn test_null_suffix_column_name_allowed() {
+    use paimon_mosaic_core::schema::MosaicSchema;
+    let result = MosaicSchema::validate(&[("info__null__".to_string(), DataType::Utf8, false)]);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_top_level_and_struct_field_same_name() {
+    // Top-level column "name" and STRUCT "info" with field "name"
+    // Both expand to physical columns named "name" — column IDs distinguish them
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::Utf8, true),
+        Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int32, true),
+            ])),
+            true,
+        ),
+    ]);
+
+    let top_names = StringArray::from(vec![Some("top_alice"), Some("top_bob")]);
+    let struct_names = StringArray::from(vec![Some("inner_alice"), Some("inner_bob")]);
+    let ages = Int32Array::from(vec![Some(30), Some(25)]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]),
+        vec![
+            Arc::new(struct_names) as ArrayRef,
+            Arc::new(ages) as ArrayRef,
+        ],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(top_names) as ArrayRef, Arc::new(info) as ArrayRef],
+    )
+    .unwrap();
+
+    // Full roundtrip
+    let result = roundtrip(&schema, &[batch.clone()]);
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 2);
+
+    let top_out = rb
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(top_out.value(0), "top_alice");
+
+    let info_out = rb
+        .column_by_name("info")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let inner_name = info_out
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(inner_name.value(0), "inner_alice");
+
+    // Project top-level "name" only
+    let result2 = roundtrip_projected(
+        &schema,
+        &[batch.clone()],
+        &Schema::new(vec![Field::new("name", DataType::Utf8, true)]),
+    );
+    let rb2 = &result2[0];
+    assert_eq!(rb2.num_columns(), 1);
+    let name_out = rb2
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(name_out.value(0), "top_alice");
+    assert_eq!(name_out.value(1), "top_bob");
+
+    // Project "info.name" — resolves to STRUCT field, not top-level column
+    let result3 = roundtrip_projected(
+        &schema,
+        &[batch.clone()],
+        &Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                "name",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        )]),
+    );
+    let rb3 = &result3[0];
+    assert_eq!(rb3.num_columns(), 1);
+    let info_out3 = rb3
+        .column(0)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let inner_name3 = info_out3
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(inner_name3.value(0), "inner_alice");
+
+    // Project both
+    let result4 = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new(
+                "info",
+                DataType::Struct(arrow_schema::Fields::from(vec![
+                    Field::new("name", DataType::Utf8, true),
+                    Field::new("age", DataType::Int32, true),
+                ])),
+                true,
+            ),
+        ]),
+    );
+    let rb4 = &result4[0];
+    assert_eq!(rb4.num_columns(), 2);
+}
+
+#[test]
+fn test_nested_struct_null_preserved_in_leaf_projection() {
+    // Verify that projecting a nested STRUCT's leaf preserves the nested STRUCT null
+    let addr_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("city", DataType::Utf8, true),
+        Field::new("zip", DataType::Int32, true),
+    ]));
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("addr", addr_type.clone(), true),
+        ])),
+        true,
+    )]);
+
+    // Row 0: {name: "a", addr: {city: "NYC", zip: 10001}}
+    // Row 1: {name: "b", addr: null}
+    let cities = StringArray::from(vec![Some("NYC"), Some("")]);
+    let zips = Int32Array::from(vec![Some(10001), Some(0)]);
+    let addr_null = NullBuffer::new(BooleanBuffer::new(Buffer::from(vec![0b0000_0001]), 0, 2));
+    let addr = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("city", DataType::Utf8, true),
+            Field::new("zip", DataType::Int32, true),
+        ]),
+        vec![Arc::new(cities) as ArrayRef, Arc::new(zips) as ArrayRef],
+        Some(addr_null),
+    );
+    let names = StringArray::from(vec![Some("a"), Some("b")]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("addr", addr_type.clone(), true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(addr) as ArrayRef],
+        None,
+    );
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(info) as ArrayRef]).unwrap();
+
+    // Project only "info.addr.city" — must still preserve addr null at row 1
+    let result = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                "addr",
+                DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                    "city",
+                    DataType::Utf8,
+                    true,
+                )])),
+                true,
+            )])),
+            true,
+        )]),
+    );
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 1);
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    let addr_out = info_out
+        .column_by_name("addr")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert!(!addr_out.is_null(0));
+    assert!(addr_out.is_null(1)); // addr null must be preserved
+    let city_out = addr_out
+        .column_by_name("city")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(city_out.value(0), "NYC");
+}
+
+#[test]
+fn test_array_of_nested_struct() {
+    // ARRAY<STRUCT<name UTF8, addr STRUCT<city UTF8, zip INT>>>
+    let addr_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("city", DataType::Utf8, true),
+        Field::new("zip", DataType::Int32, true),
+    ]));
+    let struct_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("name", DataType::Utf8, true),
+        Field::new("addr", addr_type.clone(), true),
+    ]));
+    let schema = Schema::new(vec![Field::new(
+        "col",
+        DataType::List(Arc::new(Field::new("item", struct_type.clone(), true))),
+        true,
+    )]);
+
+    // Row 0: [{name: "a", addr: {city: "NYC", zip: 10001}}]
+    let cities = StringArray::from(vec![Some("NYC")]);
+    let zips = Int32Array::from(vec![Some(10001)]);
+    let addr = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("city", DataType::Utf8, true),
+            Field::new("zip", DataType::Int32, true),
+        ]),
+        vec![Arc::new(cities) as ArrayRef, Arc::new(zips) as ArrayRef],
+        None,
+    );
+    let names = StringArray::from(vec![Some("a")]);
+    let inner = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("addr", addr_type.clone(), true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(addr) as ArrayRef],
+        None,
+    );
+
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1]));
+    let list = ListArray::new(
+        Arc::new(Field::new("item", struct_type.clone(), true)),
+        offsets,
+        Arc::new(inner),
+        None,
+    );
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(list) as ArrayRef]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let row0 = col.value(0);
+    let structs = row0.as_any().downcast_ref::<StructArray>().unwrap();
+    let name_out = structs
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(name_out.value(0), "a");
+    let addr_out = structs
+        .column_by_name("addr")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let city_out = addr_out
+        .column_by_name("city")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(city_out.value(0), "NYC");
+    let zip_out = addr_out
+        .column_by_name("zip")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(zip_out.value(0), 10001);
+}

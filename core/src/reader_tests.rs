@@ -1359,7 +1359,13 @@ fn test_projection_preserves_requested_order() {
     let len = data.len() as u64;
     let mut reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
 
-    reader.project(&["c", "a", "b"]).unwrap();
+    reader
+        .project_schema(&arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("c", DataType::Float64, true),
+            arrow_schema::Field::new("a", DataType::Int32, true),
+            arrow_schema::Field::new("b", DataType::Utf8, true),
+        ]))
+        .unwrap();
     let mut rg = reader.row_group_reader(0).unwrap();
     let batch = rg.read_columns().unwrap();
 
@@ -1424,7 +1430,9 @@ fn test_projection_empty_via_project_method() {
     let len = data.len() as u64;
     let mut reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
 
-    reader.project(&[]).unwrap();
+    reader
+        .project_schema(&arrow_schema::Schema::empty())
+        .unwrap();
     let mut rg = reader.row_group_reader(0).unwrap();
     let batch = rg.read_columns().unwrap();
 

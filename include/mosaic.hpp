@@ -286,8 +286,8 @@ public:
         if (rc != 0) throw Error("record_batch_export failed");
     }
 
-    void set_projection(const char* const* cols, uint32_t num_cols) {
-        check(mosaic_reader_set_projection(handle_, cols, num_cols));
+    void set_projection(void* arrow_schema_ptr) {
+        check(mosaic_reader_set_projection(handle_, arrow_schema_ptr));
     }
 
     uint32_t row_group_num_rows(uint32_t rg_index) const {

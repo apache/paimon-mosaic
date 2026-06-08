@@ -314,7 +314,11 @@ class TestComprehensive:
         data = _write_to_bytes(pa_schema, batch, opts)
 
         with _reader_from_bytes(data) as reader:
-            reader.project(["col_0", "col_25", "col_49"])
+            reader.project(pa.schema([
+                pa.field("col_0", pa.int32()),
+                pa.field("col_25", pa.int32()),
+                pa.field("col_49", pa.int32()),
+            ]))
             table = reader.read_all()
             assert table.num_columns == 3
             assert table.num_rows == total_rows

@@ -263,12 +263,45 @@ impl BucketWriter {
                     total_size +=
                         self.append_array_column(phys_idx, &inner_lengths, &int32_dt, child_start)?;
                     self.children[child_idx].num_elements += inner_lengths.len();
-                    // Queue keys and values for the next children
                     if child_idx + 2 < self.children.len() {
                         pending.push((child_idx + 2, inner_values));
                     }
                     if child_idx + 1 < self.children.len() {
                         pending.push((child_idx + 1, inner_keys));
+                    }
+                }
+                DataType::Struct(fields) if !types::is_timestamp_nanos_struct(fields) => {
+                    let struct_arr =
+                        values
+                            .as_any()
+                            .downcast_ref::<StructArray>()
+                            .ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidInput, "expected StructArray")
+                            })?;
+                    // Write null bitmap as BooleanArray
+                    let num_elems = struct_arr.len();
+                    let bool_values: Vec<bool> =
+                        (0..num_elems).map(|i| !struct_arr.is_null(i)).collect();
+                    let null_col = BooleanArray::from(bool_values);
+                    total_size += self.append_array_column(
+                        phys_idx,
+                        &null_col,
+                        &DataType::Boolean,
+                        child_start,
+                    )?;
+                    self.children[child_idx].num_elements += num_elems;
+                    // Queue each field (in reverse so they process in order)
+                    let num_fields = struct_arr.num_columns();
+                    for fi in (0..num_fields).rev() {
+                        let field_child_idx = child_idx + 1 + fi;
+                        if field_child_idx < self.children.len() {
+                            let mut field_arr = struct_arr.column(fi).clone();
+                            // Propagate struct null to field
+                            if struct_arr.null_count() > 0 {
+                                field_arr = Self::propagate_struct_nulls(struct_arr, &field_arr);
+                            }
+                            pending.push((field_child_idx, field_arr));
+                        }
                     }
                 }
                 _ => {
@@ -283,6 +316,10 @@ impl BucketWriter {
         self.num_rows += num_new_rows;
         total_size += num_new_rows * self.num_primary.div_ceil(8);
         Ok(total_size)
+    }
+
+    fn propagate_struct_nulls(struct_arr: &arrow_array::StructArray, child: &ArrayRef) -> ArrayRef {
+        crate::propagate_struct_nulls(struct_arr, child)
     }
 
     fn append_array_column(
@@ -1431,6 +1468,34 @@ fn take_array(array: &dyn Array, indices: &UInt32Array) -> ArrayRef {
                 *sorted,
             ))
         }
+        DataType::Struct(fields) if !types::is_timestamp_nanos_struct(fields) => {
+            let src = array.as_any().downcast_ref::<StructArray>().unwrap();
+            let mut new_children: Vec<ArrayRef> = Vec::new();
+            for col in src.columns() {
+                new_children.push(take_array(col.as_ref(), indices));
+            }
+            let null_buf = if !indices.is_empty() {
+                let mut bm = vec![0u8; indices.len().div_ceil(8)];
+                for i in 0..indices.len() {
+                    let idx = indices.value(i) as usize;
+                    if !src.is_null(idx) {
+                        bm[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                if bm.iter().all(|&b| b == 0xFF) || indices.is_empty() {
+                    None
+                } else {
+                    Some(NullBuffer::new(BooleanBuffer::new(
+                        Buffer::from_vec(bm),
+                        0,
+                        indices.len(),
+                    )))
+                }
+            } else {
+                None
+            };
+            Arc::new(StructArray::new(fields.clone(), new_children, null_buf))
+        }
         other => panic!("take_array: unsupported DataType {:?}", other),
     }
 }
@@ -1496,6 +1561,25 @@ fn expand_element(
                 num_elements: 0,
             });
             expand_type(parent_logical, elem_dt, physical_types, children);
+        }
+        DataType::Struct(fields) if !types::is_timestamp_nanos_struct(fields) => {
+            // STRUCT element: null bitmap + each field as a child column
+            // Store the original element_field so the reader knows the STRUCT's field names
+            let null_field = Arc::new(Field::new(
+                "__struct_null__",
+                element_field.data_type().clone(),
+                element_field.is_nullable(),
+            ));
+            physical_types.push(DataType::Boolean);
+            children.push(ChildColumnMeta {
+                parent_logical_col: parent_logical,
+                physical_index: child_phys_idx,
+                element_field: null_field,
+                num_elements: 0,
+            });
+            for field in fields.iter() {
+                expand_element(parent_logical, field, physical_types, children);
+            }
         }
         _ => {
             // Primitive element: direct leaf column

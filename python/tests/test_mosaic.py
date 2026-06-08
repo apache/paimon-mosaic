@@ -387,7 +387,7 @@ class TestProjection:
         data = _write_to_bytes(pa_schema, batch, opts)
 
         with _reader_from_bytes(data) as reader:
-            reader.project(["a", "b"])
+            reader.project(pa.schema([pa.field("a", pa.int32()), pa.field("b", pa.utf8())]))
 
             total_rows = 0
             for rg in range(reader.num_row_groups):
@@ -418,7 +418,7 @@ class TestProjection:
         data = _write_to_bytes(pa_schema, batch)
 
         with _reader_from_bytes(data) as reader:
-            reader.project(["b"])
+            reader.project(pa.schema([pa.field("b", pa.utf8())]))
             rb = reader.read_row_group(0)
             assert rb.num_columns == 1
             assert rb.num_rows == 10
@@ -445,7 +445,7 @@ class TestProjection:
         data = _write_to_bytes(pa_schema, batch, opts)
 
         with _reader_from_bytes(data) as reader:
-            reader.project(["c", "a", "b"])
+            reader.project(pa.schema([pa.field("c", pa.float64()), pa.field("a", pa.int32()), pa.field("b", pa.utf8())]))
             rb = reader.read_row_group(0)
             assert rb.num_columns == 3
             assert rb.schema.names == ["c", "a", "b"]
@@ -472,7 +472,7 @@ class TestProjection:
         data = _write_to_bytes(pa_schema, batch)
 
         with _reader_from_bytes(data) as reader:
-            reader.project([])
+            reader.project(pa.schema([]))
             rb = reader.read_row_group(0)
             assert rb.num_columns == 0
             assert rb.num_rows == 5
@@ -672,7 +672,7 @@ class TestConvenience:
         result = read_table(
             lambda offset, length: data[offset : offset + length],
             len(data),
-            columns=[],
+            columns=pa.schema([]),
         )
 
         assert result.num_columns == 0
@@ -696,7 +696,7 @@ class TestConvenience:
         empty_projection = read_table(
             lambda offset, length: data[offset : offset + length],
             len(data),
-            columns=[],
+            columns=pa.schema([]),
         )
         assert empty_projection.num_rows == 0
         assert empty_projection.num_columns == 0
@@ -705,7 +705,7 @@ class TestConvenience:
         name_projection = read_table(
             lambda offset, length: data[offset : offset + length],
             len(data),
-            columns=["name"],
+            columns=pa.schema([pa.field("name", pa.utf8())]),
         )
         assert name_projection.num_rows == 0
         assert name_projection.num_columns == 1
@@ -714,7 +714,7 @@ class TestConvenience:
         duplicate_projection = read_table(
             lambda offset, length: data[offset : offset + length],
             len(data),
-            columns=["name", "name"],
+            columns=pa.schema([pa.field("name", pa.utf8())]),
         )
         assert duplicate_projection.num_rows == 0
         assert duplicate_projection.num_columns == 1
@@ -722,7 +722,7 @@ class TestConvenience:
 
         with _reader_from_bytes(data) as reader:
             assert reader.num_row_groups == 0
-            reader.project(["name"])
+            reader.project(pa.schema([pa.field("name", pa.utf8())]))
             assert reader.schema.names == ["id", "name"]
             result = reader.read_all()
             assert result.schema.names == ["name"]
@@ -1114,3 +1114,179 @@ class TestWriter:
             m = rb.column("m").to_pylist()
             assert m[0] == [("x", 10), ("y", None)]
             assert m[1] == [("z", 30)]
+
+    def test_struct_type(self):
+        pa_schema = pa.schema(
+            [
+                pa.field("id", pa.int32(), nullable=False),
+                pa.field(
+                    "info",
+                    pa.struct(
+                        [
+                            pa.field("name", pa.utf8()),
+                            pa.field("age", pa.int32()),
+                        ]
+                    ),
+                ),
+            ]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array([1, 2, 3], type=pa.int32()),
+                pa.array(
+                    [{"name": "alice", "age": 30}, None, {"name": "charlie", "age": 25}],
+                    type=pa.struct(
+                        [pa.field("name", pa.utf8()), pa.field("age", pa.int32())]
+                    ),
+                ),
+            ],
+            names=["id", "info"],
+        )
+
+        data = _write_to_bytes(pa_schema, batch)
+
+        with _reader_from_bytes(data) as reader:
+            rb = reader.read_row_group(0)
+            assert rb.num_rows == 3
+
+            ids = rb.column("id").to_pylist()
+            assert ids == [1, 2, 3]
+
+            info = rb.column("info").to_pylist()
+            assert info[0]["name"] == "alice"
+            assert info[0]["age"] == 30
+            assert info[1] is None
+            assert info[2]["name"] == "charlie"
+
+    def test_struct_leaf_projection(self):
+        pa_schema = pa.schema(
+            [
+                pa.field("id", pa.int32(), nullable=False),
+                pa.field(
+                    "info",
+                    pa.struct(
+                        [
+                            pa.field("name", pa.utf8()),
+                            pa.field("age", pa.int32()),
+                        ]
+                    ),
+                ),
+            ]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array([1, 2, 3], type=pa.int32()),
+                pa.array(
+                    [{"name": "alice", "age": 30}, None, {"name": "charlie", "age": 25}],
+                    type=pa.struct(
+                        [pa.field("name", pa.utf8()), pa.field("age", pa.int32())]
+                    ),
+                ),
+            ],
+            names=["id", "info"],
+        )
+
+        data = _write_to_bytes(pa_schema, batch)
+
+        with _reader_from_bytes(data) as reader:
+            reader.project(pa.schema([pa.field("info", pa.struct([pa.field("name", pa.utf8())]))]))
+            rb = reader.read_row_group(0)
+            assert rb.num_rows == 3
+            assert rb.num_columns == 1
+            info = rb.column("info")
+            names = info.field("name").to_pylist()
+            assert names[0] == "alice"
+            assert names[1] is None  # parent struct was null
+            assert names[2] == "charlie"
+
+    def test_struct_whole_projection(self):
+        pa_schema = pa.schema(
+            [
+                pa.field("id", pa.int32(), nullable=False),
+                pa.field(
+                    "info",
+                    pa.struct(
+                        [
+                            pa.field("name", pa.utf8()),
+                            pa.field("age", pa.int32()),
+                        ]
+                    ),
+                ),
+            ]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array([1, 2], type=pa.int32()),
+                pa.array(
+                    [{"name": "alice", "age": 30}, {"name": "bob", "age": 25}],
+                    type=pa.struct(
+                        [pa.field("name", pa.utf8()), pa.field("age", pa.int32())]
+                    ),
+                ),
+            ],
+            names=["id", "info"],
+        )
+
+        data = _write_to_bytes(pa_schema, batch)
+
+        with _reader_from_bytes(data) as reader:
+            reader.project(pa.schema([pa.field("info", pa.struct([pa.field("name", pa.utf8()), pa.field("age", pa.int32())]))]))
+            rb = reader.read_row_group(0)
+            assert rb.num_rows == 2
+            assert rb.num_columns == 1
+            info = rb.column("info").to_pylist()
+            assert info[0]["name"] == "alice"
+            assert info[1]["age"] == 25
+
+    def test_struct_nested_multi_leaf_projection(self):
+        pa_schema = pa.schema(
+            [
+                pa.field(
+                    "info",
+                    pa.struct(
+                        [
+                            pa.field("name", pa.utf8()),
+                            pa.field(
+                                "addr",
+                                pa.struct(
+                                    [
+                                        pa.field("city", pa.utf8()),
+                                        pa.field("zip", pa.int32()),
+                                    ]
+                                ),
+                            ),
+                        ]
+                    ),
+                ),
+            ]
+        )
+
+        batch = pa.record_batch(
+            [
+                pa.array(
+                    [
+                        {"name": "alice", "addr": {"city": "NYC", "zip": 10001}},
+                        {"name": "bob", "addr": {"city": "LA", "zip": 90001}},
+                    ],
+                    type=pa_schema.field("info").type,
+                ),
+            ],
+            names=["info"],
+        )
+
+        data = _write_to_bytes(pa_schema, batch)
+
+        with _reader_from_bytes(data) as reader:
+            reader.project(pa.schema([pa.field("info", pa.struct([pa.field("addr", pa.struct([pa.field("zip", pa.int32()), pa.field("city", pa.utf8())]))]))]))
+            rb = reader.read_row_group(0)
+            assert rb.num_rows == 2
+            info = rb.column("info")
+            addr = info.field("addr")
+            cities = addr.field("city").to_pylist()
+            zips = addr.field("zip").to_pylist()
+            assert cities == ["NYC", "LA"]
+            assert zips == [10001, 90001]
+

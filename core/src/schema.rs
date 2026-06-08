@@ -27,20 +27,54 @@ use crate::varint;
 
 #[derive(Debug, Clone)]
 pub struct ColumnMeta {
+    /// Physical column name for sorting and bucket assignment.
+    /// STRUCT fields use dot-prefixed names (e.g. "info.name").
+    /// Not unique — e.g. top-level column "info.name" and STRUCT "info" field "name"
+    /// both produce "info.name".
     pub name: String,
+    /// DFS-incremented column ID, unique across the schema. Used for all internal matching.
+    pub column_id: u32,
     pub data_type: DataType,
     pub nullable: bool,
     pub bucket_id: usize,
 }
 
+/// Records how a STRUCT column was expanded into independent columns.
+#[derive(Debug, Clone)]
+pub struct StructMapping {
+    /// DFS column ID of the STRUCT node itself
+    pub struct_id: u32,
+    /// Index in the original Arrow schema (before expansion)
+    pub original_col_index: usize,
+    /// The original STRUCT field (for reassembly)
+    pub original_field: arrow_schema::Field,
+    /// Indices into MosaicSchema.columns for each expanded sub-column
+    pub expanded_col_indices: Vec<usize>,
+    /// Sorted index of the __null__ column (if STRUCT is nullable)
+    pub null_col_sorted_idx: Option<usize>,
+    /// DFS column IDs of each leaf field (parallel with expanded_col_indices, excluding __null__)
+    pub field_ids: Vec<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MosaicSchema {
     pub num_buckets: usize,
+    /// Expanded columns (STRUCT fields flattened, with __null__ columns).
+    /// Names may be duplicated (e.g. top-level column "info.name" and STRUCT "info"
+    /// field "name" both expand to "info.name"). Names are only used for sorting
+    /// and bucket assignment; all internal matching uses column_id.
     pub columns: Vec<ColumnMeta>,
     /// bucket_to_global[bucket_id] = [global_col_indices...] in name-sorted order
     pub bucket_to_global: Vec<Vec<usize>>,
     /// original_order[orig_pos] = sorted_pos. Used as default output order when no projection is set.
     pub original_order: Vec<usize>,
+    /// STRUCT column expansion mappings
+    pub struct_mappings: Vec<StructMapping>,
+    /// Column IDs of synthetic __null__ columns (STRUCT null bitmaps).
+    /// Used to distinguish __null__ columns from user columns without relying on names.
+    pub null_col_ids: Vec<u32>,
+    /// Original columns BEFORE STRUCT expansion (for serialization to file)
+    pub original_columns: Option<Vec<(String, DataType, bool)>>,
 }
 
 impl MosaicSchema {
@@ -62,15 +96,394 @@ impl MosaicSchema {
             .map(|f| (f.name().clone(), f.data_type().clone(), f.is_nullable()))
             .collect();
         Self::validate(&columns)?;
-        Ok(Self::new(columns, num_buckets))
+
+        // Expand STRUCT columns into independent flat columns with DFS column IDs
+        let mut expanded: Vec<(String, u32, DataType, bool)> = Vec::new();
+        let mut struct_mappings: Vec<StructMapping> = Vec::new();
+        let mut null_col_ids: Vec<u32> = Vec::new();
+        let mut id_counter: u32 = 0;
+
+        for (orig_idx, (name, dt, nullable)) in columns.iter().enumerate() {
+            if let DataType::Struct(fields) = dt {
+                if !types::is_timestamp_nanos_struct(fields) {
+                    let struct_id = id_counter;
+                    id_counter += 1;
+                    let start = expanded.len();
+                    let has_null_col = *nullable;
+                    if has_null_col {
+                        let null_name = format!("{}.__null__", name);
+                        expanded.push((null_name, struct_id, DataType::Boolean, false));
+                        null_col_ids.push(struct_id);
+                    }
+                    let field_start = expanded.len();
+                    Self::expand_struct_fields_recursive(
+                        name,
+                        fields,
+                        &mut id_counter,
+                        &mut expanded,
+                        &mut null_col_ids,
+                    );
+                    let end = expanded.len();
+
+                    let expanded_indices: Vec<usize> = (start..end).collect();
+                    let field_ids: Vec<u32> = expanded[field_start..end]
+                        .iter()
+                        .filter(|(_, id, _, _)| !null_col_ids.contains(id))
+                        .map(|(_, id, _, _)| *id)
+                        .collect();
+
+                    struct_mappings.push(StructMapping {
+                        struct_id,
+                        original_col_index: orig_idx,
+                        original_field: schema.field(orig_idx).clone(),
+                        expanded_col_indices: expanded_indices,
+                        null_col_sorted_idx: None, // filled after sorting
+                        field_ids,
+                    });
+                    continue;
+                }
+            }
+            let col_id = id_counter;
+            id_counter += 1;
+            expanded.push((name.clone(), col_id, dt.clone(), *nullable));
+        }
+
+        let mut schema = Self::new_with_ids(expanded, num_buckets);
+        schema.struct_mappings = struct_mappings;
+        schema.null_col_ids = null_col_ids;
+
+        // Fix struct_mappings expanded_col_indices and null_col_sorted_idx to sorted positions
+        for mapping in &mut schema.struct_mappings {
+            mapping.expanded_col_indices = mapping
+                .expanded_col_indices
+                .iter()
+                .map(|&input_idx| schema.original_order[input_idx])
+                .collect();
+            if mapping.original_field.is_nullable() {
+                mapping.null_col_sorted_idx = schema.columns.iter().position(|c| {
+                    c.column_id == mapping.struct_id && c.data_type == DataType::Boolean
+                });
+            }
+        }
+
+        if !schema.struct_mappings.is_empty() {
+            schema.original_columns = Some(columns);
+        }
+
+        Ok(schema)
+    }
+
+    fn expand_struct_fields_recursive(
+        prefix: &str,
+        fields: &arrow_schema::Fields,
+        id_counter: &mut u32,
+        out: &mut Vec<(String, u32, DataType, bool)>,
+        null_col_ids: &mut Vec<u32>,
+    ) {
+        for field in fields.iter() {
+            let field_id = *id_counter;
+            *id_counter += 1;
+            let full_name = format!("{}.{}", prefix, field.name());
+            let dt = field.data_type();
+            if let DataType::Struct(inner_fields) = dt {
+                if !types::is_timestamp_nanos_struct(inner_fields) {
+                    if field.is_nullable() {
+                        let null_name = format!("{}.__null__", full_name);
+                        out.push((null_name, field_id, DataType::Boolean, false));
+                        null_col_ids.push(field_id);
+                    }
+                    Self::expand_struct_fields_recursive(
+                        &full_name,
+                        inner_fields,
+                        id_counter,
+                        out,
+                        null_col_ids,
+                    );
+                    continue;
+                }
+            }
+            out.push((full_name, field_id, dt.clone(), true));
+        }
+    }
+
+    /// Resolve a projected Arrow Schema to expanded column indices.
+    /// Returns `(output_order, read_indices)`:
+    /// - `output_order`: user-requested indices in request order (for output column ordering)
+    /// - `read_indices`: output_order + auto-added `__null__` ancestors (for physical reads)
+    ///
+    /// Each field in `projected` is matched by name against the original schema.
+    /// STRUCT fields in `projected` can be partial (containing only a subset of the
+    /// original STRUCT's fields) for field-level projection.
+    pub fn resolve_schema_projection(
+        &self,
+        projected: &Schema,
+    ) -> io::Result<(Vec<usize>, Vec<usize>)> {
+        let mut output = Vec::new();
+
+        for proj_field in projected.fields() {
+            if let Some(mapping) = self
+                .struct_mappings
+                .iter()
+                .find(|m| m.original_field.name() == proj_field.name())
+            {
+                if let DataType::Struct(proj_fields) = proj_field.data_type() {
+                    // Partial STRUCT projection: collect IDs for requested sub-fields
+                    let mut local_ids = Vec::new();
+                    Self::collect_projected_ids(
+                        mapping.original_field.data_type(),
+                        &DataType::Struct(proj_fields.clone()),
+                        &mut local_ids,
+                        mapping.original_field.name(),
+                    )?;
+                    let base = mapping.struct_id + 1;
+                    for lid in local_ids {
+                        let abs_id = base + lid;
+                        if let Some(idx) = self.columns.iter().position(|c| c.column_id == abs_id) {
+                            output.push(idx);
+                        }
+                    }
+                } else {
+                    // Non-STRUCT field matching a STRUCT column — expand all
+                    output.extend_from_slice(&mapping.expanded_col_indices);
+                }
+            } else {
+                // Non-STRUCT column: find by column_id derived from original schema position
+                if let Some(orig) = self.original_columns.as_deref() {
+                    let mut target_id: Option<u32> = None;
+                    let mut id = 0u32;
+                    for (n, dt, _) in orig {
+                        if let DataType::Struct(f) = dt {
+                            if !types::is_timestamp_nanos_struct(f) {
+                                id += 1 + Self::count_tree_nodes(dt);
+                                continue;
+                            }
+                        }
+                        if n == proj_field.name() {
+                            target_id = Some(id);
+                            break;
+                        }
+                        id += 1;
+                    }
+                    if let Some(tid) = target_id {
+                        if let Some(idx) = self.columns.iter().position(|c| c.column_id == tid) {
+                            output.push(idx);
+                        } else {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("column '{}' not found in schema", proj_field.name()),
+                            ));
+                        }
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("column '{}' not found in schema", proj_field.name()),
+                        ));
+                    }
+                } else if let Some(idx) = self
+                    .columns
+                    .iter()
+                    .position(|c| c.name == *proj_field.name())
+                {
+                    output.push(idx);
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("column '{}' not found in schema", proj_field.name()),
+                    ));
+                }
+            }
+        }
+
+        // Auto-add __null__ columns for any projected STRUCT descendants
+        let mut read = output.clone();
+        for mapping in &self.struct_mappings {
+            let has_leaf = mapping
+                .expanded_col_indices
+                .iter()
+                .any(|idx| read.contains(idx) && mapping.null_col_sorted_idx != Some(*idx));
+            if has_leaf {
+                if let Some(null_idx) = mapping.null_col_sorted_idx {
+                    if !read.contains(&null_idx) {
+                        read.push(null_idx);
+                    }
+                }
+            }
+        }
+        // Also add nested __null__ columns
+        for (col_idx, col) in self.columns.iter().enumerate() {
+            if self.null_col_ids.contains(&col.column_id) && !read.contains(&col_idx) {
+                let nested_struct_id = col.column_id;
+                let has_descendant = read.iter().any(|&idx| {
+                    let cid = self.columns[idx].column_id;
+                    cid > nested_struct_id
+                        && cid
+                            <= nested_struct_id
+                                + Self::count_tree_nodes_by_id(self, nested_struct_id)
+                });
+                if has_descendant {
+                    read.push(col_idx);
+                }
+            }
+        }
+
+        Ok((output, read))
+    }
+
+    /// Collect local (0-based within parent STRUCT) column IDs for fields present
+    /// in `projected_dt` that match fields in `original_dt`.
+    /// Returns an error if a projected field does not exist in the original type
+    /// or if a projected STRUCT field targets a non-STRUCT original field.
+    fn collect_projected_ids(
+        original_dt: &DataType,
+        projected_dt: &DataType,
+        out: &mut Vec<u32>,
+        path: &str,
+    ) -> io::Result<()> {
+        if let (DataType::Struct(orig_fields), DataType::Struct(proj_fields)) =
+            (original_dt, projected_dt)
+        {
+            for proj_field in proj_fields.iter() {
+                let child_path = if path.is_empty() {
+                    proj_field.name().to_string()
+                } else {
+                    format!("{}.{}", path, proj_field.name())
+                };
+                let mut id = 0u32;
+                let mut found = false;
+                for orig_field in orig_fields.iter() {
+                    let field_id = id;
+                    id += 1;
+                    if orig_field.name() == proj_field.name() {
+                        if let DataType::Struct(proj_inner) = proj_field.data_type() {
+                            // Projected field is a STRUCT — original must also be a STRUCT
+                            if let DataType::Struct(orig_inner) = orig_field.data_type() {
+                                if !types::is_timestamp_nanos_struct(orig_inner) {
+                                    if orig_field.is_nullable() {
+                                        out.push(field_id);
+                                    }
+                                    let mut sub_ids = Vec::new();
+                                    Self::collect_projected_ids(
+                                        orig_field.data_type(),
+                                        &DataType::Struct(proj_inner.clone()),
+                                        &mut sub_ids,
+                                        &child_path,
+                                    )?;
+                                    for sid in sub_ids {
+                                        out.push(field_id + 1 + sid);
+                                    }
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!(
+                                    "projected field '{}' is a STRUCT but original field is {:?}",
+                                    child_path,
+                                    orig_field.data_type()
+                                ),
+                            ));
+                        }
+                        out.push(field_id);
+                        found = true;
+                        break;
+                    }
+                    if let DataType::Struct(inner) = orig_field.data_type() {
+                        if !types::is_timestamp_nanos_struct(inner) {
+                            id += Self::count_tree_nodes(orig_field.data_type());
+                        }
+                    }
+                }
+                if !found {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "projected field '{}' not found in original STRUCT",
+                            child_path
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn count_tree_nodes_by_id(&self, struct_id: u32) -> u32 {
+        for mapping in &self.struct_mappings {
+            if mapping.struct_id == struct_id {
+                return Self::count_tree_nodes(mapping.original_field.data_type());
+            }
+            // Check nested STRUCTs within this mapping
+            if let Some(size) = Self::find_nested_count(
+                mapping.original_field.data_type(),
+                struct_id,
+                mapping.struct_id + 1,
+            ) {
+                return size;
+            }
+        }
+        0
+    }
+
+    fn find_nested_count(dt: &DataType, target_id: u32, base_id: u32) -> Option<u32> {
+        if let DataType::Struct(fields) = dt {
+            let mut id = base_id;
+            for field in fields.iter() {
+                let field_id = id;
+                id += 1;
+                if let DataType::Struct(inner) = field.data_type() {
+                    if !types::is_timestamp_nanos_struct(inner) {
+                        if field_id == target_id {
+                            return Some(Self::count_tree_nodes(field.data_type()));
+                        }
+                        if let Some(size) =
+                            Self::find_nested_count(field.data_type(), target_id, id)
+                        {
+                            return Some(size);
+                        }
+                        id += Self::count_tree_nodes(field.data_type());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn count_tree_nodes(dt: &DataType) -> u32 {
+        let mut count = 0;
+        if let DataType::Struct(fields) = dt {
+            for field in fields.iter() {
+                count += 1;
+                if let DataType::Struct(inner) = field.data_type() {
+                    if !types::is_timestamp_nanos_struct(inner) {
+                        count += Self::count_tree_nodes(field.data_type());
+                    }
+                }
+            }
+        }
+        count
     }
 
     pub fn new(columns: Vec<(String, DataType, bool)>, num_buckets: usize) -> Self {
+        let with_ids: Vec<(String, u32, DataType, bool)> = columns
+            .into_iter()
+            .enumerate()
+            .map(|(i, (n, dt, nullable))| (n, i as u32, dt, nullable))
+            .collect();
+        Self::new_with_ids(with_ids, num_buckets)
+    }
+
+    fn new_with_ids(columns: Vec<(String, u32, DataType, bool)>, num_buckets: usize) -> Self {
         let num_columns = columns.len();
         let actual_buckets = num_buckets.min(num_columns).max(1);
 
         let mut sorted_indices: Vec<usize> = (0..num_columns).collect();
-        sorted_indices.sort_by(|&a, &b| columns[a].0.cmp(&columns[b].0));
+        sorted_indices.sort_by(|&a, &b| {
+            columns[a]
+                .0
+                .cmp(&columns[b].0)
+                .then(columns[a].1.cmp(&columns[b].1))
+        });
 
         let mut bucket_to_global = vec![Vec::new(); actual_buckets];
         let mut cols: Vec<ColumnMeta> = Vec::with_capacity(num_columns);
@@ -79,8 +492,9 @@ impl MosaicSchema {
             let bucket_id = spec::assign_bucket(sorted_pos, num_columns, actual_buckets);
             cols.push(ColumnMeta {
                 name: columns[input_idx].0.clone(),
-                data_type: columns[input_idx].1.clone(),
-                nullable: columns[input_idx].2,
+                column_id: columns[input_idx].1,
+                data_type: columns[input_idx].2.clone(),
+                nullable: columns[input_idx].3,
                 bucket_id,
             });
             bucket_to_global[bucket_id].push(sorted_pos);
@@ -96,6 +510,9 @@ impl MosaicSchema {
             columns: cols,
             bucket_to_global,
             original_order,
+            struct_mappings: Vec::new(),
+            null_col_ids: Vec::new(),
+            original_columns: None,
         }
     }
 
@@ -190,6 +607,7 @@ impl MosaicSchema {
             let bucket_id = spec::assign_bucket(sorted_pos, num_columns, num_buckets);
             columns.push(ColumnMeta {
                 name,
+                column_id: sorted_pos as u32,
                 data_type: field.data_type().clone(),
                 nullable: field.is_nullable(),
                 bucket_id,
@@ -229,19 +647,136 @@ impl MosaicSchema {
             seen[idx] = true;
         }
 
-        Ok(MosaicSchema {
-            num_buckets,
-            columns,
-            bucket_to_global,
-            original_order,
-        })
+        // Check if any deserialized columns are STRUCT types that need expansion
+        let has_structs = columns.iter().any(
+            |c| matches!(&c.data_type, DataType::Struct(f) if !types::is_timestamp_nanos_struct(f)),
+        );
+
+        if !has_structs {
+            let schema = MosaicSchema {
+                num_buckets,
+                columns,
+                bucket_to_global,
+                original_order,
+                struct_mappings: Vec::new(),
+                null_col_ids: Vec::new(),
+                original_columns: None,
+            };
+            return Ok(schema);
+        }
+
+        // Reconstruct original column order from sorted columns + original_order
+        let mut input_columns: Vec<(String, DataType, bool)> =
+            vec![(String::new(), DataType::Boolean, false); num_columns];
+        for (input_idx, &sorted_pos) in original_order.iter().enumerate() {
+            let col = &columns[sorted_pos];
+            input_columns[input_idx] = (col.name.clone(), col.data_type.clone(), col.nullable);
+        }
+
+        // Expand STRUCTs using the same logic as from_arrow (with DFS IDs)
+        let mut expanded: Vec<(String, u32, DataType, bool)> = Vec::new();
+        let mut struct_mappings: Vec<StructMapping> = Vec::new();
+        let mut null_col_ids: Vec<u32> = Vec::new();
+        let mut id_counter: u32 = 0;
+
+        for (orig_idx, (name, dt, nullable)) in input_columns.iter().enumerate() {
+            if let DataType::Struct(fields) = dt {
+                if !types::is_timestamp_nanos_struct(fields) {
+                    let struct_id = id_counter;
+                    id_counter += 1;
+                    let start = expanded.len();
+                    let has_null_col = *nullable;
+                    if has_null_col {
+                        let null_name = format!("{}.__null__", name);
+                        expanded.push((null_name, struct_id, DataType::Boolean, false));
+                        null_col_ids.push(struct_id);
+                    }
+                    let field_start = expanded.len();
+                    Self::expand_struct_fields_recursive(
+                        name,
+                        fields,
+                        &mut id_counter,
+                        &mut expanded,
+                        &mut null_col_ids,
+                    );
+                    let end = expanded.len();
+
+                    let expanded_indices: Vec<usize> = (start..end).collect();
+                    let field_ids: Vec<u32> = expanded[field_start..end]
+                        .iter()
+                        .filter(|(_, id, _, _)| !null_col_ids.contains(id))
+                        .map(|(_, id, _, _)| *id)
+                        .collect();
+
+                    let original_field = Field::new(name, dt.clone(), *nullable);
+                    struct_mappings.push(StructMapping {
+                        struct_id,
+                        original_col_index: orig_idx,
+                        original_field,
+                        expanded_col_indices: expanded_indices,
+                        null_col_sorted_idx: None,
+                        field_ids,
+                    });
+                    continue;
+                }
+            }
+            let col_id = id_counter;
+            id_counter += 1;
+            expanded.push((name.clone(), col_id, dt.clone(), *nullable));
+        }
+
+        let mut schema = Self::new_with_ids(expanded, num_buckets);
+        schema.struct_mappings = struct_mappings;
+        schema.null_col_ids = null_col_ids;
+
+        for mapping in &mut schema.struct_mappings {
+            mapping.expanded_col_indices = mapping
+                .expanded_col_indices
+                .iter()
+                .map(|&input_idx| schema.original_order[input_idx])
+                .collect();
+            if mapping.original_field.is_nullable() {
+                mapping.null_col_sorted_idx = schema.columns.iter().position(|c| {
+                    c.column_id == mapping.struct_id && c.data_type == DataType::Boolean
+                });
+            }
+        }
+
+        schema.original_columns = Some(input_columns);
+        Ok(schema)
     }
 
     pub fn serialize(&self) -> Vec<u8> {
-        let num_columns = self.columns.len();
+        // When original_columns exists (schema has STRUCTs), serialize the original
+        // pre-expansion columns with STRUCT type byte 20. The reader will expand
+        // STRUCTs on deserialize using the type metadata — no dot-heuristic needed.
+        let serialize_cols: Vec<ColumnMeta> = if let Some(ref orig) = self.original_columns {
+            let mut sorted_indices: Vec<usize> = (0..orig.len()).collect();
+            sorted_indices.sort_by(|&a, &b| orig[a].0.cmp(&orig[b].0));
+            sorted_indices
+                .iter()
+                .map(|&i| {
+                    let bucket_id = spec::assign_bucket(
+                        sorted_indices.iter().position(|&x| x == i).unwrap(),
+                        orig.len(),
+                        self.num_buckets.min(orig.len()).max(1),
+                    );
+                    ColumnMeta {
+                        name: orig[i].0.clone(),
+                        column_id: i as u32,
+                        data_type: orig[i].1.clone(),
+                        nullable: orig[i].2,
+                        bucket_id,
+                    }
+                })
+                .collect()
+        } else {
+            self.columns.clone()
+        };
 
-        let raw_names: Vec<Vec<u8>> = self
-            .columns
+        let num_columns = serialize_cols.len();
+
+        let raw_names: Vec<Vec<u8>> = serialize_cols
             .iter()
             .map(|c| c.name.as_bytes().to_vec())
             .collect();
@@ -279,15 +814,28 @@ impl MosaicSchema {
                 buf.push(rule[1]);
             }
             let bpe_refs: Vec<&[u8]> = bpe_names.iter().map(|v| v.as_slice()).collect();
-            write_front_coded(&mut buf, &bpe_refs, &self.columns);
+            write_front_coded(&mut buf, &bpe_refs, &serialize_cols);
         } else {
             buf.push(0); // NAME_ENCODING_FRONT_CODE
-            write_front_coded(&mut buf, &raw_refs, &self.columns);
+            write_front_coded(&mut buf, &raw_refs, &serialize_cols);
         }
 
         // Append original column order as delta + zigzag encoded permutation
+        // When original_columns exists, write the original column order (pre-expansion)
+        let order = if let Some(ref orig) = self.original_columns {
+            let mut sorted_indices: Vec<usize> = (0..orig.len()).collect();
+            sorted_indices.sort_by(|&a, &b| orig[a].0.cmp(&orig[b].0));
+            let mut order = vec![0usize; orig.len()];
+            for (sorted_pos, &input_idx) in sorted_indices.iter().enumerate() {
+                order[input_idx] = sorted_pos;
+            }
+            order
+        } else {
+            self.original_order.clone()
+        };
+
         let mut prev = 0i64;
-        for &pos in &self.original_order {
+        for &pos in &order {
             let delta = pos as i64 - prev;
             varint::encode_zigzag(&mut buf, delta);
             prev = pos as i64;

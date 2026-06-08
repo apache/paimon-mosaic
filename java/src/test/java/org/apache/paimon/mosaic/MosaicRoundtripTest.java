@@ -1303,4 +1303,68 @@ public class MosaicRoundtripTest {
             }
         }
     }
+
+    @Test
+    public void testStructType() {
+        Field nameField = new Field("name", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+        Field ageField = new Field("age", FieldType.nullable(new ArrowType.Int(32, true)), null);
+        Field infoField = new Field("info",
+            new FieldType(true, ArrowType.Struct.INSTANCE, null),
+            Arrays.asList(nameField, ageField));
+
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true)),
+                infoField
+        ));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            org.apache.arrow.vector.complex.StructVector structVec =
+                (org.apache.arrow.vector.complex.StructVector) root.getVector("info");
+
+            ids.allocateNew(3);
+            structVec.allocateNew();
+
+            IntVector ageVec = structVec.addOrGet("age",
+                FieldType.nullable(new ArrowType.Int(32, true)), IntVector.class);
+            VarCharVector nameVec = structVec.addOrGet("name",
+                FieldType.nullable(ArrowType.Utf8.INSTANCE), VarCharVector.class);
+
+            ids.set(0, 1);
+            nameVec.setSafe(0, "alice".getBytes());
+            ageVec.set(0, 30);
+            structVec.setIndexDefined(0);
+
+            ids.set(1, 2);
+            structVec.setNull(1);
+
+            ids.set(2, 3);
+            nameVec.setSafe(2, "charlie".getBytes());
+            ageVec.set(2, 25);
+            structVec.setIndexDefined(2);
+
+            structVec.setValueCount(3);
+            root.setRowCount(3);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            try (VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+                assertEquals(3, batch.getRowCount());
+                assertEquals(2, batch.getFieldVectors().size());
+
+                IntVector readIds = (IntVector) batch.getVector("id");
+                assertEquals(1, readIds.get(0));
+                assertEquals(2, readIds.get(1));
+                assertEquals(3, readIds.get(2));
+
+                org.apache.arrow.vector.complex.StructVector readInfo =
+                    (org.apache.arrow.vector.complex.StructVector) batch.getVector("info");
+                assertFalse(readInfo.isNull(0));
+                assertTrue(readInfo.isNull(1));
+                assertFalse(readInfo.isNull(2));
+            }
+        }
+    }
 }

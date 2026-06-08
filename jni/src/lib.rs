@@ -661,15 +661,23 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderExpor
         let rh = unsafe { &*(handle as *const ReaderHandle) };
         let reader = &*rh.reader;
         let schema = reader.schema();
-        let fields: Vec<arrow_schema::Field> = schema
-            .original_order
-            .iter()
-            .map(|&i| {
-                let c = &schema.columns[i];
-                arrow_schema::Field::new(&c.name, c.data_type.clone(), c.nullable)
-            })
-            .collect();
-        let arrow_schema = Schema::new(fields);
+        let arrow_schema = if let Some(ref orig) = schema.original_columns {
+            let fields: Vec<arrow_schema::Field> = orig
+                .iter()
+                .map(|(name, dt, nullable)| arrow_schema::Field::new(name, dt.clone(), *nullable))
+                .collect();
+            Schema::new(fields)
+        } else {
+            let fields: Vec<arrow_schema::Field> = schema
+                .original_order
+                .iter()
+                .map(|&i| {
+                    let c = &schema.columns[i];
+                    arrow_schema::Field::new(&c.name, c.data_type.clone(), c.nullable)
+                })
+                .collect();
+            Schema::new(fields)
+        };
         match FFI_ArrowSchema::try_from(&arrow_schema) {
             Ok(ffi_schema) => {
                 unsafe {
@@ -771,8 +779,35 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderSetPr
             }
             _ => Vec::new(),
         };
-        let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-        if let Err(e) = rh.reader.project(&col_refs) {
+        let schema = rh.reader.schema();
+        let mut fields = Vec::with_capacity(col_names.len());
+        for name in &col_names {
+            if let Some(mapping) = schema
+                .struct_mappings
+                .iter()
+                .find(|m| m.original_field.name() == name.as_str())
+            {
+                fields.push(mapping.original_field.clone());
+            } else if let Some(cols) = schema.original_columns.as_deref() {
+                if let Some((_, dt, nullable)) = cols.iter().find(|(n, _, _)| n == name) {
+                    fields.push(arrow_schema::Field::new(name, dt.clone(), *nullable));
+                } else {
+                    throw(&mut env, &format!("column '{}' not found", name));
+                    return;
+                }
+            } else if let Some(col) = schema.columns.iter().find(|c| c.name == *name) {
+                fields.push(arrow_schema::Field::new(
+                    name,
+                    col.data_type.clone(),
+                    col.nullable,
+                ));
+            } else {
+                throw(&mut env, &format!("column '{}' not found", name));
+                return;
+            }
+        }
+        let projected = arrow_schema::Schema::new(fields);
+        if let Err(e) = rh.reader.project_schema(&projected) {
             throw(&mut env, &format!("set projection failed: {}", e));
         }
     }));

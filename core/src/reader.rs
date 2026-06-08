@@ -18,7 +18,7 @@
 use std::io;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, StructArray};
 use arrow_schema::{DataType, Field, Schema};
 
 use crate::bucket_reader::{read_typed_value, read_variable_value, BucketReader, ColumnPageReader};
@@ -195,29 +195,57 @@ pub trait ReaderAccess {
         rg_index: usize,
         columns: &[usize],
     ) -> io::Result<RowGroupReader>;
+    fn row_group_reader_by_schema(
+        &self,
+        rg_index: usize,
+        projected: &Schema,
+    ) -> io::Result<RowGroupReader> {
+        let (output, read) = self.schema().resolve_schema_projection(projected)?;
+        self.row_group_reader_projected_with_output(rg_index, &read, &output)
+    }
+    fn row_group_reader_projected_with_output(
+        &self,
+        rg_index: usize,
+        read_indices: &[usize],
+        output_order: &[usize],
+    ) -> io::Result<RowGroupReader>;
     fn row_group_reader_by_names(
         &self,
         rg_index: usize,
         column_names: &[&str],
     ) -> io::Result<RowGroupReader> {
         let schema = self.schema();
-        let mut indices = Vec::with_capacity(column_names.len());
+        let orig = schema.original_columns.as_deref();
+        let mut fields = Vec::with_capacity(column_names.len());
         for name in column_names {
-            let idx = schema
-                .columns
+            if let Some(mapping) = schema
+                .struct_mappings
                 .iter()
-                .position(|c| c.name == *name)
-                .ok_or_else(|| {
-                    io::Error::new(
+                .find(|m| m.original_field.name() == *name)
+            {
+                fields.push(mapping.original_field.clone());
+            } else if let Some(cols) = orig {
+                if let Some((_, dt, nullable)) = cols.iter().find(|(n, _, _)| n == *name) {
+                    fields.push(Field::new(*name, dt.clone(), *nullable));
+                } else {
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("column '{}' not found in schema", name),
-                    )
-                })?;
-            indices.push(idx);
+                        format!("column '{}' not found", name),
+                    ));
+                }
+            } else if let Some(col) = schema.columns.iter().find(|c| c.name == *name) {
+                fields.push(Field::new(*name, col.data_type.clone(), col.nullable));
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("column '{}' not found", name),
+                ));
+            }
         }
-        self.row_group_reader_projected(rg_index, &indices)
+        let projected = Schema::new(fields);
+        self.row_group_reader_by_schema(rg_index, &projected)
     }
-    fn project(&mut self, column_names: &[&str]) -> io::Result<()>;
+    fn project_schema(&mut self, projected: &Schema) -> io::Result<()>;
     fn row_group_stats(&self, rg_index: usize) -> io::Result<&[ColumnStats]>;
     fn row_group_num_rows(&self, rg_index: usize) -> io::Result<usize>;
 }
@@ -228,7 +256,9 @@ pub struct MosaicReader<I: InputFile> {
     row_group_metas: Vec<RowGroupMeta>,
     compression: u8,
     num_buckets: usize,
-    projected_columns: Option<Vec<usize>>,
+    /// (output_order, read_indices) — output_order is user-requested columns for output ordering;
+    /// read_indices includes auto-added __null__ columns needed for STRUCT reassembly.
+    projected_columns: Option<(Vec<usize>, Vec<usize>)>,
 }
 
 fn read_range(input: &dyn InputFile, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -423,23 +453,9 @@ impl<I: InputFile> MosaicReader<I> {
         })
     }
 
-    pub fn project(&mut self, column_names: &[&str]) -> io::Result<()> {
-        let mut indices = Vec::with_capacity(column_names.len());
-        for name in column_names {
-            let idx = self
-                .schema
-                .columns
-                .iter()
-                .position(|c| c.name == *name)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("column '{}' not found in schema", name),
-                    )
-                })?;
-            indices.push(idx);
-        }
-        self.projected_columns = Some(indices);
+    pub fn project_schema(&mut self, projected: &Schema) -> io::Result<()> {
+        let (output, read) = self.schema.resolve_schema_projection(projected)?;
+        self.projected_columns = Some((output, read));
         Ok(())
     }
 
@@ -547,16 +563,30 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
 
     fn row_group_reader(&self, rg_index: usize) -> io::Result<RowGroupReader> {
         match &self.projected_columns {
-            Some(cols) => self.row_group_reader_projected(rg_index, cols),
-            None => self.row_group_reader_projected(rg_index, &self.schema.original_order),
+            Some((output, read)) => {
+                self.row_group_reader_projected_with_output(rg_index, read, output)
+            }
+            None => {
+                let order = &self.schema.original_order;
+                self.row_group_reader_projected_with_output(rg_index, order, order)
+            }
         }
     }
 
-    #[allow(clippy::needless_range_loop)]
     fn row_group_reader_projected(
         &self,
         rg_index: usize,
         columns: &[usize],
+    ) -> io::Result<RowGroupReader> {
+        self.row_group_reader_projected_with_output(rg_index, columns, columns)
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn row_group_reader_projected_with_output(
+        &self,
+        rg_index: usize,
+        columns: &[usize],
+        output_order: &[usize],
     ) -> io::Result<RowGroupReader> {
         if rg_index >= self.row_group_metas.len() {
             return Err(io::Error::new(
@@ -1003,27 +1033,13 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
             num_cols,
             meta.num_rows,
             projected,
-            columns.to_vec(),
+            output_order.to_vec(),
         ))
     }
 
-    fn project(&mut self, column_names: &[&str]) -> io::Result<()> {
-        let mut indices = Vec::with_capacity(column_names.len());
-        for name in column_names {
-            let idx = self
-                .schema
-                .columns
-                .iter()
-                .position(|c| c.name == *name)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("column '{}' not found in schema", name),
-                    )
-                })?;
-            indices.push(idx);
-        }
-        self.projected_columns = Some(indices);
+    fn project_schema(&mut self, projected: &Schema) -> io::Result<()> {
+        let (output, read) = self.schema.resolve_schema_projection(projected)?;
+        self.projected_columns = Some((output, read));
         Ok(())
     }
 }
@@ -1077,6 +1093,81 @@ impl RowGroupReader {
 
     pub fn num_rows(&self) -> usize {
         self.num_rows
+    }
+
+    fn reassemble_struct_recursive(
+        struct_fields: &arrow_schema::Fields,
+        id_arrays: &[(u32, ArrayRef)],
+        null_buf: Option<arrow_buffer::NullBuffer>,
+        name: &str,
+        nullable: bool,
+        base_id: u32,
+    ) -> Option<(ArrayRef, Field)> {
+        let mut ordered_fields: Vec<Arc<Field>> = Vec::new();
+        let mut ordered_children: Vec<ArrayRef> = Vec::new();
+
+        let mut field_id = base_id + 1; // first child ID = parent + 1
+        for field in struct_fields.iter() {
+            let cur_id = field_id;
+            field_id += 1;
+
+            if let DataType::Struct(inner_fields) = field.data_type() {
+                if !crate::types::is_timestamp_nanos_struct(inner_fields) {
+                    // Nested STRUCT: look for __null__ by cur_id, then recurse
+                    let inner_null_buf =
+                        id_arrays
+                            .iter()
+                            .find(|(id, _)| *id == cur_id)
+                            .and_then(|(_, arr)| {
+                                arr.as_any().downcast_ref::<BooleanArray>().map(|ba| {
+                                    let num = ba.len();
+                                    let mut bm = vec![0u8; num.div_ceil(8)];
+                                    for i in 0..num {
+                                        if ba.value(i) {
+                                            bm[i / 8] |= 1 << (i % 8);
+                                        }
+                                    }
+                                    arrow_buffer::NullBuffer::new(arrow_buffer::BooleanBuffer::new(
+                                        arrow_buffer::Buffer::from_vec(bm),
+                                        0,
+                                        num,
+                                    ))
+                                })
+                            });
+
+                    if let Some((arr, child_field)) = Self::reassemble_struct_recursive(
+                        inner_fields,
+                        id_arrays,
+                        inner_null_buf,
+                        field.name(),
+                        field.is_nullable(),
+                        cur_id,
+                    ) {
+                        ordered_fields.push(Arc::new(child_field));
+                        ordered_children.push(arr);
+                    }
+
+                    // Skip past the subtree IDs
+                    field_id += crate::schema::MosaicSchema::count_tree_nodes(field.data_type());
+                    continue;
+                }
+            }
+
+            // Leaf field: find by column_id
+            if let Some(pos) = id_arrays.iter().position(|(id, _)| *id == cur_id) {
+                ordered_fields.push(field.clone());
+                ordered_children.push(id_arrays[pos].1.clone());
+            }
+        }
+
+        if ordered_children.is_empty() {
+            return None;
+        }
+
+        let projected_fields = arrow_schema::Fields::from(ordered_fields);
+        let struct_arr = StructArray::new(projected_fields.clone(), ordered_children, null_buf);
+        let field = Field::new(name, DataType::Struct(projected_fields), nullable);
+        Some((Arc::new(struct_arr) as ArrayRef, field))
     }
 
     pub fn read_columns(&mut self) -> io::Result<RecordBatch> {
@@ -1154,17 +1245,114 @@ impl RowGroupReader {
             }
         }
 
+        // Reassemble STRUCT columns from expanded sub-field arrays
+        let mut struct_arrays: Vec<(usize, ArrayRef, Field)> = Vec::new();
+        for mapping in &self.schema.struct_mappings {
+            let mut id_arrays: Vec<(u32, ArrayRef)> = Vec::new();
+            let mut null_bitmap: Option<ArrayRef> = None;
+
+            for &sorted_idx in &mapping.expanded_col_indices {
+                if mapping.null_col_sorted_idx == Some(sorted_idx) {
+                    null_bitmap = arrays[sorted_idx].take();
+                } else if let Some(arr) = arrays[sorted_idx].take() {
+                    let col_id = self.schema.columns[sorted_idx].column_id;
+                    id_arrays.push((col_id, arr));
+                }
+            }
+
+            if let DataType::Struct(struct_fields) = mapping.original_field.data_type() {
+                let null_buf = null_bitmap.and_then(|nb| {
+                    let bool_arr = nb.as_any().downcast_ref::<BooleanArray>()?;
+                    let mut bm = vec![0u8; bool_arr.len().div_ceil(8)];
+                    for i in 0..bool_arr.len() {
+                        if bool_arr.value(i) {
+                            bm[i / 8] |= 1 << (i % 8);
+                        }
+                    }
+                    Some(arrow_buffer::NullBuffer::new(
+                        arrow_buffer::BooleanBuffer::new(
+                            arrow_buffer::Buffer::from_vec(bm),
+                            0,
+                            bool_arr.len(),
+                        ),
+                    ))
+                });
+
+                if let Some((arr, field)) = Self::reassemble_struct_recursive(
+                    struct_fields,
+                    &id_arrays,
+                    null_buf,
+                    mapping.original_field.name(),
+                    mapping.original_field.is_nullable(),
+                    mapping.struct_id,
+                ) {
+                    struct_arrays.push((mapping.original_col_index, arr, field));
+                }
+            }
+        }
+
+        // Build output RecordBatch
         let mut fields = Vec::new();
         let mut batch_arrays = Vec::new();
-        for &i in &self.output_order {
-            if let Some(arr) = arrays[i].take() {
-                let col_meta = &self.schema.columns[i];
-                fields.push(Field::new(
-                    &col_meta.name,
-                    col_meta.data_type.clone(),
-                    col_meta.nullable,
-                ));
-                batch_arrays.push(arr);
+
+        if !self.schema.struct_mappings.is_empty() {
+            // Track which expanded indices are consumed by STRUCTs
+            let struct_expanded: std::collections::HashSet<usize> = self
+                .schema
+                .struct_mappings
+                .iter()
+                .flat_map(|m| m.expanded_col_indices.iter().copied())
+                .collect();
+
+            // Map the first projected expanded index of each STRUCT to its reassembled array.
+            // This ensures the STRUCT appears at the right position in output_order
+            // even when only some sub-fields are projected.
+            let mut struct_emit_idx: std::collections::HashMap<usize, (ArrayRef, Field)> =
+                std::collections::HashMap::new();
+            for (_, arr, field) in &struct_arrays {
+                if let Some(mapping) = self
+                    .schema
+                    .struct_mappings
+                    .iter()
+                    .find(|m| m.original_field.name() == field.name())
+                {
+                    if let Some(&first_in_output) = self
+                        .output_order
+                        .iter()
+                        .find(|idx| mapping.expanded_col_indices.contains(idx))
+                    {
+                        struct_emit_idx.insert(first_in_output, (arr.clone(), field.clone()));
+                    }
+                }
+            }
+
+            for &i in &self.output_order {
+                if struct_expanded.contains(&i) {
+                    if let Some((arr, field)) = struct_emit_idx.remove(&i) {
+                        fields.push(field);
+                        batch_arrays.push(arr);
+                    }
+                } else if let Some(arr) = arrays[i].take() {
+                    let col_meta = &self.schema.columns[i];
+                    fields.push(Field::new(
+                        &col_meta.name,
+                        col_meta.data_type.clone(),
+                        col_meta.nullable,
+                    ));
+                    batch_arrays.push(arr);
+                }
+            }
+        } else {
+            for &i in &self.output_order {
+                if let Some(arr) = arrays[i].take() {
+                    let col_meta = &self.schema.columns[i];
+                    fields.push(Field::new(
+                        &col_meta.name,
+                        col_meta.data_type.clone(),
+                        col_meta.nullable,
+                    ));
+                    batch_arrays.push(arr);
+                }
             }
         }
 

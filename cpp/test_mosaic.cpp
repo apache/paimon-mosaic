@@ -322,8 +322,15 @@ static void test_projection() {
     buf.data = data_vec;
     auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
 
-    const char* cols[] = {"c", "a", "b"};
-    reader.set_projection(cols, 3);
+    auto proj_schema = arrow::schema({
+        arrow::field("c", arrow::float64()),
+        arrow::field("a", arrow::int32()),
+        arrow::field("b", arrow::utf8()),
+    });
+    struct ArrowSchema c_schema;
+    auto export_status = arrow::ExportSchema(*proj_schema, &c_schema);
+    assert(export_status.ok());
+    reader.set_projection(&c_schema);
     auto rb = read_row_group(reader, 0);
     ASSERT_EQ(rb->num_columns(), 3);
     ASSERT_EQ(rb->num_rows(), 20);
@@ -355,7 +362,11 @@ static void test_projection_empty() {
     buf.data = data_vec;
     auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
 
-    reader.set_projection(nullptr, 0);
+    auto empty_schema = arrow::schema({});
+    struct ArrowSchema c_schema;
+    auto export_status = arrow::ExportSchema(*empty_schema, &c_schema);
+    assert(export_status.ok());
+    reader.set_projection(&c_schema);
     auto rb = read_row_group(reader, 0);
     ASSERT_EQ(rb->num_columns(), 0);
     ASSERT_EQ(rb->num_rows(), 5);
@@ -1059,6 +1070,70 @@ static void test_map_type() {
     printf("  PASS test_map_type\n");
 }
 
+static void test_struct_type() {
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::int32(), false),
+        arrow::field("info", arrow::struct_({
+            arrow::field("name", arrow::utf8()),
+            arrow::field("age", arrow::int32()),
+        }), true),
+    });
+
+    arrow::Int32Builder id_b;
+    assert(id_b.Append(1).ok());
+    assert(id_b.Append(2).ok());
+    assert(id_b.Append(3).ok());
+
+    auto name_b = std::make_shared<arrow::StringBuilder>();
+    auto age_b = std::make_shared<arrow::Int32Builder>();
+    std::vector<std::shared_ptr<arrow::ArrayBuilder>> field_builders = {name_b, age_b};
+    auto struct_type = arrow::struct_({
+        arrow::field("name", arrow::utf8()),
+        arrow::field("age", arrow::int32()),
+    });
+    arrow::StructBuilder struct_b(struct_type, arrow::default_memory_pool(), field_builders);
+
+    // Row 0: {name: "alice", age: 30}
+    assert(struct_b.Append().ok());
+    assert(name_b->Append("alice").ok());
+    assert(age_b->Append(30).ok());
+
+    // Row 1: null
+    assert(struct_b.AppendNull().ok());
+    assert(name_b->AppendNull().ok());
+    assert(age_b->AppendNull().ok());
+
+    // Row 2: {name: "charlie", age: 25}
+    assert(struct_b.Append().ok());
+    assert(name_b->Append("charlie").ok());
+    assert(age_b->Append(25).ok());
+
+    auto batch = arrow::RecordBatch::Make(schema, 3, {
+        id_b.Finish().ValueUnsafe(),
+        struct_b.Finish().ValueUnsafe(),
+    });
+
+    auto data_vec = write_and_get(schema, batch);
+
+    MemBuffer buf;
+    buf.data = data_vec;
+    auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
+    auto rb = read_row_group(reader, 0);
+    ASSERT_EQ(rb->num_rows(), 3);
+    ASSERT_EQ(rb->num_columns(), 2);
+
+    auto ids = std::static_pointer_cast<arrow::Int32Array>(rb->GetColumnByName("id"));
+    ASSERT_EQ(ids->Value(0), 1);
+    ASSERT_EQ(ids->Value(2), 3);
+
+    auto info = std::static_pointer_cast<arrow::StructArray>(rb->GetColumnByName("info"));
+    ASSERT_TRUE(!info->IsNull(0));
+    ASSERT_TRUE(info->IsNull(1));
+    ASSERT_TRUE(!info->IsNull(2));
+
+    printf("  PASS test_struct_type\n");
+}
+
 int main() {
     printf("Running Mosaic C++ tests...\n");
     test_basic_roundtrip();
@@ -1080,6 +1155,7 @@ int main() {
     test_array_with_null_elements();
     test_array_string_elements();
     test_map_type();
-    printf("All %d tests passed.\n", 19);
+    test_struct_type();
+    printf("All %d tests passed.\n", 20);
     return 0;
 }
