@@ -209,10 +209,24 @@ impl MosaicSchema {
             {
                 output.extend_from_slice(&mapping.expanded_col_indices);
             } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("column '{}' not found in schema", name),
-                ));
+                // Try prefix match for nested STRUCT paths (e.g. "info.addr")
+                let prefix = format!("{}.", name);
+                let matching: Vec<usize> = self
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| {
+                        c.name.starts_with(&prefix) || c.name == format!("{}.__null__", name)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if matching.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("column '{}' not found in schema", name),
+                    ));
+                }
+                output.extend(matching);
             }
         }
 

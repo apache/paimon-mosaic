@@ -273,6 +273,85 @@ class ColumnStatistics:
         return self.min is not None
 
 
+def _resolve_field(schema_or_type, path_parts):
+    """Resolve a dotted path against a schema or struct type, returning a pa.Field."""
+    name = path_parts[0]
+    rest = path_parts[1:]
+
+    if isinstance(schema_or_type, pa.Schema):
+        field = schema_or_type.field(name)
+    elif isinstance(schema_or_type, pa.StructType):
+        idx = schema_or_type.get_field_index(name)
+        if idx < 0:
+            raise KeyError(f"field '{name}' not found")
+        field = schema_or_type.field(idx)
+    else:
+        raise KeyError(f"cannot resolve '{name}' in non-struct type")
+
+    if not rest:
+        return field
+
+    if not isinstance(field.type, pa.StructType):
+        raise KeyError(f"field '{name}' is not a struct, cannot resolve '{'.'.join(rest)}'")
+
+    child = _resolve_field(field.type, rest)
+    return pa.field(
+        name,
+        pa.struct([child]),
+        nullable=field.nullable,
+    )
+
+
+def _build_projected_schema(original_schema, column_names):
+    """Build a projected PyArrow schema from dotted column paths."""
+    seen = {}
+    output_fields = []
+
+    for col in column_names:
+        parts = col.split(".")
+        root = parts[0]
+
+        if root in seen:
+            continue
+
+        try:
+            top_field = original_schema.field(root)
+        except KeyError:
+            continue
+
+        if len(parts) == 1:
+            seen[root] = True
+            output_fields.append(top_field)
+            continue
+
+        if not isinstance(top_field.type, pa.StructType):
+            seen[root] = True
+            output_fields.append(top_field)
+            continue
+
+        if root not in seen:
+            seen[root] = []
+
+        same_root = [c for c in column_names if c.startswith(root + ".")]
+        child_fields = []
+        child_names_seen = set()
+        for leaf in same_root:
+            leaf_parts = leaf.split(".")[1:]
+            child_name = leaf_parts[0]
+            if child_name in child_names_seen:
+                continue
+            child_names_seen.add(child_name)
+            child = _resolve_field(top_field.type, leaf_parts)
+            child_fields.append(child)
+
+        output_fields.append(
+            pa.field(root, pa.struct(child_fields), nullable=top_field.nullable)
+        )
+        seen[root] = True
+
+    return pa.schema(output_fields, metadata=original_schema.metadata)
+
+
 class MosaicReader:
 
     def __init__(self, handle, refs=None):
@@ -332,18 +411,19 @@ class MosaicReader:
         return out.value
 
     def project(self, columns):
-        """Set projection on the reader. Subsequent reads only return the named columns."""
+        """Set projection on the reader. Subsequent reads only return the named columns.
+
+        Supports top-level column names, original STRUCT names (e.g. ``"info"``),
+        STRUCT leaf paths (e.g. ``"info.name"``), and nested STRUCT paths
+        (e.g. ``"info.addr"``).
+        """
         column_names = list(columns)
         c_strs = [c.encode("utf-8") for c in column_names]
         arr = (ctypes.c_char_p * len(column_names))(*c_strs)
         rc = lib.mosaic_reader_set_projection(self._handle, arr, len(column_names))
         if rc != 0:
             _check_error("set_projection failed")
-        projected_field_names = list(dict.fromkeys(column_names))
-        self._projected_schema = pa.schema(
-            [self._schema.field(name) for name in projected_field_names],
-            metadata=self._schema.metadata,
-        )
+        self._projected_schema = _build_projected_schema(self._schema, column_names)
 
     def read_row_group(self, rg_index):
         rg_handle = lib.mosaic_reader_open_row_group(self._handle, rg_index)

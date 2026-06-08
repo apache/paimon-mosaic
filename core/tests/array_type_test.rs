@@ -2417,3 +2417,69 @@ fn test_struct_sliced_null_propagation() {
     assert!(age_out.is_null(0)); // propagated from struct null
     assert_eq!(age_out.value(1), 30); // valid value, not corrupted
 }
+
+#[test]
+fn test_struct_nested_path_projection() {
+    // Project "info.addr" as a nested STRUCT path (not a leaf)
+    let addr_type = DataType::Struct(arrow_schema::Fields::from(vec![
+        Field::new("city", DataType::Utf8, true),
+        Field::new("zip", DataType::Int32, true),
+    ]));
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("addr", addr_type.clone(), true),
+            ])),
+            true,
+        ),
+    ]);
+
+    let ids = Int32Array::from(vec![1, 2]);
+    let cities = StringArray::from(vec![Some("NYC"), Some("LA")]);
+    let zips = Int32Array::from(vec![Some(10001), Some(90001)]);
+    let addr = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("city", DataType::Utf8, true),
+            Field::new("zip", DataType::Int32, true),
+        ]),
+        vec![Arc::new(cities) as ArrayRef, Arc::new(zips) as ArrayRef],
+        None,
+    );
+    let names = StringArray::from(vec![Some("alice"), Some("bob")]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("addr", addr_type.clone(), true),
+        ]),
+        vec![Arc::new(names) as ArrayRef, Arc::new(addr) as ArrayRef],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids) as ArrayRef, Arc::new(info) as ArrayRef],
+    )
+    .unwrap();
+
+    // Project only "info.addr" — a nested STRUCT, not a leaf
+    let result = roundtrip_projected(&schema, &[batch], &["info.addr"]);
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 1);
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    let addr_out = info_out
+        .column_by_name("addr")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let city_out = addr_out
+        .column_by_name("city")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(city_out.value(0), "NYC");
+    assert_eq!(city_out.value(1), "LA");
+}
