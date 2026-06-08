@@ -70,6 +70,9 @@ pub struct MosaicSchema {
     pub original_order: Vec<usize>,
     /// STRUCT column expansion mappings
     pub struct_mappings: Vec<StructMapping>,
+    /// Column IDs of synthetic __null__ columns (STRUCT null bitmaps).
+    /// Used to distinguish __null__ columns from user columns without relying on names.
+    pub null_col_ids: Vec<u32>,
     /// Original columns BEFORE STRUCT expansion (for serialization to file)
     pub original_columns: Option<Vec<(String, DataType, bool)>>,
 }
@@ -97,6 +100,7 @@ impl MosaicSchema {
         // Expand STRUCT columns into independent flat columns with DFS column IDs
         let mut expanded: Vec<(String, u32, DataType, bool)> = Vec::new();
         let mut struct_mappings: Vec<StructMapping> = Vec::new();
+        let mut null_col_ids: Vec<u32> = Vec::new();
         let mut id_counter: u32 = 0;
 
         for (orig_idx, (name, dt, nullable)) in columns.iter().enumerate() {
@@ -109,6 +113,7 @@ impl MosaicSchema {
                     if has_null_col {
                         let null_name = format!("{}.__null__", name);
                         expanded.push((null_name, struct_id, DataType::Boolean, false));
+                        null_col_ids.push(struct_id);
                     }
                     let field_start = expanded.len();
                     Self::expand_struct_fields_recursive(
@@ -116,13 +121,14 @@ impl MosaicSchema {
                         fields,
                         &mut id_counter,
                         &mut expanded,
+                        &mut null_col_ids,
                     );
                     let end = expanded.len();
 
                     let expanded_indices: Vec<usize> = (start..end).collect();
                     let field_ids: Vec<u32> = expanded[field_start..end]
                         .iter()
-                        .filter(|(n, _, _, _)| !n.ends_with(".__null__"))
+                        .filter(|(_, id, _, _)| !null_col_ids.contains(id))
                         .map(|(_, id, _, _)| *id)
                         .collect();
 
@@ -144,6 +150,7 @@ impl MosaicSchema {
 
         let mut schema = Self::new_with_ids(expanded, num_buckets);
         schema.struct_mappings = struct_mappings;
+        schema.null_col_ids = null_col_ids;
 
         // Fix struct_mappings expanded_col_indices and null_col_sorted_idx to sorted positions
         for mapping in &mut schema.struct_mappings {
@@ -171,6 +178,7 @@ impl MosaicSchema {
         fields: &arrow_schema::Fields,
         id_counter: &mut u32,
         out: &mut Vec<(String, u32, DataType, bool)>,
+        null_col_ids: &mut Vec<u32>,
     ) {
         for field in fields.iter() {
             let field_id = *id_counter;
@@ -182,8 +190,15 @@ impl MosaicSchema {
                     if field.is_nullable() {
                         let null_name = format!("{}.__null__", full_name);
                         out.push((null_name, field_id, DataType::Boolean, false));
+                        null_col_ids.push(field_id);
                     }
-                    Self::expand_struct_fields_recursive(&full_name, inner_fields, id_counter, out);
+                    Self::expand_struct_fields_recursive(
+                        &full_name,
+                        inner_fields,
+                        id_counter,
+                        out,
+                        null_col_ids,
+                    );
                     continue;
                 }
             }
@@ -233,9 +248,8 @@ impl MosaicSchema {
             } else {
                 // Non-STRUCT column: find by name in original schema
                 let orig = self.original_columns.as_deref();
-                let found = orig.is_some_and(|cols| {
-                    cols.iter().any(|(n, _, _)| n == proj_field.name())
-                });
+                let found =
+                    orig.is_some_and(|cols| cols.iter().any(|(n, _, _)| n == proj_field.name()));
                 if found || self.struct_mappings.is_empty() {
                     if let Some(idx) = self
                         .columns
@@ -275,7 +289,7 @@ impl MosaicSchema {
         }
         // Also add nested __null__ columns
         for (col_idx, col) in self.columns.iter().enumerate() {
-            if col.name.ends_with(".__null__") && !read.contains(&col_idx) {
+            if self.null_col_ids.contains(&col.column_id) && !read.contains(&col_idx) {
                 let nested_struct_id = col.column_id;
                 let has_descendant = read.iter().any(|&idx| {
                     let cid = self.columns[idx].column_id;
@@ -436,6 +450,7 @@ impl MosaicSchema {
             bucket_to_global,
             original_order,
             struct_mappings: Vec::new(),
+            null_col_ids: Vec::new(),
             original_columns: None,
         }
     }
@@ -583,6 +598,7 @@ impl MosaicSchema {
                 bucket_to_global,
                 original_order,
                 struct_mappings: Vec::new(),
+                null_col_ids: Vec::new(),
                 original_columns: None,
             };
             return Ok(schema);
@@ -599,6 +615,7 @@ impl MosaicSchema {
         // Expand STRUCTs using the same logic as from_arrow (with DFS IDs)
         let mut expanded: Vec<(String, u32, DataType, bool)> = Vec::new();
         let mut struct_mappings: Vec<StructMapping> = Vec::new();
+        let mut null_col_ids: Vec<u32> = Vec::new();
         let mut id_counter: u32 = 0;
 
         for (orig_idx, (name, dt, nullable)) in input_columns.iter().enumerate() {
@@ -611,6 +628,7 @@ impl MosaicSchema {
                     if has_null_col {
                         let null_name = format!("{}.__null__", name);
                         expanded.push((null_name, struct_id, DataType::Boolean, false));
+                        null_col_ids.push(struct_id);
                     }
                     let field_start = expanded.len();
                     Self::expand_struct_fields_recursive(
@@ -618,13 +636,14 @@ impl MosaicSchema {
                         fields,
                         &mut id_counter,
                         &mut expanded,
+                        &mut null_col_ids,
                     );
                     let end = expanded.len();
 
                     let expanded_indices: Vec<usize> = (start..end).collect();
                     let field_ids: Vec<u32> = expanded[field_start..end]
                         .iter()
-                        .filter(|(n, _, _, _)| !n.ends_with(".__null__"))
+                        .filter(|(_, id, _, _)| !null_col_ids.contains(id))
                         .map(|(_, id, _, _)| *id)
                         .collect();
 
@@ -647,6 +666,7 @@ impl MosaicSchema {
 
         let mut schema = Self::new_with_ids(expanded, num_buckets);
         schema.struct_mappings = struct_mappings;
+        schema.null_col_ids = null_col_ids;
 
         for mapping in &mut schema.struct_mappings {
             mapping.expanded_col_indices = mapping
