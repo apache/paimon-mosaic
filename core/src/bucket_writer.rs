@@ -37,10 +37,19 @@ pub struct PagedBucketOutput {
     pub children: Vec<ChildColumnMeta>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildColumnRole {
+    ListElement,
+    MapKey,
+    MapValue,
+}
+
+#[derive(Clone, Debug)]
 pub struct ChildColumnMeta {
     pub parent_logical_col: usize,
     pub physical_index: usize,
+    pub length_physical_index: usize,
+    pub role: ChildColumnRole,
     pub element_field: Arc<Field>,
     pub num_elements: usize,
 }
@@ -117,6 +126,30 @@ impl BucketWriter {
         &self.children
     }
 
+    fn find_child_index(
+        &self,
+        parent_logical_col: usize,
+        length_physical_index: usize,
+        role: ChildColumnRole,
+    ) -> io::Result<usize> {
+        self.children
+            .iter()
+            .position(|c| {
+                c.parent_logical_col == parent_logical_col
+                    && c.length_physical_index == length_physical_index
+                    && c.role == role
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "missing complex child column: parent={}, length={}, role={:?}",
+                        parent_logical_col, length_physical_index, role
+                    ),
+                )
+            })
+    }
+
     fn col_num_rows(&self, col: usize) -> usize {
         if col < self.num_primary {
             self.num_rows
@@ -157,9 +190,9 @@ impl BucketWriter {
         struct ColSplit {
             col: usize,
             lengths: Int32Array,
-            child_arrays: Vec<ArrayRef>, // 1 for List, 2 for Map (keys + values)
         }
         let mut splits: Vec<ColSplit> = Vec::new();
+        let mut pending: Vec<(usize, ArrayRef)> = Vec::new();
         let mut seen_cols = Vec::new();
         for child in &self.children {
             let col = child.parent_logical_col;
@@ -178,11 +211,10 @@ impl BucketWriter {
                         })?;
                     let lengths = extract_list_lengths(list_array);
                     let values = flatten_list_values(list_array);
-                    splits.push(ColSplit {
-                        col,
-                        lengths,
-                        child_arrays: vec![values],
-                    });
+                    splits.push(ColSplit { col, lengths });
+                    let child_idx =
+                        self.find_child_index(col, col, ChildColumnRole::ListElement)?;
+                    pending.push((child_idx, values));
                 }
                 DataType::Map(_, _) => {
                     let map_array =
@@ -194,11 +226,11 @@ impl BucketWriter {
                             })?;
                     let lengths = extract_map_lengths(map_array);
                     let (keys, values) = flatten_map_entries(map_array);
-                    splits.push(ColSplit {
-                        col,
-                        lengths,
-                        child_arrays: vec![keys, values],
-                    });
+                    splits.push(ColSplit { col, lengths });
+                    let key_idx = self.find_child_index(col, col, ChildColumnRole::MapKey)?;
+                    let value_idx = self.find_child_index(col, col, ChildColumnRole::MapValue)?;
+                    pending.push((key_idx, keys));
+                    pending.push((value_idx, values));
                 }
                 _ => {}
             }
@@ -214,23 +246,7 @@ impl BucketWriter {
             }
         }
 
-        // Write child columns — for List: 1 child (values), for Map: 2 children (keys, values)
-        let mut pending: Vec<(usize, ArrayRef)> = Vec::new();
-        for split in &splits {
-            let parent_children: Vec<usize> = self
-                .children
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.parent_logical_col == split.col)
-                .map(|(idx, _)| idx)
-                .collect();
-            for (i, child_arr) in split.child_arrays.iter().enumerate() {
-                if i < parent_children.len() {
-                    pending.push((parent_children[i], child_arr.clone()));
-                }
-            }
-        }
-
+        // Write child columns. Nested children are located through explicit layout metadata.
         while let Some((child_idx, values)) = pending.pop() {
             if child_idx >= self.children.len() || values.is_empty() {
                 continue;
@@ -249,9 +265,12 @@ impl BucketWriter {
                     total_size +=
                         self.append_array_column(phys_idx, &inner_lengths, &int32_dt, child_start)?;
                     self.children[child_idx].num_elements += inner_lengths.len();
-                    if child_idx + 1 < self.children.len() {
-                        pending.push((child_idx + 1, inner_values));
-                    }
+                    let nested_idx = self.find_child_index(
+                        self.children[child_idx].parent_logical_col,
+                        phys_idx,
+                        ChildColumnRole::ListElement,
+                    )?;
+                    pending.push((nested_idx, inner_values));
                 }
                 DataType::Map(_, _) => {
                     let inner_map =
@@ -263,13 +282,13 @@ impl BucketWriter {
                     total_size +=
                         self.append_array_column(phys_idx, &inner_lengths, &int32_dt, child_start)?;
                     self.children[child_idx].num_elements += inner_lengths.len();
-                    // Queue keys and values for the next children
-                    if child_idx + 2 < self.children.len() {
-                        pending.push((child_idx + 2, inner_values));
-                    }
-                    if child_idx + 1 < self.children.len() {
-                        pending.push((child_idx + 1, inner_keys));
-                    }
+                    let parent = self.children[child_idx].parent_logical_col;
+                    let key_idx =
+                        self.find_child_index(parent, phys_idx, ChildColumnRole::MapKey)?;
+                    let value_idx =
+                        self.find_child_index(parent, phys_idx, ChildColumnRole::MapValue)?;
+                    pending.push((key_idx, inner_keys));
+                    pending.push((value_idx, inner_values));
                 }
                 _ => {
                     let elem_dt = self.children[child_idx].element_field.data_type().clone();
@@ -1449,27 +1468,47 @@ pub(crate) fn expand_col_types(col_types: &[&DataType]) -> (Vec<DataType>, Vec<C
     let mut children = Vec::new();
 
     for (i, t) in col_types.iter().enumerate() {
-        expand_type(i, t, &mut physical_types, &mut children);
+        expand_container(i, i, t, &mut physical_types, &mut children);
     }
     (physical_types, children)
 }
 
-fn expand_type(
+fn expand_container(
     parent_logical: usize,
+    length_physical_index: usize,
     dt: &DataType,
     physical_types: &mut Vec<DataType>,
     children: &mut Vec<ChildColumnMeta>,
 ) {
     match dt {
         DataType::List(element_field) => {
-            expand_element(parent_logical, element_field, physical_types, children);
+            expand_element(
+                parent_logical,
+                length_physical_index,
+                ChildColumnRole::ListElement,
+                element_field,
+                physical_types,
+                children,
+            );
         }
         DataType::Map(entries_field, _) => {
             if let DataType::Struct(fields) = entries_field.data_type() {
-                // Keys child — recurse if key is complex
-                expand_element(parent_logical, &fields[0], physical_types, children);
-                // Values child — recurse if value is complex
-                expand_element(parent_logical, &fields[1], physical_types, children);
+                expand_element(
+                    parent_logical,
+                    length_physical_index,
+                    ChildColumnRole::MapKey,
+                    &fields[0],
+                    physical_types,
+                    children,
+                );
+                expand_element(
+                    parent_logical,
+                    length_physical_index,
+                    ChildColumnRole::MapValue,
+                    &fields[1],
+                    physical_types,
+                    children,
+                );
             }
         }
         _ => {}
@@ -1478,6 +1517,8 @@ fn expand_type(
 
 fn expand_element(
     parent_logical: usize,
+    length_physical_index: usize,
+    role: ChildColumnRole,
     element_field: &Arc<Field>,
     physical_types: &mut Vec<DataType>,
     children: &mut Vec<ChildColumnMeta>,
@@ -1492,10 +1533,18 @@ fn expand_element(
             children.push(ChildColumnMeta {
                 parent_logical_col: parent_logical,
                 physical_index: child_phys_idx,
+                length_physical_index,
+                role,
                 element_field: element_field.clone(),
                 num_elements: 0,
             });
-            expand_type(parent_logical, elem_dt, physical_types, children);
+            expand_container(
+                parent_logical,
+                child_phys_idx,
+                elem_dt,
+                physical_types,
+                children,
+            );
         }
         _ => {
             // Primitive element: direct leaf column
@@ -1503,6 +1552,8 @@ fn expand_element(
             children.push(ChildColumnMeta {
                 parent_logical_col: parent_logical,
                 physical_index: child_phys_idx,
+                length_physical_index,
+                role,
                 element_field: element_field.clone(),
                 num_elements: 0,
             });
@@ -1557,6 +1608,53 @@ mod tests {
     fn header_size(_data: &[u8]) -> usize {
         // No header for non-ARRAY buckets (v1 compatible)
         0
+    }
+
+    #[test]
+    fn test_expand_col_types_records_explicit_child_layout() {
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(arrow_schema::Fields::from(vec![
+                    Field::new("keys", DataType::Int32, false),
+                    Field::new(
+                        "values",
+                        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                        true,
+                    ),
+                ])),
+                false,
+            )),
+            false,
+        );
+        let list_type = DataType::List(Arc::new(Field::new("item", map_type, true)));
+        let col_refs = vec![&list_type];
+
+        let (physical_types, children) = expand_col_types(&col_refs);
+
+        assert_eq!(
+            physical_types,
+            vec![
+                DataType::Int32,
+                DataType::Int32,
+                DataType::Int32,
+                DataType::Int32,
+                DataType::Utf8,
+            ]
+        );
+        assert_eq!(children.len(), 4);
+        assert_eq!(children[0].role, ChildColumnRole::ListElement);
+        assert_eq!(children[0].physical_index, 1);
+        assert_eq!(children[0].length_physical_index, 0);
+        assert_eq!(children[1].role, ChildColumnRole::MapKey);
+        assert_eq!(children[1].physical_index, 2);
+        assert_eq!(children[1].length_physical_index, 1);
+        assert_eq!(children[2].role, ChildColumnRole::MapValue);
+        assert_eq!(children[2].physical_index, 3);
+        assert_eq!(children[2].length_physical_index, 1);
+        assert_eq!(children[3].role, ChildColumnRole::ListElement);
+        assert_eq!(children[3].physical_index, 4);
+        assert_eq!(children[3].length_physical_index, 3);
     }
 
     #[test]
