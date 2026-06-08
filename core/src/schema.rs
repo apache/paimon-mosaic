@@ -103,7 +103,12 @@ impl MosaicSchema {
                         expanded.push((null_name, struct_id, DataType::Boolean, false));
                     }
                     let field_start = expanded.len();
-                    Self::expand_struct_fields_recursive(fields, &mut id_counter, &mut expanded);
+                    Self::expand_struct_fields_recursive(
+                        name,
+                        fields,
+                        &mut id_counter,
+                        &mut expanded,
+                    );
                     let end = expanded.len();
 
                     let expanded_indices: Vec<usize> = (start..end).collect();
@@ -152,6 +157,7 @@ impl MosaicSchema {
     }
 
     fn expand_struct_fields_recursive(
+        prefix: &str,
         fields: &arrow_schema::Fields,
         id_counter: &mut u32,
         out: &mut Vec<(String, u32, DataType, bool)>,
@@ -159,6 +165,7 @@ impl MosaicSchema {
         for field in fields.iter() {
             let field_id = *id_counter;
             *id_counter += 1;
+            let full_name = format!("{}.{}", prefix, field.name());
             let dt = field.data_type();
             if let DataType::Struct(inner_fields) = dt {
                 if !types::is_timestamp_nanos_struct(inner_fields) {
@@ -166,11 +173,11 @@ impl MosaicSchema {
                         let null_name = format!("__null__({})", field_id);
                         out.push((null_name, field_id, DataType::Boolean, false));
                     }
-                    Self::expand_struct_fields_recursive(inner_fields, id_counter, out);
+                    Self::expand_struct_fields_recursive(&full_name, inner_fields, id_counter, out);
                     continue;
                 }
             }
-            out.push((field.name().clone(), field_id, dt.clone(), true));
+            out.push((full_name, field_id, dt.clone(), true));
         }
     }
 
@@ -590,7 +597,12 @@ impl MosaicSchema {
                         expanded.push((null_name, struct_id, DataType::Boolean, false));
                     }
                     let field_start = expanded.len();
-                    Self::expand_struct_fields_recursive(fields, &mut id_counter, &mut expanded);
+                    Self::expand_struct_fields_recursive(
+                        name,
+                        fields,
+                        &mut id_counter,
+                        &mut expanded,
+                    );
                     let end = expanded.len();
 
                     let expanded_indices: Vec<usize> = (start..end).collect();
