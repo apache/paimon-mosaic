@@ -145,6 +145,25 @@ impl<S: OutputFile> MosaicWriter<S> {
                     io::Error::new(io::ErrorKind::InvalidInput, "expected StructArray")
                 })?;
 
+            // Validate non-nullable STRUCT parent
+            if !mapping.original_field.is_nullable() && struct_arr.null_count() > 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "non-nullable STRUCT column '{}' has {} null rows in batch",
+                        mapping.original_field.name(),
+                        struct_arr.null_count()
+                    ),
+                ));
+            }
+
+            // Validate non-nullable fields and nested STRUCTs
+            Self::validate_struct_nullability(
+                struct_arr,
+                mapping.original_field.data_type(),
+                mapping.original_field.name(),
+            )?;
+
             // Extract all expanded arrays (including __null__ for each nullable STRUCT level)
             let mut flat_arrays = Vec::new();
             Self::extract_struct_expanded(
@@ -173,6 +192,63 @@ impl<S: OutputFile> MosaicWriter<S> {
     /// Recursively extract expanded arrays from a StructArray.
     /// For each nullable nested STRUCT, emits a __null__ BooleanArray before its fields.
     /// Propagates parent null to all children.
+    fn validate_struct_nullability(
+        struct_arr: &arrow_array::StructArray,
+        declared_type: &DataType,
+        path: &str,
+    ) -> io::Result<()> {
+        if let DataType::Struct(fields) = declared_type {
+            for (fi, field) in fields.iter().enumerate() {
+                let child = struct_arr.column(fi);
+                let child_path = format!("{}.{}", path, field.name());
+
+                if !field.is_nullable() {
+                    let effective_nulls = if struct_arr.null_count() > 0 {
+                        (0..struct_arr.len())
+                            .filter(|&i| !struct_arr.is_null(i) && child.is_null(i))
+                            .count()
+                    } else {
+                        child.null_count()
+                    };
+                    if effective_nulls > 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "non-nullable STRUCT field '{}' has {} null values in batch",
+                                child_path, effective_nulls
+                            ),
+                        ));
+                    }
+                }
+
+                if let DataType::Struct(inner_fields) = field.data_type() {
+                    if !crate::types::is_timestamp_nanos_struct(inner_fields) {
+                        if let Some(inner) =
+                            child.as_any().downcast_ref::<arrow_array::StructArray>()
+                        {
+                            if !field.is_nullable() && inner.null_count() > 0 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!(
+                                        "non-nullable STRUCT column '{}' has {} null rows in batch",
+                                        child_path,
+                                        inner.null_count()
+                                    ),
+                                ));
+                            }
+                            Self::validate_struct_nullability(
+                                inner,
+                                field.data_type(),
+                                &child_path,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn extract_struct_expanded(
         struct_arr: &arrow_array::StructArray,
         emit_null_col: bool,

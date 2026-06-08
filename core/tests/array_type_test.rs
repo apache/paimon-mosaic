@@ -2287,3 +2287,80 @@ fn test_struct_leaf_stats() {
         other => panic!("expected Some(Integer(30)), got {:?}", other),
     }
 }
+
+#[test]
+fn test_non_nullable_struct_leaf_rejects_nulls() {
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+            "age",
+            DataType::Int32,
+            false,
+        )])),
+        true,
+    )]);
+
+    let ages = Int32Array::from(vec![Some(1), None]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![Field::new("age", DataType::Int32, true)]),
+        vec![Arc::new(ages) as ArrayRef],
+        None,
+    );
+    let batch_schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+            "age",
+            DataType::Int32,
+            true,
+        )])),
+        true,
+    )]);
+    let batch =
+        RecordBatch::try_new(Arc::new(batch_schema), vec![Arc::new(info) as ArrayRef]).unwrap();
+
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(out, &schema, WriterOptions::default()).unwrap();
+    let result = writer.write_batch(&batch);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("non-nullable STRUCT field"), "got: {}", err);
+}
+
+#[test]
+fn test_non_nullable_struct_parent_rejects_nulls() {
+    let schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+            "age",
+            DataType::Int32,
+            true,
+        )])),
+        false, // non-nullable STRUCT
+    )]);
+
+    let ages = Int32Array::from(vec![Some(1), Some(2)]);
+    let null_buf = NullBuffer::new(BooleanBuffer::new(Buffer::from(vec![0b0000_0001]), 0, 2));
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![Field::new("age", DataType::Int32, true)]),
+        vec![Arc::new(ages) as ArrayRef],
+        Some(null_buf),
+    );
+    let batch_schema = Schema::new(vec![Field::new(
+        "info",
+        DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+            "age",
+            DataType::Int32,
+            true,
+        )])),
+        true,
+    )]);
+    let batch =
+        RecordBatch::try_new(Arc::new(batch_schema), vec![Arc::new(info) as ArrayRef]).unwrap();
+
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(out, &schema, WriterOptions::default()).unwrap();
+    let result = writer.write_batch(&batch);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("non-nullable STRUCT column"), "got: {}", err);
+}
