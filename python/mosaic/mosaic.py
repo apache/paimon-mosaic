@@ -276,17 +276,30 @@ class ColumnStatistics:
 def _build_projected_schema(original_schema, column_names):
     """Build a projected PyArrow schema from dotted column paths.
 
+    Uses exact-match-first strategy (like ORC/Parquet): if a column name
+    exactly matches a top-level field (even if it contains '.'), it is
+    returned directly. Otherwise, the name is split on '.' and resolved
+    as a STRUCT field path.
+
     Merges multiple leaves under the same nested STRUCT parent recursively.
     For example, ["info.addr.city", "info.addr.zip"] produces
     info: struct<addr: struct<city, zip>>.
     """
-    seen_roots = set()
+    all_top_names = {original_schema.field(i).name for i in range(len(original_schema))}
+    seen = set()
     output_fields = []
 
     for col in column_names:
+        # Exact match first: handles top-level column names containing '.'
+        if col in all_top_names:
+            if col not in seen:
+                seen.add(col)
+                output_fields.append(original_schema.field(col))
+            continue
+
         parts = col.split(".")
         root = parts[0]
-        if root in seen_roots:
+        if root in seen:
             continue
 
         try:
@@ -295,12 +308,13 @@ def _build_projected_schema(original_schema, column_names):
             continue
 
         if len(parts) == 1 or not isinstance(top_field.type, pa.StructType):
-            seen_roots.add(root)
+            seen.add(root)
             output_fields.append(top_field)
             continue
 
-        seen_roots.add(root)
-        same_root = [c.split(".")[1:] for c in column_names if c.startswith(root + ".")]
+        seen.add(root)
+        same_root = [c.split(".")[1:] for c in column_names
+                     if c.startswith(root + ".") and c not in all_top_names]
         projected = _project_struct_type(top_field.type, same_root)
         output_fields.append(pa.field(root, projected, nullable=top_field.nullable))
 

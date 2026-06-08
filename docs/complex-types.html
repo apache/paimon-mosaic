@@ -272,32 +272,33 @@ DFS IDs:
   4: city     (addr.city)
   5: zip      (addr.zip)</code></pre>
             <p>
-                Expanded physical columns use the original field name (not dot-separated paths).
-                Internal <code>__null__</code> columns are named <code>__null__(&lt;struct_id&gt;)</code>
-                to associate them with their STRUCT node. All internal column matching &mdash;
+                Expanded physical columns use dot-prefixed names (e.g. <code>info.name</code>)
+                for sorting and bucket assignment. Nullable STRUCT levels get a
+                <code>&lt;name&gt;.__null__</code> column. All internal column matching &mdash;
                 projection resolution, STRUCT reassembly, null bitmap lookup &mdash; uses column IDs,
-                not names.
+                not names. Column names may be non-unique when a top-level column name coincides
+                with an expanded STRUCT path.
             </p>
 
             <h3>Physical Column Expansion</h3>
 <pre><code>STRUCT(name UTF8, age INT) as "info" (nullable) expands to:
-  __null__(1)    (Boolean, STRUCT null bitmap, struct_id=1)
-  age            (INT32, column_id=3)
-  name           (UTF8, column_id=2)
+  info.__null__    (Boolean, STRUCT null bitmap, column_id=1)
+  info.age         (INT32, column_id=3)
+  info.name        (UTF8, column_id=2)
 &rarr; 3 independent columns, sorted by name and distributed across buckets</code></pre>
 
             <h3>Nested STRUCT</h3>
             <p>
                 Nested STRUCT fields expand recursively.
-                Each nullable STRUCT level gets its own <code>__null__</code> column keyed by struct_id:
+                Each nullable STRUCT level gets its own <code>__null__</code> column:
             </p>
 <pre><code>STRUCT(name UTF8, addr STRUCT(city UTF8, zip INT) NULLABLE) as "info" (nullable):
 
-  __null__(1)          (Boolean)   &larr; info-level null (struct_id=1)
-  __null__(3)          (Boolean)   &larr; addr-level null (struct_id=3)
-  city                 (UTF8, column_id=4)
-  name                 (UTF8, column_id=2)
-  zip                  (INT32, column_id=5)
+  info.__null__          (Boolean)   &larr; info-level null (column_id=1)
+  info.addr.__null__     (Boolean)   &larr; addr-level null (column_id=3)
+  info.addr.city         (UTF8, column_id=4)
+  info.addr.zip          (INT32, column_id=5)
+  info.name              (UTF8, column_id=2)
 &rarr; 5 independent columns</code></pre>
             <p>
                 Per-level <code>__null__</code> columns preserve Arrow STRUCT null semantics:
@@ -386,7 +387,7 @@ DFS IDs:
                     </tr>
                     <tr>
                         <td>Null tracking</td>
-                        <td><code>__null__(&lt;id&gt;)</code> Boolean column per nullable STRUCT level</td>
+                        <td><code>&lt;name&gt;.__null__</code> Boolean column per nullable STRUCT level</td>
                         <td>PRESENT stream per STRUCT node</td>
                         <td>Definition level encodes null at each level</td>
                     </tr>
