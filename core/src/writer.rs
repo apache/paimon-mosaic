@@ -363,10 +363,20 @@ impl<S: OutputFile> MosaicWriter<S> {
         let stats_collector = if options.stats_columns.is_empty() {
             None
         } else {
-            let stat_names: Vec<&str> = options.stats_columns.iter().map(|s| s.as_str()).collect();
-            let (_, stat_indices) = schema.resolve_projection(&stat_names).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("stats_columns: {}", e))
-            })?;
+            let mut stat_indices = Vec::new();
+            for name in &options.stats_columns {
+                let idx = schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name == *name)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("stats_columns: column '{}' not found in schema", name),
+                        )
+                    })?;
+                stat_indices.push(idx);
+            }
             let mut cols: Vec<(usize, usize, arrow_schema::DataType)> = Vec::new();
             for idx in stat_indices {
                 let dt = &schema.columns[idx].data_type;

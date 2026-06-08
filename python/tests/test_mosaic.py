@@ -387,7 +387,7 @@ class TestProjection:
         data = _write_to_bytes(pa_schema, batch, opts)
 
         with _reader_from_bytes(data) as reader:
-            reader.project(["a", "b"])
+            reader.project(pa.schema([pa.field("a", pa.int32()), pa.field("b", pa.utf8())]))
 
             total_rows = 0
             for rg in range(reader.num_row_groups):
@@ -418,7 +418,7 @@ class TestProjection:
         data = _write_to_bytes(pa_schema, batch)
 
         with _reader_from_bytes(data) as reader:
-            reader.project(["b"])
+            reader.project(pa.schema([pa.field("b", pa.utf8())]))
             rb = reader.read_row_group(0)
             assert rb.num_columns == 1
             assert rb.num_rows == 10
@@ -445,7 +445,7 @@ class TestProjection:
         data = _write_to_bytes(pa_schema, batch, opts)
 
         with _reader_from_bytes(data) as reader:
-            reader.project(["c", "a", "b"])
+            reader.project(pa.schema([pa.field("c", pa.float64()), pa.field("a", pa.int32()), pa.field("b", pa.utf8())]))
             rb = reader.read_row_group(0)
             assert rb.num_columns == 3
             assert rb.schema.names == ["c", "a", "b"]
@@ -472,7 +472,7 @@ class TestProjection:
         data = _write_to_bytes(pa_schema, batch)
 
         with _reader_from_bytes(data) as reader:
-            reader.project([])
+            reader.project(pa.schema([]))
             rb = reader.read_row_group(0)
             assert rb.num_columns == 0
             assert rb.num_rows == 5
@@ -672,7 +672,7 @@ class TestConvenience:
         result = read_table(
             lambda offset, length: data[offset : offset + length],
             len(data),
-            columns=[],
+            columns=pa.schema([]),
         )
 
         assert result.num_columns == 0
@@ -696,7 +696,7 @@ class TestConvenience:
         empty_projection = read_table(
             lambda offset, length: data[offset : offset + length],
             len(data),
-            columns=[],
+            columns=pa.schema([]),
         )
         assert empty_projection.num_rows == 0
         assert empty_projection.num_columns == 0
@@ -705,7 +705,7 @@ class TestConvenience:
         name_projection = read_table(
             lambda offset, length: data[offset : offset + length],
             len(data),
-            columns=["name"],
+            columns=pa.schema([pa.field("name", pa.utf8())]),
         )
         assert name_projection.num_rows == 0
         assert name_projection.num_columns == 1
@@ -714,7 +714,7 @@ class TestConvenience:
         duplicate_projection = read_table(
             lambda offset, length: data[offset : offset + length],
             len(data),
-            columns=["name", "name"],
+            columns=pa.schema([pa.field("name", pa.utf8())]),
         )
         assert duplicate_projection.num_rows == 0
         assert duplicate_projection.num_columns == 1
@@ -722,7 +722,7 @@ class TestConvenience:
 
         with _reader_from_bytes(data) as reader:
             assert reader.num_row_groups == 0
-            reader.project(["name"])
+            reader.project(pa.schema([pa.field("name", pa.utf8())]))
             assert reader.schema.names == ["id", "name"]
             result = reader.read_all()
             assert result.schema.names == ["name"]
@@ -1191,7 +1191,7 @@ class TestWriter:
         data = _write_to_bytes(pa_schema, batch)
 
         with _reader_from_bytes(data) as reader:
-            reader.project(["info.name"])
+            reader.project(pa.schema([pa.field("info", pa.struct([pa.field("name", pa.utf8())]))]))
             rb = reader.read_row_group(0)
             assert rb.num_rows == 3
             assert rb.num_columns == 1
@@ -1233,7 +1233,7 @@ class TestWriter:
         data = _write_to_bytes(pa_schema, batch)
 
         with _reader_from_bytes(data) as reader:
-            reader.project(["info"])
+            reader.project(pa.schema([pa.field("info", pa.struct([pa.field("name", pa.utf8()), pa.field("age", pa.int32())]))]))
             rb = reader.read_row_group(0)
             assert rb.num_rows == 2
             assert rb.num_columns == 1
@@ -1280,7 +1280,7 @@ class TestWriter:
         data = _write_to_bytes(pa_schema, batch)
 
         with _reader_from_bytes(data) as reader:
-            reader.project(["info.addr.zip", "info.addr.city"])
+            reader.project(pa.schema([pa.field("info", pa.struct([pa.field("addr", pa.struct([pa.field("zip", pa.int32()), pa.field("city", pa.utf8())]))]))]))
             rb = reader.read_row_group(0)
             assert rb.num_rows == 2
             info = rb.column("info")
@@ -1290,10 +1290,3 @@ class TestWriter:
             assert cities == ["NYC", "LA"]
             assert zips == [10001, 90001]
 
-        # Verify _projected_schema also has both fields
-        from mosaic.mosaic import _build_projected_schema
-
-        ps = _build_projected_schema(pa_schema, ["info.addr.zip", "info.addr.city"])
-        info_type = ps.field("info").type
-        addr_type = info_type.field("addr").type
-        assert addr_type.num_fields == 2

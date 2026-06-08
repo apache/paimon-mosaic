@@ -273,93 +273,6 @@ class ColumnStatistics:
         return self.min is not None
 
 
-def _build_projected_schema(original_schema, column_names):
-    """Build a projected PyArrow schema from dotted column paths.
-
-    Uses exact-match-first strategy (like ORC/Parquet): if a column name
-    exactly matches a top-level field (even if it contains '.'), it is
-    returned directly. Otherwise, the name is split on '.' and resolved
-    as a STRUCT field path.
-
-    Merges multiple leaves under the same nested STRUCT parent recursively.
-    For example, ["info.addr.city", "info.addr.zip"] produces
-    info: struct<addr: struct<city, zip>>.
-    """
-    all_top_names = {original_schema.field(i).name for i in range(len(original_schema))}
-    seen = set()
-    output_fields = []
-
-    for col in column_names:
-        # Exact match first: handles top-level column names containing '.'
-        if col in all_top_names:
-            if col not in seen:
-                seen.add(col)
-                output_fields.append(original_schema.field(col))
-            continue
-
-        parts = col.split(".")
-        root = parts[0]
-        if root in seen:
-            continue
-
-        try:
-            top_field = original_schema.field(root)
-        except KeyError:
-            continue
-
-        if len(parts) == 1 or not isinstance(top_field.type, pa.StructType):
-            seen.add(root)
-            output_fields.append(top_field)
-            continue
-
-        seen.add(root)
-        same_root = [c.split(".")[1:] for c in column_names
-                     if c.startswith(root + ".") and c not in all_top_names]
-        projected = _project_struct_type(top_field.type, same_root)
-        output_fields.append(pa.field(root, projected, nullable=top_field.nullable))
-
-    return pa.schema(output_fields, metadata=original_schema.metadata)
-
-
-def _project_struct_type(struct_type, sub_paths):
-    """Build a partial struct type from a list of relative sub-paths.
-
-    Each sub_path is a list of path segments, e.g. ["addr", "city"].
-    Paths referring to the same nested struct are merged recursively.
-    """
-    children = {}
-    child_order = []
-
-    for path in sub_paths:
-        name = path[0]
-        rest = path[1:]
-
-        if name not in children:
-            idx = struct_type.get_field_index(name)
-            if idx < 0:
-                continue
-            field = struct_type.field(idx)
-            children[name] = {"field": field, "sub_paths": []}
-            child_order.append(name)
-
-        if rest:
-            children[name]["sub_paths"].append(rest)
-
-    result_fields = []
-    for name in child_order:
-        entry = children[name]
-        field = entry["field"]
-        subs = entry["sub_paths"]
-
-        if not subs or not isinstance(field.type, pa.StructType):
-            result_fields.append(field)
-        else:
-            projected = _project_struct_type(field.type, subs)
-            result_fields.append(pa.field(name, projected, nullable=field.nullable))
-
-    return pa.struct(result_fields)
-
-
 class MosaicReader:
 
     def __init__(self, handle, refs=None):
@@ -418,20 +331,23 @@ class MosaicReader:
             _check_error("num_row_groups failed")
         return out.value
 
-    def project(self, columns):
-        """Set projection on the reader. Subsequent reads only return the named columns.
+    def project(self, projected_schema):
+        """Set projection on the reader using an Arrow Schema.
 
-        Supports top-level column names, original STRUCT names (e.g. ``"info"``),
-        STRUCT leaf paths (e.g. ``"info.name"``), and nested STRUCT paths
-        (e.g. ``"info.addr"``).
+        The projected schema should be a subset of the original schema.
+        STRUCT fields can be partial (containing only a subset of fields)
+        for field-level projection.
+
+        Args:
+            projected_schema: A ``pyarrow.Schema`` describing the columns to read.
         """
-        column_names = list(columns)
-        c_strs = [c.encode("utf-8") for c in column_names]
-        arr = (ctypes.c_char_p * len(column_names))(*c_strs)
-        rc = lib.mosaic_reader_set_projection(self._handle, arr, len(column_names))
+        c_schema = _ArrowSchema()
+        schema_ptr = ctypes.addressof(c_schema)
+        projected_schema._export_to_c(schema_ptr)
+        rc = lib.mosaic_reader_set_projection(self._handle, ctypes.c_void_p(schema_ptr))
         if rc != 0:
             _check_error("set_projection failed")
-        self._projected_schema = _build_projected_schema(self._schema, column_names)
+        self._projected_schema = projected_schema
 
     def read_row_group(self, rg_index):
         rg_handle = lib.mosaic_reader_open_row_group(self._handle, rg_index)

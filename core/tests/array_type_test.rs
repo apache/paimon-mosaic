@@ -1787,7 +1787,7 @@ fn test_map_of_struct_value() {
 fn roundtrip_projected(
     schema: &Schema,
     batches: &[RecordBatch],
-    projection: &[&str],
+    projected: &Schema,
 ) -> Vec<RecordBatch> {
     let out = MemOutputFile::new();
     let mut writer = MosaicWriter::new(out, schema, WriterOptions::default()).unwrap();
@@ -1800,7 +1800,7 @@ fn roundtrip_projected(
     let file_len = data.len() as u64;
     let input = ByteArrayInputFile { data };
     let mut reader = MosaicReader::new(input, file_len).unwrap();
-    reader.project(projection).unwrap();
+    reader.project_schema(projected).unwrap();
 
     let mut result = Vec::new();
     for rg in 0..reader.num_row_groups() {
@@ -1965,7 +1965,19 @@ fn test_struct_leaf_projection() {
     .unwrap();
 
     // Project only info.name (leaf projection)
-    let result = roundtrip_projected(&schema, &[batch.clone()], &["info.name"]);
+    let result = roundtrip_projected(
+        &schema,
+        &[batch.clone()],
+        &Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                "name",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        )]),
+    );
     let rb = &result[0];
     assert_eq!(rb.num_columns(), 1);
     let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
@@ -2013,7 +2025,18 @@ fn test_struct_whole_column_projection() {
     .unwrap();
 
     // Project using original STRUCT name "info"
-    let result = roundtrip_projected(&schema, &[batch], &["info"]);
+    let result = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int32, true),
+            ])),
+            true,
+        )]),
+    );
     let rb = &result[0];
     assert_eq!(rb.num_columns(), 1);
     let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
@@ -2185,7 +2208,19 @@ fn test_struct_leaf_projection_preserves_parent_null() {
         RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(info) as ArrayRef]).unwrap();
 
     // Leaf projection: only info.name — must still preserve info null at row 1
-    let result = roundtrip_projected(&schema, &[batch], &["info.name"]);
+    let result = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                "name",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        )]),
+    );
     let rb = &result[0];
     assert_eq!(rb.num_columns(), 1);
     let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
@@ -2225,7 +2260,21 @@ fn test_struct_mixed_projection_order() {
     .unwrap();
 
     // Project in non-alphabetical order: info.age first, then id, then info.name
-    let result = roundtrip_projected(&schema, &[batch], &["info.age", "id", "info.name"]);
+    let result = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![
+            Field::new(
+                "info",
+                DataType::Struct(arrow_schema::Fields::from(vec![
+                    Field::new("age", DataType::Int32, true),
+                    Field::new("name", DataType::Utf8, true),
+                ])),
+                true,
+            ),
+            Field::new("id", DataType::Int32, false),
+        ]),
+    );
     let rb = &result[0];
     // Output should be: info (with age+name), id — info appears first because info.age was first
     assert_eq!(rb.num_columns(), 2);
@@ -2482,7 +2531,22 @@ fn test_struct_nested_path_projection() {
     .unwrap();
 
     // Project only "info.addr" — a nested STRUCT, not a leaf
-    let result = roundtrip_projected(&schema, &[batch], &["info.addr"]);
+    let result = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                "addr",
+                DataType::Struct(arrow_schema::Fields::from(vec![
+                    Field::new("city", DataType::Utf8, true),
+                    Field::new("zip", DataType::Int32, true),
+                ])),
+                true,
+            )])),
+            true,
+        )]),
+    );
     let rb = &result[0];
     assert_eq!(rb.num_columns(), 1);
     let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
@@ -2536,7 +2600,11 @@ fn test_dot_column_coexists_with_struct() {
     assert_eq!(rb.num_columns(), 2);
 
     // project("a.b") should match the top-level column (exact match first)
-    let result2 = roundtrip_projected(&schema, &[batch.clone()], &["a.b"]);
+    let result2 = roundtrip_projected(
+        &schema,
+        &[batch.clone()],
+        &Schema::new(vec![Field::new("a.b", DataType::Int32, false)]),
+    );
     let rb2 = &result2[0];
     assert_eq!(rb2.num_columns(), 1);
     let col = rb2.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
@@ -2544,7 +2612,19 @@ fn test_dot_column_coexists_with_struct() {
     assert_eq!(col.value(1), 20);
 
     // project("a") should return the STRUCT
-    let result3 = roundtrip_projected(&schema, &[batch.clone()], &["a"]);
+    let result3 = roundtrip_projected(
+        &schema,
+        &[batch.clone()],
+        &Schema::new(vec![Field::new(
+            "a",
+            DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                "b",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        )]),
+    );
     let rb3 = &result3[0];
     assert_eq!(rb3.num_columns(), 1);
     let struct_out = rb3
@@ -2561,7 +2641,22 @@ fn test_dot_column_coexists_with_struct() {
     assert_eq!(b_out.value(0), "x");
 
     // project("a.b") should NOT resolve to STRUCT a's field b — it matches the top-level column
-    let result4 = roundtrip_projected(&schema, &[batch], &["a.b", "a"]);
+    let result4 = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![
+            Field::new("a.b", DataType::Int32, false),
+            Field::new(
+                "a",
+                DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                    "b",
+                    DataType::Utf8,
+                    true,
+                )])),
+                true,
+            ),
+        ]),
+    );
     let rb4 = &result4[0];
     assert_eq!(rb4.num_columns(), 2);
 }
@@ -2580,7 +2675,11 @@ fn test_dot_column_name_projection() {
     )
     .unwrap();
 
-    let result = roundtrip_projected(&schema, &[batch], &["x.y.z"]);
+    let result = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![Field::new("x.y.z", DataType::Int32, false)]),
+    );
     let rb = &result[0];
     assert_eq!(rb.num_columns(), 1);
     let col = rb.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
@@ -2589,10 +2688,10 @@ fn test_dot_column_name_projection() {
 }
 
 #[test]
-fn test_struct_field_name_with_dot_rejected() {
-    use paimon_mosaic_core::schema::MosaicSchema;
-    let result = MosaicSchema::validate(&[(
-        "info".to_string(),
+fn test_struct_field_name_with_dot() {
+    // STRUCT fields with dots in their names are now allowed with Schema-based projection
+    let schema = Schema::new(vec![Field::new(
+        "info",
         DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
             "user.name",
             DataType::Utf8,
@@ -2600,8 +2699,28 @@ fn test_struct_field_name_with_dot_rejected() {
         )])),
         false,
     )]);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("must not contain '.'"));
+
+    let user_names = StringArray::from(vec![Some("alice"), Some("bob")]);
+    let info = StructArray::new(
+        arrow_schema::Fields::from(vec![Field::new("user.name", DataType::Utf8, true)]),
+        vec![Arc::new(user_names) as ArrayRef],
+        None,
+    );
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(info) as ArrayRef]).unwrap();
+
+    let result = roundtrip(&schema, &[batch]);
+    let rb = &result[0];
+    assert_eq!(rb.num_columns(), 1);
+    let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    let name_out = info_out
+        .column_by_name("user.name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(name_out.value(0), "alice");
+    assert_eq!(name_out.value(1), "bob");
 }
 
 #[test]
@@ -2675,7 +2794,11 @@ fn test_top_level_and_struct_field_same_name() {
     assert_eq!(inner_name.value(0), "inner_alice");
 
     // Project top-level "name" only
-    let result2 = roundtrip_projected(&schema, &[batch.clone()], &["name"]);
+    let result2 = roundtrip_projected(
+        &schema,
+        &[batch.clone()],
+        &Schema::new(vec![Field::new("name", DataType::Utf8, true)]),
+    );
     let rb2 = &result2[0];
     assert_eq!(rb2.num_columns(), 1);
     let name_out = rb2
@@ -2687,7 +2810,19 @@ fn test_top_level_and_struct_field_same_name() {
     assert_eq!(name_out.value(1), "top_bob");
 
     // Project "info.name" — resolves to STRUCT field, not top-level column
-    let result3 = roundtrip_projected(&schema, &[batch.clone()], &["info.name"]);
+    let result3 = roundtrip_projected(
+        &schema,
+        &[batch.clone()],
+        &Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                "name",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        )]),
+    );
     let rb3 = &result3[0];
     assert_eq!(rb3.num_columns(), 1);
     let info_out3 = rb3
@@ -2704,7 +2839,21 @@ fn test_top_level_and_struct_field_same_name() {
     assert_eq!(inner_name3.value(0), "inner_alice");
 
     // Project both
-    let result4 = roundtrip_projected(&schema, &[batch], &["name", "info"]);
+    let result4 = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new(
+                "info",
+                DataType::Struct(arrow_schema::Fields::from(vec![
+                    Field::new("name", DataType::Utf8, true),
+                    Field::new("age", DataType::Int32, true),
+                ])),
+                true,
+            ),
+        ]),
+    );
     let rb4 = &result4[0];
     assert_eq!(rb4.num_columns(), 2);
 }
@@ -2751,7 +2900,23 @@ fn test_nested_struct_null_preserved_in_leaf_projection() {
         RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(info) as ArrayRef]).unwrap();
 
     // Project only "info.addr.city" — must still preserve addr null at row 1
-    let result = roundtrip_projected(&schema, &[batch], &["info.addr.city"]);
+    let result = roundtrip_projected(
+        &schema,
+        &[batch],
+        &Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                "addr",
+                DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                    "city",
+                    DataType::Utf8,
+                    true,
+                )])),
+                true,
+            )])),
+            true,
+        )]),
+    );
     let rb = &result[0];
     assert_eq!(rb.num_columns(), 1);
     let info_out = rb.column(0).as_any().downcast_ref::<StructArray>().unwrap();

@@ -140,12 +140,6 @@ pub fn validate_data_type(dt: &DataType) -> Result<(), String> {
                 return Err("STRUCT must have at least one field".to_string());
             }
             for field in fields.iter() {
-                if field.name().contains('.') {
-                    return Err(format!(
-                        "STRUCT field name '{}' must not contain '.' (reserved for projection path separator)",
-                        field.name()
-                    ));
-                }
                 validate_data_type(field.data_type())?;
             }
             Ok(())

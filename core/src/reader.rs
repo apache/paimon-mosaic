@@ -195,12 +195,12 @@ pub trait ReaderAccess {
         rg_index: usize,
         columns: &[usize],
     ) -> io::Result<RowGroupReader>;
-    fn row_group_reader_by_names(
+    fn row_group_reader_by_schema(
         &self,
         rg_index: usize,
-        column_names: &[&str],
+        projected: &Schema,
     ) -> io::Result<RowGroupReader> {
-        let (output, read) = self.schema().resolve_projection(column_names)?;
+        let (output, read) = self.schema().resolve_schema_projection(projected)?;
         self.row_group_reader_projected_with_output(rg_index, &read, &output)
     }
     fn row_group_reader_projected_with_output(
@@ -209,7 +209,43 @@ pub trait ReaderAccess {
         read_indices: &[usize],
         output_order: &[usize],
     ) -> io::Result<RowGroupReader>;
-    fn project(&mut self, column_names: &[&str]) -> io::Result<()>;
+    fn row_group_reader_by_names(
+        &self,
+        rg_index: usize,
+        column_names: &[&str],
+    ) -> io::Result<RowGroupReader> {
+        let schema = self.schema();
+        let orig = schema.original_columns.as_deref();
+        let mut fields = Vec::with_capacity(column_names.len());
+        for name in column_names {
+            if let Some(mapping) = schema
+                .struct_mappings
+                .iter()
+                .find(|m| m.original_field.name() == *name)
+            {
+                fields.push(mapping.original_field.clone());
+            } else if let Some(cols) = orig {
+                if let Some((_, dt, nullable)) = cols.iter().find(|(n, _, _)| n == *name) {
+                    fields.push(Field::new(*name, dt.clone(), *nullable));
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("column '{}' not found", name),
+                    ));
+                }
+            } else if let Some(col) = schema.columns.iter().find(|c| c.name == *name) {
+                fields.push(Field::new(*name, col.data_type.clone(), col.nullable));
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("column '{}' not found", name),
+                ));
+            }
+        }
+        let projected = Schema::new(fields);
+        self.row_group_reader_by_schema(rg_index, &projected)
+    }
+    fn project_schema(&mut self, projected: &Schema) -> io::Result<()>;
     fn row_group_stats(&self, rg_index: usize) -> io::Result<&[ColumnStats]>;
     fn row_group_num_rows(&self, rg_index: usize) -> io::Result<usize>;
 }
@@ -417,8 +453,8 @@ impl<I: InputFile> MosaicReader<I> {
         })
     }
 
-    pub fn project(&mut self, column_names: &[&str]) -> io::Result<()> {
-        let (output, read) = self.schema.resolve_projection(column_names)?;
+    pub fn project_schema(&mut self, projected: &Schema) -> io::Result<()> {
+        let (output, read) = self.schema.resolve_schema_projection(projected)?;
         self.projected_columns = Some((output, read));
         Ok(())
     }
@@ -1001,8 +1037,8 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
         ))
     }
 
-    fn project(&mut self, column_names: &[&str]) -> io::Result<()> {
-        let (output, read) = self.schema.resolve_projection(column_names)?;
+    fn project_schema(&mut self, projected: &Schema) -> io::Result<()> {
+        let (output, read) = self.schema.resolve_schema_projection(projected)?;
         self.projected_columns = Some((output, read));
         Ok(())
     }

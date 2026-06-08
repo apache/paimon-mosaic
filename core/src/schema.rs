@@ -191,97 +191,74 @@ impl MosaicSchema {
         }
     }
 
-    /// Resolve column names to expanded column indices.
+    /// Resolve a projected Arrow Schema to expanded column indices.
     /// Returns `(output_order, read_indices)`:
     /// - `output_order`: user-requested indices in request order (for output column ordering)
     /// - `read_indices`: output_order + auto-added `__null__` ancestors (for physical reads)
     ///
-    /// Resolution strategy (like ORC/Parquet):
-    /// 1. Exact match against original top-level column names (including STRUCT names
-    ///    and names containing `.`)
-    /// 2. If no match, split on `.` and resolve as a path in the schema tree
-    pub fn resolve_projection(
+    /// Each field in `projected` is matched by name against the original schema.
+    /// STRUCT fields in `projected` can be partial (containing only a subset of the
+    /// original STRUCT's fields) for field-level projection.
+    pub fn resolve_schema_projection(
         &self,
-        column_names: &[&str],
+        projected: &Schema,
     ) -> io::Result<(Vec<usize>, Vec<usize>)> {
-        let orig = self.original_columns.as_deref();
-        let mut output = Vec::with_capacity(column_names.len());
+        let mut output = Vec::new();
 
-        for name in column_names {
-            // Step 1: exact match against original top-level column names
-            let exact = orig.is_some_and(|cols| cols.iter().any(|(n, _, _)| n == *name));
-            if exact {
-                // Check if it's a STRUCT (expand all sub-columns)
-                if let Some(mapping) = self
-                    .struct_mappings
-                    .iter()
-                    .find(|m| m.original_field.name() == *name)
-                {
-                    output.extend_from_slice(&mapping.expanded_col_indices);
-                } else {
-                    // Non-STRUCT top-level column: find by column_id
-                    if let Some(idx) = self.columns.iter().position(|c| c.name == *name) {
-                        output.push(idx);
-                    }
-                }
-                continue;
-            }
-
-            // For non-STRUCT schemas, try direct column name match
-            if self.struct_mappings.is_empty() {
-                if let Some(idx) = self.columns.iter().position(|c| c.name == *name) {
-                    output.push(idx);
-                    continue;
-                }
-            }
-
-            // Step 2: split on '.' and resolve as path in schema tree
-            let parts: Vec<&str> = name.split('.').collect();
-            let mut resolved = false;
-            if parts.len() >= 2 {
-                if let Some(mapping) = self
-                    .struct_mappings
-                    .iter()
-                    .find(|m| m.original_field.name() == parts[0])
-                {
-                    let local_ids =
-                        Self::resolve_struct_path(mapping.original_field.data_type(), &parts[1..]);
+        for proj_field in projected.fields() {
+            if let Some(mapping) = self
+                .struct_mappings
+                .iter()
+                .find(|m| m.original_field.name() == proj_field.name())
+            {
+                if let DataType::Struct(proj_fields) = proj_field.data_type() {
+                    // Partial STRUCT projection: collect IDs for requested sub-fields
+                    let mut local_ids = Vec::new();
+                    Self::collect_projected_ids(
+                        mapping.original_field.data_type(),
+                        &DataType::Struct(proj_fields.clone()),
+                        &mut local_ids,
+                    );
                     let base = mapping.struct_id + 1;
-                    if !local_ids.is_empty() {
-                        let target_ids: Vec<u32> = local_ids.iter().map(|&id| base + id).collect();
-                        for &tid in &target_ids {
-                            if let Some(idx) = self.columns.iter().position(|c| c.column_id == tid)
-                            {
-                                output.push(idx);
-                            }
+                    for lid in local_ids {
+                        let abs_id = base + lid;
+                        if let Some(idx) = self.columns.iter().position(|c| c.column_id == abs_id) {
+                            output.push(idx);
                         }
-                        // Also include __null__ columns for intermediate STRUCTs
-                        for &tid in &target_ids {
-                            for m in &self.struct_mappings {
-                                if m.field_ids.contains(&tid) || m.struct_id == tid {
-                                    if let Some(null_idx) = m.null_col_sorted_idx {
-                                        if !output.contains(&null_idx) {
-                                            output.push(null_idx);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        resolved = true;
                     }
+                } else {
+                    // Non-STRUCT field matching a STRUCT column — expand all
+                    output.extend_from_slice(&mapping.expanded_col_indices);
                 }
-            }
-
-            if !resolved {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("column '{}' not found in schema", name),
-                ));
+            } else {
+                // Non-STRUCT column: find by name in original schema
+                let orig = self.original_columns.as_deref();
+                let found = orig.is_some_and(|cols| {
+                    cols.iter().any(|(n, _, _)| n == proj_field.name())
+                });
+                if found || self.struct_mappings.is_empty() {
+                    if let Some(idx) = self
+                        .columns
+                        .iter()
+                        .position(|c| c.name == *proj_field.name())
+                    {
+                        output.push(idx);
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("column '{}' not found in schema", proj_field.name()),
+                        ));
+                    }
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("column '{}' not found in schema", proj_field.name()),
+                    ));
+                }
             }
         }
 
-        // Auto-add top-level STRUCT __null__ columns when any descendant is projected.
-        // Nested __null__ columns are already included by resolve_struct_path.
+        // Auto-add __null__ columns for any projected STRUCT descendants
         let mut read = output.clone();
         for mapping in &self.struct_mappings {
             let has_leaf = mapping
@@ -296,81 +273,110 @@ impl MosaicSchema {
                 }
             }
         }
+        // Also add nested __null__ columns
+        for (col_idx, col) in self.columns.iter().enumerate() {
+            if col.name.ends_with(".__null__") && !read.contains(&col_idx) {
+                let nested_struct_id = col.column_id;
+                let has_descendant = read.iter().any(|&idx| {
+                    let cid = self.columns[idx].column_id;
+                    cid > nested_struct_id
+                        && cid
+                            <= nested_struct_id
+                                + Self::count_tree_nodes_by_id(self, nested_struct_id)
+                });
+                if has_descendant {
+                    read.push(col_idx);
+                }
+            }
+        }
 
         Ok((output, read))
     }
 
-    /// Resolve a dotted path within a STRUCT type tree, returning matching column IDs.
-    /// Includes intermediate nullable STRUCT node IDs (for __null__ columns).
-    fn resolve_struct_path(dt: &DataType, path: &[&str]) -> Vec<u32> {
-        if let DataType::Struct(fields) = dt {
-            if path.is_empty() {
-                return Self::collect_all_leaf_ids(dt, &mut 0);
+    /// Collect local (0-based within parent STRUCT) column IDs for fields present
+    /// in `projected_dt` that match fields in `original_dt`.
+    fn collect_projected_ids(original_dt: &DataType, projected_dt: &DataType, out: &mut Vec<u32>) {
+        if let (DataType::Struct(orig_fields), DataType::Struct(proj_fields)) =
+            (original_dt, projected_dt)
+        {
+            for proj_field in proj_fields.iter() {
+                let mut id = 0u32;
+                for orig_field in orig_fields.iter() {
+                    let field_id = id;
+                    id += 1;
+                    if orig_field.name() == proj_field.name() {
+                        if let (DataType::Struct(orig_inner), DataType::Struct(proj_inner)) =
+                            (orig_field.data_type(), proj_field.data_type())
+                        {
+                            if !types::is_timestamp_nanos_struct(orig_inner) {
+                                // Nested STRUCT: include __null__ if nullable, then recurse
+                                if orig_field.is_nullable() {
+                                    out.push(field_id);
+                                }
+                                let mut sub_ids = Vec::new();
+                                Self::collect_projected_ids(
+                                    orig_field.data_type(),
+                                    &DataType::Struct(proj_inner.clone()),
+                                    &mut sub_ids,
+                                );
+                                for sid in sub_ids {
+                                    out.push(field_id + 1 + sid);
+                                }
+                                break;
+                            }
+                        }
+                        out.push(field_id);
+                        break;
+                    }
+                    if let DataType::Struct(inner) = orig_field.data_type() {
+                        if !types::is_timestamp_nanos_struct(inner) {
+                            id += Self::count_tree_nodes(orig_field.data_type());
+                        }
+                    }
+                }
             }
-            let target = path[0];
-            let mut id = 0u32;
+        }
+    }
+
+    fn count_tree_nodes_by_id(&self, struct_id: u32) -> u32 {
+        for mapping in &self.struct_mappings {
+            if mapping.struct_id == struct_id {
+                return Self::count_tree_nodes(mapping.original_field.data_type());
+            }
+            // Check nested STRUCTs within this mapping
+            if let Some(size) = Self::find_nested_count(
+                mapping.original_field.data_type(),
+                struct_id,
+                mapping.struct_id + 1,
+            ) {
+                return size;
+            }
+        }
+        0
+    }
+
+    fn find_nested_count(dt: &DataType, target_id: u32, base_id: u32) -> Option<u32> {
+        if let DataType::Struct(fields) = dt {
+            let mut id = base_id;
             for field in fields.iter() {
                 let field_id = id;
                 id += 1;
-                if field.name() == target {
-                    if path.len() == 1 {
-                        if let DataType::Struct(inner) = field.data_type() {
-                            if !types::is_timestamp_nanos_struct(inner) {
-                                let mut ids: Vec<u32> =
-                                    Self::collect_all_leaf_ids(field.data_type(), &mut 0)
-                                        .into_iter()
-                                        .map(|offset| field_id + 1 + offset)
-                                        .collect();
-                                if field.is_nullable() {
-                                    ids.push(field_id);
-                                }
-                                return ids;
-                            }
-                        }
-                        return vec![field_id];
-                    }
-                    if let DataType::Struct(inner) = field.data_type() {
-                        if !types::is_timestamp_nanos_struct(inner) {
-                            let mut ids: Vec<u32> =
-                                Self::resolve_struct_path(field.data_type(), &path[1..])
-                                    .into_iter()
-                                    .map(|offset| field_id + 1 + offset)
-                                    .collect();
-                            if field.is_nullable() && !ids.is_empty() {
-                                ids.push(field_id);
-                            }
-                            return ids;
-                        }
-                    }
-                    return vec![];
-                }
-                // Skip past this field's subtree
                 if let DataType::Struct(inner) = field.data_type() {
                     if !types::is_timestamp_nanos_struct(inner) {
+                        if field_id == target_id {
+                            return Some(Self::count_tree_nodes(field.data_type()));
+                        }
+                        if let Some(size) =
+                            Self::find_nested_count(field.data_type(), target_id, id)
+                        {
+                            return Some(size);
+                        }
                         id += Self::count_tree_nodes(field.data_type());
                     }
                 }
             }
         }
-        vec![]
-    }
-
-    fn collect_all_leaf_ids(dt: &DataType, counter: &mut u32) -> Vec<u32> {
-        let mut ids = Vec::new();
-        if let DataType::Struct(fields) = dt {
-            for field in fields.iter() {
-                let field_id = *counter;
-                *counter += 1;
-                if let DataType::Struct(inner) = field.data_type() {
-                    if !types::is_timestamp_nanos_struct(inner) {
-                        ids.extend(Self::collect_all_leaf_ids(field.data_type(), counter));
-                        continue;
-                    }
-                }
-                ids.push(field_id);
-            }
-        }
-        ids
+        None
     }
 
     pub fn count_tree_nodes(dt: &DataType) -> u32 {

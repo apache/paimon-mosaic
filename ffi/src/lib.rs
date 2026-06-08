@@ -638,13 +638,13 @@ pub unsafe extern "C" fn mosaic_reader_open_row_group(
     }
 }
 
-/// Set projection on the reader. Subsequent row group reads will only
-/// decompress buckets containing the specified columns.
+/// Set projection on the reader using an Arrow C Schema.
+/// Subsequent row group reads will only decompress buckets containing the specified columns.
+/// The projected schema can be a subset of the original schema, including partial STRUCTs.
 #[no_mangle]
 pub unsafe extern "C" fn mosaic_reader_set_projection(
     handle: *mut MosaicReaderHandle,
-    columns: *const *const c_char,
-    num_columns: u32,
+    schema_ptr: *mut std::ffi::c_void,
 ) -> c_int {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         if handle.is_null() {
@@ -652,32 +652,19 @@ pub unsafe extern "C" fn mosaic_reader_set_projection(
             return -1;
         }
         let h = &mut *handle;
-        if num_columns == 0 || columns.is_null() {
-            match h.reader.project(&[]) {
-                Ok(()) => return 0,
-                Err(e) => {
-                    set_error(e.to_string());
-                    return -1;
-                }
-            }
+        if schema_ptr.is_null() {
+            set_error("null schema pointer".into());
+            return -1;
         }
-        let ptrs = std::slice::from_raw_parts(columns, num_columns as usize);
-        let mut names = Vec::with_capacity(num_columns as usize);
-        for &p in ptrs {
-            if p.is_null() {
-                set_error("columns contains null pointer".into());
+        let ffi_schema = arrow_schema::ffi::FFI_ArrowSchema::from_raw(schema_ptr as *mut _);
+        let projected = match arrow_schema::Schema::try_from(&ffi_schema) {
+            Ok(s) => s,
+            Err(e) => {
+                set_error(format!("invalid projection schema: {}", e));
                 return -1;
             }
-            match std::ffi::CStr::from_ptr(p).to_str() {
-                Ok(s) => names.push(s),
-                Err(_) => {
-                    set_error("columns contains invalid UTF-8".into());
-                    return -1;
-                }
-            }
-        }
-        let col_refs: Vec<&str> = names.to_vec();
-        match h.reader.project(&col_refs) {
+        };
+        match h.reader.project_schema(&projected) {
             Ok(()) => 0,
             Err(e) => {
                 set_error(e.to_string());
