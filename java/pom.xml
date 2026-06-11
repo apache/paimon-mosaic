@@ -186,6 +186,17 @@
                             </execution>
                         </executions>
                     </plugin>
+                    <plugin>
+                        <groupId>org.sonatype.plugins</groupId>
+                        <artifactId>nexus-staging-maven-plugin</artifactId>
+                        <version>1.7.0</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <serverId>apache.releases.https</serverId>
+                            <nexusUrl>https://repository.apache.org/</nexusUrl>
+                            <autoReleaseAfterClose>false</autoReleaseAfterClose>
+                        </configuration>
+                    </plugin>
                 </plugins>
             </build>
         </profile>

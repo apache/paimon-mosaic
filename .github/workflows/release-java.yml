@@ -172,9 +172,7 @@ jobs:
         run: |
           mvn clean deploy \
             -Prelease \
-            -DskipTests \
-            -DretryFailedDeploymentCount=10 \
-            -Daether.connector.basic.parallelPut=false
+            -DskipTests
         env:
           MAVEN_USERNAME: ${{ secrets.NEXUS_STAGE_DEPLOYER_USER }}
           MAVEN_PASSWORD: ${{ secrets.NEXUS_STAGE_DEPLOYER_PW }}
