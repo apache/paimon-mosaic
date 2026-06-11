@@ -10,15 +10,15 @@ arrow-array@58.3.0	X					X
 arrow-buffer@58.3.0	X								
 arrow-data@58.3.0	X								
 arrow-schema@58.3.0	X								
-autocfg@1.5.0	X					X			
-bitflags@2.11.1	X					X			
-bumpalo@3.20.2	X					X			
+autocfg@1.5.1	X					X			
+bitflags@2.13.0	X					X			
+bumpalo@3.20.3	X					X			
 bytes@1.11.1						X			
 cbindgen@0.27.0							X		
-cc@1.2.62	X					X			
+cc@1.2.63	X					X			
 cesu8@1.1.0	X					X			
 cfg-if@1.0.4	X					X			
-chrono@0.4.44	X					X			
+chrono@0.4.45	X					X			
 clap@4.6.1	X					X			
 clap_builder@4.6.0	X					X			
 clap_lex@1.1.0	X					X			
@@ -37,6 +37,7 @@ futures-task@0.3.32	X					X
 futures-util@0.3.32	X					X			
 getrandom@0.2.17	X					X			
 getrandom@0.3.4	X					X			
+getrandom@0.4.2	X					X			
 half@2.7.1	X					X			
 hashbrown@0.17.1	X					X			
 heck@0.4.1	X					X			
@@ -50,35 +51,36 @@ jni-sys@0.3.1	X					X
 jni-sys@0.4.1	X					X			
 jni-sys-macros@0.4.1	X					X			
 jobserver@0.1.34	X					X			
-js-sys@0.3.98	X					X			
+js-sys@0.3.100	X					X			
 libc@0.2.186	X					X			
 libm@0.2.16						X			
 linux-raw-sys@0.12.1	X	X				X			
-log@0.4.29	X					X			
-memchr@2.8.0						X			X
+log@0.4.32	X					X			
+memchr@2.8.1						X			X
 num-bigint@0.4.6	X					X			
 num-complex@0.4.6	X					X			
 num-integer@0.1.46	X					X			
 num-traits@0.2.19	X					X			
 once_cell@1.21.4	X					X			
 once_cell_polyfill@1.70.2	X					X			
-paimon-mosaic-core@0.1.0	X								
-paimon-mosaic-ffi@0.1.0	X								
-paimon-mosaic-jni@0.1.0	X								
+paimon-mosaic-core@0.2.0	X								
+paimon-mosaic-ffi@0.2.0	X								
+paimon-mosaic-jni@0.2.0	X								
 pin-project-lite@0.2.17	X					X			
 pkg-config@0.3.33	X					X			
 proc-macro2@1.0.106	X					X			
 quote@1.0.45	X					X			
 r-efi@5.3.0	X				X	X			
+r-efi@6.0.0	X				X	X			
 rustix@1.1.4	X	X				X			
 rustversion@1.0.22	X					X			
 same-file@1.0.6						X			X
 serde@1.0.228	X					X			
 serde_core@1.0.228	X					X			
 serde_derive@1.0.228	X					X			
-serde_json@1.0.149	X					X			
+serde_json@1.0.150	X					X			
 serde_spanned@0.6.9	X					X			
-shlex@1.3.0	X					X			
+shlex@2.0.1	X					X			
 slab@0.4.12						X			
 strsim@0.11.1						X			
 syn@2.0.117	X					X			
@@ -96,10 +98,11 @@ version_check@0.9.5	X					X
 walkdir@2.5.0						X			X
 wasi@0.11.1+wasi-snapshot-preview1	X	X				X			
 wasip2@1.0.3+wasi-0.2.9	X	X				X			
-wasm-bindgen@0.2.121	X					X			
-wasm-bindgen-macro@0.2.121	X					X			
-wasm-bindgen-macro-support@0.2.121	X					X			
-wasm-bindgen-shared@0.2.121	X					X			
+wasip3@0.4.0+wasi-0.3.0-rc-2026-01-06	X	X				X			
+wasm-bindgen@0.2.123	X					X			
+wasm-bindgen-macro@0.2.123	X					X			
+wasm-bindgen-macro-support@0.2.123	X					X			
+wasm-bindgen-shared@0.2.123	X					X			
 winapi-util@0.1.11						X			X
 windows-core@0.62.2	X					X			
 windows-implement@0.60.2	X					X			
@@ -118,9 +121,10 @@ windows_x86_64_gnu@0.42.2	X					X
 windows_x86_64_gnullvm@0.42.2	X					X			
 windows_x86_64_msvc@0.42.2	X					X			
 winnow@0.7.15						X			
+wit-bindgen@0.51.0	X	X				X			
 wit-bindgen@0.57.1	X	X				X			
-zerocopy@0.8.48	X		X			X			
-zerocopy-derive@0.8.48	X		X			X			
+zerocopy@0.8.52	X		X			X			
+zerocopy-derive@0.8.52	X		X			X			
 zmij@1.0.21						X			
 zstd@0.13.3						X			
 zstd-safe@7.2.4	X					X			
