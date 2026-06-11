@@ -170,9 +170,17 @@ jobs:
       - name: Deploy to Apache Nexus staging
         working-directory: java
         run: |
+          REF="${{ github.ref_name }}"
+          VERSION="${REF#v}"
+          if [[ "$VERSION" == *-rc* ]]; then
+            DESC="Apache Paimon Mosaic, version ${VERSION%-rc*}, release candidate ${VERSION#*-rc}"
+          else
+            DESC="Apache Paimon Mosaic, version ${VERSION}"
+          fi
           mvn clean deploy \
             -Prelease \
-            -DskipTests
+            -DskipTests \
+            -DstagingDescription="$DESC"
         env:
           MAVEN_USERNAME: ${{ secrets.NEXUS_STAGE_DEPLOYER_USER }}
           MAVEN_PASSWORD: ${{ secrets.NEXUS_STAGE_DEPLOYER_PW }}
