@@ -52,17 +52,19 @@ fi
 
 cd ..
 
-# For Cargo.toml and pyproject.toml, strip any -SNAPSHOT suffix (not valid in those ecosystems)
+# Cargo.toml and pyproject.toml never carry the -SNAPSHOT suffix, so strip it
+# from both old and new versions when matching/replacing there.
+OLD_VERSION_CLEAN=$(echo "$OLD_VERSION" | sed 's/-SNAPSHOT//')
 NEW_VERSION_CLEAN=$(echo "$NEW_VERSION" | sed 's/-SNAPSHOT//')
 
 #change version in all pom files (match both exact and -SNAPSHOT suffix)
 find . -name 'pom.xml' -type f -exec perl -pi -e 's#<version>'$OLD_VERSION'(-SNAPSHOT)?</version>#<version>'$NEW_VERSION'</version>#' {} \;
 
 #change version in Cargo.toml files
-find . -name 'Cargo.toml' -not -path '*/target/*' -type f -exec perl -pi -e 's#^version = "'$OLD_VERSION'"#version = "'$NEW_VERSION_CLEAN'"#' {} \;
+find . -name 'Cargo.toml' -not -path '*/target/*' -type f -exec perl -pi -e 's#^version = "'$OLD_VERSION_CLEAN'"#version = "'$NEW_VERSION_CLEAN'"#' {} \;
 
 #change version in pyproject.toml
-perl -pi -e 's#^version = "'$OLD_VERSION'"#version = "'$NEW_VERSION_CLEAN'"#' python/pyproject.toml
+perl -pi -e 's#^version = "'$OLD_VERSION_CLEAN'"#version = "'$NEW_VERSION_CLEAN'"#' python/pyproject.toml
 
 git commit -am "Update version to $NEW_VERSION"
 
