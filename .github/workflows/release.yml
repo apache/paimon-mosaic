@@ -53,7 +53,7 @@ jobs:
 
   python-publish:
     name: Python publish
-    needs: [python-wheels]
+    needs: [rust, java, python-wheels]
     if: startsWith(github.ref, 'refs/tags/')
     uses: ./.github/workflows/release-python-publish.yml
     secrets: inherit
