@@ -507,6 +507,11 @@ impl BucketReader {
         self.num_rows - null_count
     }
 
+    /// Per-column encoding ids (in this bucket's column order). See `spec::ENCODING_*`.
+    pub fn encodings(&self) -> &[u8] {
+        &self.encodings
+    }
+
     pub fn read_all_columns(&self) -> io::Result<Vec<ArrayRef>> {
         let num_rows = self.num_rows;
         let mut result = Vec::with_capacity(self.num_columns);
@@ -766,6 +771,11 @@ impl ColumnPageReader {
         } else {
             read_variable_value(&self.col_type, &self.data, pos)
         }
+    }
+
+    /// Encoding id of this column page. See `spec::ENCODING_*`.
+    pub fn encoding(&self) -> u8 {
+        self.encoding
     }
 
     pub fn read_all(&self) -> io::Result<ArrayRef> {

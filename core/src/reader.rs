@@ -179,6 +179,16 @@ fn read_merged_ranges<I: InputFile + ?Sized>(
     Ok((merged, fetched))
 }
 
+/// Physical placement of one column within one row group.
+pub struct PageInfo {
+    pub column_index: usize,
+    pub bucket: usize,
+    /// `spec::ENCODING_*`: plain / const / dict / all_null.
+    pub encoding: u8,
+    /// Paged-bucket on-disk slot size in bytes; 0 for monolithic/empty buckets.
+    pub slot_size: usize,
+}
+
 pub struct RowGroupMeta {
     pub num_rows: usize,
     pub bucket_offsets: Vec<u64>,
@@ -445,6 +455,67 @@ impl<I: InputFile> MosaicReader<I> {
 
     pub fn input(&self) -> &I {
         &self.input
+    }
+
+    /// Per-column physical layout for a row group: bucket, encoding and on-disk
+    /// slot size. Reads and decompresses each non-empty bucket; used by tooling
+    /// (the `pages` command). Columns are reported in global (name-sorted) order.
+    pub fn page_infos(&self, rg_index: usize) -> io::Result<Vec<PageInfo>> {
+        if rg_index >= self.row_group_metas.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "row group index out of range",
+            ));
+        }
+        let meta = &self.row_group_metas[rg_index];
+        let mut out = Vec::with_capacity(self.schema.columns.len());
+        for b in 0..self.num_buckets {
+            let globals = &self.schema.bucket_to_global[b];
+            match meta.bucket_layouts[b] {
+                BucketLayout::Empty => {
+                    for &gi in globals {
+                        out.push(PageInfo { column_index: gi, bucket: b, encoding: ENCODING_ALL_NULL, slot_size: 0 });
+                    }
+                }
+                BucketLayout::Monolithic { compressed_size, uncompressed_size } => {
+                    let buf = read_range(&self.input, meta.bucket_offsets[b], compressed_size)?;
+                    let data = match self.compression {
+                        COMPRESSION_NONE => buf,
+                        COMPRESSION_ZSTD => zstd::bulk::decompress(&buf, uncompressed_size)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported compression")),
+                    };
+                    let col_types: Vec<DataType> = globals.iter().map(|&gi| self.schema.columns[gi].data_type.clone()).collect();
+                    let reader = BucketReader::new(col_types, data, meta.num_rows)?;
+                    for (local, &gi) in globals.iter().enumerate() {
+                        out.push(PageInfo { column_index: gi, bucket: b, encoding: reader.encodings()[local], slot_size: 0 });
+                    }
+                }
+                BucketLayout::Paged { total_size } => {
+                    let dir_size = globals.len() * 4;
+                    let dir = read_range(&self.input, meta.bucket_offsets[b], dir_size)?;
+                    let mut sizes = Vec::with_capacity(globals.len());
+                    for i in 0..globals.len() {
+                        sizes.push(u32::from_le_bytes(dir[i * 4..i * 4 + 4].try_into().unwrap()) as usize);
+                    }
+                    let mut foff = meta.bucket_offsets[b] + dir_size as u64;
+                    for (local, &gi) in globals.iter().enumerate() {
+                        let enc = if sizes[local] == 0 {
+                            ENCODING_ALL_NULL
+                        } else {
+                            let slot = read_range(&self.input, foff, sizes[local])?;
+                            let ct = self.schema.columns[gi].data_type.clone();
+                            Self::parse_column_slot(&slot, &ct, meta.num_rows)?.encoding()
+                        };
+                        out.push(PageInfo { column_index: gi, bucket: b, encoding: enc, slot_size: sizes[local] });
+                        foff += sizes[local] as u64;
+                    }
+                    let _ = total_size;
+                }
+            }
+        }
+        out.sort_by_key(|p| p.column_index);
+        Ok(out)
     }
 
     fn parse_column_slot(

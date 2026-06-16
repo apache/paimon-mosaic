@@ -15,8 +15,19 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[workspace]
-members = ["core", "ffi", "jni", "cli"]
-resolver = "2"
+[package]
+name = "paimon-mosaic-cli"
+version = "0.2.0"
+edition = "2021"
+description = "Mosaic file format — command line inspector (cat/meta/schema)"
+license = "Apache-2.0"
 
-[profile.release]
+[[bin]]
+name = "mosaic"
+path = "src/main.rs"
+
+[dependencies]
+paimon-mosaic-core = { path = "../core" }
+arrow-array = "58"
+arrow-schema = "58"
+clap = { version = "4", features = ["derive"] }
