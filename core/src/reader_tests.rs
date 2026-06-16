@@ -4180,3 +4180,54 @@ fn test_row_group_num_rows_out_of_range() {
     assert!(reader.row_group_num_rows(1).is_err());
     assert!(reader.row_group_num_rows(999).is_err());
 }
+
+#[test]
+fn test_page_infos_encodings() {
+    use crate::spec::{ENCODING_CONST, ENCODING_DICT, ENCODING_PLAIN};
+    let columns = vec![
+        ("id".to_string(), DataType::Int32, false),    // unique -> plain
+        ("kind".to_string(), DataType::Utf8, true),    // low cardinality -> dict
+        ("flag".to_string(), DataType::Int32, true),   // constant -> const
+    ];
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            num_buckets: 3,
+            page_size_threshold: 1, // force paged buckets
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let rows: Vec<Vec<Value>> = (0..200)
+        .map(|i| {
+            vec![
+                Value::Integer(i),
+                Value::String(["a", "b", "c"][(i % 3) as usize].as_bytes().to_vec()),
+                Value::Integer(7),
+            ]
+        })
+        .collect();
+    write_values(&mut writer, &columns, &rows);
+    writer.close().unwrap();
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    let reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
+
+    let infos = reader.page_infos(0).unwrap();
+    assert_eq!(infos.len(), 3);
+    // page_infos is sorted by column_index; name-sorted order: flag, id, kind
+    let by_name = |n: &str| {
+        infos
+            .iter()
+            .find(|p| reader.schema().columns[p.column_index].name == n)
+            .unwrap()
+    };
+    assert_eq!(by_name("id").encoding, ENCODING_PLAIN);
+    assert_eq!(by_name("kind").encoding, ENCODING_DICT);
+    assert_eq!(by_name("flag").encoding, ENCODING_CONST);
+    assert!(by_name("id").slot_size > 0);
+    assert!(reader.page_infos(999).is_err());
+}

@@ -195,3 +195,60 @@ fn cell(arr: &dyn Array, row: usize) -> String {
         _ => "?".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Int32Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn sample() -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("ann"), None])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn json_str_escapes() {
+        assert_eq!(json_str("a\"b\n"), "\"a\\\"b\\n\"");
+        assert_eq!(json_str("x"), "\"x\"");
+    }
+
+    #[test]
+    fn render_value_types() {
+        assert_eq!(render_value(&Value::Integer(5)), "5");
+        assert_eq!(render_value(&Value::String(b"hi".to_vec())), "hi");
+        assert_eq!(render_value(&Value::Null), "null");
+    }
+
+    #[test]
+    fn encoding_names() {
+        assert_eq!(encoding_name(0), "plain");
+        assert_eq!(encoding_name(2), "dict");
+        assert_eq!(encoding_name(3), "all_null");
+    }
+
+    #[test]
+    fn ndjson_renders_null_and_quotes() {
+        let out = ndjson(&[sample()], 10);
+        assert_eq!(out, "{\"id\":1,\"name\":\"ann\"}\n{\"id\":2,\"name\":null}\n");
+    }
+
+    #[test]
+    fn pretty_table_truncates_and_aligns() {
+        let t = pretty_table(&[sample()], 1);
+        assert!(t.contains("| id "));
+        assert!(t.contains("| 1  "));
+        assert!(!t.contains("| 2 "));
+    }
+}
