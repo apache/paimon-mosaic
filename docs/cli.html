@@ -1,0 +1,164 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CLI - Paimon Mosaic</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="js/main.js"></script>
+</head>
+<body>
+    <button class="menu-toggle" aria-label="Menu">&#9776;</button>
+    <div class="overlay"></div>
+
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <h2>Paimon Mosaic</h2>
+            <p>Columnar-bucket hybrid format</p>
+        </div>
+        <nav>
+            <ul>
+                <li><a href="index.html">Home</a></li>
+                <li><a href="design.html">Design</a></li>
+                <li><a href="java-api.html">Java API</a></li>
+                <li><a href="python-api.html">Python API</a></li>
+                <li><a href="cpp-api.html">C++ API</a></li>
+                <li><a href="cli.html" class="active">CLI</a></li>
+                <li><a href="releases.html">Releases</a></li>
+            </ul>
+        </nav>
+        <div class="sidebar-footer">
+            <button class="theme-toggle">Dark Mode</button>
+        </div>
+    </aside>
+
+    <main class="main">
+        <div class="content">
+            <h1>CLI</h1>
+            <p class="subtitle">A <code>mosaic</code> binary for inspecting files from the shell &mdash; schema, metadata, contents, and physical encoding, in text or JSON.</p>
+
+            <h2>Install</h2>
+            <p>
+                The CLI is the <code>cli/</code> workspace crate. Build the binary and put it on your
+                <code>PATH</code>:
+            </p>
+<pre><code>cargo build --release -p paimon-mosaic-cli
+cp target/release/mosaic /usr/local/bin/</code></pre>
+            <p>Every command takes a file path and prints to stdout; add <code>--json</code> for machine-readable output.</p>
+<pre><code><span class="cmt"># schema, metadata, encoding, and first rows</span>
+mosaic schema file.mosaic
+mosaic meta   file.mosaic
+mosaic pages  file.mosaic
+mosaic cat    file.mosaic -n 20</code></pre>
+
+            <h2>schema</h2>
+            <p>Column names, Arrow types, nullability, and bucket assignment. Columns are listed in original (write) order.</p>
+<pre><code>$ mosaic schema file.mosaic
+3 columns, 2 buckets
+  id: Int32 not null [bucket 0]
+  name: Utf8 [bucket 1]
+  age: Int32 [bucket 0]</code></pre>
+<pre><code>$ mosaic schema file.mosaic --json
+{<span class="str">"columns"</span>:3,<span class="str">"buckets"</span>:2,<span class="str">"fields"</span>:[{<span class="str">"name"</span>:<span class="str">"id"</span>,<span class="str">"type"</span>:<span class="str">"Int32"</span>,<span class="str">"nullable"</span>:false,<span class="str">"bucket"</span>:0}, ...]}</code></pre>
+
+            <h2>meta</h2>
+            <p>Row counts, row groups, and per-column statistics (null count and min/max for stats columns).</p>
+<pre><code>$ mosaic meta file.mosaic
+file: 5 rows, 3 columns, 2 buckets, 1 row groups
+row group 0: 5 rows
+    age: nulls=1 min=25 max=40
+    id: nulls=0 min=1 max=5
+    name: nulls=1 min=alice max=eve</code></pre>
+
+            <h2>pages</h2>
+            <p>Per-column physical encoding and slot size, per row group. Encodings are <code>const</code>, <code>plain</code>, <code>dict</code>, or <code>all_null</code>.</p>
+<pre><code>$ mosaic pages file.mosaic
+row group 0:
+    age: bucket 0 encoding=plain slot=0B
+    id: bucket 0 encoding=plain slot=0B
+    name: bucket 1 encoding=plain slot=0B</code></pre>
+
+            <h2>cat</h2>
+            <p>First <code>N</code> rows as a table. Project with <code>-c</code>/<code>--columns</code>; output NDJSON with <code>--json</code>.</p>
+<pre><code>$ mosaic cat file.mosaic -n 3
++----+-------+-----+
+| id | name  | age |
++----+-------+-----+
+| 1  | alice | 30  |
+| 2  | bob   | 25  |
+| 3  |       | 40  |
++----+-------+-----+
+
+$ mosaic cat file.mosaic -c name,id -n 1 --json
+{<span class="str">"name"</span>:<span class="str">"alice"</span>,<span class="str">"id"</span>:1}</code></pre>
+
+            <h3>Options</h3>
+            <table>
+                <thead>
+                    <tr><th>Command</th><th>Flag</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>all</td><td><code>--json</code></td><td>Machine-readable output (objects/NDJSON)</td></tr>
+                    <tr><td><code>cat</code></td><td><code>-n, --num</code></td><td>Rows to print (default 10)</td></tr>
+                    <tr><td><code>cat</code></td><td><code>-c, --columns</code></td><td>Comma-separated columns to project and reorder</td></tr>
+                </tbody>
+            </table>
+
+            <h2>Comparison with parquet-cli</h2>
+            <p>
+                The command surface mirrors Apache Parquet's <code>parquet-cli</code> so the muscle memory carries over,
+                but the design is deliberately leaner. The mapping:
+            </p>
+            <table>
+                <thead>
+                    <tr><th>mosaic</th><th>parquet-cli</th><th>Purpose</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>schema</code></td><td><code>schema</code></td><td>Columns, types, nullability (+ bucket assignment)</td></tr>
+                    <tr><td><code>meta</code></td><td><code>meta</code></td><td>Row groups + per-column stats</td></tr>
+                    <tr><td><code>cat</code></td><td><code>cat</code> / <code>head</code></td><td>Rows; <code>-n</code> caps like <code>head</code></td></tr>
+                    <tr><td><code>pages</code></td><td><code>pages</code> / <code>column-index</code></td><td>Per-column encoding &amp; slot size</td></tr>
+                </tbody>
+            </table>
+            <p>Design differences worth noting:</p>
+            <table>
+                <thead>
+                    <tr><th>Aspect</th><th>parquet-cli</th><th>mosaic</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>Runtime</td><td>JVM jar</td><td>Single static native binary, no runtime</td></tr>
+                    <tr><td>JSON output</td><td>Per-command, uneven</td><td><code>--json</code> on every command</td></tr>
+                    <tr><td>Physical unit</td><td>Column chunk per row group</td><td>Bucket (the Mosaic column-group unit)</td></tr>
+                    <tr><td>Column order</td><td>As stored</td><td>Original write order (disk is name-sorted; CLI un-sorts)</td></tr>
+                    <tr><td>Stats</td><td>Always present</td><td>Only opt-in stats columns carry min/max</td></tr>
+                </tbody>
+            </table>
+
+            <div class="tip">
+                <strong>JSON for pipelines</strong>
+                <code>--json</code> emits objects (schema/meta/pages) and NDJSON (cat), so you can pipe
+                straight into <code>jq</code>: <code>mosaic meta f.mosaic --json | jq .row_groups[0].rows</code>.
+            </div>
+        </div>
+    </main>
+</body>
+</html>
