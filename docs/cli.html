@@ -54,13 +54,9 @@
     <main class="main">
         <div class="content">
             <h1>CLI</h1>
-            <p class="subtitle">Inspect Mosaic files from the terminal with the <code>mosaic</code> binary — schema, meta, cat and pages. A native, JVM-free toolkit modeled on parquet-cli.</p>
+            <p class="subtitle">Inspect Mosaic files from the terminal with the <code>mosaic</code> binary. A native, JVM-free toolkit driving the read-only <code>MosaicReader</code> API.</p>
 
             <h2>Install</h2>
-            <p>
-                The CLI lives in the <code>cli/</code> directory and drives the read-only
-                <code>MosaicReader</code> API. Build and run from source, or install the binary:
-            </p>
 <pre><code><span class="cmt"># run from source</span>
 cargo run -p paimon-mosaic-cli -- schema data.mosaic
 
@@ -75,69 +71,97 @@ mosaic schema data.mosaic</code></pre>
                 </thead>
                 <tbody>
                     <tr><td><code>schema</code></td><td>column names, Arrow types, nullability, bucket</td><td>footer only</td></tr>
-                    <tr><td><code>meta</code></td><td>row groups, rows, per-column stats (null/min/max)</td><td>footer + index</td></tr>
-                    <tr><td><code>pages</code></td><td>per-column encoding + on-disk slot size</td><td>bucket data</td></tr>
-                    <tr><td><code>cat</code></td><td>first N rows as a table</td><td>column data</td></tr>
+                    <tr><td><code>meta</code></td><td>row groups, rows, per-column stats</td><td>footer + index</td></tr>
+                    <tr><td><code>footer</code></td><td>magic, version, buckets, compression</td><td>footer only</td></tr>
+                    <tr><td><code>buckets</code></td><td>per-bucket layout and member columns</td><td>footer + index</td></tr>
+                    <tr><td><code>pages</code></td><td>per-column encoding + slot size</td><td>bucket data</td></tr>
+                    <tr><td><code>dictionary</code></td><td>dictionary entries of a dict column</td><td>bucket data</td></tr>
+                    <tr><td><code>column-size</code></td><td>on-disk bytes per column</td><td>footer + index</td></tr>
+                    <tr><td><code>cat</code> / <code>head</code></td><td>first N rows as a table</td><td>column data</td></tr>
                 </tbody>
             </table>
-            <p>All four accept <code>--json</code>. <code>cat</code> also takes <code>-n &lt;N&gt;</code> and <code>-c a,b</code> (projection).</p>
+            <p>Every command accepts <code>--json</code>. <code>cat</code>/<code>head</code> take <code>-n &lt;N&gt;</code> and <code>-c a,b</code> (projection); <code>dictionary</code> takes <code>-c &lt;col&gt;</code>.</p>
 
             <h2>schema</h2>
+            <p>Columns, Arrow types, nullability and bucket assignment, in original input order. Footer only.</p>
 <pre><code><span class="cmt">$ mosaic schema data.mosaic</span>
-3 columns, 3 buckets
-  id: Int32 not null [bucket 1]
-  kind: Utf8 [bucket 2]
-  flag: Int32 [bucket 0]</code></pre>
+5 columns, 4 buckets
+  id: Int32 not null [bucket 0]
+  name: Utf8 [bucket 2]
+  kind: Utf8 [bucket 1]
+  score: Float64 [bucket 3]
+  flag: Int32 [bucket 0]
+
+<span class="cmt">$ mosaic schema data.mosaic --json</span>
+{"columns":5,"buckets":4,"fields":[{"name":"id","type":"Int32","nullable":false,"bucket":0}, ...]}</code></pre>
 
             <h2>meta</h2>
+            <p>Total rows, row groups, and per-column stats (null count / min / max) for columns configured with stats.</p>
 <pre><code><span class="cmt">$ mosaic meta data.mosaic</span>
-file: 200 rows, 3 columns, 3 buckets, 1 row groups
+file: 200 rows, 5 columns, 4 buckets, 1 row groups
 row group 0: 200 rows
-    id: nulls=0 min=0 max=199</code></pre>
+    id: nulls=0 min=0 max=199
+    score: nulls=0 min=0 max=298.5</code></pre>
+
+            <h2>footer</h2>
+            <p>The 32-byte file footer: magic, format version, bucket count, row groups and compression.</p>
+<pre><code><span class="cmt">$ mosaic footer data.mosaic</span>
+magic=MOSA version=1 buckets=4 row_groups=1 compression=zstd</code></pre>
+
+            <h2>buckets</h2>
+            <p>Per row group, each bucket's layout (empty / monolithic / paged), on-disk size and member columns. Mosaic groups columns into buckets by name order.</p>
+<pre><code><span class="cmt">$ mosaic buckets data.mosaic</span>
+row group 0:
+    bucket 0: paged 373B [flag, id]
+    bucket 1: paged 32B [kind]
+    bucket 2: paged 220B [name]
+    bucket 3: paged 542B [score]</code></pre>
 
             <h2>pages</h2>
-            <p>
-                Per-column physical encoding within each row group: <code>plain</code>,
-                <code>const</code>, <code>dict</code> or <code>all_null</code>, plus the on-disk slot size.
-            </p>
+            <p>Per-column physical encoding (<code>plain</code> / <code>const</code> / <code>dict</code> / <code>all_null</code>) and on-disk slot size.</p>
 <pre><code><span class="cmt">$ mosaic pages data.mosaic</span>
 row group 0:
-    flag: bucket 0 encoding=const slot=0B
-    id: bucket 1 encoding=plain slot=8684B
-    kind: bucket 2 encoding=dict slot=31B</code></pre>
+    flag: bucket 0 encoding=const slot=16B
+    id: bucket 0 encoding=plain slot=349B
+    kind: bucket 1 encoding=dict slot=28B
+    name: bucket 2 encoding=plain slot=216B
+    score: bucket 3 encoding=plain slot=538B</code></pre>
 
-            <h2>cat</h2>
+            <h2>dictionary</h2>
+            <p>Dump the dictionary of a dict-encoded column. Non-dict columns report as such.</p>
+<pre><code><span class="cmt">$ mosaic dictionary data.mosaic -c kind</span>
+row group 0: 3 entries
+    0: a
+    1: b
+    2: c
+
+<span class="cmt">$ mosaic dictionary data.mosaic -c kind --json</span>
+{"column":"kind","row_groups":[["a","b","c"]]}</code></pre>
+
+            <h2>column-size</h2>
+            <p>On-disk bytes per column, summed across row groups.</p>
+<pre><code><span class="cmt">$ mosaic column-size data.mosaic</span>
+  id: 349 B
+  name: 216 B
+  kind: 28 B
+  score: 538 B
+  flag: 16 B</code></pre>
+
+            <h2>cat / head</h2>
+            <p>Read the first N rows as a table. <code>-n</code> sets the count, <code>-c</code> projects columns, <code>--json</code> emits newline-delimited JSON. <code>head</code> is an alias of <code>cat</code>.</p>
 <pre><code><span class="cmt">$ mosaic cat data.mosaic -n 2</span>
-+----+------+------+
-| id | kind | flag |
-+----+------+------+
-| 0  | a    | 7    |
-| 1  | b    | 7    |
-+----+------+------+
++----+--------+------+-------+------+
+| id | name   | kind | score | flag |
++----+--------+------+-------+------+
+| 0  | user_0 | a    | 0     | 7    |
+| 1  | user_1 | b    | 1.5   | 7    |
++----+--------+------+-------+------+
+
+<span class="cmt">$ mosaic cat data.mosaic -n 2 -c name,score</span>   <span class="cmt"># projection</span>
 
 <span class="cmt">$ mosaic cat data.mosaic -n 2 --json</span>
-{"id":0,"kind":"a","flag":7}
-{"id":1,"kind":"b","flag":7}</code></pre>
-
-            <h2>Design vs parquet-cli</h2>
-            <p>
-                Both follow the same shape — thin subcommands over a shared reader — but Mosaic
-                is a single Rust implementation of a private format, so the tool is intentionally
-                smaller and read-only.
-            </p>
-            <table>
-                <thead>
-                    <tr><th></th><th>parquet-cli (Java)</th><th>mosaic CLI</th></tr>
-                </thead>
-                <tbody>
-                    <tr><td>Parser</td><td>airline annotations</td><td>clap derive</td></tr>
-                    <tr><td>Base</td><td>BaseCommand + Hadoop FS</td><td>MosaicReader + FileInput (pread)</td></tr>
-                    <tr><td>IO</td><td>local / HDFS / S3</td><td>local file</td></tr>
-                    <tr><td>Schema</td><td>printed as Avro</td><td>printed as Arrow</td></tr>
-                    <tr><td>Runtime</td><td>JVM (hadoop jar)</td><td>native, no JVM</td></tr>
-                    <tr><td>Scope</td><td>22 cmds (view + convert + rewrite)</td><td>4 view cmds</td></tr>
-                </tbody>
-            </table>
+{"id":0,"name":"user_0","kind":"a","score":0,"flag":7}
+{"id":1,"name":"user_1","kind":"b","score":1.5,"flag":7}</code></pre>
 
             <div class="tip">
                 <strong>Embedding instead</strong>
