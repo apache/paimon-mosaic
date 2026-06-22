@@ -457,6 +457,18 @@ impl<I: InputFile> MosaicReader<I> {
         &self.input
     }
 
+    /// Footer compression code (`spec::COMPRESSION_*`).
+    pub fn compression(&self) -> u8 {
+        self.compression
+    }
+
+    /// Dictionary entries for one column in one row group, or `None` if that
+    /// column is not dict-encoded there. Used by the `dictionary` command.
+    pub fn dictionary(&self, rg_index: usize, col: usize) -> io::Result<Option<Vec<Value>>> {
+        let rg = self.row_group_reader_projected(rg_index, &[col])?;
+        Ok(rg.take_dictionary(col))
+    }
+
     /// Per-column physical layout for a row group: bucket, encoding and on-disk
     /// slot size. Reads and decompresses each non-empty bucket; used by tooling
     /// (the `pages` command). Columns are reported in global (name-sorted) order.
@@ -1033,6 +1045,22 @@ impl RowGroupReader {
             num_columns,
             projected_columns,
             output_order,
+        }
+    }
+
+    /// Dictionary entries for a projected column, or `None` if not dict-encoded.
+    pub fn take_dictionary(&self, global_col: usize) -> Option<Vec<Value>> {
+        let bucket = self.schema.columns[global_col].bucket_id;
+        let local = self.bucket_to_global[bucket].iter().position(|&g| g == global_col)?;
+        match self.bucket_states[bucket].as_ref()? {
+            BucketState::Paged { column_readers } => {
+                let d = column_readers[local].as_ref()?.dict_values();
+                if d.is_empty() { None } else { Some(d.to_vec()) }
+            }
+            BucketState::Monolithic { reader } => {
+                let d = reader.dict_values(local);
+                if d.is_empty() { None } else { Some(d.to_vec()) }
+            }
         }
     }
 

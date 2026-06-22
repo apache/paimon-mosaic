@@ -67,6 +67,30 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Print the first N rows (alias of cat).
+    Head {
+        file: PathBuf,
+        #[arg(short = 'n', long, default_value_t = 10)]
+        num: usize,
+        #[arg(short, long)]
+        columns: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the file footer: version, buckets, compression, offsets.
+    Footer {
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print on-disk bytes per column (summed over row groups).
+    ColumnSize {
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the dictionary of a dict-encoded column.
+    Dictionary { file: PathBuf, column: String },
 }
 
 fn main() -> ExitCode {
@@ -76,6 +100,10 @@ fn main() -> ExitCode {
         Cmd::Meta { file, json } => meta(&file, json),
         Cmd::Pages { file, json } => pages(&file, json),
         Cmd::Cat { file, num, columns, json } => cat(&file, num, columns, json),
+        Cmd::Head { file, num, columns, json } => cat(&file, num, columns, json),
+        Cmd::Footer { file, json } => footer(&file, json),
+        Cmd::ColumnSize { file, json } => column_size(&file, json),
+        Cmd::Dictionary { file, column } => dictionary(&file, &column),
     };
     match res {
         Ok(()) => ExitCode::SUCCESS,
@@ -209,6 +237,61 @@ fn cat(file: &PathBuf, num: usize, columns: Option<String>, json: bool) -> std::
         print!("{}", fmt::ndjson(&batches, num));
     } else {
         print!("{}", fmt::pretty_table(&batches, num));
+    }
+    Ok(())
+}
+
+fn footer(file: &PathBuf, json: bool) -> std::io::Result<()> {
+    use paimon_mosaic_core::spec::{COMPRESSION_ZSTD, MAGIC, VERSION};
+    let reader = open(file)?;
+    let s = reader.schema();
+    let comp = if reader.compression() == COMPRESSION_ZSTD { "zstd" } else { "none" };
+    let magic = std::str::from_utf8(&MAGIC).unwrap_or("MOSA");
+    if json {
+        println!("{{\"magic\":{},\"version\":{},\"buckets\":{},\"row_groups\":{},\"compression\":{}}}",
+            fmt::json_str(magic), VERSION, s.num_buckets, reader.num_row_groups(), fmt::json_str(comp));
+    } else {
+        println!("magic={} version={} buckets={} row_groups={} compression={}",
+            magic, VERSION, s.num_buckets, reader.num_row_groups(), comp);
+    }
+    Ok(())
+}
+
+fn column_size(file: &PathBuf, json: bool) -> std::io::Result<()> {
+    let reader = open(file)?;
+    let s = reader.schema();
+    let mut bytes = vec![0usize; s.columns.len()];
+    for rg in 0..reader.num_row_groups() {
+        for p in reader.page_infos(rg)? {
+            bytes[p.column_index] += p.slot_size;
+        }
+    }
+    let cols = original_order(s);
+    if json {
+        let items: Vec<String> = cols.iter().map(|&i| format!("{{\"column\":{},\"bytes\":{}}}", fmt::json_str(&s.columns[i].name), bytes[i])).collect();
+        println!("[{}]", items.join(","));
+    } else {
+        for i in cols {
+            println!("  {}: {} B", s.columns[i].name, bytes[i]);
+        }
+    }
+    Ok(())
+}
+
+fn dictionary(file: &PathBuf, column: &str) -> std::io::Result<()> {
+    let reader = open(file)?;
+    let col = reader.schema().columns.iter().position(|c| c.name == column)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("column '{column}' not found")))?;
+    for rg in 0..reader.num_row_groups() {
+        match reader.dictionary(rg, col)? {
+            Some(vals) => {
+                println!("row group {rg}: {} entries", vals.len());
+                for (i, v) in vals.iter().enumerate() {
+                    println!("    {i}: {}", fmt::render_value(v));
+                }
+            }
+            None => println!("row group {rg}: not dict-encoded"),
+        }
     }
     Ok(())
 }

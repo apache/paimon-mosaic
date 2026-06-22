@@ -141,3 +141,31 @@ fn missing_file_fails() {
     assert!(!ok);
     assert!(err.contains("error:"));
 }
+
+#[test]
+fn footer_shows_format() {
+    let f = fixture("footer");
+    let (out, _, ok) = run(&["footer", &f]);
+    assert!(ok);
+    assert!(out.contains("magic=MOSA"));
+    assert!(out.contains("buckets=3"));
+    assert!(out.contains("compression=zstd"));
+}
+
+#[test]
+fn dictionary_dumps_entries() {
+    let f = fixture("dict");
+    let (out, _, ok) = run(&["dictionary", &f, "kind"]);
+    assert!(ok);
+    assert!(out.contains("3 entries"));
+    assert!(out.contains("a") && out.contains("b") && out.contains("c"));
+}
+
+#[test]
+fn column_size_sums_bytes() {
+    let f = fixture("size");
+    let (out, _, ok) = run(&["column-size", &f]);
+    assert!(ok);
+    assert!(out.contains("id:") && out.contains("kind:"));
+    assert!(out.contains("flag: 0 B")); // const column has no slot
+}

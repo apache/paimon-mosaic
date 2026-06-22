@@ -512,6 +512,11 @@ impl BucketReader {
         &self.encodings
     }
 
+    /// Dictionary entries for one column (empty if it is not dict-encoded).
+    pub fn dict_values(&self, col: usize) -> &[Value] {
+        &self.dict_values[col]
+    }
+
     pub fn read_all_columns(&self) -> io::Result<Vec<ArrayRef>> {
         let num_rows = self.num_rows;
         let mut result = Vec::with_capacity(self.num_columns);
@@ -776,6 +781,11 @@ impl ColumnPageReader {
     /// Encoding id of this column page. See `spec::ENCODING_*`.
     pub fn encoding(&self) -> u8 {
         self.encoding
+    }
+
+    /// Dictionary entries for a dict-encoded page (empty for other encodings).
+    pub fn dict_values(&self) -> &[Value] {
+        &self.dict_values
     }
 
     pub fn read_all(&self) -> io::Result<ArrayRef> {
