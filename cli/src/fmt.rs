@@ -165,7 +165,8 @@ fn cell_json(arr: &dyn Array, row: usize) -> String {
         return "null".to_string();
     }
     match arr.data_type() {
-        Utf8 | Date32 => json_str(&cell(arr, row)),
+        Utf8 => json_str(&cell(arr, row)),
+        // Date32 is an epoch-day integer; emit bare like other numerics.
         _ => cell(arr, row),
     }
 }

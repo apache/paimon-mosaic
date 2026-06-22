@@ -139,7 +139,7 @@ row group 0: 3 entries
 {"column":"kind","row_groups":[["a","b","c"]]}</code></pre>
 
             <h2>column-size</h2>
-            <p>On-disk bytes per column, summed across row groups.</p>
+            <p>On-disk bytes per column, summed across row groups. When a bucket groups several columns its bytes are split evenly among them.</p>
 <pre><code><span class="cmt">$ mosaic column-size data.mosaic</span>
   id: 349 B
   name: 216 B

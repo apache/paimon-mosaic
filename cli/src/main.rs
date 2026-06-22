@@ -276,8 +276,15 @@ fn column_size(file: &PathBuf, json: bool) -> std::io::Result<()> {
     let s = reader.schema();
     let mut bytes = vec![0usize; s.columns.len()];
     for rg in 0..reader.num_row_groups() {
-        for p in reader.page_infos(rg)? {
-            bytes[p.column_index] += p.slot_size;
+        // On-disk bytes are tracked per bucket (works for both monolithic and
+        // paged layouts); split a bucket's size across its member columns.
+        for b in reader.bucket_infos(rg)? {
+            if b.columns.is_empty() { continue; }
+            let share = b.size / b.columns.len();
+            let mut rem = b.size % b.columns.len();
+            for &c in &b.columns {
+                bytes[c] += share + if rem > 0 { rem -= 1; 1 } else { 0 };
+            }
         }
     }
     let cols = original_order(s);

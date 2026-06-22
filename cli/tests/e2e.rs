@@ -47,6 +47,12 @@ impl OutputFile for FileOut {
 
 /// Write a small fixture and return its path under the test temp dir.
 fn fixture(name: &str) -> String {
+    fixture_threshold(name, 1)
+}
+
+/// Like `fixture` but with an explicit `page_size_threshold`; threshold 1 forces
+/// paged buckets, the default (32 KiB) keeps small files monolithic.
+fn fixture_threshold(name: &str, threshold: usize) -> String {
     let path = format!("{}/mosaic_e2e_{}.mosaic", std::env::temp_dir().display(), name);
     let schema = Schema::new(vec![
         Field::new("id", DataType::Int32, false),
@@ -56,7 +62,7 @@ fn fixture(name: &str) -> String {
     let out = FileOut { f: File::create(&path).unwrap(), pos: 0 };
     let opts = WriterOptions {
         num_buckets: 3,
-        page_size_threshold: 1,
+        page_size_threshold: threshold,
         stats_columns: vec!["id".into()],
         ..Default::default()
     };
@@ -173,7 +179,21 @@ fn column_size_sums_bytes() {
     let (out, _, ok) = run(&["column-size", &f]);
     assert!(ok);
     assert!(out.contains("id:") && out.contains("kind:"));
-    assert!(out.contains("flag: 0 B")); // const column has no slot
+    // Every column attributes its on-disk bucket bytes (even the const flag bucket).
+    assert!(out.contains("flag: 15 B") && !out.contains(": 0 B"));
+}
+
+#[test]
+fn column_size_nonzero_on_monolithic() {
+    // Default threshold keeps small files monolithic; bytes must still attribute
+    // (regression: monolithic buckets previously reported 0 B everywhere).
+    let f = fixture_threshold("size_mono", 32 * 1024);
+    let (b, _, _) = run(&["buckets", &f]);
+    assert!(b.contains("monolithic"), "default file should be monolithic: {b}");
+    let (out, _, ok) = run(&["column-size", &f]);
+    assert!(ok);
+    assert!(out.contains("id: ") && !out.contains("id: 0 B"), "id must be non-zero: {out}");
+    assert!(out.contains("kind: ") && !out.contains("kind: 0 B"), "kind must be non-zero: {out}");
 }
 
 #[test]
