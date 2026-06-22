@@ -189,6 +189,17 @@ pub struct PageInfo {
     pub slot_size: usize,
 }
 
+/// Layout of one bucket within one row group.
+pub struct BucketInfo {
+    pub bucket: usize,
+    /// "empty" | "monolithic" | "paged".
+    pub kind: &'static str,
+    /// On-disk compressed size in bytes (0 for empty buckets).
+    pub size: usize,
+    /// Member column indices (global, name-sorted order).
+    pub columns: Vec<usize>,
+}
+
 pub struct RowGroupMeta {
     pub num_rows: usize,
     pub bucket_offsets: Vec<u64>,
@@ -460,6 +471,24 @@ impl<I: InputFile> MosaicReader<I> {
     /// Footer compression code (`spec::COMPRESSION_*`).
     pub fn compression(&self) -> u8 {
         self.compression
+    }
+
+    /// Per-bucket layout for a row group: kind, on-disk size and member columns
+    /// (global indices). The bucket is Mosaic's defining structure — exposed for
+    /// the `buckets` command.
+    pub fn bucket_infos(&self, rg_index: usize) -> io::Result<Vec<BucketInfo>> {
+        if rg_index >= self.row_group_metas.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "row group index out of range"));
+        }
+        let meta = &self.row_group_metas[rg_index];
+        Ok((0..self.num_buckets).map(|b| {
+            let (kind, size) = match meta.bucket_layouts[b] {
+                BucketLayout::Empty => ("empty", 0),
+                BucketLayout::Monolithic { compressed_size, .. } => ("monolithic", compressed_size),
+                BucketLayout::Paged { total_size } => ("paged", total_size),
+            };
+            BucketInfo { bucket: b, kind, size, columns: self.schema.bucket_to_global[b].clone() }
+        }).collect())
     }
 
     /// Dictionary entries for one column in one row group, or `None` if that

@@ -169,3 +169,13 @@ fn column_size_sums_bytes() {
     assert!(out.contains("id:") && out.contains("kind:"));
     assert!(out.contains("flag: 0 B")); // const column has no slot
 }
+
+#[test]
+fn buckets_show_layout() {
+    let f = fixture("buckets");
+    let (out, _, ok) = run(&["buckets", &f]);
+    assert!(ok);
+    assert!(out.contains("row group 0:"));
+    assert!(out.contains("[flag]") && out.contains("[id]") && out.contains("[kind]"));
+    assert!(out.contains("monolithic") || out.contains("paged"));
+}

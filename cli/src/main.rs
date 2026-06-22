@@ -91,6 +91,12 @@ enum Cmd {
     },
     /// Print the dictionary of a dict-encoded column.
     Dictionary { file: PathBuf, column: String },
+    /// Print bucket layout per row group (Mosaic's column grouping).
+    Buckets {
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -104,6 +110,7 @@ fn main() -> ExitCode {
         Cmd::Footer { file, json } => footer(&file, json),
         Cmd::ColumnSize { file, json } => column_size(&file, json),
         Cmd::Dictionary { file, column } => dictionary(&file, &column),
+        Cmd::Buckets { file, json } => buckets(&file, json),
     };
     match res {
         Ok(()) => ExitCode::SUCCESS,
@@ -292,6 +299,33 @@ fn dictionary(file: &PathBuf, column: &str) -> std::io::Result<()> {
             }
             None => println!("row group {rg}: not dict-encoded"),
         }
+    }
+    Ok(())
+}
+
+fn buckets(file: &PathBuf, json: bool) -> std::io::Result<()> {
+    let reader = open(file)?;
+    let s = reader.schema();
+    let name = |i: usize| s.columns[i].name.clone();
+    let mut rgs = Vec::new();
+    for rg in 0..reader.num_row_groups() {
+        let infos = reader.bucket_infos(rg)?;
+        if json {
+            let items: Vec<String> = infos.iter().map(|b| {
+                let cols: Vec<String> = b.columns.iter().map(|&i| fmt::json_str(&name(i))).collect();
+                format!("{{\"bucket\":{},\"kind\":{},\"size\":{},\"columns\":[{}]}}", b.bucket, fmt::json_str(b.kind), b.size, cols.join(","))
+            }).collect();
+            rgs.push(format!("[{}]", items.join(",")));
+        } else {
+            println!("row group {rg}:");
+            for b in &infos {
+                let cols: Vec<String> = b.columns.iter().map(|&i| name(i)).collect();
+                println!("    bucket {}: {} {}B [{}]", b.bucket, b.kind, b.size, cols.join(", "));
+            }
+        }
+    }
+    if json {
+        println!("{{\"row_groups\":[{}]}}", rgs.join(","));
     }
     Ok(())
 }
