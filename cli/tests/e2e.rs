@@ -159,6 +159,9 @@ fn dictionary_dumps_entries() {
     assert!(ok);
     assert!(out.contains("3 entries"));
     assert!(out.contains("a") && out.contains("b") && out.contains("c"));
+    let (j, _, ok) = run(&["dictionary", &f, "-c", "kind", "--json"]);
+    assert!(ok);
+    assert_eq!(j, "{\"column\":\"kind\",\"row_groups\":[[\"a\",\"b\",\"c\"]]}\n");
 }
 
 #[test]

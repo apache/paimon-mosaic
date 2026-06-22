@@ -95,6 +95,8 @@ enum Cmd {
         /// Column name to dump.
         #[arg(short = 'c', long)]
         column: String,
+        #[arg(long)]
+        json: bool,
     },
     /// Print bucket layout per row group (Mosaic's column grouping).
     Buckets {
@@ -114,7 +116,7 @@ fn main() -> ExitCode {
         Cmd::Head { file, num, columns, json } => cat(&file, num, columns, json),
         Cmd::Footer { file, json } => footer(&file, json),
         Cmd::ColumnSize { file, json } => column_size(&file, json),
-        Cmd::Dictionary { file, column } => dictionary(&file, &column),
+        Cmd::Dictionary { file, column, json } => dictionary(&file, &column, json),
         Cmd::Buckets { file, json } => buckets(&file, json),
     };
     match res {
@@ -290,10 +292,24 @@ fn column_size(file: &PathBuf, json: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-fn dictionary(file: &PathBuf, column: &str) -> std::io::Result<()> {
+fn dictionary(file: &PathBuf, column: &str, json: bool) -> std::io::Result<()> {
     let reader = open(file)?;
     let col = reader.schema().columns.iter().position(|c| c.name == column)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("column '{column}' not found")))?;
+    if json {
+        let mut rgs = Vec::new();
+        for rg in 0..reader.num_row_groups() {
+            match reader.dictionary(rg, col)? {
+                Some(vals) => {
+                    let e: Vec<String> = vals.iter().map(|v| fmt::json_str(&fmt::render_value(v))).collect();
+                    rgs.push(format!("[{}]", e.join(",")));
+                }
+                None => rgs.push("null".to_string()),
+            }
+        }
+        println!("{{\"column\":{},\"row_groups\":[{}]}}", fmt::json_str(column), rgs.join(","));
+        return Ok(());
+    }
     for rg in 0..reader.num_row_groups() {
         match reader.dictionary(rg, col)? {
             Some(vals) => {
