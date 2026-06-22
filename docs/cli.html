@@ -39,10 +39,10 @@
             <ul>
                 <li><a href="index.html">Home</a></li>
                 <li><a href="design.html">Design</a></li>
+                <li><a href="cli.html" class="active">CLI</a></li>
                 <li><a href="java-api.html">Java API</a></li>
                 <li><a href="python-api.html">Python API</a></li>
                 <li><a href="cpp-api.html">C++ API</a></li>
-                <li><a href="cli.html" class="active">CLI</a></li>
                 <li><a href="releases.html">Releases</a></li>
             </ul>
         </nav>
@@ -54,109 +54,95 @@
     <main class="main">
         <div class="content">
             <h1>CLI</h1>
-            <p class="subtitle">A <code>mosaic</code> binary for inspecting files from the shell &mdash; schema, metadata, contents, and physical encoding, in text or JSON.</p>
+            <p class="subtitle">Inspect Mosaic files from the terminal with the <code>mosaic</code> binary — schema, meta, cat and pages. A native, JVM-free toolkit modeled on parquet-cli.</p>
 
             <h2>Install</h2>
             <p>
-                The CLI is the <code>cli/</code> workspace crate. Build the binary and put it on your
-                <code>PATH</code>:
+                The CLI lives in the <code>cli/</code> directory and drives the read-only
+                <code>MosaicReader</code> API. Build and run from source, or install the binary:
             </p>
-<pre><code>cargo build --release -p paimon-mosaic-cli
-cp target/release/mosaic /usr/local/bin/</code></pre>
-            <p>Every command takes a file path and prints to stdout; add <code>--json</code> for machine-readable output.</p>
-<pre><code><span class="cmt"># schema, metadata, encoding, and first rows</span>
-mosaic schema file.mosaic
-mosaic meta   file.mosaic
-mosaic pages  file.mosaic
-mosaic cat    file.mosaic -n 20</code></pre>
+<pre><code><span class="cmt"># run from source</span>
+cargo run -p paimon-mosaic-cli -- schema data.mosaic
+
+<span class="cmt"># install the `mosaic` binary</span>
+cargo install --path cli
+mosaic schema data.mosaic</code></pre>
+
+            <h2>Commands</h2>
+            <table>
+                <thead>
+                    <tr><th>Command</th><th>Shows</th><th>Reads</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>schema</code></td><td>column names, Arrow types, nullability, bucket</td><td>footer only</td></tr>
+                    <tr><td><code>meta</code></td><td>row groups, rows, per-column stats (null/min/max)</td><td>footer + index</td></tr>
+                    <tr><td><code>pages</code></td><td>per-column encoding + on-disk slot size</td><td>bucket data</td></tr>
+                    <tr><td><code>cat</code></td><td>first N rows as a table</td><td>column data</td></tr>
+                </tbody>
+            </table>
+            <p>All four accept <code>--json</code>. <code>cat</code> also takes <code>-n &lt;N&gt;</code> and <code>-c a,b</code> (projection).</p>
 
             <h2>schema</h2>
-            <p>Column names, Arrow types, nullability, and bucket assignment. Columns are listed in original (write) order.</p>
-<pre><code>$ mosaic schema file.mosaic
-3 columns, 2 buckets
-  id: Int32 not null [bucket 0]
-  name: Utf8 [bucket 1]
-  age: Int32 [bucket 0]</code></pre>
-<pre><code>$ mosaic schema file.mosaic --json
-{<span class="str">"columns"</span>:3,<span class="str">"buckets"</span>:2,<span class="str">"fields"</span>:[{<span class="str">"name"</span>:<span class="str">"id"</span>,<span class="str">"type"</span>:<span class="str">"Int32"</span>,<span class="str">"nullable"</span>:false,<span class="str">"bucket"</span>:0}, ...]}</code></pre>
+<pre><code><span class="cmt">$ mosaic schema data.mosaic</span>
+3 columns, 3 buckets
+  id: Int32 not null [bucket 1]
+  kind: Utf8 [bucket 2]
+  flag: Int32 [bucket 0]</code></pre>
 
             <h2>meta</h2>
-            <p>Row counts, row groups, and per-column statistics (null count and min/max for stats columns).</p>
-<pre><code>$ mosaic meta file.mosaic
-file: 5 rows, 3 columns, 2 buckets, 1 row groups
-row group 0: 5 rows
-    age: nulls=1 min=25 max=40
-    id: nulls=0 min=1 max=5
-    name: nulls=1 min=alice max=eve</code></pre>
+<pre><code><span class="cmt">$ mosaic meta data.mosaic</span>
+file: 200 rows, 3 columns, 3 buckets, 1 row groups
+row group 0: 200 rows
+    id: nulls=0 min=0 max=199</code></pre>
 
             <h2>pages</h2>
-            <p>Per-column physical encoding and slot size, per row group. Encodings are <code>const</code>, <code>plain</code>, <code>dict</code>, or <code>all_null</code>.</p>
-<pre><code>$ mosaic pages file.mosaic
+            <p>
+                Per-column physical encoding within each row group: <code>plain</code>,
+                <code>const</code>, <code>dict</code> or <code>all_null</code>, plus the on-disk slot size.
+            </p>
+<pre><code><span class="cmt">$ mosaic pages data.mosaic</span>
 row group 0:
-    age: bucket 0 encoding=plain slot=0B
-    id: bucket 0 encoding=plain slot=0B
-    name: bucket 1 encoding=plain slot=0B</code></pre>
+    flag: bucket 0 encoding=const slot=0B
+    id: bucket 1 encoding=plain slot=8684B
+    kind: bucket 2 encoding=dict slot=31B</code></pre>
 
             <h2>cat</h2>
-            <p>First <code>N</code> rows as a table. Project with <code>-c</code>/<code>--columns</code>; output NDJSON with <code>--json</code>.</p>
-<pre><code>$ mosaic cat file.mosaic -n 3
-+----+-------+-----+
-| id | name  | age |
-+----+-------+-----+
-| 1  | alice | 30  |
-| 2  | bob   | 25  |
-| 3  |       | 40  |
-+----+-------+-----+
+<pre><code><span class="cmt">$ mosaic cat data.mosaic -n 2</span>
++----+------+------+
+| id | kind | flag |
++----+------+------+
+| 0  | a    | 7    |
+| 1  | b    | 7    |
++----+------+------+
 
-$ mosaic cat file.mosaic -c name,id -n 1 --json
-{<span class="str">"name"</span>:<span class="str">"alice"</span>,<span class="str">"id"</span>:1}</code></pre>
+<span class="cmt">$ mosaic cat data.mosaic -n 2 --json</span>
+{"id":0,"kind":"a","flag":7}
+{"id":1,"kind":"b","flag":7}</code></pre>
 
-            <h3>Options</h3>
-            <table>
-                <thead>
-                    <tr><th>Command</th><th>Flag</th><th>Description</th></tr>
-                </thead>
-                <tbody>
-                    <tr><td>all</td><td><code>--json</code></td><td>Machine-readable output (objects/NDJSON)</td></tr>
-                    <tr><td><code>cat</code></td><td><code>-n, --num</code></td><td>Rows to print (default 10)</td></tr>
-                    <tr><td><code>cat</code></td><td><code>-c, --columns</code></td><td>Comma-separated columns to project and reorder</td></tr>
-                </tbody>
-            </table>
-
-            <h2>Comparison with parquet-cli</h2>
+            <h2>Design vs parquet-cli</h2>
             <p>
-                The command surface mirrors Apache Parquet's <code>parquet-cli</code> so the muscle memory carries over,
-                but the design is deliberately leaner. The mapping:
+                Both follow the same shape — thin subcommands over a shared reader — but Mosaic
+                is a single Rust implementation of a private format, so the tool is intentionally
+                smaller and read-only.
             </p>
             <table>
                 <thead>
-                    <tr><th>mosaic</th><th>parquet-cli</th><th>Purpose</th></tr>
+                    <tr><th></th><th>parquet-cli (Java)</th><th>mosaic CLI</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td><code>schema</code></td><td><code>schema</code></td><td>Columns, types, nullability (+ bucket assignment)</td></tr>
-                    <tr><td><code>meta</code></td><td><code>meta</code></td><td>Row groups + per-column stats</td></tr>
-                    <tr><td><code>cat</code></td><td><code>cat</code> / <code>head</code></td><td>Rows; <code>-n</code> caps like <code>head</code></td></tr>
-                    <tr><td><code>pages</code></td><td><code>pages</code> / <code>column-index</code></td><td>Per-column encoding &amp; slot size</td></tr>
-                </tbody>
-            </table>
-            <p>Design differences worth noting:</p>
-            <table>
-                <thead>
-                    <tr><th>Aspect</th><th>parquet-cli</th><th>mosaic</th></tr>
-                </thead>
-                <tbody>
-                    <tr><td>Runtime</td><td>JVM jar</td><td>Single static native binary, no runtime</td></tr>
-                    <tr><td>JSON output</td><td>Per-command, uneven</td><td><code>--json</code> on every command</td></tr>
-                    <tr><td>Physical unit</td><td>Column chunk per row group</td><td>Bucket (the Mosaic column-group unit)</td></tr>
-                    <tr><td>Column order</td><td>As stored</td><td>Original write order (disk is name-sorted; CLI un-sorts)</td></tr>
-                    <tr><td>Stats</td><td>Always present</td><td>Only opt-in stats columns carry min/max</td></tr>
+                    <tr><td>Parser</td><td>airline annotations</td><td>clap derive</td></tr>
+                    <tr><td>Base</td><td>BaseCommand + Hadoop FS</td><td>MosaicReader + FileInput (pread)</td></tr>
+                    <tr><td>IO</td><td>local / HDFS / S3</td><td>local file</td></tr>
+                    <tr><td>Schema</td><td>printed as Avro</td><td>printed as Arrow</td></tr>
+                    <tr><td>Runtime</td><td>JVM (hadoop jar)</td><td>native, no JVM</td></tr>
+                    <tr><td>Scope</td><td>22 cmds (view + convert + rewrite)</td><td>4 view cmds</td></tr>
                 </tbody>
             </table>
 
             <div class="tip">
-                <strong>JSON for pipelines</strong>
-                <code>--json</code> emits objects (schema/meta/pages) and NDJSON (cat), so you can pipe
-                straight into <code>jq</code>: <code>mosaic meta f.mosaic --json | jq .row_groups[0].rows</code>.
+                <strong>Embedding instead</strong>
+                For C/C++ or Java callers, embed the format directly via the <code>ffi</code>
+                (<code>mosaic.h</code>) or <code>jni</code> crates rather than shelling out to this CLI.
             </div>
         </div>
     </main>
