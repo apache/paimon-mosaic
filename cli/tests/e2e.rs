@@ -150,6 +150,9 @@ fn footer_shows_format() {
     assert!(out.contains("magic=MOSA"));
     assert!(out.contains("buckets=3"));
     assert!(out.contains("compression=zstd"));
+    let (j, _, ok) = run(&["footer", &f, "--json"]);
+    assert!(ok);
+    assert!(j.contains("\"magic\":\"MOSA\"") && j.contains("\"compression\":\"zstd\""));
 }
 
 #[test]
@@ -181,4 +184,7 @@ fn buckets_show_layout() {
     assert!(out.contains("row group 0:"));
     assert!(out.contains("[flag]") && out.contains("[id]") && out.contains("[kind]"));
     assert!(out.contains("monolithic") || out.contains("paged"));
+    let (j, _, ok) = run(&["buckets", &f, "--json"]);
+    assert!(ok);
+    assert!(j.contains("\"bucket\":0") && j.contains("\"columns\":"));
 }

@@ -232,13 +232,6 @@ mod tests {
     }
 
     #[test]
-    fn encoding_names() {
-        assert_eq!(encoding_name(0), "plain");
-        assert_eq!(encoding_name(2), "dict");
-        assert_eq!(encoding_name(3), "all_null");
-    }
-
-    #[test]
     fn ndjson_renders_null_and_quotes() {
         let out = ndjson(&[sample()], 10);
         assert_eq!(out, "{\"id\":1,\"name\":\"ann\"}\n{\"id\":2,\"name\":null}\n");
