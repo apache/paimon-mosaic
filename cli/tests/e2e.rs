@@ -155,7 +155,7 @@ fn footer_shows_format() {
 #[test]
 fn dictionary_dumps_entries() {
     let f = fixture("dict");
-    let (out, _, ok) = run(&["dictionary", &f, "kind"]);
+    let (out, _, ok) = run(&["dictionary", &f, "-c", "kind"]);
     assert!(ok);
     assert!(out.contains("3 entries"));
     assert!(out.contains("a") && out.contains("b") && out.contains("c"));

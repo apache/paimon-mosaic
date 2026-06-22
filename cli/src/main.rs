@@ -90,7 +90,12 @@ enum Cmd {
         json: bool,
     },
     /// Print the dictionary of a dict-encoded column.
-    Dictionary { file: PathBuf, column: String },
+    Dictionary {
+        file: PathBuf,
+        /// Column name to dump.
+        #[arg(short = 'c', long)]
+        column: String,
+    },
     /// Print bucket layout per row group (Mosaic's column grouping).
     Buckets {
         file: PathBuf,
