@@ -134,6 +134,13 @@ fn cat_truncates_and_projects() {
 }
 
 #[test]
+fn head_is_alias_of_cat() {
+    let f = fixture("headalias");
+    let (out, _, ok) = run(&["head", &f, "-n", "1"]);
+    assert!(ok && out.contains("| id | kind | flag |"));
+}
+
+#[test]
 fn count_reports_total() {
     let f = fixture("count");
     let (out, _, ok) = run(&["count", &f]);
@@ -201,6 +208,18 @@ fn where_pushdown_keeps_correct_rows() {
     assert!(none.contains("(no rows)"));
     let (keep, _, _) = run(&["cat", &out, "--all", "--where", "id>=3", "--json"]);
     assert_eq!(keep.lines().count(), 1); // boundary kept, not skipped
+}
+
+#[test]
+fn date_column_pushdown_keeps_match() {
+    // Date stats are epoch-day ints; pushdown must read them numerically (no
+    // string suffix) so the filter still finds the matching row.
+    let csv = format!("{}/mosaic_e2e_date.csv", std::env::temp_dir().display());
+    std::fs::write(&csv, "d\n2020-01-01\n2021-01-01\n").unwrap();
+    let out = format!("{}/mosaic_e2e_date.mosaic", std::env::temp_dir().display());
+    run(&["convert", &csv, "-o", &out, "--stats", "d"]);
+    let (j, _, ok) = run(&["cat", &out, "--all", "--where", "d>18627", "--json"]);
+    assert!(ok && j.lines().count() == 1 && j.contains("2021-01-01"), "{j}");
 }
 
 #[test]

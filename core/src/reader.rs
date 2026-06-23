@@ -546,7 +546,8 @@ impl<I: InputFile> MosaicReader<I> {
                     }
                     // Directory + slots must equal the bucket total, else a forged
                     // slot size could drive a huge read_range allocation.
-                    if dir_size + sizes.iter().sum::<usize>() != total_size {
+                    let slot_sum = sizes.iter().try_fold(dir_size, |a, &s| a.checked_add(s));
+                    if slot_sum != Some(total_size) {
                         return Err(io::Error::new(io::ErrorKind::InvalidData,
                             format!("paged bucket {}: slot sizes do not sum to total {}", b, total_size)));
                     }

@@ -55,7 +55,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Print the first N rows as a table.
+    /// Print the first N rows as a table (alias: head).
+    #[command(visible_alias = "head")]
     Cat {
         file: PathBuf,
         /// Number of rows to print.
@@ -68,20 +69,6 @@ enum Cmd {
         #[arg(short, long)]
         columns: Option<String>,
         /// Row filter, e.g. `id>100` or `kind=a` (one condition).
-        #[arg(long)]
-        r#where: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Print the first N rows (alias of cat).
-    Head {
-        file: PathBuf,
-        #[arg(short = 'n', long, default_value_t = 10)]
-        num: usize,
-        #[arg(long)]
-        all: bool,
-        #[arg(short, long)]
-        columns: Option<String>,
         #[arg(long)]
         r#where: Option<String>,
         #[arg(long)]
@@ -140,7 +127,6 @@ fn main() -> ExitCode {
         Cmd::Meta { file, json } => meta(&file, json),
         Cmd::Pages { file, json } => pages(&file, json),
         Cmd::Cat { file, num, all, columns, r#where, json } => cat(&file, if all { usize::MAX } else { num }, columns, r#where, json),
-        Cmd::Head { file, num, all, columns, r#where, json } => cat(&file, if all { usize::MAX } else { num }, columns, r#where, json),
         Cmd::Count { file, json } => count(&file, json),
         Cmd::Footer { file, json } => footer(&file, json),
         Cmd::ColumnSize { file, json } => column_size(&file, json),

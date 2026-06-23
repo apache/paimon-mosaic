@@ -88,6 +88,7 @@ pub fn json_str(s: &str) -> String {
 
 /// Pretty-print a slice of record batches as an aligned ASCII table.
 pub fn pretty_table(batches: &[RecordBatch], max_rows: usize) -> String {
+    if batches.is_empty() { return String::new(); }
     let schema = batches[0].schema();
     let headers: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
     let ncols = headers.len();
@@ -144,6 +145,7 @@ pub fn pretty_table(batches: &[RecordBatch], max_rows: usize) -> String {
 pub fn ndjson(batches: &[RecordBatch], max_rows: usize) -> String {
     // Use Arrow's JSON writer so every type the reader supports renders as valid
     // JSON (NaN/Infinity become null); explicit nulls keep absent fields visible.
+    if batches.is_empty() { return String::new(); }
     let mut taken: Vec<RecordBatch> = Vec::new();
     let mut got = 0usize;
     for b in batches {
@@ -181,7 +183,8 @@ fn cell(arr: &dyn Array, row: usize) -> String {
         Float64 => d!(Float64Array),
         Date32 => d!(Date32Array),
         Utf8 => arr.as_any().downcast_ref::<StringArray>().unwrap().value(row).to_string(),
-        _ => "?".to_string(),
+        // Text rendering for types cat doesn't format yet — show the type, not "?".
+        other => format!("<{other:?}>"),
     }
 }
 
@@ -236,14 +239,27 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
     arrow_select::filter::filter_record_batch(batch, &m).map_err(|e| e.to_string())
 }
 
+/// Numeric value of a stats [`Value`], or `None` for non-numeric types. Reads
+/// the variant directly (no string round-trip) so Date/Time pushdown works.
+fn to_f64(v: &Value) -> Option<f64> {
+    use Value::*;
+    match v {
+        Boolean(b) => Some(*b as u8 as f64),
+        TinyInt(x) => Some(*x as f64), SmallInt(x) => Some(*x as f64),
+        Integer(x) | Date(x) | Time(x) => Some(*x as f64),
+        BigInt(x) | DecimalCompact(x) | TimestampMillis(x) | TimestampMicros(x) => Some(*x as f64),
+        Float(x) => Some(*x as f64), Double(x) => Some(*x),
+        _ => None,
+    }
+}
+
 /// True when a row group's `[min, max]` provably excludes the filter — safe to
 /// skip. Numeric only and conservative: any missing/unparsable stat → keep.
 pub fn stats_exclude(w: &Where, min: &Option<Value>, max: &Option<Value>) -> bool {
-    let (lo, hi, v) = match (min.as_ref(), max.as_ref(), w.value.parse::<f64>()) {
-        (Some(a), Some(b), Ok(v)) => (render_value(a).parse::<f64>(), render_value(b).parse::<f64>(), v),
+    let (lo, hi, v) = match (min.as_ref().and_then(to_f64), max.as_ref().and_then(to_f64), w.value.parse::<f64>()) {
+        (Some(a), Some(b), Ok(v)) => (a, b, v),
         _ => return false,
     };
-    let (Ok(lo), Ok(hi)) = (lo, hi) else { return false };
     match w.op {
         ">" => hi <= v, ">=" => hi < v, "<" => lo >= v, "<=" => lo > v,
         "=" => v < lo || v > hi, _ => false,

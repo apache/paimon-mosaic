@@ -82,7 +82,7 @@ mosaic schema data.mosaic</code></pre>
                     <tr><td><code>convert</code></td><td>import a CSV into a new Mosaic file</td><td>writes file</td></tr>
                 </tbody>
             </table>
-            <p>Every command accepts <code>--json</code>. <code>cat</code>/<code>head</code> take <code>-n &lt;N&gt;</code> and <code>-c a,b</code> (projection); <code>dictionary</code> takes <code>-c &lt;col&gt;</code>.</p>
+            <p>Inspection and query commands accept <code>--json</code> (<code>convert</code> writes a file). <code>cat</code>/<code>head</code> take <code>-n &lt;N&gt;</code>, <code>--all</code>, <code>-c a,b</code> (projection) and <code>--where</code>; <code>dictionary</code> takes <code>-c &lt;col&gt;</code>.</p>
 
             <h2>schema</h2>
             <p>Columns, Arrow types, nullability and bucket assignment, in original input order. Footer only.</p>
