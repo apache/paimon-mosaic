@@ -77,7 +77,8 @@ row group 0:
 ## Query
 
 `cat`/`head` take `-n <N>`, `--all`, `-c a,b` (projection) and
-`--where "col op val"` (one condition: `=` `!=` `>` `>=` `<` `<=`).
+`--where "col op val"` (one condition: `=` `!=` `>` `>=` `<` `<=`; integers and
+floats compare exactly, so `=0.3` only matches a stored 0.3).
 
 ```text
 $ mosaic count data.mosaic

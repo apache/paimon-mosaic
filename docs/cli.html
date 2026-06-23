@@ -149,7 +149,7 @@ row group 0: 3 entries
   total: 593 B</code></pre>
 
             <h2>cat / head</h2>
-            <p>Read the first N rows as a table. <code>-n</code> sets the count, <code>--all</code> prints every row, <code>-c</code> projects columns, <code>--where</code> filters rows (one condition: <code>=</code> <code>!=</code> <code>&gt;</code> <code>&gt;=</code> <code>&lt;</code> <code>&lt;=</code>; row groups whose stats exclude the predicate are skipped), <code>--json</code> emits newline-delimited JSON. <code>head</code> is an alias of <code>cat</code>.</p>
+            <p>Read the first N rows as a table. <code>-n</code> sets the count, <code>--all</code> prints every row, <code>-c</code> projects columns, <code>--where</code> filters rows (one condition: <code>=</code> <code>!=</code> <code>&gt;</code> <code>&gt;=</code> <code>&lt;</code> <code>&lt;=</code>; integers compare exactly, floats compare exactly so <code>=0.3</code> only matches a stored 0.3; row groups whose stats exclude the predicate are skipped), <code>--json</code> emits newline-delimited JSON. <code>head</code> is an alias of <code>cat</code>.</p>
 <pre><code><span class="cmt">$ mosaic cat data.mosaic -n 2</span>
 +----+--------+------+-------+------+
 | id | name   | kind | score | flag |
