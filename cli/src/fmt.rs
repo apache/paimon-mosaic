@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::{Array, RecordBatch};
+use arrow::array::{Array, RecordBatch};
 use paimon_mosaic_core::values::Value;
 
 /// Render a stats min/max [`Value`] to a short, human-readable string.
@@ -156,7 +156,7 @@ pub fn ndjson(batches: &[RecordBatch], max_rows: usize) -> std::io::Result<Strin
         got += n;
     }
     let buf = Vec::new();
-    let mut w = arrow_json::WriterBuilder::new().with_explicit_nulls(true).build::<_, arrow_json::writer::LineDelimited>(buf);
+    let mut w = arrow::json::WriterBuilder::new().with_explicit_nulls(true).build::<_, arrow::json::writer::LineDelimited>(buf);
     for b in &taken {
         w.write(b).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     }
@@ -166,8 +166,8 @@ pub fn ndjson(batches: &[RecordBatch], max_rows: usize) -> std::io::Result<Strin
 
 /// Render one Arrow cell to a string by downcasting on the column type.
 fn cell(arr: &dyn Array, row: usize) -> String {
-    use arrow_array::*;
-    use arrow_schema::DataType::*;
+    use arrow::array::*;
+    use arrow::datatypes::DataType::*;
     if arr.is_null(row) {
         return "".to_string();
     }
@@ -216,7 +216,7 @@ pub fn parse_where(s: &str) -> Result<Where, String> {
 /// Keep rows where the condition holds. Numeric columns compare numerically;
 /// others compare as strings (only `=`/`!=` meaningful). Nulls never match.
 pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String> {
-    use arrow_schema::DataType::*;
+    use arrow::datatypes::DataType::*;
     let col = batch.column_by_name(&w.column)
         .ok_or_else(|| format!("--where: column '{}' not found", w.column))?;
     let int = matches!(col.data_type(), Int8|Int16|Int32|Int64|Date32);
@@ -245,8 +245,8 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
             match w.op { "=" => lhs==w.value, "!=" => lhs!=w.value, _ => false }
         }
     }).collect();
-    let m = arrow_array::BooleanArray::from(mask);
-    arrow_select::filter::filter_record_batch(batch, &m).map_err(|e| e.to_string())
+    let m = arrow::array::BooleanArray::from(mask);
+    arrow::compute::filter_record_batch(batch, &m).map_err(|e| e.to_string())
 }
 
 /// Apply a comparison operator to any ordered pair.
@@ -297,8 +297,8 @@ fn excl<T: PartialOrd>(op: &str, lo: T, hi: T, v: T) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
     fn sample() -> RecordBatch {

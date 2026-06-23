@@ -23,8 +23,8 @@ use std::io::Write;
 use std::process::Command;
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
+use arrow::array::{Int32Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
 use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
 
 struct FileOut {

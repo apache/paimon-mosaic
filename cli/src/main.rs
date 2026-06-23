@@ -21,7 +21,7 @@ mod input;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use arrow_array::RecordBatch;
+use arrow::array::RecordBatch;
 use clap::{Parser, Subcommand};
 use paimon_mosaic_core::reader::{MosaicReader, ReaderAccess};
 
@@ -273,21 +273,21 @@ impl paimon_mosaic_core::writer::OutputFile for FileOut {
 
 fn convert(input: &PathBuf, out: &PathBuf, stats: Option<String>) -> std::io::Result<()> {
     use paimon_mosaic_core::writer::{MosaicWriter, WriterOptions};
-    use arrow_schema::ArrowError;
+    use arrow::error::ArrowError;
     let bad = |e: ArrowError| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
     let is_json = matches!(input.extension().and_then(|e| e.to_str()), Some("json") | Some("ndjson") | Some("jsonl"));
     // Infer schema, then build a batch iterator — CSV (header) or JSON (one object per line).
     type Batches = Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>>>;
-    let (schema, reader): (arrow_schema::Schema, Batches) = if is_json {
+    let (schema, reader): (arrow::datatypes::Schema, Batches) = if is_json {
         let mut r = std::io::BufReader::new(std::fs::File::open(input)?);
-        let (schema, _) = arrow_json::reader::infer_json_schema(&mut r, None).map_err(bad)?;
-        let rd = arrow_json::ReaderBuilder::new(std::sync::Arc::new(schema.clone()))
+        let (schema, _) = arrow::json::reader::infer_json_schema(&mut r, None).map_err(bad)?;
+        let rd = arrow::json::ReaderBuilder::new(std::sync::Arc::new(schema.clone()))
             .build(std::io::BufReader::new(std::fs::File::open(input)?)).map_err(bad)?;
         (schema, Box::new(rd))
     } else {
-        let (schema, _) = arrow_csv::reader::Format::default().with_header(true)
+        let (schema, _) = arrow::csv::reader::Format::default().with_header(true)
             .infer_schema(std::io::BufReader::new(std::fs::File::open(input)?), None).map_err(bad)?;
-        let rd = arrow_csv::ReaderBuilder::new(std::sync::Arc::new(schema.clone()))
+        let rd = arrow::csv::ReaderBuilder::new(std::sync::Arc::new(schema.clone()))
             .with_header(true).build(std::io::BufReader::new(std::fs::File::open(input)?)).map_err(bad)?;
         (schema, Box::new(rd))
     };
