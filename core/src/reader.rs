@@ -544,6 +544,12 @@ impl<I: InputFile> MosaicReader<I> {
                     for i in 0..globals.len() {
                         sizes.push(u32::from_le_bytes(dir[i * 4..i * 4 + 4].try_into().unwrap()) as usize);
                     }
+                    // Directory + slots must equal the bucket total, else a forged
+                    // slot size could drive a huge read_range allocation.
+                    if dir_size + sizes.iter().sum::<usize>() != total_size {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData,
+                            format!("paged bucket {}: slot sizes do not sum to total {}", b, total_size)));
+                    }
                     let mut foff = meta.bucket_offsets[b] + dir_size as u64;
                     for (local, &gi) in globals.iter().enumerate() {
                         let enc = if sizes[local] == 0 {

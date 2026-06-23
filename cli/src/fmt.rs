@@ -173,8 +173,12 @@ fn cell_json(arr: &dyn Array, row: usize) -> String {
     if arr.is_null(row) {
         return "null".to_string();
     }
+    use arrow_array::{Float32Array, Float64Array};
     match arr.data_type() {
         Utf8 => json_str(&cell(arr, row)),
+        // NaN / Infinity are not valid JSON numbers — emit null.
+        Float32 if !arr.as_any().downcast_ref::<Float32Array>().unwrap().value(row).is_finite() => "null".into(),
+        Float64 if !arr.as_any().downcast_ref::<Float64Array>().unwrap().value(row).is_finite() => "null".into(),
         // Date32 is an epoch-day integer; emit bare like other numerics.
         _ => cell(arr, row),
     }
@@ -233,6 +237,13 @@ pub fn parse_where(s: &str) -> Result<Where, String> {
 pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String> {
     let col = batch.column_by_name(&w.column)
         .ok_or_else(|| format!("--where: column '{}' not found", w.column))?;
+    if matches!(w.op, ">"|">="|"<"|"<=") {
+        use arrow_schema::DataType::*;
+        let numeric = matches!(col.data_type(), Int8|Int16|Int32|Int64|Float32|Float64|Date32);
+        if !numeric || w.value.parse::<f64>().is_err() {
+            return Err(format!("--where: '{}' needs a numeric column and value (got '{}' {} '{}')", w.op, w.column, w.op, w.value));
+        }
+    }
     let mask: Vec<bool> = (0..batch.num_rows()).map(|r| {
         if col.is_null(r) { return false; }
         let lhs = cell(col.as_ref(), r);

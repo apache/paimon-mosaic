@@ -161,6 +161,8 @@ fn cat_where_filters_rows() {
     assert!(none.contains("(no rows)"));
     let (_, _, bad) = run(&["cat", &f, "--where", "nope??"]);
     assert!(!bad); // unparseable filter fails
+    let (_, _, str_ord) = run(&["cat", &f, "--where", "kind>5"]);
+    assert!(!str_ord); // ordering on a string column errors, not silent drop
 }
 
 #[test]

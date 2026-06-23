@@ -309,15 +309,25 @@ fn convert(input: &PathBuf, out: &PathBuf, stats: Option<String>) -> std::io::Re
         stats_columns: stats.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default(),
         ..Default::default()
     };
-    let sink = FileOut { f: std::fs::File::create(out)?, pos: 0 };
-    let mut w = MosaicWriter::new(sink, &schema, opts)?;
+    // Write to a temp file and rename on success, so a mid-stream failure never
+    // leaves a truncated .mosaic in place.
+    let tmp = out.with_extension("mosaic.tmp");
     let mut rows = 0;
-    for batch in reader {
-        let batch = batch.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        rows += batch.num_rows();
-        w.write_batch(&batch)?;
+    let res = (|| {
+        let sink = FileOut { f: std::fs::File::create(&tmp)?, pos: 0 };
+        let mut w = MosaicWriter::new(sink, &schema, opts)?;
+        for batch in reader {
+            let batch = batch.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            rows += batch.num_rows();
+            w.write_batch(&batch)?;
+        }
+        w.close()
+    })();
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    w.close()?;
+    std::fs::rename(&tmp, out)?;
     println!("wrote {} ({} rows, {} columns)", out.display(), rows, schema.fields().len());
     Ok(())
 }
