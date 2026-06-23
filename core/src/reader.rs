@@ -196,6 +196,9 @@ pub struct BucketInfo {
     pub kind: &'static str,
     /// On-disk compressed size in bytes (0 for empty buckets).
     pub size: usize,
+    /// Uncompressed size in bytes; 0 when unknown (paged buckets store only the
+    /// on-disk total). Exact for monolithic buckets — enough for a ratio.
+    pub uncompressed: usize,
     /// Member column indices (global, name-sorted order).
     pub columns: Vec<usize>,
 }
@@ -482,12 +485,14 @@ impl<I: InputFile> MosaicReader<I> {
         }
         let meta = &self.row_group_metas[rg_index];
         Ok((0..self.num_buckets).map(|b| {
-            let (kind, size) = match meta.bucket_layouts[b] {
-                BucketLayout::Empty => ("empty", 0),
-                BucketLayout::Monolithic { compressed_size, .. } => ("monolithic", compressed_size),
-                BucketLayout::Paged { total_size } => ("paged", total_size),
+            let (kind, size, uncompressed) = match meta.bucket_layouts[b] {
+                BucketLayout::Empty => ("empty", 0, 0),
+                BucketLayout::Monolithic { compressed_size, uncompressed_size } => {
+                    ("monolithic", compressed_size, uncompressed_size)
+                }
+                BucketLayout::Paged { total_size } => ("paged", total_size, 0),
             };
-            BucketInfo { bucket: b, kind, size, columns: self.schema.bucket_to_global[b].clone() }
+            BucketInfo { bucket: b, kind, size, uncompressed, columns: self.schema.bucket_to_global[b].clone() }
         }).collect())
     }
 

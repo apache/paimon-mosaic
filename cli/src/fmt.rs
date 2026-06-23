@@ -58,6 +58,15 @@ pub fn encoding_name(e: u8) -> &'static str {
     }
 }
 
+/// Compression ratio suffix like `" (uncompressed 1024 B, 2.50x)"`, or empty
+/// when the uncompressed size is unknown (paged buckets don't record it).
+pub fn ratio(compressed: usize, uncompressed: usize) -> String {
+    if uncompressed == 0 || compressed == 0 {
+        return String::new();
+    }
+    format!(" (uncompressed {} B, {:.2}x)", uncompressed, uncompressed as f64 / compressed as f64)
+}
+
 /// Escape a string as a JSON string literal (quotes included).
 pub fn json_str(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);

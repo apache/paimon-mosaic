@@ -40,7 +40,7 @@ mosaic <command> <file>
 | `buckets`| per-bucket layout and member columns | footer + index |
 | `pages`  | per-column encoding + on-disk slot size | bucket data |
 | `dictionary` | dictionary entries of a dict column (`-c`) | bucket data |
-| `column-size` | on-disk bytes per column | footer + index |
+| `column-size` | on-disk bytes per column + total compression ratio | footer + index |
 | `cat` / `head` | first N rows as a table | column data |
 
 Every command accepts `--json`. `cat`/`head` take `-n <N>` and `-c a,b`
@@ -55,8 +55,13 @@ $ mosaic schema data.mosaic
 
 $ mosaic buckets data.mosaic
 row group 0:
-    bucket 0: paged 373B [flag, id]
-    bucket 1: paged 32B [kind]
+    bucket 0: monolithic 27B (uncompressed 59 B, 2.19x) [kind]
+    bucket 1: paged 373B [flag, id]
+
+$ mosaic column-size data.mosaic
+  id: 349 B
+  kind: 28 B
+  total: 377 B (uncompressed 861 B, 2.28x)
 
 $ mosaic pages data.mosaic
 row group 0:

@@ -145,6 +145,16 @@ fn original_order(s: &paimon_mosaic_core::schema::MosaicSchema) -> Vec<usize> {
     cols
 }
 
+/// Add `total` across `cols`, distributing the remainder so the parts sum exactly.
+fn split_evenly(total: usize, cols: &[usize], acc: &mut [usize]) {
+    if cols.is_empty() { return; }
+    let share = total / cols.len();
+    let mut rem = total % cols.len();
+    for &c in cols {
+        acc[c] += share + if rem > 0 { rem -= 1; 1 } else { 0 };
+    }
+}
+
 fn schema(file: &PathBuf, json: bool) -> std::io::Result<()> {
     let reader = open(file)?;
     let s = reader.schema();
@@ -275,26 +285,27 @@ fn column_size(file: &PathBuf, json: bool) -> std::io::Result<()> {
     let reader = open(file)?;
     let s = reader.schema();
     let mut bytes = vec![0usize; s.columns.len()];
+    let mut raw = vec![0usize; s.columns.len()];
     for rg in 0..reader.num_row_groups() {
         // On-disk bytes are tracked per bucket (works for both monolithic and
         // paged layouts); split a bucket's size across its member columns.
         for b in reader.bucket_infos(rg)? {
             if b.columns.is_empty() { continue; }
-            let share = b.size / b.columns.len();
-            let mut rem = b.size % b.columns.len();
-            for &c in &b.columns {
-                bytes[c] += share + if rem > 0 { rem -= 1; 1 } else { 0 };
-            }
+            split_evenly(b.size, &b.columns, &mut bytes);
+            split_evenly(b.uncompressed, &b.columns, &mut raw);
         }
     }
     let cols = original_order(s);
+    let comp: usize = bytes.iter().sum();
+    let uncomp: usize = raw.iter().sum();
     if json {
-        let items: Vec<String> = cols.iter().map(|&i| format!("{{\"column\":{},\"bytes\":{}}}", fmt::json_str(&s.columns[i].name), bytes[i])).collect();
-        println!("[{}]", items.join(","));
+        let items: Vec<String> = cols.iter().map(|&i| format!("{{\"column\":{},\"bytes\":{},\"uncompressed\":{}}}", fmt::json_str(&s.columns[i].name), bytes[i], raw[i])).collect();
+        println!("{{\"columns\":[{}],\"total_bytes\":{},\"uncompressed\":{}}}", items.join(","), comp, uncomp);
     } else {
         for i in cols {
             println!("  {}: {} B", s.columns[i].name, bytes[i]);
         }
+        println!("  total: {} B{}", comp, fmt::ratio(comp, uncomp));
     }
     Ok(())
 }
@@ -341,14 +352,14 @@ fn buckets(file: &PathBuf, json: bool) -> std::io::Result<()> {
         if json {
             let items: Vec<String> = infos.iter().map(|b| {
                 let cols: Vec<String> = b.columns.iter().map(|&i| fmt::json_str(&name(i))).collect();
-                format!("{{\"bucket\":{},\"kind\":{},\"size\":{},\"columns\":[{}]}}", b.bucket, fmt::json_str(b.kind), b.size, cols.join(","))
+                format!("{{\"bucket\":{},\"kind\":{},\"size\":{},\"uncompressed\":{},\"columns\":[{}]}}", b.bucket, fmt::json_str(b.kind), b.size, b.uncompressed, cols.join(","))
             }).collect();
             rgs.push(format!("[{}]", items.join(",")));
         } else {
             println!("row group {rg}:");
             for b in &infos {
                 let cols: Vec<String> = b.columns.iter().map(|&i| name(i)).collect();
-                println!("    bucket {}: {} {}B [{}]", b.bucket, b.kind, b.size, cols.join(", "));
+                println!("    bucket {}: {} {}B{} [{}]", b.bucket, b.kind, b.size, fmt::ratio(b.size, b.uncompressed), cols.join(", "));
             }
         }
     }
