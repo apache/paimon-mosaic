@@ -77,7 +77,8 @@ mosaic schema data.mosaic</code></pre>
                     <tr><td><code>pages</code></td><td>per-column encoding + slot size</td><td>bucket data</td></tr>
                     <tr><td><code>dictionary</code></td><td>dictionary entries of a dict column</td><td>bucket data</td></tr>
                     <tr><td><code>column-size</code></td><td>on-disk bytes per column</td><td>footer + index</td></tr>
-                    <tr><td><code>cat</code> / <code>head</code></td><td>first N rows as a table</td><td>column data</td></tr>
+                    <tr><td><code>cat</code> / <code>head</code></td><td>first N rows as a table; <code>--all</code>, <code>--where</code></td><td>column data</td></tr>
+                    <tr><td><code>count</code></td><td>total row count</td><td>footer + index</td></tr>
                 </tbody>
             </table>
             <p>Every command accepts <code>--json</code>. <code>cat</code>/<code>head</code> take <code>-n &lt;N&gt;</code> and <code>-c a,b</code> (projection); <code>dictionary</code> takes <code>-c &lt;col&gt;</code>.</p>
@@ -149,7 +150,7 @@ row group 0: 3 entries
   total: 1447 B (uncompressed 3220 B, 2.23x)</code></pre>
 
             <h2>cat / head</h2>
-            <p>Read the first N rows as a table. <code>-n</code> sets the count, <code>-c</code> projects columns, <code>--json</code> emits newline-delimited JSON. <code>head</code> is an alias of <code>cat</code>.</p>
+            <p>Read the first N rows as a table. <code>-n</code> sets the count, <code>--all</code> prints every row, <code>-c</code> projects columns, <code>--where</code> filters rows (one condition: <code>=</code> <code>!=</code> <code>&gt;</code> <code>&gt;=</code> <code>&lt;</code> <code>&lt;=</code>), <code>--json</code> emits newline-delimited JSON. <code>head</code> is an alias of <code>cat</code>.</p>
 <pre><code><span class="cmt">$ mosaic cat data.mosaic -n 2</span>
 +----+--------+------+-------+------+
 | id | name   | kind | score | flag |
@@ -162,7 +163,14 @@ row group 0: 3 entries
 
 <span class="cmt">$ mosaic cat data.mosaic -n 2 --json</span>
 {"id":0,"name":"user_0","kind":"a","score":0,"flag":7}
-{"id":1,"name":"user_1","kind":"b","score":1.5,"flag":7}</code></pre>
+{"id":1,"name":"user_1","kind":"b","score":1.5,"flag":7}
+
+<span class="cmt">$ mosaic cat data.mosaic --all --where "kind=a"</span>   <span class="cmt"># every matching row</span></code></pre>
+
+            <h2>count</h2>
+            <p>Total row count across all row groups.</p>
+<pre><code><span class="cmt">$ mosaic count data.mosaic</span>
+200</code></pre>
 
             <div class="tip">
                 <strong>Embedding instead</strong>

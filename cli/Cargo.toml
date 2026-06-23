@@ -30,4 +30,5 @@ path = "src/main.rs"
 paimon-mosaic-core = { path = "../core" }
 arrow-array = "58"
 arrow-schema = "58"
+arrow-select = "58"
 clap = { version = "4", features = ["derive"] }

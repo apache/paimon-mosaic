@@ -134,6 +134,36 @@ fn cat_truncates_and_projects() {
 }
 
 #[test]
+fn count_reports_total() {
+    let f = fixture("count");
+    let (out, _, ok) = run(&["count", &f]);
+    assert!(ok && out.trim() == "200");
+    let (j, _, _) = run(&["count", &f, "--json"]);
+    assert!(j.contains("\"rows\":200"));
+}
+
+#[test]
+fn cat_all_overrides_limit() {
+    let f = fixture("all");
+    let (out, _, ok) = run(&["cat", &f, "--all", "--json"]);
+    assert!(ok);
+    assert_eq!(out.lines().count(), 200); // every row, not the -n default
+}
+
+#[test]
+fn cat_where_filters_rows() {
+    let f = fixture("where");
+    let (num, _, ok) = run(&["cat", &f, "--all", "--where", "id>197", "--json"]);
+    assert!(ok && num.lines().count() == 2); // 198, 199
+    let (str_eq, _, _) = run(&["cat", &f, "--all", "--where", "kind=b", "--json"]);
+    assert!(str_eq.lines().count() > 0 && str_eq.lines().all(|l| l.contains("\"kind\":\"b\"")));
+    let (none, _, _) = run(&["cat", &f, "--where", "id>9999"]);
+    assert!(none.contains("(no rows)"));
+    let (_, _, bad) = run(&["cat", &f, "--where", "nope??"]);
+    assert!(!bad); // unparseable filter fails
+}
+
+#[test]
 fn cat_json_is_ndjson() {
     let f = fixture("json");
     let (out, _, ok) = run(&["cat", &f, "-n", "2", "--json"]);

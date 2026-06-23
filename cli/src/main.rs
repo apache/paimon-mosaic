@@ -61,9 +61,15 @@ enum Cmd {
         /// Number of rows to print.
         #[arg(short = 'n', long, default_value_t = 10)]
         num: usize,
+        /// Print all rows (overrides -n).
+        #[arg(long)]
+        all: bool,
         /// Comma-separated columns to project.
         #[arg(short, long)]
         columns: Option<String>,
+        /// Row filter, e.g. `id>100` or `kind=a` (one condition).
+        #[arg(long)]
+        r#where: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -72,8 +78,18 @@ enum Cmd {
         file: PathBuf,
         #[arg(short = 'n', long, default_value_t = 10)]
         num: usize,
+        #[arg(long)]
+        all: bool,
         #[arg(short, long)]
         columns: Option<String>,
+        #[arg(long)]
+        r#where: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the total row count.
+    Count {
+        file: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -112,8 +128,9 @@ fn main() -> ExitCode {
         Cmd::Schema { file, json } => schema(&file, json),
         Cmd::Meta { file, json } => meta(&file, json),
         Cmd::Pages { file, json } => pages(&file, json),
-        Cmd::Cat { file, num, columns, json } => cat(&file, num, columns, json),
-        Cmd::Head { file, num, columns, json } => cat(&file, num, columns, json),
+        Cmd::Cat { file, num, all, columns, r#where, json } => cat(&file, if all { usize::MAX } else { num }, columns, r#where, json),
+        Cmd::Head { file, num, all, columns, r#where, json } => cat(&file, if all { usize::MAX } else { num }, columns, r#where, json),
+        Cmd::Count { file, json } => count(&file, json),
         Cmd::Footer { file, json } => footer(&file, json),
         Cmd::ColumnSize { file, json } => column_size(&file, json),
         Cmd::Dictionary { file, column, json } => dictionary(&file, &column, json),
@@ -237,23 +254,36 @@ fn pages(file: &PathBuf, json: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-fn cat(file: &PathBuf, num: usize, columns: Option<String>, json: bool) -> std::io::Result<()> {
+fn count(file: &PathBuf, json: bool) -> std::io::Result<()> {
+    let reader = open(file)?;
+    let n: usize = (0..reader.num_row_groups()).map(|i| reader.row_group_num_rows(i).unwrap_or(0)).sum();
+    if json { println!("{{\"rows\":{}}}", n); } else { println!("{}", n); }
+    Ok(())
+}
+
+fn cat(file: &PathBuf, num: usize, columns: Option<String>, filter: Option<String>, json: bool) -> std::io::Result<()> {
     let mut reader = open(file)?;
     if let Some(list) = &columns {
         let names: Vec<&str> = list.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect();
         reader.project(&names)?;
     }
+    let pred = filter.as_deref().map(fmt::parse_where).transpose()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let mut batches: Vec<RecordBatch> = Vec::new();
     let mut got = 0usize;
     for rg in 0..reader.num_row_groups() {
         if got >= num {
             break;
         }
-        let batch = reader.row_group_reader(rg)?.read_columns()?;
+        let mut batch = reader.row_group_reader(rg)?.read_columns()?;
+        if let Some(p) = &pred {
+            batch = fmt::apply_where(&batch, p)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        }
         got += batch.num_rows();
         batches.push(batch);
     }
-    if batches.is_empty() {
+    if batches.iter().all(|b| b.num_rows() == 0) {
         if !json {
             println!("(no rows)");
         }

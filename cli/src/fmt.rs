@@ -206,6 +206,45 @@ fn cell(arr: &dyn Array, row: usize) -> String {
     }
 }
 
+/// A single `column op value` filter. Ops: `=` `!=` `>` `>=` `<` `<=`.
+pub struct Where {
+    pub column: String,
+    pub op: &'static str,
+    pub value: String,
+}
+
+/// Parse one condition like `id>100` or `kind=a`. Longest operators first.
+pub fn parse_where(s: &str) -> Result<Where, String> {
+    for op in [">=", "<=", "!=", "=", ">", "<"] {
+        if let Some(i) = s.find(op) {
+            let column = s[..i].trim().to_string();
+            let value = s[i + op.len()..].trim().to_string();
+            if column.is_empty() || value.is_empty() {
+                return Err(format!("bad --where: {s}"));
+            }
+            return Ok(Where { column, op, value });
+        }
+    }
+    Err(format!("bad --where (need =, !=, >, >=, <, <=): {s}"))
+}
+
+/// Keep rows where the condition holds. Numeric columns compare numerically;
+/// others compare as strings (only `=`/`!=` meaningful). Nulls never match.
+pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String> {
+    let col = batch.column_by_name(&w.column)
+        .ok_or_else(|| format!("--where: column '{}' not found", w.column))?;
+    let mask: Vec<bool> = (0..batch.num_rows()).map(|r| {
+        if col.is_null(r) { return false; }
+        let lhs = cell(col.as_ref(), r);
+        match (lhs.parse::<f64>(), w.value.parse::<f64>()) {
+            (Ok(a), Ok(b)) => match w.op { "=" => a==b, "!=" => a!=b, ">" => a>b, ">=" => a>=b, "<" => a<b, "<=" => a<=b, _ => false },
+            _ => match w.op { "=" => lhs==w.value, "!=" => lhs!=w.value, _ => false },
+        }
+    }).collect();
+    let m = arrow_array::BooleanArray::from(mask);
+    arrow_select::filter::filter_record_batch(batch, &m).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

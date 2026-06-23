@@ -42,9 +42,11 @@ mosaic <command> <file>
 | `dictionary` | dictionary entries of a dict column (`-c`) | bucket data |
 | `column-size` | on-disk bytes per column + total compression ratio | footer + index |
 | `cat` / `head` | first N rows as a table | column data |
+| `count` | total row count | footer + index |
 
-Every command accepts `--json`. `cat`/`head` take `-n <N>` and `-c a,b`
-(projection); `dictionary` takes `-c <col>`.
+Every command accepts `--json`. `cat`/`head` take `-n <N>`, `--all`, `-c a,b`
+(projection) and `--where "col op val"` (one condition: `=`,`!=`,`>`,`>=`,`<`,`<=`);
+`dictionary` takes `-c <col>`.
 
 ```text
 $ mosaic schema data.mosaic
@@ -71,6 +73,10 @@ row group 0:
 $ mosaic cat data.mosaic -n 2 --json
 {"id":0,"name":"user_0","kind":"a","score":0,"flag":7}
 {"id":1,"name":"user_1","kind":"b","score":1.5,"flag":7}
+
+$ mosaic cat data.mosaic --all --where "score>1" -c id,score
+$ mosaic count data.mosaic
+200
 ```
 
 For C/C++ or Java callers, embed the format directly via the `ffi`
