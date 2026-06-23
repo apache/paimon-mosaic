@@ -20,34 +20,36 @@
 # mosaic CLI
 
 A native command-line inspector for Mosaic files. It drives the read-only
-`MosaicReader` API, so it needs no JVM and ships as a single native binary.
+`MosaicReader` API, so it needs no JVM and ships as a single binary. For C/C++
+or Java callers, embed the format via the `ffi` (`mosaic.h`) or `jni` crates
+rather than shelling out to this tool.
 
-## Build & run
+## Install
 
 ```bash
-cargo run -p paimon-mosaic-cli -- <command> <file>   # from source
+cargo run -p paimon-mosaic-cli -- <command> <file>   # run from source
 cargo install --path cli                             # install `mosaic`
 mosaic <command> <file>
 ```
 
 ## Commands
 
+Every command accepts `--json`.
+
 | Command | Shows | Reads |
 |---------|-------|-------|
 | `schema` | column names, Arrow types, nullability, bucket | footer only |
-| `meta`   | row groups, rows, per-column stats (null/min/max) | footer + index |
+| `meta` | row groups, rows, per-column stats (null/min/max) | footer + index |
 | `footer` | magic, version, buckets, compression | footer only |
-| `buckets`| per-bucket layout and member columns | footer + index |
-| `pages`  | per-column encoding + on-disk slot size | bucket data |
-| `dictionary` | dictionary entries of a dict column (`-c`) | bucket data |
-| `column-size` | on-disk bytes per column + total compression ratio | footer + index |
-| `cat` / `head` | first N rows as a table | column data |
+| `buckets` | per-bucket layout, member columns, ratio | footer + index |
+| `pages` | per-column encoding + on-disk slot size | bucket data |
+| `dictionary` | dictionary entries of a dict column | bucket data |
+| `column-size` | bytes per column + total compression ratio | footer + index |
+| `cat` / `head` | rows as a table | column data |
 | `count` | total row count | footer + index |
-| `convert` | import a CSV or JSON file into a new Mosaic file | writes file |
+| `convert` | import CSV or JSON into a new file | writes file |
 
-Every command accepts `--json`. `cat`/`head` take `-n <N>`, `--all`, `-c a,b`
-(projection) and `--where "col op val"` (one condition: `=`,`!=`,`>`,`>=`,`<`,`<=`);
-`dictionary` takes `-c <col>`.
+## Inspect
 
 ```text
 $ mosaic schema data.mosaic
@@ -70,21 +72,31 @@ $ mosaic pages data.mosaic
 row group 0:
     flag: bucket 0 encoding=const slot=16B
     kind: bucket 1 encoding=dict slot=28B
+```
 
-$ mosaic cat data.mosaic -n 2 --json
-{"id":0,"name":"user_0","kind":"a","score":0,"flag":7}
-{"id":1,"name":"user_1","kind":"b","score":1.5,"flag":7}
+## Query
 
-$ mosaic cat data.mosaic --all --where "score>1" -c id,score
+`cat`/`head` take `-n <N>`, `--all`, `-c a,b` (projection) and
+`--where "col op val"` (one condition: `=` `!=` `>` `>=` `<` `<=`).
+
+```text
 $ mosaic count data.mosaic
 200
 
+$ mosaic cat data.mosaic -n 2 --json
+{"id":0,"name":"user_0","kind":"a","flag":7}
+{"id":1,"name":"user_1","kind":"b","flag":7}
+
+$ mosaic cat data.mosaic --all --where "id>100" -c id,kind
+```
+
+## Convert
+
+Import CSV or JSON lines into a new Mosaic file; the schema is inferred.
+`--stats id` builds min/max for those columns, which `cat --where` then uses to
+skip row groups that cannot match.
+
+```text
 $ mosaic convert data.csv -o data.mosaic --stats id
 wrote data.mosaic (200 rows, 5 columns)
 ```
-
-`convert` builds stats for the named columns; `cat --where` then skips row
-groups whose min/max exclude the predicate.
-
-For C/C++ or Java callers, embed the format directly via the `ffi`
-(`mosaic.h`) or `jni` crates rather than shelling out to this CLI.
