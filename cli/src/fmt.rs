@@ -142,10 +142,11 @@ pub fn pretty_table(batches: &[RecordBatch], max_rows: usize) -> String {
 }
 
 /// Render up to `max_rows` as newline-delimited JSON objects.
-pub fn ndjson(batches: &[RecordBatch], max_rows: usize) -> String {
+pub fn ndjson(batches: &[RecordBatch], max_rows: usize) -> std::io::Result<String> {
+    use std::io;
     // Use Arrow's JSON writer so every type the reader supports renders as valid
     // JSON (NaN/Infinity become null); explicit nulls keep absent fields visible.
-    if batches.is_empty() { return String::new(); }
+    if batches.is_empty() { return Ok(String::new()); }
     let mut taken: Vec<RecordBatch> = Vec::new();
     let mut got = 0usize;
     for b in batches {
@@ -156,9 +157,11 @@ pub fn ndjson(batches: &[RecordBatch], max_rows: usize) -> String {
     }
     let buf = Vec::new();
     let mut w = arrow_json::WriterBuilder::new().with_explicit_nulls(true).build::<_, arrow_json::writer::LineDelimited>(buf);
-    for b in &taken { w.write(b).expect("json write"); }
-    w.finish().expect("json finish");
-    String::from_utf8(w.into_inner()).expect("utf8")
+    for b in &taken {
+        w.write(b).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    }
+    w.finish().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    String::from_utf8(w.into_inner()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
 }
 
 /// Render one Arrow cell to a string by downcasting on the column type.
@@ -216,19 +219,26 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
     use arrow_schema::DataType::*;
     let col = batch.column_by_name(&w.column)
         .ok_or_else(|| format!("--where: column '{}' not found", w.column))?;
-    let numeric = matches!(col.data_type(), Int8|Int16|Int32|Int64|Float32|Float64|Date32);
-    // Numeric columns compare numerically; everything else compares as exact
-    // strings. Ordering (<,>) is only defined on numeric columns.
-    if matches!(w.op, ">"|">="|"<"|"<=") && (!numeric || w.value.parse::<f64>().is_err()) {
+    let int = matches!(col.data_type(), Int8|Int16|Int32|Int64|Date32);
+    let float = matches!(col.data_type(), Float32|Float64);
+    // Integer columns compare in i128 (exact for full i64 range); float columns
+    // in f64; everything else as exact strings. Ordering is numeric-only.
+    if matches!(w.op, ">"|">="|"<"|"<=") && !((int && w.value.parse::<i128>().is_ok()) || (float && w.value.parse::<f64>().is_ok())) {
         return Err(format!("--where: '{}' needs a numeric column and value (got '{}' {} '{}')", w.op, w.column, w.op, w.value));
     }
-    let rhs_num = w.value.parse::<f64>();
+    let rhs_i = w.value.parse::<i128>();
+    let rhs_f = w.value.parse::<f64>();
     let mask: Vec<bool> = (0..batch.num_rows()).map(|r| {
         if col.is_null(r) { return false; }
         let lhs = cell(col.as_ref(), r);
-        if numeric {
-            match (lhs.parse::<f64>(), &rhs_num) {
-                (Ok(a), Ok(b)) => match w.op { "=" => a==*b, "!=" => a!=*b, ">" => a>*b, ">=" => a>=*b, "<" => a<*b, "<=" => a<=*b, _ => false },
+        if int {
+            match (lhs.parse::<i128>(), &rhs_i) {
+                (Ok(a), Ok(b)) => cmp_op(w.op, &a, b),
+                _ => false,
+            }
+        } else if float {
+            match (lhs.parse::<f64>(), &rhs_f) {
+                (Ok(a), Ok(b)) => cmp_op(w.op, &a, b),
                 _ => false,
             }
         } else {
@@ -239,28 +249,46 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
     arrow_select::filter::filter_record_batch(batch, &m).map_err(|e| e.to_string())
 }
 
-/// Numeric value of a stats [`Value`], or `None` for non-numeric types. Reads
-/// the variant directly (no string round-trip) so Date/Time pushdown works.
-fn to_f64(v: &Value) -> Option<f64> {
+/// Apply a comparison operator to any ordered pair.
+fn cmp_op<T: PartialOrd>(op: &str, a: &T, b: &T) -> bool {
+    match op { "=" => a==b, "!=" => a!=b, ">" => a>b, ">=" => a>=b, "<" => a<b, "<=" => a<=b, _ => false }
+}
+
+/// Integer value of a stats [`Value`], or `None` if not integral. Used so large
+/// i64 (e.g. Snowflake ids) compare exactly rather than via lossy f64.
+fn to_i128(v: &Value) -> Option<i128> {
     use Value::*;
     match v {
-        Boolean(b) => Some(*b as u8 as f64),
-        TinyInt(x) => Some(*x as f64), SmallInt(x) => Some(*x as f64),
-        Integer(x) | Date(x) | Time(x) => Some(*x as f64),
-        BigInt(x) | DecimalCompact(x) | TimestampMillis(x) | TimestampMicros(x) => Some(*x as f64),
-        Float(x) => Some(*x as f64), Double(x) => Some(*x),
+        TinyInt(x) => Some(*x as i128), SmallInt(x) => Some(*x as i128),
+        Integer(x) | Date(x) | Time(x) => Some(*x as i128),
+        BigInt(x) | DecimalCompact(x) | TimestampMillis(x) | TimestampMicros(x) => Some(*x as i128),
         _ => None,
     }
+}
+
+/// Float value of a stats [`Value`], or `None` for non-numeric types.
+fn to_f64(v: &Value) -> Option<f64> {
+    use Value::*;
+    match v { Float(x) => Some(*x as f64), Double(x) => Some(*x), _ => None }
 }
 
 /// True when a row group's `[min, max]` provably excludes the filter — safe to
 /// skip. Numeric only and conservative: any missing/unparsable stat → keep.
 pub fn stats_exclude(w: &Where, min: &Option<Value>, max: &Option<Value>) -> bool {
-    let (lo, hi, v) = match (min.as_ref().and_then(to_f64), max.as_ref().and_then(to_f64), w.value.parse::<f64>()) {
-        (Some(a), Some(b), Ok(v)) => (a, b, v),
-        _ => return false,
-    };
-    match w.op {
+    let (min, max) = match (min.as_ref(), max.as_ref()) { (Some(a), Some(b)) => (a, b), _ => return false };
+    // Integer columns: compare exactly in i128. Float columns: f64. Excluded
+    // when the value lies strictly outside [lo, hi] for the operator.
+    if let (Some(lo), Some(hi), Ok(v)) = (to_i128(min), to_i128(max), w.value.parse::<i128>()) {
+        return excl(w.op, lo, hi, v);
+    }
+    if let (Some(lo), Some(hi), Ok(v)) = (to_f64(min), to_f64(max), w.value.parse::<f64>()) {
+        return excl(w.op, lo, hi, v);
+    }
+    false
+}
+
+fn excl<T: PartialOrd>(op: &str, lo: T, hi: T, v: T) -> bool {
+    match op {
         ">" => hi <= v, ">=" => hi < v, "<" => lo >= v, "<=" => lo > v,
         "=" => v < lo || v > hi, _ => false,
     }
@@ -303,7 +331,7 @@ mod tests {
 
     #[test]
     fn ndjson_renders_null_and_quotes() {
-        let out = ndjson(&[sample()], 10);
+        let out = ndjson(&[sample()], 10).unwrap();
         assert_eq!(out, "{\"id\":1,\"name\":\"ann\"}\n{\"id\":2,\"name\":null}\n");
     }
 

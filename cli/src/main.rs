@@ -353,7 +353,7 @@ fn cat(file: &PathBuf, num: usize, columns: Option<String>, filter: Option<Strin
             println!("(no rows)");
         }
     } else if json {
-        print!("{}", fmt::ndjson(&batches, num));
+        print!("{}", fmt::ndjson(&batches, num)?);
     } else {
         print!("{}", fmt::pretty_table(&batches, num));
     }
