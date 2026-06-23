@@ -321,12 +321,17 @@ fn convert(input: &PathBuf, out: &PathBuf, stats: Option<String>) -> std::io::Re
 
 fn cat(file: &PathBuf, num: usize, columns: Option<String>, filter: Option<String>, json: bool) -> std::io::Result<()> {
     let mut reader = open(file)?;
-    if let Some(list) = &columns {
-        let names: Vec<&str> = list.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect();
-        reader.project(&names)?;
-    }
     let pred = filter.as_deref().map(fmt::parse_where).transpose()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // The display columns; the filter column is read even if projected out, then
+    // dropped before printing, so `--where` works on a hidden column.
+    let mut display: Vec<String> = Vec::new();
+    if let Some(list) = &columns {
+        display = list.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).map(String::from).collect();
+        let mut read: Vec<&str> = display.iter().map(String::as_str).collect();
+        if let Some(p) = &pred { if !read.contains(&p.column.as_str()) { read.push(&p.column); } }
+        reader.project(&read)?;
+    }
     // Column index of the filter target, for stats-based row-group skipping.
     let pred_col = pred.as_ref().and_then(|p| reader.schema().columns.iter().position(|c| c.name == p.column));
     let mut batches: Vec<RecordBatch> = Vec::new();
@@ -345,6 +350,12 @@ fn cat(file: &PathBuf, num: usize, columns: Option<String>, filter: Option<Strin
         if let Some(p) = &pred {
             batch = fmt::apply_where(&batch, p)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        }
+        // Drop the filter-only column so it isn't printed when -c excluded it.
+        if !display.is_empty() {
+            let keep: Vec<usize> = display.iter()
+                .filter_map(|n| batch.schema().index_of(n).ok()).collect();
+            batch = batch.project(&keep).map_err(|e| std::io::Error::other(e.to_string()))?;
         }
         got += batch.num_rows();
         batches.push(batch);

@@ -170,6 +170,9 @@ fn cat_where_filters_rows() {
     assert!(!bad); // unparseable filter fails
     let (_, _, str_ord) = run(&["cat", &f, "--where", "kind>5"]);
     assert!(!str_ord); // ordering on a string column errors, not silent drop
+    // Filtering a column dropped by -c works and doesn't leak into output.
+    let (hid, _, ok) = run(&["cat", &f, "-c", "kind", "--where", "id>197", "--json"]);
+    assert!(ok && hid.lines().count() == 2 && !hid.contains("\"id\""), "{hid}");
 }
 
 #[test]
