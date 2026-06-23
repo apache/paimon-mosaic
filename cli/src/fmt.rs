@@ -142,46 +142,21 @@ pub fn pretty_table(batches: &[RecordBatch], max_rows: usize) -> String {
 
 /// Render up to `max_rows` as newline-delimited JSON objects.
 pub fn ndjson(batches: &[RecordBatch], max_rows: usize) -> String {
-    let schema = batches[0].schema();
-    let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-    let mut out = String::new();
+    // Use Arrow's JSON writer so every type the reader supports renders as valid
+    // JSON (NaN/Infinity become null); explicit nulls keep absent fields visible.
+    let mut taken: Vec<RecordBatch> = Vec::new();
     let mut got = 0usize;
-    'outer: for batch in batches {
-        for r in 0..batch.num_rows() {
-            if got >= max_rows {
-                break 'outer;
-            }
-            out.push('{');
-            for (c, name) in names.iter().enumerate() {
-                if c > 0 {
-                    out.push(',');
-                }
-                out.push_str(&json_str(name));
-                out.push(':');
-                out.push_str(&cell_json(batch.column(c).as_ref(), r));
-            }
-            out.push_str("}\n");
-            got += 1;
-        }
+    for b in batches {
+        if got >= max_rows { break; }
+        let n = b.num_rows().min(max_rows - got);
+        taken.push(b.slice(0, n));
+        got += n;
     }
-    out
-}
-
-/// Render one Arrow cell as a JSON value (numbers bare, strings quoted, null).
-fn cell_json(arr: &dyn Array, row: usize) -> String {
-    use arrow_schema::DataType::*;
-    if arr.is_null(row) {
-        return "null".to_string();
-    }
-    use arrow_array::{Float32Array, Float64Array};
-    match arr.data_type() {
-        Utf8 => json_str(&cell(arr, row)),
-        // NaN / Infinity are not valid JSON numbers — emit null.
-        Float32 if !arr.as_any().downcast_ref::<Float32Array>().unwrap().value(row).is_finite() => "null".into(),
-        Float64 if !arr.as_any().downcast_ref::<Float64Array>().unwrap().value(row).is_finite() => "null".into(),
-        // Date32 is an epoch-day integer; emit bare like other numerics.
-        _ => cell(arr, row),
-    }
+    let buf = Vec::new();
+    let mut w = arrow_json::WriterBuilder::new().with_explicit_nulls(true).build::<_, arrow_json::writer::LineDelimited>(buf);
+    for b in &taken { w.write(b).expect("json write"); }
+    w.finish().expect("json finish");
+    String::from_utf8(w.into_inner()).expect("utf8")
 }
 
 /// Render one Arrow cell to a string by downcasting on the column type.
@@ -235,21 +210,26 @@ pub fn parse_where(s: &str) -> Result<Where, String> {
 /// Keep rows where the condition holds. Numeric columns compare numerically;
 /// others compare as strings (only `=`/`!=` meaningful). Nulls never match.
 pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String> {
+    use arrow_schema::DataType::*;
     let col = batch.column_by_name(&w.column)
         .ok_or_else(|| format!("--where: column '{}' not found", w.column))?;
-    if matches!(w.op, ">"|">="|"<"|"<=") {
-        use arrow_schema::DataType::*;
-        let numeric = matches!(col.data_type(), Int8|Int16|Int32|Int64|Float32|Float64|Date32);
-        if !numeric || w.value.parse::<f64>().is_err() {
-            return Err(format!("--where: '{}' needs a numeric column and value (got '{}' {} '{}')", w.op, w.column, w.op, w.value));
-        }
+    let numeric = matches!(col.data_type(), Int8|Int16|Int32|Int64|Float32|Float64|Date32);
+    // Numeric columns compare numerically; everything else compares as exact
+    // strings. Ordering (<,>) is only defined on numeric columns.
+    if matches!(w.op, ">"|">="|"<"|"<=") && (!numeric || w.value.parse::<f64>().is_err()) {
+        return Err(format!("--where: '{}' needs a numeric column and value (got '{}' {} '{}')", w.op, w.column, w.op, w.value));
     }
+    let rhs_num = w.value.parse::<f64>();
     let mask: Vec<bool> = (0..batch.num_rows()).map(|r| {
         if col.is_null(r) { return false; }
         let lhs = cell(col.as_ref(), r);
-        match (lhs.parse::<f64>(), w.value.parse::<f64>()) {
-            (Ok(a), Ok(b)) => match w.op { "=" => a==b, "!=" => a!=b, ">" => a>b, ">=" => a>=b, "<" => a<b, "<=" => a<=b, _ => false },
-            _ => match w.op { "=" => lhs==w.value, "!=" => lhs!=w.value, _ => false },
+        if numeric {
+            match (lhs.parse::<f64>(), &rhs_num) {
+                (Ok(a), Ok(b)) => match w.op { "=" => a==*b, "!=" => a!=*b, ">" => a>*b, ">=" => a>=*b, "<" => a<*b, "<=" => a<=*b, _ => false },
+                _ => false,
+            }
+        } else {
+            match w.op { "=" => lhs==w.value, "!=" => lhs!=w.value, _ => false }
         }
     }).collect();
     let m = arrow_array::BooleanArray::from(mask);

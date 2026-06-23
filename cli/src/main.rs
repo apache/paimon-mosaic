@@ -394,31 +394,31 @@ fn column_size(file: &PathBuf, json: bool) -> std::io::Result<()> {
     let reader = open(file)?;
     let s = reader.schema();
     let mut bytes = vec![0usize; s.columns.len()];
-    let mut raw = vec![0usize; s.columns.len()];
-    let mut all_uncomp_known = true;
+    let mut approx = vec![false; s.columns.len()];
     for rg in 0..reader.num_row_groups() {
-        // On-disk bytes are tracked per bucket (works for both monolithic and
-        // paged layouts); split a bucket's size across its member columns.
+        // Paged buckets store each column in its own slot → exact per-column bytes.
+        for p in reader.page_infos(rg)? {
+            bytes[p.column_index] += p.slot_size;
+        }
+        // Monolithic buckets are one blob; split evenly and mark approximate when
+        // more than one column shares the bucket (a single-column bucket is exact).
         for b in reader.bucket_infos(rg)? {
-            if b.columns.is_empty() { continue; }
+            if b.kind != "monolithic" || b.columns.is_empty() { continue; }
             split_evenly(b.size, &b.columns, &mut bytes);
-            split_evenly(b.uncompressed, &b.columns, &mut raw);
-            if b.size > 0 && b.uncompressed == 0 { all_uncomp_known = false; }
+            if b.columns.len() > 1 { for &c in &b.columns { approx[c] = true; } }
         }
     }
     let cols = original_order(s);
     let comp: usize = bytes.iter().sum();
-    // Only report a total ratio when every bucket's uncompressed size is known
-    // (paged buckets don't record it); a partial sum would be misleading.
-    let uncomp: usize = if all_uncomp_known { raw.iter().sum() } else { 0 };
+    let any_approx = approx.iter().any(|&a| a);
     if json {
-        let items: Vec<String> = cols.iter().map(|&i| format!("{{\"column\":{},\"bytes\":{},\"uncompressed\":{}}}", fmt::json_str(&s.columns[i].name), bytes[i], raw[i])).collect();
-        println!("{{\"columns\":[{}],\"total_bytes\":{},\"uncompressed\":{}}}", items.join(","), comp, uncomp);
+        let items: Vec<String> = cols.iter().map(|&i| format!("{{\"column\":{},\"bytes\":{},\"approximate\":{}}}", fmt::json_str(&s.columns[i].name), bytes[i], approx[i])).collect();
+        println!("{{\"columns\":[{}],\"total_bytes\":{}}}", items.join(","), comp);
     } else {
         for i in cols {
-            println!("  {}: {} B", s.columns[i].name, bytes[i]);
+            println!("  {}: {} B{}", s.columns[i].name, bytes[i], if approx[i] { " (approx)" } else { "" });
         }
-        println!("  total: {} B{}", comp, fmt::ratio(comp, uncomp));
+        println!("  total: {} B{}", comp, if any_approx { " (some columns approximate)" } else { "" });
     }
     Ok(())
 }

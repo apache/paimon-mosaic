@@ -266,8 +266,8 @@ fn column_size_nonzero_on_monolithic() {
     assert!(ok);
     assert!(out.contains("id: ") && !out.contains("id: 0 B"), "id must be non-zero: {out}");
     assert!(out.contains("kind: ") && !out.contains("kind: 0 B"), "kind must be non-zero: {out}");
-    // Monolithic buckets record uncompressed size, so a ratio is reported.
-    assert!(out.contains("total:") && out.contains("uncompressed") && out.contains("x)"), "ratio: {out}");
+    // Single-column buckets are exact, so nothing is flagged approximate.
+    assert!(out.contains("total:") && !out.contains("approx"), "single-col exact: {out}");
 }
 
 #[test]

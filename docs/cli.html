@@ -141,14 +141,12 @@ row group 0: 3 entries
 {"column":"kind","row_groups":[["a","b","c"]]}</code></pre>
 
             <h2>column-size</h2>
-            <p>On-disk bytes per column, summed across row groups. When a bucket groups several columns its bytes are split evenly among them. The total line shows uncompressed size and ratio when known (monolithic buckets; paged buckets omit it).</p>
+            <p>On-disk bytes per column. Paged buckets give exact per-column sizes; a multi-column monolithic bucket is split evenly and marked <code>(approx)</code>.</p>
 <pre><code><span class="cmt">$ mosaic column-size data.mosaic</span>
   id: 349 B
   name: 216 B
   kind: 28 B
-  score: 538 B
-  flag: 16 B
-  total: 1447 B (uncompressed 3220 B, 2.23x)</code></pre>
+  total: 593 B</code></pre>
 
             <h2>cat / head</h2>
             <p>Read the first N rows as a table. <code>-n</code> sets the count, <code>--all</code> prints every row, <code>-c</code> projects columns, <code>--where</code> filters rows (one condition: <code>=</code> <code>!=</code> <code>&gt;</code> <code>&gt;=</code> <code>&lt;</code> <code>&lt;=</code>; row groups whose stats exclude the predicate are skipped), <code>--json</code> emits newline-delimited JSON. <code>head</code> is an alias of <code>cat</code>.</p>

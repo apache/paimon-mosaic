@@ -34,7 +34,7 @@ mosaic <command> <file>
 
 ## Commands
 
-Every command accepts `--json`.
+All inspection and query commands accept `--json`; `convert` writes a file.
 
 | Command | Shows | Reads |
 |---------|-------|-------|
@@ -66,7 +66,7 @@ row group 0:
 $ mosaic column-size data.mosaic
   id: 349 B
   kind: 28 B
-  total: 377 B (uncompressed 861 B, 2.28x)
+  total: 377 B
 
 $ mosaic pages data.mosaic
 row group 0:
