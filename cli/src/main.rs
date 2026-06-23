@@ -314,7 +314,8 @@ fn convert(input: &PathBuf, out: &PathBuf, stats: Option<String>) -> std::io::Re
         return Err(e);
     }
     std::fs::rename(&tmp, out)?;
-    println!("wrote {} ({} rows, {} columns)", out.display(), rows, schema.fields().len());
+    let plural = |n: usize, w: &str| if n == 1 { format!("1 {w}") } else { format!("{n} {w}s") };
+    println!("wrote {} ({}, {})", out.display(), plural(rows, "row"), plural(schema.fields().len(), "column"));
     Ok(())
 }
 
