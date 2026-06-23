@@ -177,6 +177,18 @@ fn convert_csv_then_inspect() {
 }
 
 #[test]
+fn convert_json_then_inspect() {
+    let js = format!("{}/mosaic_e2e_in.ndjson", std::env::temp_dir().display());
+    std::fs::write(&js, "{\"id\":1,\"kind\":\"a\"}\n{\"id\":2,\"kind\":\"b\"}\n").unwrap();
+    let out = format!("{}/mosaic_e2e_jconv.mosaic", std::env::temp_dir().display());
+    let (msg, _, ok) = run(&["convert", &js, "-o", &out]);
+    assert!(ok && msg.contains("2 rows"), "{msg}");
+    let (j, _, _) = run(&["cat", &out, "--all", "--json"]);
+    assert_eq!(j.lines().count(), 2);
+    assert!(j.contains("\"kind\":\"a\""));
+}
+
+#[test]
 fn where_pushdown_keeps_correct_rows() {
     // stats on id let id>100 skip the row group; boundaries must not drop matches.
     let csv = format!("{}/mosaic_e2e_pd.csv", std::env::temp_dir().display());

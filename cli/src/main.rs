@@ -120,9 +120,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Import a CSV file into a new Mosaic file (schema inferred).
+    /// Import a CSV or JSON file into a new Mosaic file (schema inferred).
     Convert {
-        /// Input CSV (first line is the header).
+        /// Input: CSV (.csv, header row) or JSON lines (.json/.ndjson/.jsonl).
         input: PathBuf,
         /// Output .mosaic path.
         #[arg(short, long)]
@@ -287,14 +287,24 @@ impl paimon_mosaic_core::writer::OutputFile for FileOut {
 
 fn convert(input: &PathBuf, out: &PathBuf, stats: Option<String>) -> std::io::Result<()> {
     use paimon_mosaic_core::writer::{MosaicWriter, WriterOptions};
-    let file = std::fs::File::open(input)?;
-    let (schema, _) = arrow_csv::reader::Format::default().with_header(true)
-        .infer_schema(std::io::BufReader::new(&file), None)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    let file = std::fs::File::open(input)?;
-    let reader = arrow_csv::ReaderBuilder::new(std::sync::Arc::new(schema.clone()))
-        .with_header(true).build(std::io::BufReader::new(file))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    use arrow_schema::ArrowError;
+    let bad = |e: ArrowError| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
+    let is_json = matches!(input.extension().and_then(|e| e.to_str()), Some("json") | Some("ndjson") | Some("jsonl"));
+    // Infer schema, then build a batch iterator — CSV (header) or JSON (one object per line).
+    type Batches = Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>>>;
+    let (schema, reader): (arrow_schema::Schema, Batches) = if is_json {
+        let mut r = std::io::BufReader::new(std::fs::File::open(input)?);
+        let (schema, _) = arrow_json::reader::infer_json_schema(&mut r, None).map_err(bad)?;
+        let rd = arrow_json::ReaderBuilder::new(std::sync::Arc::new(schema.clone()))
+            .build(std::io::BufReader::new(std::fs::File::open(input)?)).map_err(bad)?;
+        (schema, Box::new(rd))
+    } else {
+        let (schema, _) = arrow_csv::reader::Format::default().with_header(true)
+            .infer_schema(std::io::BufReader::new(std::fs::File::open(input)?), None).map_err(bad)?;
+        let rd = arrow_csv::ReaderBuilder::new(std::sync::Arc::new(schema.clone()))
+            .with_header(true).build(std::io::BufReader::new(std::fs::File::open(input)?)).map_err(bad)?;
+        (schema, Box::new(rd))
+    };
     let opts = WriterOptions {
         stats_columns: stats.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default(),
         ..Default::default()

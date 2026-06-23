@@ -43,7 +43,7 @@ mosaic <command> <file>
 | `column-size` | on-disk bytes per column + total compression ratio | footer + index |
 | `cat` / `head` | first N rows as a table | column data |
 | `count` | total row count | footer + index |
-| `convert` | import a CSV into a new Mosaic file | writes file |
+| `convert` | import a CSV or JSON file into a new Mosaic file | writes file |
 
 Every command accepts `--json`. `cat`/`head` take `-n <N>`, `--all`, `-c a,b`
 (projection) and `--where "col op val"` (one condition: `=`,`!=`,`>`,`>=`,`<`,`<=`);

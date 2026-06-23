@@ -174,8 +174,10 @@ row group 0: 3 entries
 200</code></pre>
 
             <h2>convert</h2>
-            <p>Import a CSV (with header) into a new Mosaic file; the schema is inferred. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups.</p>
+            <p>Import a CSV (with header) or JSON lines (one object per line) into a new Mosaic file; the schema is inferred. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups.</p>
 <pre><code><span class="cmt">$ mosaic convert data.csv -o data.mosaic --stats id</span>
+wrote data.mosaic (200 rows, 5 columns)
+<span class="cmt">$ mosaic convert data.ndjson -o data.mosaic</span>
 wrote data.mosaic (200 rows, 5 columns)</code></pre>
 
             <div class="tip">
