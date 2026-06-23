@@ -395,6 +395,7 @@ fn column_size(file: &PathBuf, json: bool) -> std::io::Result<()> {
     let s = reader.schema();
     let mut bytes = vec![0usize; s.columns.len()];
     let mut raw = vec![0usize; s.columns.len()];
+    let mut all_uncomp_known = true;
     for rg in 0..reader.num_row_groups() {
         // On-disk bytes are tracked per bucket (works for both monolithic and
         // paged layouts); split a bucket's size across its member columns.
@@ -402,11 +403,14 @@ fn column_size(file: &PathBuf, json: bool) -> std::io::Result<()> {
             if b.columns.is_empty() { continue; }
             split_evenly(b.size, &b.columns, &mut bytes);
             split_evenly(b.uncompressed, &b.columns, &mut raw);
+            if b.size > 0 && b.uncompressed == 0 { all_uncomp_known = false; }
         }
     }
     let cols = original_order(s);
     let comp: usize = bytes.iter().sum();
-    let uncomp: usize = raw.iter().sum();
+    // Only report a total ratio when every bucket's uncompressed size is known
+    // (paged buckets don't record it); a partial sum would be misleading.
+    let uncomp: usize = if all_uncomp_known { raw.iter().sum() } else { 0 };
     if json {
         let items: Vec<String> = cols.iter().map(|&i| format!("{{\"column\":{},\"bytes\":{},\"uncompressed\":{}}}", fmt::json_str(&s.columns[i].name), bytes[i], raw[i])).collect();
         println!("{{\"columns\":[{}],\"total_bytes\":{},\"uncompressed\":{}}}", items.join(","), comp, uncomp);

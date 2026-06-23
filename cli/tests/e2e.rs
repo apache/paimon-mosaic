@@ -251,6 +251,8 @@ fn column_size_sums_bytes() {
     assert!(out.contains("id:") && out.contains("kind:"));
     // Every column attributes its on-disk bucket bytes (even the const flag bucket).
     assert!(out.contains("flag: 15 B") && !out.contains(": 0 B"));
+    // Paged buckets lack uncompressed sizes, so no (misleading) total ratio.
+    assert!(!out.contains("uncompressed"), "paged total must omit ratio: {out}");
 }
 
 #[test]
