@@ -43,6 +43,7 @@ mosaic <command> <file>
 | `column-size` | on-disk bytes per column + total compression ratio | footer + index |
 | `cat` / `head` | first N rows as a table | column data |
 | `count` | total row count | footer + index |
+| `convert` | import a CSV into a new Mosaic file | writes file |
 
 Every command accepts `--json`. `cat`/`head` take `-n <N>`, `--all`, `-c a,b`
 (projection) and `--where "col op val"` (one condition: `=`,`!=`,`>`,`>=`,`<`,`<=`);
@@ -77,7 +78,13 @@ $ mosaic cat data.mosaic -n 2 --json
 $ mosaic cat data.mosaic --all --where "score>1" -c id,score
 $ mosaic count data.mosaic
 200
+
+$ mosaic convert data.csv -o data.mosaic --stats id
+wrote data.mosaic (200 rows, 5 columns)
 ```
+
+`convert` builds stats for the named columns; `cat --where` then skips row
+groups whose min/max exclude the predicate.
 
 For C/C++ or Java callers, embed the format directly via the `ffi`
 (`mosaic.h`) or `jni` crates rather than shelling out to this CLI.

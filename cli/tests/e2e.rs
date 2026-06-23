@@ -164,6 +164,32 @@ fn cat_where_filters_rows() {
 }
 
 #[test]
+fn convert_csv_then_inspect() {
+    let csv = format!("{}/mosaic_e2e_in.csv", std::env::temp_dir().display());
+    std::fs::write(&csv, "id,kind,score\n1,a,10.5\n2,b,20\n3,a,30.5\n").unwrap();
+    let out = format!("{}/mosaic_e2e_conv.mosaic", std::env::temp_dir().display());
+    let (msg, _, ok) = run(&["convert", &csv, "-o", &out, "--stats", "id"]);
+    assert!(ok && msg.contains("3 rows"));
+    let (c, _, _) = run(&["count", &out]);
+    assert_eq!(c.trim(), "3");
+    let (s, _, _) = run(&["schema", &out]);
+    assert!(s.contains("id:") && s.contains("score:")); // inferred schema
+}
+
+#[test]
+fn where_pushdown_keeps_correct_rows() {
+    // stats on id let id>100 skip the row group; boundaries must not drop matches.
+    let csv = format!("{}/mosaic_e2e_pd.csv", std::env::temp_dir().display());
+    std::fs::write(&csv, "id,kind\n1,a\n2,b\n3,a\n").unwrap();
+    let out = format!("{}/mosaic_e2e_pd.mosaic", std::env::temp_dir().display());
+    run(&["convert", &csv, "-o", &out, "--stats", "id"]);
+    let (none, _, _) = run(&["cat", &out, "--all", "--where", "id>100"]);
+    assert!(none.contains("(no rows)"));
+    let (keep, _, _) = run(&["cat", &out, "--all", "--where", "id>=3", "--json"]);
+    assert_eq!(keep.lines().count(), 1); // boundary kept, not skipped
+}
+
+#[test]
 fn cat_json_is_ndjson() {
     let f = fixture("json");
     let (out, _, ok) = run(&["cat", &f, "-n", "2", "--json"]);

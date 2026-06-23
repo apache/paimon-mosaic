@@ -31,4 +31,5 @@ paimon-mosaic-core = { path = "../core" }
 arrow-array = "58"
 arrow-schema = "58"
 arrow-select = "58"
+arrow-csv = "58"
 clap = { version = "4", features = ["derive"] }

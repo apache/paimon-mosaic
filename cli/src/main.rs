@@ -120,6 +120,17 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Import a CSV file into a new Mosaic file (schema inferred).
+    Convert {
+        /// Input CSV (first line is the header).
+        input: PathBuf,
+        /// Output .mosaic path.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// Columns to build min/max stats for (comma-separated).
+        #[arg(long)]
+        stats: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -135,6 +146,7 @@ fn main() -> ExitCode {
         Cmd::ColumnSize { file, json } => column_size(&file, json),
         Cmd::Dictionary { file, column, json } => dictionary(&file, &column, json),
         Cmd::Buckets { file, json } => buckets(&file, json),
+        Cmd::Convert { input, out, stats } => convert(&input, &out, stats),
     };
     match res {
         Ok(()) => ExitCode::SUCCESS,
@@ -261,6 +273,45 @@ fn count(file: &PathBuf, json: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Output sink writing a Mosaic file to disk, tracking its own position.
+struct FileOut { f: std::fs::File, pos: u64 }
+impl paimon_mosaic_core::writer::OutputFile for FileOut {
+    fn write(&mut self, d: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        self.pos += d.len() as u64;
+        self.f.write_all(d)
+    }
+    fn flush(&mut self) -> std::io::Result<()> { use std::io::Write; self.f.flush() }
+    fn pos(&self) -> u64 { self.pos }
+}
+
+fn convert(input: &PathBuf, out: &PathBuf, stats: Option<String>) -> std::io::Result<()> {
+    use paimon_mosaic_core::writer::{MosaicWriter, WriterOptions};
+    let file = std::fs::File::open(input)?;
+    let (schema, _) = arrow_csv::reader::Format::default().with_header(true)
+        .infer_schema(std::io::BufReader::new(&file), None)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let file = std::fs::File::open(input)?;
+    let reader = arrow_csv::ReaderBuilder::new(std::sync::Arc::new(schema.clone()))
+        .with_header(true).build(std::io::BufReader::new(file))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let opts = WriterOptions {
+        stats_columns: stats.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default(),
+        ..Default::default()
+    };
+    let sink = FileOut { f: std::fs::File::create(out)?, pos: 0 };
+    let mut w = MosaicWriter::new(sink, &schema, opts)?;
+    let mut rows = 0;
+    for batch in reader {
+        let batch = batch.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        rows += batch.num_rows();
+        w.write_batch(&batch)?;
+    }
+    w.close()?;
+    println!("wrote {} ({} rows, {} columns)", out.display(), rows, schema.fields().len());
+    Ok(())
+}
+
 fn cat(file: &PathBuf, num: usize, columns: Option<String>, filter: Option<String>, json: bool) -> std::io::Result<()> {
     let mut reader = open(file)?;
     if let Some(list) = &columns {
@@ -269,11 +320,19 @@ fn cat(file: &PathBuf, num: usize, columns: Option<String>, filter: Option<Strin
     }
     let pred = filter.as_deref().map(fmt::parse_where).transpose()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // Column index of the filter target, for stats-based row-group skipping.
+    let pred_col = pred.as_ref().and_then(|p| reader.schema().columns.iter().position(|c| c.name == p.column));
     let mut batches: Vec<RecordBatch> = Vec::new();
     let mut got = 0usize;
     for rg in 0..reader.num_row_groups() {
         if got >= num {
             break;
+        }
+        // Pushdown: skip a row group when its min/max prove no row can match.
+        if let (Some(p), Some(ci)) = (&pred, pred_col) {
+            if let Some(st) = reader.row_group_stats(rg)?.iter().find(|s| s.column_index == ci) {
+                if fmt::stats_exclude(p, &st.min, &st.max) { continue; }
+            }
         }
         let mut batch = reader.row_group_reader(rg)?.read_columns()?;
         if let Some(p) = &pred {

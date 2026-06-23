@@ -245,6 +245,20 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
     arrow_select::filter::filter_record_batch(batch, &m).map_err(|e| e.to_string())
 }
 
+/// True when a row group's `[min, max]` provably excludes the filter — safe to
+/// skip. Numeric only and conservative: any missing/unparsable stat → keep.
+pub fn stats_exclude(w: &Where, min: &Option<Value>, max: &Option<Value>) -> bool {
+    let (lo, hi, v) = match (min.as_ref(), max.as_ref(), w.value.parse::<f64>()) {
+        (Some(a), Some(b), Ok(v)) => (render_value(a).parse::<f64>(), render_value(b).parse::<f64>(), v),
+        _ => return false,
+    };
+    let (Ok(lo), Ok(hi)) = (lo, hi) else { return false };
+    match w.op {
+        ">" => hi <= v, ">=" => hi < v, "<" => lo >= v, "<=" => lo > v,
+        "=" => v < lo || v > hi, _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
