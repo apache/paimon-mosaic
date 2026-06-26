@@ -32,6 +32,34 @@ use crate::varint;
 const COALESCE_GAP: u64 = 1024 * 1024;
 const COALESCE_MAX_RANGE: u64 = 32 * 1024 * 1024;
 
+/// A forged `uncompressed_size` would otherwise make `zstd::bulk::decompress`
+/// pre-allocate an arbitrarily large buffer before it ever sees the data.
+/// Highly repetitive data really does compress thousands-fold, so the ratio is
+/// deliberately generous; it only exists to reject absurd claims (a tiny block
+/// declaring gigabytes). The floor keeps tiny-but-genuine blocks working.
+const MAX_DECOMPRESS_RATIO: usize = 65536;
+const MIN_DECOMPRESS_CAP: usize = 1024 * 1024;
+
+fn decompress_zstd(compressed: &[u8], uncompressed_size: usize) -> io::Result<Vec<u8>> {
+    let cap = compressed
+        .len()
+        .saturating_mul(MAX_DECOMPRESS_RATIO)
+        .max(MIN_DECOMPRESS_CAP);
+    if uncompressed_size > cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "declared uncompressed size {} exceeds cap {} for {}-byte block",
+                uncompressed_size,
+                cap,
+                compressed.len()
+            ),
+        ));
+    }
+    zstd::bulk::decompress(compressed, uncompressed_size)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 #[derive(Clone)]
 pub struct ReadRangeBuffer {
     data: Arc<Vec<u8>>,
@@ -368,8 +396,7 @@ impl<I: InputFile> MosaicReader<I> {
 
         let schema_raw = match compression {
             COMPRESSION_NONE => schema_compressed.to_vec(),
-            COMPRESSION_ZSTD => zstd::bulk::decompress(schema_compressed, schema_uncompressed_size)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            COMPRESSION_ZSTD => decompress_zstd(schema_compressed, schema_uncompressed_size)?,
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -580,8 +607,7 @@ impl<I: InputFile> MosaicReader<I> {
                     let buf = read_range(&self.input, meta.bucket_offsets[b], compressed_size)?;
                     let data = match self.compression {
                         COMPRESSION_NONE => buf,
-                        COMPRESSION_ZSTD => zstd::bulk::decompress(&buf, uncompressed_size)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                        COMPRESSION_ZSTD => decompress_zstd(&buf, uncompressed_size)?,
                         _ => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -606,24 +632,8 @@ impl<I: InputFile> MosaicReader<I> {
                 BucketLayout::Paged { total_size } => {
                     let dir_size = globals.len() * 4;
                     let dir = read_range(&self.input, meta.bucket_offsets[b], dir_size)?;
-                    let mut sizes = Vec::with_capacity(globals.len());
-                    for i in 0..globals.len() {
-                        sizes.push(
-                            u32::from_le_bytes(dir[i * 4..i * 4 + 4].try_into().unwrap()) as usize,
-                        );
-                    }
-                    // Directory + slots must equal the bucket total, else a forged
-                    // slot size could drive a huge read_range allocation.
-                    let slot_sum = sizes.iter().try_fold(dir_size, |a, &s| a.checked_add(s));
-                    if slot_sum != Some(total_size) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "paged bucket {}: slot sizes do not sum to total {}",
-                                b, total_size
-                            ),
-                        ));
-                    }
+                    let sizes = Self::paged_slot_sizes(&dir, globals.len());
+                    Self::validate_paged_total(b, dir_size, &sizes, total_size)?;
                     let mut foff = meta.bucket_offsets[b] + dir_size as u64;
                     for (local, &gi) in globals.iter().enumerate() {
                         let enc = if sizes[local] == 0 {
@@ -649,6 +659,34 @@ impl<I: InputFile> MosaicReader<I> {
         Ok(out)
     }
 
+    /// Decode the paged-bucket directory: `ncols` little-endian u32 slot sizes.
+    fn paged_slot_sizes(dir: &[u8], ncols: usize) -> Vec<usize> {
+        (0..ncols)
+            .map(|i| u32::from_le_bytes(dir[i * 4..i * 4 + 4].try_into().unwrap()) as usize)
+            .collect()
+    }
+
+    /// Verify directory + slots sum exactly to the bucket total (rejects forged
+    /// slot sizes that could drive a huge allocation). Uses checked addition.
+    fn validate_paged_total(
+        b: usize,
+        dir_size: usize,
+        sizes: &[usize],
+        total: usize,
+    ) -> io::Result<()> {
+        let sum = sizes.iter().try_fold(dir_size, |a, &s| a.checked_add(s));
+        if sum != Some(total) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "paged bucket {}: slot sizes do not sum to total {}",
+                    b, total
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn parse_column_slot(
         slot_data: &[u8],
         col_type: &DataType,
@@ -657,8 +695,7 @@ impl<I: InputFile> MosaicReader<I> {
         let mut spos = 0usize;
         let uncompressed_size = varint::decode(slot_data, &mut spos)? as usize;
         let compressed_data = &slot_data[spos..];
-        let page_content = zstd::bulk::decompress(compressed_data, uncompressed_size)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let page_content = decompress_zstd(compressed_data, uncompressed_size)?;
 
         if page_content.len() < 2 {
             return Err(io::Error::new(
@@ -873,8 +910,7 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                     let global_indices = &self.schema.bucket_to_global[b];
                     let bucket_data = match self.compression {
                         COMPRESSION_NONE => buf.to_vec(),
-                        COMPRESSION_ZSTD => zstd::bulk::decompress(buf, uncompressed_size)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                        COMPRESSION_ZSTD => decompress_zstd(buf, uncompressed_size)?,
                         _ => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -894,27 +930,10 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                     let global_indices = &self.schema.bucket_to_global[b];
                     let num_columns = global_indices.len();
 
-                    // Parse directory
-                    let mut slot_sizes = Vec::with_capacity(num_columns);
-                    for i in 0..num_columns {
-                        let off = i * 4;
-                        let size =
-                            u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
-                        slot_sizes.push(size);
-                    }
-
-                    // Validate: directory + slots must exactly equal total_size
+                    // Parse + validate the directory (shared with page_infos).
                     let dir_size = num_columns * 4;
-                    let slot_total: usize = slot_sizes.iter().sum();
-                    if dir_size + slot_total != total_size {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "paged bucket {}: directory ({}) + slots ({}) != total size ({})",
-                                b, dir_size, slot_total, total_size
-                            ),
-                        ));
-                    }
+                    let slot_sizes = Self::paged_slot_sizes(buf, num_columns);
+                    Self::validate_paged_total(b, dir_size, &slot_sizes, total_size)?;
 
                     if all_projected_in_bucket[b] {
                         // All columns projected — we already read the full bucket in round 1,

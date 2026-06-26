@@ -90,7 +90,7 @@ $ mosaic cat data.mosaic -n 2 --json
 {"id":0,"name":"user_0","kind":"a","flag":7}
 {"id":1,"name":"user_1","kind":"b","flag":7}
 
-$ mosaic cat data.mosaic --all --where "id>100" -c id,kind
+$ mosaic cat data.mosaic --where "id>100" -c id,kind
 ```
 
 ## Convert

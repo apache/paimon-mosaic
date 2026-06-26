@@ -4231,3 +4231,16 @@ fn test_page_infos_encodings() {
     assert!(by_name("id").slot_size > 0);
     assert!(reader.page_infos(999).is_err());
 }
+
+#[test]
+fn decompress_zstd_caps_forged_size() {
+    let blob = zstd::bulk::compress(&vec![7u8; 8192], 3).unwrap();
+    // Honest size round-trips.
+    assert_eq!(decompress_zstd(&blob, 8192).unwrap().len(), 8192);
+    // A tiny block claiming gigabytes is rejected before any huge alloc.
+    let err = decompress_zstd(&blob, 8 * 1024 * 1024 * 1024).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    // The floor keeps small-but-genuine blocks (1 byte -> ~64KB) working.
+    let small = zstd::bulk::compress(&vec![0u8; 64 * 1024], 3).unwrap();
+    assert_eq!(decompress_zstd(&small, 64 * 1024).unwrap().len(), 64 * 1024);
+}

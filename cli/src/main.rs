@@ -203,15 +203,32 @@ fn original_order(s: &paimon_mosaic_core::schema::MosaicSchema) -> Vec<usize> {
     cols
 }
 
+/// Split a comma list into trimmed, non-empty names (e.g. `-c a, b,` -> [a, b]).
+fn parse_comma_list(l: &str) -> Vec<String> {
+    l.split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(String::from)
+        .collect()
+}
+
 /// Parse a `-c a,b` list into a name set, or `None` for "all columns".
-fn col_filter(columns: &Option<String>) -> Option<std::collections::HashSet<String>> {
-    columns.as_ref().map(|l| {
-        l.split(',')
-            .map(|x| x.trim())
-            .filter(|x| !x.is_empty())
-            .map(String::from)
-            .collect()
-    })
+fn col_filter(
+    columns: &Option<String>,
+    s: &paimon_mosaic_core::schema::MosaicSchema,
+) -> std::io::Result<Option<std::collections::HashSet<String>>> {
+    let Some(l) = columns else { return Ok(None) };
+    let set: std::collections::HashSet<String> = parse_comma_list(l).into_iter().collect();
+    if let Some(bad) = set
+        .iter()
+        .find(|n| !s.columns.iter().any(|c| &c.name == *n))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("column '{bad}' not found in schema"),
+        ));
+    }
+    Ok(Some(set))
 }
 
 /// Add `total` across `cols`, distributing the remainder so the parts sum exactly.
@@ -345,7 +362,7 @@ fn meta(file: &Path, json: bool) -> std::io::Result<()> {
 fn pages(file: &Path, columns: Option<String>, json: bool) -> std::io::Result<()> {
     let reader = open(file)?;
     let s = reader.schema();
-    let want = col_filter(&columns);
+    let want = col_filter(&columns, s)?;
     let nrg = reader.num_row_groups();
     if json {
         let mut rgs = Vec::new();
@@ -464,14 +481,7 @@ fn convert(
         (schema, Box::new(rd))
     };
     let opts = WriterOptions {
-        stats_columns: stats
-            .map(|s| {
-                s.split(',')
-                    .map(|x| x.trim().to_string())
-                    .filter(|x| !x.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default(),
+        stats_columns: stats.map(|s| parse_comma_list(&s)).unwrap_or_default(),
         ..Default::default()
     };
     // Write to a temp file and rename on success, so a mid-stream failure never
@@ -530,12 +540,7 @@ fn cat(
     // dropped before printing, so `--where` works on a hidden column.
     let mut display: Vec<String> = Vec::new();
     if let Some(list) = &columns {
-        display = list
-            .split(',')
-            .map(|x| x.trim())
-            .filter(|x| !x.is_empty())
-            .map(String::from)
-            .collect();
+        display = parse_comma_list(list);
         let mut read: Vec<&str> = display.iter().map(String::as_str).collect();
         if let Some(p) = &pred {
             if !read.contains(&p.column.as_str()) {
@@ -635,7 +640,7 @@ fn footer(file: &Path, json: bool) -> std::io::Result<()> {
 fn column_size(file: &Path, columns: Option<String>, json: bool) -> std::io::Result<()> {
     let reader = open(file)?;
     let s = reader.schema();
-    let want = col_filter(&columns);
+    let want = col_filter(&columns, s)?;
     let mut bytes = vec![0usize; s.columns.len()];
     let mut approx = vec![false; s.columns.len()];
     for rg in 0..reader.num_row_groups() {

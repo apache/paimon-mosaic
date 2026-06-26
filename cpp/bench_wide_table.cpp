@@ -8,6 +8,7 @@
 // Build:    cmake --build cpp/build --target bench_wide_table
 // Run:      ./bench_wide_table --benchmark_repetitions=5
 
+#include "bench_common.hpp"
 #include "mosaic.hpp"
 
 #include <arrow/api.h>
@@ -38,149 +39,11 @@ namespace {
 
 constexpr int kDefaultNumRows = 1500;
 constexpr int kZstdLevel = 3;
-constexpr unsigned kSeed = 42;
 constexpr const char* kDiskPath = "/tmp/bench_wide_table.out";
 
-enum class ColType { Timestamp, Int8, Int16, Int32, Float64 };
-enum class Sparsity { AllNull, AlwaysPresent, MostlyNull };
-
-struct ColSpec {
-    ColType type;
-    Sparsity sparsity;
-    std::string name;
-};
-
-std::vector<ColSpec> build_specs(int n_cols) {
-    std::vector<ColSpec> out;
-    out.reserve(n_cols);
-    out.push_back({ColType::Timestamp, Sparsity::AlwaysPresent, "timestamp"});
-
-    int data_cols = n_cols - 1;
-    int n_i8 = data_cols * 794 / 1000;           // uint8 in real data
-    int n_f64 = data_cols * 113 / 1000;
-    int n_i16_wide = data_cols * 45 / 1000;      // uint16 in real data
-    int n_i16 = data_cols * 31 / 1000;
-    int n_i32_wide = data_cols - n_i8 - n_f64 - n_i16_wide - n_i16;  // uint32 in real
-
-    auto add = [&](ColType t, int n) {
-        for (int i = 0; i < n; i++) {
-            int idx = static_cast<int>(out.size());
-            char buf[80];
-            std::snprintf(buf, sizeof(buf),
-                "054.O1O4NO5.NN2g60ObDkkukO5Jz0g1uaaDU8DSCZ%c.col_%05d_pad",
-                'A' + (idx % 26), idx);
-            Sparsity s;
-            int x = idx % 100;
-            if (x < 18) s = Sparsity::AllNull;
-            else if (x < 34) s = Sparsity::AlwaysPresent;
-            else s = Sparsity::MostlyNull;
-            out.push_back({t, s, std::string(buf)});
-        }
-    };
-    add(ColType::Int8, n_i8);
-    add(ColType::Float64, n_f64);
-    add(ColType::Int16, n_i16_wide);
-    add(ColType::Int16, n_i16);
-    add(ColType::Int32, n_i32_wide);
-    return out;
-}
-
-std::shared_ptr<arrow::DataType> arrow_type_for(ColType t) {
-    switch (t) {
-        case ColType::Timestamp: return arrow::int64();
-        case ColType::Int8:      return arrow::int8();
-        case ColType::Int16:     return arrow::int16();
-        case ColType::Int32:     return arrow::int32();
-        case ColType::Float64:   return arrow::float64();
-    }
-    return arrow::null();
-}
-
-std::shared_ptr<arrow::RecordBatch> build_batch(const std::vector<ColSpec>& specs,
-                                                 int n_rows) {
-    arrow::FieldVector fields;
-    fields.reserve(specs.size());
-    for (const auto& s : specs) {
-        fields.push_back(arrow::field(
-            s.name, arrow_type_for(s.type),
-            s.sparsity != Sparsity::AlwaysPresent));
-    }
-    auto schema = arrow::schema(std::move(fields));
-
-    std::mt19937 rng(kSeed);
-    std::uniform_int_distribution<int> d_pres(0, 99);
-    std::uniform_int_distribution<int> d_i8(-128, 127);
-    std::uniform_int_distribution<int> d_i16(-32768, 32767);
-    std::uniform_int_distribution<int32_t> d_i32(INT32_MIN, INT32_MAX);
-    std::uniform_real_distribution<double> d_f64(-256.0, 255.9);
-
-    auto present = [&](Sparsity s) {
-        if (s == Sparsity::AllNull) return false;
-        if (s == Sparsity::AlwaysPresent) return true;
-        return d_pres(rng) < 25;
-    };
-
-    constexpr int64_t base_ts = 1778218500000LL;
-
-    std::vector<std::shared_ptr<arrow::Array>> arrays;
-    arrays.reserve(specs.size());
-
-    for (const auto& spec : specs) {
-        std::shared_ptr<arrow::Array> arr;
-        switch (spec.type) {
-            case ColType::Timestamp: {
-                arrow::Int64Builder b;
-                (void)b.Reserve(n_rows);
-                for (int r = 0; r < n_rows; r++)
-                    (void)b.Append(base_ts + r * 200);
-                (void)b.Finish(&arr);
-                break;
-            }
-            case ColType::Int8: {
-                arrow::Int8Builder b;
-                (void)b.Reserve(n_rows);
-                for (int r = 0; r < n_rows; r++) {
-                    if (present(spec.sparsity)) (void)b.Append((int8_t)d_i8(rng));
-                    else (void)b.AppendNull();
-                }
-                (void)b.Finish(&arr);
-                break;
-            }
-            case ColType::Int16: {
-                arrow::Int16Builder b;
-                (void)b.Reserve(n_rows);
-                for (int r = 0; r < n_rows; r++) {
-                    if (present(spec.sparsity)) (void)b.Append((int16_t)d_i16(rng));
-                    else (void)b.AppendNull();
-                }
-                (void)b.Finish(&arr);
-                break;
-            }
-            case ColType::Int32: {
-                arrow::Int32Builder b;
-                (void)b.Reserve(n_rows);
-                for (int r = 0; r < n_rows; r++) {
-                    if (present(spec.sparsity)) (void)b.Append(d_i32(rng));
-                    else (void)b.AppendNull();
-                }
-                (void)b.Finish(&arr);
-                break;
-            }
-            case ColType::Float64: {
-                arrow::DoubleBuilder b;
-                (void)b.Reserve(n_rows);
-                for (int r = 0; r < n_rows; r++) {
-                    if (present(spec.sparsity)) (void)b.Append(d_f64(rng));
-                    else (void)b.AppendNull();
-                }
-                (void)b.Finish(&arr);
-                break;
-            }
-        }
-        arrays.push_back(std::move(arr));
-    }
-    return arrow::RecordBatch::Make(schema, n_rows, std::move(arrays));
-}
+// Synthetic-data generators (ColSpec/build_specs/build_batch) live in
+// bench_common.hpp, shared with bench_append.cpp so both benchmarks run the
+// identical column distribution.
 
 // ============== Batch cache (build once per column count) ==============
 
@@ -191,8 +54,8 @@ std::shared_ptr<arrow::RecordBatch> get_or_build_batch(int n_cols, int n_rows) {
     std::lock_guard<std::mutex> lock(mu);
     Key k{n_cols, n_rows};
     for (auto& [kk, v] : cache) if (kk == k) return v;
-    auto specs = build_specs(n_cols);
-    auto b = build_batch(specs, n_rows);
+    auto specs = bench::build_specs(n_cols);
+    auto b = bench::build_batch(specs, n_rows);
     cache.emplace_back(k, b);
     return b;
 }

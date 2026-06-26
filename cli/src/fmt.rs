@@ -250,7 +250,8 @@ pub fn parse_where(s: &str) -> Result<Where, String> {
 }
 
 /// Keep rows where the condition holds. Numeric columns compare numerically;
-/// others compare as strings (only `=`/`!=` meaningful). Nulls never match.
+/// booleans by true/false; everything else as exact strings (only `=`/`!=`
+/// meaningful). Nulls never match. Unsupported types error rather than drop.
 pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String> {
     use arrow::datatypes::DataType::*;
     let col = batch
@@ -258,6 +259,7 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
         .ok_or_else(|| format!("--where: column '{}' not found", w.column))?;
     let int = matches!(col.data_type(), Int8 | Int16 | Int32 | Int64 | Date32);
     let float = matches!(col.data_type(), Float32 | Float64);
+    let boolean = matches!(col.data_type(), Boolean);
     // Integer columns compare in i128 (exact for full i64 range); float columns
     // in f64; everything else as exact strings. Ordering is numeric-only.
     if matches!(w.op, ">" | ">=" | "<" | "<=")
@@ -268,33 +270,94 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
             w.op, w.column, w.op, w.value
         ));
     }
-    let rhs_i = w.value.parse::<i128>();
-    let rhs_f = w.value.parse::<f64>();
-    let mask: Vec<bool> = (0..batch.num_rows())
-        .map(|r| {
-            if col.is_null(r) {
-                return false;
-            }
-            let lhs = cell(col.as_ref(), r);
-            if int {
-                match (lhs.parse::<i128>(), &rhs_i) {
-                    (Ok(a), Ok(b)) => cmp_op(w.op, &a, b),
-                    _ => false,
-                }
-            } else if float {
-                match (lhs.parse::<f64>(), &rhs_f) {
-                    (Ok(a), Ok(b)) => cmp_op(w.op, &a, b),
-                    _ => false,
-                }
-            } else {
-                match w.op {
-                    "=" => lhs == w.value,
-                    "!=" => lhs != w.value,
-                    _ => false,
-                }
-            }
-        })
-        .collect();
+    // Downcast the column once and compare per row directly, instead of
+    // rendering each cell to a String. Integers use i128 (exact), floats f64.
+    use arrow::array::*;
+    let n = batch.num_rows();
+    let row_ok = |r: usize| !col.is_null(r);
+    // When the RHS can't parse for a numeric column, `=` matches nothing and
+    // `!=` matches every non-null row (nulls never match, either way).
+    let no_match = |keep_nonnull: bool| -> Vec<bool> {
+        (0..n).map(|r| keep_nonnull && row_ok(r)).collect()
+    };
+    // Downcast the column once and return a per-row value accessor; avoids
+    // re-downcasting inside the row loop.
+    macro_rules! d {
+        ($ty:ty, $v:ident, $r:ident => $body:expr) => {{
+            let $v = col.as_any().downcast_ref::<$ty>().unwrap();
+            Box::new(move |$r: usize| $body)
+        }};
+    }
+    let mask: Vec<bool> = if int {
+        let Ok(rhs) = w.value.parse::<i128>() else {
+            return finish(batch, no_match(w.op == "!="));
+        };
+        let at: Box<dyn Fn(usize) -> i128 + '_> = match col.data_type() {
+            Int8 => d!(Int8Array, v, r => v.value(r) as i128),
+            Int16 => d!(Int16Array, v, r => v.value(r) as i128),
+            Int32 => d!(Int32Array, v, r => v.value(r) as i128),
+            Date32 => d!(Date32Array, v, r => v.value(r) as i128),
+            _ => d!(Int64Array, v, r => v.value(r) as i128),
+        };
+        (0..n)
+            .map(|r| row_ok(r) && cmp_op(w.op, &at(r), &rhs))
+            .collect()
+    } else if float {
+        let Ok(rhs) = w.value.parse::<f64>() else {
+            return finish(batch, no_match(w.op == "!="));
+        };
+        let at: Box<dyn Fn(usize) -> f64 + '_> = match col.data_type() {
+            Float32 => d!(Float32Array, v, r => v.value(r) as f64),
+            _ => d!(Float64Array, v, r => v.value(r)),
+        };
+        (0..n)
+            .map(|r| row_ok(r) && cmp_op(w.op, &at(r), &rhs))
+            .collect()
+    } else if boolean {
+        let rhs = match w.value.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return Err(format!(
+                "--where: boolean column '{}' needs true/false (got '{}')",
+                w.column, w.value
+            )),
+        };
+        let a = col.as_any().downcast_ref::<BooleanArray>().unwrap();
+        (0..n)
+            .map(|r| {
+                row_ok(r)
+                    && match w.op {
+                        "=" => a.value(r) == rhs,
+                        "!=" => a.value(r) != rhs,
+                        _ => false,
+                    }
+            })
+            .collect()
+    } else if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+        (0..n)
+            .map(|r| {
+                row_ok(r)
+                    && match w.op {
+                        "=" => a.value(r) == w.value,
+                        "!=" => a.value(r) != w.value,
+                        _ => false,
+                    }
+            })
+            .collect()
+    } else {
+        // Fail loudly rather than silently dropping every row for a type we
+        // can't compare (e.g. nested/binary), instead of returning "(no rows)".
+        return Err(format!(
+            "--where: column '{}' has unsupported type {:?}",
+            w.column,
+            col.data_type()
+        ));
+    };
+    finish(batch, mask)
+}
+
+/// Apply a boolean row mask to a batch, returning the filtered batch.
+fn finish(batch: &RecordBatch, mask: Vec<bool>) -> Result<RecordBatch, String> {
     let m = arrow::array::BooleanArray::from(mask);
     arrow::compute::filter_record_batch(batch, &m).map_err(|e| e.to_string())
 }
@@ -319,8 +382,8 @@ fn to_i128(v: &Value) -> Option<i128> {
     match v {
         TinyInt(x) => Some(*x as i128),
         SmallInt(x) => Some(*x as i128),
-        Integer(x) | Date(x) | Time(x) => Some(*x as i128),
-        BigInt(x) | DecimalCompact(x) | TimestampMillis(x) | TimestampMicros(x) => Some(*x as i128),
+        Integer(x) | Date(x) => Some(*x as i128),
+        BigInt(x) => Some(*x as i128),
         _ => None,
     }
 }

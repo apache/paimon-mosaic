@@ -23,7 +23,7 @@ use std::io::Write;
 use std::process::Command;
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, RecordBatch, StringArray};
+use arrow::array::{BooleanArray, Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
 
@@ -151,6 +151,15 @@ fn head_is_alias_of_cat() {
 }
 
 #[test]
+fn pages_unknown_column_errors() {
+    let f = fixture("badcol");
+    let (_, _, ok) = run(&["pages", &f, "-c", "nope"]);
+    assert!(!ok); // typo in -c fails instead of silently printing nothing
+    let (_, _, ok2) = run(&["column-size", &f, "-c", "nope"]);
+    assert!(!ok2);
+}
+
+#[test]
 fn count_reports_total() {
     let f = fixture("count");
     let (out, _, ok) = run(&["count", &f]);
@@ -180,12 +189,52 @@ fn cat_where_filters_rows() {
     assert!(!bad); // unparseable filter fails
     let (_, _, str_ord) = run(&["cat", &f, "--where", "kind>5"]);
     assert!(!str_ord); // ordering on a string column errors, not silent drop
+    // != with a non-numeric value matches all rows (nothing equals it).
+    let (ne, _, _) = run(&["cat", &f, "--where", "id!=abc", "--json"]);
+    assert_eq!(ne.lines().count(), 200);
                        // Filtering a column dropped by -c works and doesn't leak into output.
     let (hid, _, ok) = run(&["cat", &f, "-c", "kind", "--where", "id>197", "--json"]);
     assert!(
         ok && hid.lines().count() == 2 && !hid.contains("\"id\""),
         "{hid}"
     );
+}
+
+/// Fixture with a Boolean column so `--where` on bools can be exercised.
+fn fixture_bool(name: &str) -> String {
+    let path = format!("{}/mosaic_e2e_{}.mosaic", std::env::temp_dir().display(), name);
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("active", DataType::Boolean, true),
+    ]);
+    let out = FileOut { f: File::create(&path).unwrap(), pos: 0 };
+    let opts = WriterOptions { num_buckets: 1, stats_columns: vec!["id".into()], ..Default::default() };
+    let mut w = MosaicWriter::new(out, &schema, opts).unwrap();
+    let n = 10;
+    let ids: Vec<i32> = (0..n).collect();
+    let active: Vec<bool> = (0..n).map(|i| i % 2 == 0).collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(Int32Array::from(ids)), Arc::new(BooleanArray::from(active))],
+    )
+    .unwrap();
+    w.write_batch(&batch).unwrap();
+    w.close().unwrap();
+    path
+}
+
+#[test]
+fn cat_where_boolean_filters() {
+    let f = fixture_bool("wherebool");
+    // 5 of 10 rows are active=true; must not silently drop them all.
+    let (t, _, ok) = run(&["cat", &f, "--where", "active=true", "--json"]);
+    assert!(ok && t.lines().count() == 5, "{t}");
+    assert!(t.lines().all(|l| l.contains("\"active\":true")));
+    let (f2, _, _) = run(&["cat", &f, "--where", "active!=true", "--json"]);
+    assert_eq!(f2.lines().count(), 5);
+    // A non-bool literal on a bool column errors instead of returning nothing.
+    let (_, _, bad) = run(&["cat", &f, "--where", "active=yes"]);
+    assert!(!bad);
 }
 
 #[test]
