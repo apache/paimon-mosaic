@@ -4244,3 +4244,49 @@ fn decompress_zstd_caps_forged_size() {
     let small = zstd::bulk::compress(&vec![0u8; 64 * 1024], 3).unwrap();
     assert_eq!(decompress_zstd(&small, 64 * 1024).unwrap().len(), 64 * 1024);
 }
+
+// A paged bucket containing an ARRAY column stores its child slots after the
+// primaries plus a child header; page_infos/slot_sizes must skip the header and
+// attribute child bytes to the parent, else they mis-read or fail validation.
+#[test]
+fn test_slot_sizes_paged_array_column() {
+    let item = Arc::new(Field::new("item", DataType::Int32, true));
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("vals", DataType::List(item.clone()), true),
+    ]);
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &schema,
+        WriterOptions {
+            num_buckets: 1,
+            page_size_threshold: 1, // force paged buckets
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut lb = arrow_array::builder::ListBuilder::new(arrow_array::builder::Int32Builder::new());
+    for i in 0..100i32 {
+        lb.values().append_value(i);
+        lb.values().append_value(i + 1);
+        lb.append(true);
+    }
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int32Array::from((0..100).collect::<Vec<_>>())), Arc::new(lb.finish())],
+    )
+    .unwrap();
+    writer.write_batch(&batch).unwrap();
+    writer.close().unwrap();
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    let reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
+
+    // Both inspection paths must succeed (regression: ARRAY child header broke them).
+    let sizes = reader.slot_sizes(0).unwrap();
+    assert_eq!(sizes.len(), reader.schema().columns.len());
+    let vals = reader.schema().columns.iter().position(|c| c.name == "vals").unwrap();
+    assert!(sizes[vals] > 0, "ARRAY column bytes (incl. child slots) attributed");
+    assert!(reader.page_infos(0).is_ok());
+}
