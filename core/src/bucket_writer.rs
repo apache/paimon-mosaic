@@ -17,9 +17,11 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 
 use arrow_array::*;
-use arrow_schema::DataType;
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_schema::{DataType, Field};
 
 use crate::spec::*;
 use crate::types;
@@ -31,21 +33,39 @@ pub struct PagedBucketOutput {
     pub has_nulls: Vec<bool>,
     pub const_data: Vec<Vec<u8>>,
     pub column_pages: Vec<Option<Vec<u8>>>,
+    pub num_primary: usize,
+    pub children: Vec<ChildColumnMeta>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildColumnRole {
+    ListElement,
+    MapKey,
+    MapValue,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChildColumnMeta {
+    pub parent_logical_col: usize,
+    pub physical_index: usize,
+    pub length_physical_index: usize,
+    pub role: ChildColumnRole,
+    pub element_field: Arc<Field>,
+    pub num_elements: usize,
 }
 
 pub struct BucketWriter {
-    num_columns: usize,
+    num_primary: usize,
+    total_columns: usize,
     fixed_widths: Vec<i32>,
 
     null_bitmaps: Vec<Vec<u8>>,
     value_buffers: Vec<Vec<u8>>,
     non_null_counts: Vec<usize>,
 
-    // CONST tracking
     const_tracking: Vec<bool>,
     first_value_len: Vec<usize>,
 
-    // Dict tracking: fixed-width <=8 uses u64 keys, variable-width uses byte keys
     long_dict_maps: Vec<Option<HashMap<u64, usize>>>,
     byte_dict_maps: Vec<Option<HashMap<Vec<u8>, usize>>>,
     dict_total_bytes: Vec<usize>,
@@ -53,6 +73,7 @@ pub struct BucketWriter {
     max_dict_entries: usize,
 
     num_rows: usize,
+    children: Vec<ChildColumnMeta>,
 }
 
 impl BucketWriter {
@@ -61,13 +82,14 @@ impl BucketWriter {
         max_dict_total_bytes: usize,
         max_dict_entries: usize,
     ) -> Self {
-        let num_columns = col_types.len();
-        let fixed_widths: Vec<i32> = col_types.iter().map(|t| types::fixed_width(t)).collect();
+        let num_primary = col_types.len();
+        let (physical_types, children) = expand_col_types(col_types);
+        let total_columns = physical_types.len();
+        let fixed_widths: Vec<i32> = physical_types.iter().map(types::fixed_width).collect();
 
-        let mut long_dict_maps = Vec::with_capacity(num_columns);
-        let mut byte_dict_maps = Vec::with_capacity(num_columns);
-
-        for fw in fixed_widths.iter().take(num_columns) {
+        let mut long_dict_maps = Vec::with_capacity(total_columns);
+        let mut byte_dict_maps = Vec::with_capacity(total_columns);
+        for fw in &fixed_widths {
             if uses_long_dict(*fw) {
                 long_dict_maps.push(Some(HashMap::new()));
                 byte_dict_maps.push(None);
@@ -78,19 +100,64 @@ impl BucketWriter {
         }
 
         BucketWriter {
-            num_columns,
+            num_primary,
+            total_columns,
             fixed_widths,
-            null_bitmaps: vec![vec![0u8; 128]; num_columns],
-            value_buffers: vec![Vec::with_capacity(1024); num_columns],
-            non_null_counts: vec![0; num_columns],
-            const_tracking: vec![true; num_columns],
-            first_value_len: vec![0; num_columns],
+            null_bitmaps: vec![vec![0u8; 128]; total_columns],
+            value_buffers: vec![Vec::with_capacity(1024); total_columns],
+            non_null_counts: vec![0; total_columns],
+            const_tracking: vec![true; total_columns],
+            first_value_len: vec![0; total_columns],
             long_dict_maps,
             byte_dict_maps,
-            dict_total_bytes: vec![0; num_columns],
+            dict_total_bytes: vec![0; total_columns],
             max_dict_total_bytes,
             max_dict_entries,
             num_rows: 0,
+            children,
+        }
+    }
+
+    pub fn num_primary(&self) -> usize {
+        self.num_primary
+    }
+
+    pub fn children(&self) -> &[ChildColumnMeta] {
+        &self.children
+    }
+
+    fn find_child_index(
+        &self,
+        parent_logical_col: usize,
+        length_physical_index: usize,
+        role: ChildColumnRole,
+    ) -> io::Result<usize> {
+        self.children
+            .iter()
+            .position(|c| {
+                c.parent_logical_col == parent_logical_col
+                    && c.length_physical_index == length_physical_index
+                    && c.role == role
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "missing complex child column: parent={}, length={}, role={:?}",
+                        parent_logical_col, length_physical_index, role
+                    ),
+                )
+            })
+    }
+
+    fn col_num_rows(&self, col: usize) -> usize {
+        if col < self.num_primary {
+            self.num_rows
+        } else {
+            self.children
+                .iter()
+                .find(|c| c.physical_index == col)
+                .map_or(0, |c| c.num_elements)
         }
     }
 
@@ -111,7 +178,7 @@ impl BucketWriter {
         arrays: &[&dyn Array],
         data_types: &[&DataType],
     ) -> io::Result<usize> {
-        debug_assert_eq!(arrays.len(), self.num_columns);
+        debug_assert_eq!(arrays.len(), self.num_primary);
         let num_new_rows = arrays[0].len();
         if num_new_rows == 0 {
             return Ok(0);
@@ -119,12 +186,121 @@ impl BucketWriter {
         let start_row = self.num_rows;
         let mut total_size = 0;
 
-        for i in 0..self.num_columns {
-            total_size += self.append_array_column(i, arrays[i], data_types[i], start_row)?;
+        // Split List/Map arrays into lengths + child values
+        struct ColSplit {
+            col: usize,
+            lengths: Int32Array,
+        }
+        let mut splits: Vec<ColSplit> = Vec::new();
+        let mut pending: Vec<(usize, ArrayRef)> = Vec::new();
+        let mut seen_cols = Vec::new();
+        for child in &self.children {
+            let col = child.parent_logical_col;
+            if seen_cols.contains(&col) {
+                continue;
+            }
+            seen_cols.push(col);
+
+            match data_types[col] {
+                DataType::List(_) => {
+                    let list_array = arrays[col]
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "expected ListArray")
+                        })?;
+                    let lengths = extract_list_lengths(list_array);
+                    let values = flatten_list_values(list_array);
+                    splits.push(ColSplit { col, lengths });
+                    let child_idx =
+                        self.find_child_index(col, col, ChildColumnRole::ListElement)?;
+                    pending.push((child_idx, values));
+                }
+                DataType::Map(_, _) => {
+                    let map_array =
+                        arrays[col]
+                            .as_any()
+                            .downcast_ref::<MapArray>()
+                            .ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidInput, "expected MapArray")
+                            })?;
+                    let lengths = extract_map_lengths(map_array);
+                    let (keys, values) = flatten_map_entries(map_array);
+                    splits.push(ColSplit { col, lengths });
+                    let key_idx = self.find_child_index(col, col, ChildColumnRole::MapKey)?;
+                    let value_idx = self.find_child_index(col, col, ChildColumnRole::MapValue)?;
+                    pending.push((key_idx, keys));
+                    pending.push((value_idx, values));
+                }
+                _ => {}
+            }
+        }
+
+        // Write primary columns (lengths for ARRAY/MAP cols, regular data for others)
+        let int32_dt = DataType::Int32;
+        for i in 0..self.num_primary {
+            if let Some(split) = splits.iter().find(|s| s.col == i) {
+                total_size += self.append_array_column(i, &split.lengths, &int32_dt, start_row)?;
+            } else {
+                total_size += self.append_array_column(i, arrays[i], data_types[i], start_row)?;
+            }
+        }
+
+        // Write child columns. Nested children are located through explicit layout metadata.
+        while let Some((child_idx, values)) = pending.pop() {
+            if child_idx >= self.children.len() || values.is_empty() {
+                continue;
+            }
+            let phys_idx = self.children[child_idx].physical_index;
+            let child_start = self.children[child_idx].num_elements;
+
+            match values.data_type() {
+                DataType::List(_) => {
+                    let inner_list =
+                        values.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "expected ListArray")
+                        })?;
+                    let inner_lengths = extract_list_lengths(inner_list);
+                    let inner_values = flatten_list_values(inner_list);
+                    total_size +=
+                        self.append_array_column(phys_idx, &inner_lengths, &int32_dt, child_start)?;
+                    self.children[child_idx].num_elements += inner_lengths.len();
+                    let nested_idx = self.find_child_index(
+                        self.children[child_idx].parent_logical_col,
+                        phys_idx,
+                        ChildColumnRole::ListElement,
+                    )?;
+                    pending.push((nested_idx, inner_values));
+                }
+                DataType::Map(_, _) => {
+                    let inner_map =
+                        values.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "expected MapArray")
+                        })?;
+                    let inner_lengths = extract_map_lengths(inner_map);
+                    let (inner_keys, inner_values) = flatten_map_entries(inner_map);
+                    total_size +=
+                        self.append_array_column(phys_idx, &inner_lengths, &int32_dt, child_start)?;
+                    self.children[child_idx].num_elements += inner_lengths.len();
+                    let parent = self.children[child_idx].parent_logical_col;
+                    let key_idx =
+                        self.find_child_index(parent, phys_idx, ChildColumnRole::MapKey)?;
+                    let value_idx =
+                        self.find_child_index(parent, phys_idx, ChildColumnRole::MapValue)?;
+                    pending.push((key_idx, inner_keys));
+                    pending.push((value_idx, inner_values));
+                }
+                _ => {
+                    let elem_dt = self.children[child_idx].element_field.data_type().clone();
+                    total_size +=
+                        self.append_array_column(phys_idx, values.as_ref(), &elem_dt, child_start)?;
+                    self.children[child_idx].num_elements += values.len();
+                }
+            }
         }
 
         self.num_rows += num_new_rows;
-        total_size += num_new_rows * self.num_columns.div_ceil(8);
+        total_size += num_new_rows * self.num_primary.div_ceil(8);
         Ok(total_size)
     }
 
@@ -374,14 +550,15 @@ impl BucketWriter {
     }
 
     fn compute_encodings(&self) -> (Vec<u8>, Vec<bool>) {
-        let mut encodings = vec![0u8; self.num_columns];
-        let mut has_nulls = vec![false; self.num_columns];
-        for i in 0..self.num_columns {
+        let mut encodings = vec![0u8; self.total_columns];
+        let mut has_nulls = vec![false; self.total_columns];
+        for i in 0..self.total_columns {
+            let col_rows = self.col_num_rows(i);
             if self.non_null_counts[i] == 0 {
                 encodings[i] = ENCODING_ALL_NULL;
             } else if self.const_tracking[i] {
                 encodings[i] = ENCODING_CONST;
-                has_nulls[i] = self.non_null_counts[i] < self.num_rows;
+                has_nulls[i] = self.non_null_counts[i] < col_rows;
             } else {
                 let dict_size = self.get_dict_size(i);
                 if dict_size >= 2
@@ -392,7 +569,7 @@ impl BucketWriter {
                 } else {
                     encodings[i] = ENCODING_PLAIN;
                 }
-                has_nulls[i] = self.non_null_counts[i] < self.num_rows;
+                has_nulls[i] = self.non_null_counts[i] < col_rows;
             }
         }
         (encodings, has_nulls)
@@ -406,88 +583,92 @@ impl BucketWriter {
 
         let (encodings, has_nulls) = self.compute_encodings();
 
-        let out_size = self.compute_out_size(&encodings, &has_nulls);
-        let mut out = vec![0u8; out_size];
-        let mut pos = 0;
+        let mut out = Vec::new();
 
-        // Encoding flags: 2 bits per column
-        let encoding_flags_bytes = (self.num_columns * 2).div_ceil(8);
-        for i in 0..self.num_columns {
-            let byte_idx = (i * 2) / 8;
-            let bit_idx = (i * 2) % 8;
-            out[pos + byte_idx] |= encodings[i] << bit_idx;
-        }
-        pos += encoding_flags_bytes;
-
-        // Has-nulls flags: 1 bit per column
-        let has_nulls_bytes = self.num_columns.div_ceil(8);
-        for i in 0..self.num_columns {
-            if has_nulls[i] {
-                out[pos + i / 8] |= 1 << (i % 8);
+        // Header: only written when ARRAY columns exist (backward compatible with v1)
+        if !self.children.is_empty() {
+            varint::encode(&mut out, self.num_primary as u32);
+            varint::encode(&mut out, self.children.len() as u32);
+            for child in &self.children {
+                varint::encode(&mut out, child.num_elements as u32);
             }
         }
-        pos += has_nulls_bytes;
+
+        // Encoding flags: 2 bits per column
+        let encoding_flags_bytes = (self.total_columns * 2).div_ceil(8);
+        let ef_start = out.len();
+        out.resize(ef_start + encoding_flags_bytes, 0);
+        for i in 0..self.total_columns {
+            let byte_idx = (i * 2) / 8;
+            let bit_idx = (i * 2) % 8;
+            out[ef_start + byte_idx] |= encodings[i] << bit_idx;
+        }
+
+        // Has-nulls flags: 1 bit per column
+        let has_nulls_bytes = self.total_columns.div_ceil(8);
+        let hn_start = out.len();
+        out.resize(hn_start + has_nulls_bytes, 0);
+        for i in 0..self.total_columns {
+            if has_nulls[i] {
+                out[hn_start + i / 8] |= 1 << (i % 8);
+            }
+        }
 
         // CONST metadata
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
             if encodings[i] == ENCODING_CONST {
                 let len = self.first_value_len[i];
-                out[pos..pos + len].copy_from_slice(&self.value_buffers[i][..len]);
-                pos += len;
+                out.extend_from_slice(&self.value_buffers[i][..len]);
             }
         }
 
         // Dict metadata
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
             if encodings[i] == ENCODING_DICT {
                 if let Some(ref dict) = self.long_dict_maps[i] {
                     let num_entries = dict.len();
-                    pos = varint::encode_to_slice(&mut out, pos, num_entries as u32);
+                    varint::encode(&mut out, num_entries as u32);
                     let w = self.fixed_widths[i];
                     let mut keys = vec![0u64; num_entries];
                     for (&key, &idx) in dict {
                         keys[idx] = key;
                     }
                     for key in &keys {
-                        write_fixed_key_to_slice(&mut out, &mut pos, *key, w);
+                        write_fixed_key_to_vec(&mut out, *key, w);
                     }
                 } else if let Some(ref dict) = self.byte_dict_maps[i] {
                     let num_entries = dict.len();
-                    pos = varint::encode_to_slice(&mut out, pos, num_entries as u32);
+                    varint::encode(&mut out, num_entries as u32);
                     let mut keys: Vec<(&Vec<u8>, &usize)> = dict.iter().collect();
                     keys.sort_by_key(|&(_, idx)| *idx);
                     for (key, _) in keys {
-                        out[pos..pos + key.len()].copy_from_slice(key);
-                        pos += key.len();
+                        out.extend_from_slice(key);
                     }
                 }
             }
         }
 
-        // Null bitmaps
-        let null_bitmap_bytes = self.num_rows.div_ceil(8);
-        for i in 0..self.num_columns {
+        // Null bitmaps (per-column row count)
+        for i in 0..self.total_columns {
             if has_nulls[i] && encodings[i] != ENCODING_ALL_NULL {
-                out[pos..pos + null_bitmap_bytes]
-                    .copy_from_slice(&self.null_bitmaps[i][..null_bitmap_bytes]);
-                pos += null_bitmap_bytes;
+                let nbytes = self.col_num_rows(i).div_ceil(8);
+                out.extend_from_slice(&self.null_bitmaps[i][..nbytes]);
             }
         }
 
         // Column data
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
             if encodings[i] == ENCODING_PLAIN {
-                let len = self.value_buffers[i].len();
-                out[pos..pos + len].copy_from_slice(&self.value_buffers[i]);
-                pos += len;
+                out.extend_from_slice(&self.value_buffers[i]);
             } else if encodings[i] == ENCODING_DICT {
-                let data_start = pos;
-                let bit_offset = self.write_dict_bit_packed(i, &mut out, data_start);
-                pos += bit_offset.div_ceil(8);
+                let bw = bit_width(self.get_dict_size(i));
+                let packed_bytes = (self.non_null_counts[i] * bw).div_ceil(8);
+                let data_start = out.len();
+                out.resize(data_start + packed_bytes, 0);
+                self.write_dict_bit_packed(i, &mut out, data_start);
             }
         }
 
-        debug_assert_eq!(pos, out.len());
         out
     }
 
@@ -499,16 +680,20 @@ impl BucketWriter {
                 has_nulls: Vec::new(),
                 const_data: Vec::new(),
                 column_pages: Vec::new(),
+                num_primary: self.num_primary,
+                children: self.children.clone(),
             };
         }
 
         let (encodings, has_nulls) = self.compute_encodings();
-        let null_bitmap_bytes = self.num_rows.div_ceil(8);
 
-        let mut const_data = vec![Vec::new(); self.num_columns];
-        let mut column_pages: Vec<Option<Vec<u8>>> = vec![None; self.num_columns];
+        let mut const_data = vec![Vec::new(); self.total_columns];
+        let mut column_pages: Vec<Option<Vec<u8>>> = vec![None; self.total_columns];
 
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
+            let col_rows = self.col_num_rows(i);
+            let null_bitmap_bytes = col_rows.div_ceil(8);
+
             match encodings[i] {
                 ENCODING_ALL_NULL => {}
                 ENCODING_CONST => {
@@ -520,7 +705,6 @@ impl BucketWriter {
                 }
                 ENCODING_DICT => {
                     let mut page = Vec::new();
-                    // Dict table
                     if let Some(ref dict) = self.long_dict_maps[i] {
                         let num_entries = dict.len();
                         varint::encode(&mut page, num_entries as u32);
@@ -541,11 +725,9 @@ impl BucketWriter {
                             page.extend_from_slice(key);
                         }
                     }
-                    // Null bitmap
                     if has_nulls[i] {
                         page.extend_from_slice(&self.null_bitmaps[i][..null_bitmap_bytes]);
                     }
-                    // Bit-packed indices
                     let dict_size = self.get_dict_size(i);
                     let bw = bit_width(dict_size);
                     let packed_bytes = (self.non_null_counts[i] * bw).div_ceil(8);
@@ -571,11 +753,13 @@ impl BucketWriter {
             has_nulls,
             const_data,
             column_pages,
+            num_primary: self.num_primary,
+            children: self.children.clone(),
         }
     }
 
     pub fn reset(&mut self) {
-        for i in 0..self.num_columns {
+        for i in 0..self.total_columns {
             for b in &mut self.null_bitmaps[i] {
                 *b = 0;
             }
@@ -597,6 +781,9 @@ impl BucketWriter {
             }
         }
         self.num_rows = 0;
+        for child in &mut self.children {
+            child.num_elements = 0;
+        }
     }
 
     fn get_dict_size(&self, col: usize) -> usize {
@@ -616,7 +803,7 @@ impl BucketWriter {
         let mut bit_offset = 0usize;
         let mut val_pos = 0usize;
 
-        for r in 0..self.num_rows {
+        for r in 0..self.col_num_rows(col) {
             let is_null = (self.null_bitmaps[col][r / 8] & (1 << (r % 8))) != 0;
             if !is_null {
                 let idx = if let Some(ref dict) = self.long_dict_maps[col] {
@@ -659,15 +846,24 @@ impl BucketWriter {
     }
 
     fn compute_out_size(&self, encodings: &[u8], has_nulls: &[bool]) -> usize {
-        let null_bitmap_bytes = self.num_rows.div_ceil(8);
-        let mut size = (self.num_columns * 2).div_ceil(8) + self.num_columns.div_ceil(8);
+        // Header: varint(num_primary) + varint(num_children) + varint per child
+        let mut size = 0;
+        if !self.children.is_empty() {
+            size += varint::encoded_size(self.num_primary as u32)
+                + varint::encoded_size(self.children.len() as u32);
+            for child in &self.children {
+                size += varint::encoded_size(child.num_elements as u32);
+            }
+        }
 
-        for i in 0..self.num_columns {
+        size += (self.total_columns * 2).div_ceil(8) + self.total_columns.div_ceil(8);
+
+        for i in 0..self.total_columns {
             if encodings[i] == ENCODING_ALL_NULL {
                 continue;
             }
             if has_nulls[i] {
-                size += null_bitmap_bytes;
+                size += self.col_num_rows(i).div_ceil(8);
             }
             match encodings[i] {
                 ENCODING_CONST => {
@@ -926,6 +1122,445 @@ fn i128_to_biginteger_bytes(val: i128) -> Vec<u8> {
     bytes[start..].to_vec()
 }
 
+fn extract_map_lengths(map_array: &MapArray) -> Int32Array {
+    let offsets = map_array.value_offsets();
+    let num_rows = map_array.len();
+    let mut lengths = Vec::with_capacity(num_rows);
+    for i in 0..num_rows {
+        if map_array.is_null(i) {
+            lengths.push(0);
+        } else {
+            lengths.push(offsets[i + 1] - offsets[i]);
+        }
+    }
+    let null_buf = map_array.nulls().cloned();
+    Int32Array::new(ScalarBuffer::from(lengths), null_buf)
+}
+
+fn flatten_map_entries(map_array: &MapArray) -> (ArrayRef, ArrayRef) {
+    let offsets = map_array.value_offsets();
+    let num_rows = map_array.len();
+    let keys = map_array.keys();
+    let values = map_array.values();
+
+    if map_array.null_count() == 0 {
+        let start = offsets[0] as usize;
+        let end = offsets[num_rows] as usize;
+        return (
+            keys.slice(start, end - start),
+            values.slice(start, end - start),
+        );
+    }
+
+    let mut indices: Vec<u32> = Vec::new();
+    for i in 0..num_rows {
+        if !map_array.is_null(i) {
+            let start = offsets[i] as u32;
+            let end = offsets[i + 1] as u32;
+            for idx in start..end {
+                indices.push(idx);
+            }
+        }
+    }
+
+    if indices.is_empty() {
+        return (keys.slice(0, 0), values.slice(0, 0));
+    }
+
+    let idx_array = UInt32Array::from(indices);
+    (
+        take_array(keys.as_ref(), &idx_array),
+        take_array(values.as_ref(), &idx_array),
+    )
+}
+
+fn extract_list_lengths(list_array: &ListArray) -> Int32Array {
+    let offsets = list_array.value_offsets();
+    let num_rows = list_array.len();
+    let mut lengths = Vec::with_capacity(num_rows);
+    for i in 0..num_rows {
+        if list_array.is_null(i) {
+            lengths.push(0);
+        } else {
+            lengths.push(offsets[i + 1] - offsets[i]);
+        }
+    }
+    let null_buf = list_array.nulls().cloned();
+    Int32Array::new(ScalarBuffer::from(lengths), null_buf)
+}
+
+fn flatten_list_values(list_array: &ListArray) -> ArrayRef {
+    let offsets = list_array.value_offsets();
+    let values = list_array.values();
+    let num_rows = list_array.len();
+
+    if list_array.null_count() == 0 {
+        let start = offsets[0] as usize;
+        let end = offsets[num_rows] as usize;
+        return values.slice(start, end - start);
+    }
+
+    // Skip child values for null rows — collect only non-null row ranges
+    let mut indices: Vec<u32> = Vec::new();
+    for i in 0..num_rows {
+        if !list_array.is_null(i) {
+            let start = offsets[i] as u32;
+            let end = offsets[i + 1] as u32;
+            for idx in start..end {
+                indices.push(idx);
+            }
+        }
+    }
+
+    if indices.is_empty() {
+        return values.slice(0, 0);
+    }
+
+    let idx_array = UInt32Array::from(indices);
+    take_array(values.as_ref(), &idx_array)
+}
+
+fn take_array(array: &dyn Array, indices: &UInt32Array) -> ArrayRef {
+    use arrow_array::builder::*;
+    macro_rules! take_prim {
+        ($arr_ty:ty, $bld_ty:ty) => {{
+            let src = array.as_any().downcast_ref::<$arr_ty>().unwrap();
+            let mut b = <$bld_ty>::with_capacity(indices.len());
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                if src.is_null(idx) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(idx));
+                }
+            }
+            Arc::new(b.finish()) as ArrayRef
+        }};
+    }
+    match array.data_type() {
+        DataType::Boolean => take_prim!(BooleanArray, BooleanBuilder),
+        DataType::Int8 => take_prim!(Int8Array, Int8Builder),
+        DataType::Int16 => take_prim!(Int16Array, Int16Builder),
+        DataType::Int32 => take_prim!(Int32Array, Int32Builder),
+        DataType::Int64 => take_prim!(Int64Array, Int64Builder),
+        DataType::Float32 => take_prim!(Float32Array, Float32Builder),
+        DataType::Float64 => take_prim!(Float64Array, Float64Builder),
+        DataType::Date32 => take_prim!(Date32Array, Date32Builder),
+        DataType::Time32(_) => take_prim!(Time32MillisecondArray, Time32MillisecondBuilder),
+        DataType::Decimal128(p, s) => {
+            let src = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let mut b = Decimal128Builder::new()
+                .with_precision_and_scale(*p, *s)
+                .unwrap();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                if src.is_null(idx) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(idx));
+                }
+            }
+            Arc::new(b.finish()) as ArrayRef
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, tz) => {
+            let src = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            let mut b = TimestampMillisecondBuilder::new();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                if src.is_null(idx) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(idx));
+                }
+            }
+            let arr = b.finish();
+            Arc::new(if let Some(tz) = tz {
+                arr.with_timezone(tz.clone())
+            } else {
+                arr
+            })
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, tz) => {
+            let src = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            let mut b = TimestampMicrosecondBuilder::new();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                if src.is_null(idx) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(idx));
+                }
+            }
+            let arr = b.finish();
+            Arc::new(if let Some(tz) = tz {
+                arr.with_timezone(tz.clone())
+            } else {
+                arr
+            })
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, tz) => {
+            let src = array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            let mut b = TimestampNanosecondBuilder::new();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                if src.is_null(idx) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(idx));
+                }
+            }
+            let arr = b.finish();
+            Arc::new(if let Some(tz) = tz {
+                arr.with_timezone(tz.clone())
+            } else {
+                arr
+            })
+        }
+        DataType::Utf8 => {
+            let src = array.as_any().downcast_ref::<StringArray>().unwrap();
+            let mut b = StringBuilder::new();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                if src.is_null(idx) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(idx));
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::Binary => {
+            let src = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            let mut b = BinaryBuilder::new();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                if src.is_null(idx) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(idx));
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::List(_) => {
+            // For nested arrays, rebuild by collecting slices
+            let src = array.as_any().downcast_ref::<ListArray>().unwrap();
+            let mut offsets_builder = vec![0i32];
+            let mut child_indices: Vec<u32> = Vec::new();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                let start = src.value_offsets()[idx] as u32;
+                let end = src.value_offsets()[idx + 1] as u32;
+                for ci in start..end {
+                    child_indices.push(ci);
+                }
+                offsets_builder.push(child_indices.len() as i32);
+            }
+            let child_idx_arr = UInt32Array::from(child_indices);
+            let new_values = take_array(src.values().as_ref(), &child_idx_arr);
+            let field = match array.data_type() {
+                DataType::List(f) => f.clone(),
+                _ => unreachable!(),
+            };
+            let null_buf = if !indices.is_empty() {
+                let mut bm = vec![0u8; indices.len().div_ceil(8)];
+                for i in 0..indices.len() {
+                    let idx = indices.value(i) as usize;
+                    if !src.is_null(idx) {
+                        bm[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                if bm.iter().all(|&b| b == 0xFF) || indices.is_empty() {
+                    None
+                } else {
+                    Some(NullBuffer::new(BooleanBuffer::new(
+                        Buffer::from_vec(bm),
+                        0,
+                        indices.len(),
+                    )))
+                }
+            } else {
+                None
+            };
+            Arc::new(ListArray::new(
+                field,
+                OffsetBuffer::new(ScalarBuffer::from(offsets_builder)),
+                new_values,
+                null_buf,
+            ))
+        }
+        DataType::Map(entries_field, sorted) => {
+            let src = array.as_any().downcast_ref::<MapArray>().unwrap();
+            let mut offsets_builder = vec![0i32];
+            let mut child_indices: Vec<u32> = Vec::new();
+            for i in 0..indices.len() {
+                let idx = indices.value(i) as usize;
+                let start = src.value_offsets()[idx] as u32;
+                let end = src.value_offsets()[idx + 1] as u32;
+                for ci in start..end {
+                    child_indices.push(ci);
+                }
+                offsets_builder.push(child_indices.len() as i32);
+            }
+            let child_idx_arr = UInt32Array::from(child_indices);
+            let new_keys = take_array(src.keys().as_ref(), &child_idx_arr);
+            let new_values = take_array(src.values().as_ref(), &child_idx_arr);
+            let null_buf = if !indices.is_empty() {
+                let mut bm = vec![0u8; indices.len().div_ceil(8)];
+                for i in 0..indices.len() {
+                    let idx = indices.value(i) as usize;
+                    if !src.is_null(idx) {
+                        bm[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                if bm.iter().all(|&b| b == 0xFF) || indices.is_empty() {
+                    None
+                } else {
+                    Some(NullBuffer::new(BooleanBuffer::new(
+                        Buffer::from_vec(bm),
+                        0,
+                        indices.len(),
+                    )))
+                }
+            } else {
+                None
+            };
+            let entries_struct = StructArray::new(
+                match entries_field.data_type() {
+                    DataType::Struct(fields) => fields.clone(),
+                    _ => unreachable!(),
+                },
+                vec![new_keys, new_values],
+                None,
+            );
+            Arc::new(MapArray::new(
+                entries_field.clone(),
+                OffsetBuffer::new(ScalarBuffer::from(offsets_builder)),
+                entries_struct,
+                null_buf,
+                *sorted,
+            ))
+        }
+        other => panic!("take_array: unsupported DataType {:?}", other),
+    }
+}
+
+pub(crate) fn expand_col_types(col_types: &[&DataType]) -> (Vec<DataType>, Vec<ChildColumnMeta>) {
+    let mut physical_types: Vec<DataType> = col_types
+        .iter()
+        .map(|t| {
+            if matches!(t, DataType::List(_) | DataType::Map(_, _)) {
+                DataType::Int32
+            } else {
+                (*t).clone()
+            }
+        })
+        .collect();
+    let mut children = Vec::new();
+
+    for (i, t) in col_types.iter().enumerate() {
+        expand_container(i, i, t, &mut physical_types, &mut children);
+    }
+    (physical_types, children)
+}
+
+fn expand_container(
+    parent_logical: usize,
+    length_physical_index: usize,
+    dt: &DataType,
+    physical_types: &mut Vec<DataType>,
+    children: &mut Vec<ChildColumnMeta>,
+) {
+    match dt {
+        DataType::List(element_field) => {
+            expand_element(
+                parent_logical,
+                length_physical_index,
+                ChildColumnRole::ListElement,
+                element_field,
+                physical_types,
+                children,
+            );
+        }
+        DataType::Map(entries_field, _) => {
+            if let DataType::Struct(fields) = entries_field.data_type() {
+                expand_element(
+                    parent_logical,
+                    length_physical_index,
+                    ChildColumnRole::MapKey,
+                    &fields[0],
+                    physical_types,
+                    children,
+                );
+                expand_element(
+                    parent_logical,
+                    length_physical_index,
+                    ChildColumnRole::MapValue,
+                    &fields[1],
+                    physical_types,
+                    children,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn expand_element(
+    parent_logical: usize,
+    length_physical_index: usize,
+    role: ChildColumnRole,
+    element_field: &Arc<Field>,
+    physical_types: &mut Vec<DataType>,
+    children: &mut Vec<ChildColumnMeta>,
+) {
+    let elem_dt = element_field.data_type();
+    let child_phys_idx = physical_types.len();
+
+    match elem_dt {
+        DataType::List(_) | DataType::Map(_, _) => {
+            // Complex element: this child stores lengths (INT32), recurse for deeper levels
+            physical_types.push(DataType::Int32);
+            children.push(ChildColumnMeta {
+                parent_logical_col: parent_logical,
+                physical_index: child_phys_idx,
+                length_physical_index,
+                role,
+                element_field: element_field.clone(),
+                num_elements: 0,
+            });
+            expand_container(
+                parent_logical,
+                child_phys_idx,
+                elem_dt,
+                physical_types,
+                children,
+            );
+        }
+        _ => {
+            // Primitive element: direct leaf column
+            physical_types.push(elem_dt.clone());
+            children.push(ChildColumnMeta {
+                parent_logical_col: parent_logical,
+                physical_index: child_phys_idx,
+                length_physical_index,
+                role,
+                element_field: element_field.clone(),
+                num_elements: 0,
+            });
+        }
+    }
+}
+
 fn uses_long_dict(fixed_width: i32) -> bool {
     fixed_width > 0 && fixed_width <= 8
 }
@@ -966,34 +1601,61 @@ fn write_fixed_key_to_vec(buf: &mut Vec<u8>, key: u64, width: i32) {
     }
 }
 
-fn write_fixed_key_to_slice(buf: &mut [u8], pos: &mut usize, key: u64, width: i32) {
-    match width {
-        1 => {
-            buf[*pos] = key as u8;
-            *pos += 1;
-        }
-        2 => {
-            let bytes = (key as u16).to_be_bytes();
-            buf[*pos..*pos + 2].copy_from_slice(&bytes);
-            *pos += 2;
-        }
-        4 => {
-            let bytes = (key as u32).to_be_bytes();
-            buf[*pos..*pos + 4].copy_from_slice(&bytes);
-            *pos += 4;
-        }
-        8 => {
-            let bytes = key.to_be_bytes();
-            buf[*pos..*pos + 8].copy_from_slice(&bytes);
-            *pos += 8;
-        }
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn header_size(_data: &[u8]) -> usize {
+        // No header for non-ARRAY buckets (v1 compatible)
+        0
+    }
+
+    #[test]
+    fn test_expand_col_types_records_explicit_child_layout() {
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(arrow_schema::Fields::from(vec![
+                    Field::new("keys", DataType::Int32, false),
+                    Field::new(
+                        "values",
+                        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                        true,
+                    ),
+                ])),
+                false,
+            )),
+            false,
+        );
+        let list_type = DataType::List(Arc::new(Field::new("item", map_type, true)));
+        let col_refs = vec![&list_type];
+
+        let (physical_types, children) = expand_col_types(&col_refs);
+
+        assert_eq!(
+            physical_types,
+            vec![
+                DataType::Int32,
+                DataType::Int32,
+                DataType::Int32,
+                DataType::Int32,
+                DataType::Utf8,
+            ]
+        );
+        assert_eq!(children.len(), 4);
+        assert_eq!(children[0].role, ChildColumnRole::ListElement);
+        assert_eq!(children[0].physical_index, 1);
+        assert_eq!(children[0].length_physical_index, 0);
+        assert_eq!(children[1].role, ChildColumnRole::MapKey);
+        assert_eq!(children[1].physical_index, 2);
+        assert_eq!(children[1].length_physical_index, 1);
+        assert_eq!(children[2].role, ChildColumnRole::MapValue);
+        assert_eq!(children[2].physical_index, 3);
+        assert_eq!(children[2].length_physical_index, 1);
+        assert_eq!(children[3].role, ChildColumnRole::ListElement);
+        assert_eq!(children[3].physical_index, 4);
+        assert_eq!(children[3].length_physical_index, 3);
+    }
 
     #[test]
     fn test_all_null_encoding() {
@@ -1006,7 +1668,8 @@ mod tests {
 
         let data = writer.finish();
         assert!(!data.is_empty());
-        assert_eq!(data[0] & 0x03, ENCODING_ALL_NULL);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_ALL_NULL);
     }
 
     #[test]
@@ -1019,7 +1682,8 @@ mod tests {
         writer.write_columns(&[&arr], &[&DataType::Int32]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_CONST);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_CONST);
     }
 
     #[test]
@@ -1033,7 +1697,8 @@ mod tests {
         writer.write_columns(&[&arr], &[&DataType::Int32]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_DICT);
     }
 
     #[test]
@@ -1047,7 +1712,8 @@ mod tests {
         writer.write_columns(&[&arr], &[&DataType::Int32]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_PLAIN);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_PLAIN);
     }
 
     #[test]
@@ -1060,7 +1726,8 @@ mod tests {
         writer.write_columns(&[&arr], &[&DataType::Utf8]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_CONST);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_CONST);
     }
 
     #[test]
@@ -1074,7 +1741,8 @@ mod tests {
         writer.write_columns(&[&arr], &[&DataType::Utf8]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_DICT);
     }
 
     #[test]
@@ -1090,7 +1758,8 @@ mod tests {
         writer.write_columns(&[&arr], &[&DataType::Int32]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_CONST);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_CONST);
     }
 
     #[test]
@@ -1106,7 +1775,8 @@ mod tests {
         writer.write_columns(&[&arr], &[&DataType::Int32]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_DICT);
     }
 
     #[test]
@@ -1126,7 +1796,8 @@ mod tests {
         writer.write_columns(&[&second], &[&types[0]]).unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_DICT);
     }
 
     #[test]
@@ -1148,9 +1819,10 @@ mod tests {
             .unwrap();
 
         let data = writer.finish();
-        assert_eq!(data[0] & 0x03, ENCODING_ALL_NULL);
-        assert_eq!((data[0] >> 2) & 0x03, ENCODING_CONST);
-        assert_eq!((data[0] >> 4) & 0x03, ENCODING_DICT);
+        let h = header_size(&data);
+        assert_eq!(data[h] & 0x03, ENCODING_ALL_NULL);
+        assert_eq!((data[h] >> 2) & 0x03, ENCODING_CONST);
+        assert_eq!((data[h] >> 4) & 0x03, ENCODING_DICT);
     }
 
     #[test]
@@ -1171,6 +1843,7 @@ mod tests {
         let arr2 = Int32Array::from(vals);
         writer.write_columns(&[&arr2], &[&DataType::Int32]).unwrap();
         let data2 = writer.finish();
-        assert_eq!(data2[0] & 0x03, ENCODING_PLAIN);
+        let h2 = header_size(&data2);
+        assert_eq!(data2[h2] & 0x03, ENCODING_PLAIN);
     }
 }

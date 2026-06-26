@@ -118,6 +118,60 @@
                 Nanosecond timestamps are exposed as standard Arrow <code>TimeUnit.NANOSECOND</code>
                 vectors while Mosaic keeps its 12-byte physical encoding internally.
             </p>
+            <p>
+                ARRAY types are defined using Arrow&rsquo;s <code>ArrowType.List</code> with a child field
+                for the element type. Nested arrays (<code>ARRAY&lt;ARRAY&lt;INT&gt;&gt;</code>) are supported:
+            </p>
+<pre><code><span class="ty">Field</span> elementField = <span class="kw">new</span> <span class="ty">Field</span>(<span class="str">"item"</span>,
+    <span class="ty">FieldType</span>.nullable(<span class="kw">new</span> <span class="ty">ArrowType.Int</span>(<span class="num">32</span>, <span class="kw">true</span>)), <span class="kw">null</span>);
+<span class="ty">Field</span> tagsField = <span class="kw">new</span> <span class="ty">Field</span>(<span class="str">"tags"</span>,
+    <span class="ty">FieldType</span>.nullable(<span class="ty">ArrowType.List</span>.INSTANCE), <span class="ty">Arrays</span>.asList(elementField));
+
+<span class="ty">Schema</span> schema = <span class="kw">new</span> <span class="ty">Schema</span>(<span class="ty">Arrays</span>.asList(
+    <span class="ty">Field</span>.notNullable(<span class="str">"id"</span>, <span class="kw">new</span> <span class="ty">ArrowType.Int</span>(<span class="num">32</span>, <span class="kw">true</span>)),
+    tagsField
+));</code></pre>
+            <p>
+                Writing ARRAY values uses Arrow&rsquo;s <code>ListVector</code> and <code>UnionListWriter</code>:
+            </p>
+<pre><code><span class="ty">ListVector</span> tags = (<span class="ty">ListVector</span>) root.getVector(<span class="str">"tags"</span>);
+tags.allocateNew();
+<span class="ty">UnionListWriter</span> listWriter = tags.getWriter();
+
+<span class="cmt">// Row 0: [10, 20, 30]</span>
+listWriter.setPosition(<span class="num">0</span>);
+listWriter.startList();
+listWriter.writeInt(<span class="num">10</span>);
+listWriter.writeInt(<span class="num">20</span>);
+listWriter.writeInt(<span class="num">30</span>);
+listWriter.endList();
+
+<span class="cmt">// Row 1: null</span>
+tags.setNull(<span class="num">1</span>);
+
+<span class="cmt">// Row 2: [] (empty array)</span>
+listWriter.setPosition(<span class="num">2</span>);
+listWriter.startList();
+listWriter.endList();</code></pre>
+            <p>
+                Reading uses <code>ListVector.getObject()</code>:
+            </p>
+<pre><code><span class="ty">ListVector</span> readTags = (<span class="ty">ListVector</span>) batch.getVector(<span class="str">"tags"</span>);
+<span class="ty">List</span>&lt;?&gt; row0 = readTags.getObject(<span class="num">0</span>);  <span class="cmt">// [10, 20, 30]</span>
+<span class="kw">boolean</span> isNull = readTags.isNull(<span class="num">1</span>);    <span class="cmt">// true</span>
+<span class="ty">List</span>&lt;?&gt; row2 = readTags.getObject(<span class="num">2</span>);  <span class="cmt">// [] (empty)</span></code></pre>
+            <p>
+                MAP types use Arrow&rsquo;s <code>MapVector</code> and <code>UnionMapWriter</code>:
+            </p>
+<pre><code><span class="ty">MapVector</span> mapVec = (<span class="ty">MapVector</span>) root.getVector(<span class="str">"props"</span>);
+<span class="ty">UnionMapWriter</span> w = mapVec.getWriter();
+w.setPosition(<span class="num">0</span>);
+w.startMap();
+w.startEntry();
+w.key().integer().writeInt(<span class="num">1</span>);
+w.value().varChar().writeVarChar(<span class="kw">new</span> <span class="ty">Text</span>(<span class="str">"a"</span>));
+w.endEntry();
+w.endMap();</code></pre>
 
             <h3>2. Create Writer and Write Batches</h3>
             <p>

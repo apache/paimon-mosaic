@@ -57,7 +57,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --workspace -- -D warnings
 
-  build-and-test:
+  rust-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -76,8 +76,11 @@ jobs:
       - name: Build
         run: cargo build --all-targets
 
-      - name: Test
-        run: cargo test
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Test with coverage
+        run: cargo llvm-cov --summary-only -- --skip test_read_java_written_file --skip test_read_python_written_file
 
   cpp-test:
     runs-on: ubuntu-latest
@@ -143,9 +146,15 @@ jobs:
       - name: Build JNI library
         run: cargo build -p paimon-mosaic-jni --release
 
+      - name: Write interop files (Rust)
+        run: cargo test --release -p paimon-mosaic-core --test interop_write_test
+
       - name: Run Java tests
         working-directory: java
         run: mvn test "-DargLine=-Djava.library.path=${{ github.workspace }}/target/release"
+
+      - name: Read Java-written interop file (Rust)
+        run: cargo test --release -p paimon-mosaic-core --test interop_read_test test_read_java_written_file
 
   python-test:
     runs-on: ubuntu-latest
@@ -171,6 +180,9 @@ jobs:
       - name: Build FFI library
         run: cargo build --release -p paimon-mosaic-ffi
 
+      - name: Write interop files (Rust)
+        run: cargo test --release -p paimon-mosaic-core --test interop_write_test
+
       - name: Install Python dependencies
         working-directory: python
         run: pip install pyarrow pytest
@@ -180,3 +192,6 @@ jobs:
         run: pytest -v
         env:
           MOSAIC_LIB_PATH: ${{ github.workspace }}/target/release
+
+      - name: Read Python-written interop file (Rust)
+        run: cargo test --release -p paimon-mosaic-core --test interop_read_test test_read_python_written_file

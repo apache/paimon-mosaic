@@ -32,6 +32,7 @@ MVN=${MVN:-mvn}
 # fail immediately
 set -o errexit
 set -o nounset
+set -o pipefail
 # print command before executing
 set -o xtrace
 
@@ -62,32 +63,25 @@ cd ..
 
 echo "Creating source package"
 
-# create a temporary git clone to ensure that we have a pristine source release
-git clone . tools/release/paimon-mosaic-tmp-clone
-cd tools/release/paimon-mosaic-tmp-clone
+ARCHIVE="apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz"
+# Archive from Git objects so filesystem metadata such as macOS xattrs is not included.
+git archive --format=tar --prefix="paimon-mosaic-${RELEASE_VERSION}/" 'HEAD^{tree}' . \
+  ':(exclude).gitignore' ':(exclude).gitattributes' \
+  ':(exclude).asf.yaml' ':(exclude).github' \
+  ':(exclude)deploysettings.xml' ':(exclude)target' \
+  ':(exclude).idea' ':(exclude)*.iml' ':(exclude).DS_Store' \
+  | gzip -n > "tools/release/${ARCHIVE}"
 
-trap 'cd ${CURR_DIR}/release;rm -rf paimon-mosaic-tmp-clone' ERR
+cd tools/release
 
-rsync -a \
-  --exclude ".git" --exclude ".gitignore" --exclude ".gitattributes" \
-  --exclude ".asf.yaml" --exclude ".github" \
-  --exclude "deploysettings.xml" --exclude "target" \
-  --exclude ".idea" --exclude "*.iml" --exclude ".DS_Store" \
-  . paimon-mosaic-$RELEASE_VERSION
-
-tar czf apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz paimon-mosaic-$RELEASE_VERSION
-gpg --armor --detach-sig apache-paimon-mosaic-$RELEASE_VERSION-src.tgz
-$SHASUM apache-paimon-mosaic-$RELEASE_VERSION-src.tgz > apache-paimon-mosaic-$RELEASE_VERSION-src.tgz.sha512
+gpg --armor --detach-sig "${ARCHIVE}"
+$SHASUM "${ARCHIVE}" > "${ARCHIVE}.sha512"
 
 echo "Verifying GPG signature"
-gpg --verify apache-paimon-mosaic-$RELEASE_VERSION-src.tgz.asc apache-paimon-mosaic-$RELEASE_VERSION-src.tgz
+gpg --verify "${ARCHIVE}.asc" "${ARCHIVE}"
 
 echo "Verifying tarball integrity"
-tar tzf apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz > /dev/null
-
-mv apache-paimon-mosaic-$RELEASE_VERSION-src.* ../
-cd ..
-rm -rf paimon-mosaic-tmp-clone
+tar tzf "${ARCHIVE}" > /dev/null
 
 echo ""
 echo "Source release created successfully. Artifacts in tools/release/:"

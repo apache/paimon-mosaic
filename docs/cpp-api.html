@@ -147,6 +147,52 @@ g++ -std=c++17 -I include/ example.cpp \
     <span class="kw">return</span> <span class="num">0</span>;
 }</code></pre>
 
+            <h3>Writing ARRAY Columns</h3>
+            <p>
+                ARRAY types use Arrow&rsquo;s <code>ListBuilder</code>. Element values are
+                flattened across all rows and benefit from dictionary encoding:
+            </p>
+<pre><code><span class="kw">auto</span> schema = arrow::schema({
+    arrow::field(<span class="str">"id"</span>, arrow::int32()),
+    arrow::field(<span class="str">"tags"</span>, arrow::list(arrow::field(<span class="str">"item"</span>, arrow::int32()))),
+});
+
+arrow::Int32Builder id_b;
+<span class="kw">auto</span> val_builder = std::make_shared&lt;arrow::Int32Builder&gt;();
+arrow::ListBuilder list_b(arrow::default_memory_pool(), val_builder);
+
+<span class="cmt">// Row 0: [10, 20]</span>
+id_b.Append(<span class="num">1</span>);
+list_b.Append();
+val_builder-&gt;Append(<span class="num">10</span>);
+val_builder-&gt;Append(<span class="num">20</span>);
+
+<span class="cmt">// Row 1: null</span>
+id_b.Append(<span class="num">2</span>);
+list_b.AppendNull();
+
+<span class="cmt">// Row 2: [] (empty)</span>
+id_b.Append(<span class="num">3</span>);
+list_b.Append();
+
+<span class="kw">auto</span> batch = arrow::RecordBatch::Make(schema, <span class="num">3</span>, {
+    id_b.Finish().ValueOrDie(),
+    list_b.Finish().ValueOrDie(),
+});
+
+<span class="cmt">// Reading back</span>
+<span class="kw">auto</span> tags = std::static_pointer_cast&lt;arrow::ListArray&gt;(rb-&gt;GetColumnByName(<span class="str">"tags"</span>));
+<span class="kw">auto</span> row0 = std::static_pointer_cast&lt;arrow::Int32Array&gt;(tags-&gt;value_slice(<span class="num">0</span>));
+<span class="cmt">// row0: [10, 20]</span>
+
+<span class="cmt">// MAP columns use MapBuilder</span>
+<span class="kw">auto</span> key_b = std::make_shared&lt;arrow::Int32Builder&gt;();
+<span class="kw">auto</span> val_b = std::make_shared&lt;arrow::StringBuilder&gt;();
+arrow::MapBuilder map_b(arrow::default_memory_pool(), key_b, val_b);
+map_b.Append();
+key_b-&gt;Append(<span class="num">1</span>);
+val_b-&gt;Append(<span class="str">"a"</span>);</code></pre>
+
             <h2>C++ API Reference</h2>
 
             <h3>Writer Options</h3>

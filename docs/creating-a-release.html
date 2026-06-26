@@ -179,7 +179,7 @@ python3 tools/dependencies.py generate
 git add DEPENDENCIES.rust.tsv core/DEPENDENCIES.rust.tsv ffi/DEPENDENCIES.rust.tsv jni/DEPENDENCIES.rust.tsv
 git commit -m "chore: update dependency list for release ${RELEASE_VERSION}"
 git push origin main</code></pre>
-            <p>Fix any license violations before proceeding. The generated files must be committed before tagging because <code>create_source_release.sh</code> builds the archive from a git clone.</p>
+            <p>Fix any license violations before proceeding. The generated files must be committed before tagging because <code>create_source_release.sh</code> builds the archive from the committed Git tree.</p>
 
             <h3>Create a Release Branch</h3>
             <p>Create one stable release branch for the release line. Do not include the RC number in the branch name; RC attempts are represented by tags such as <code>v0.1.0-rc1</code> and <code>v0.1.0-rc2</code>.</p>

@@ -30,13 +30,13 @@
 
     <groupId>org.apache.paimon</groupId>
     <artifactId>mosaic</artifactId>
-    <version>0.2.0-SNAPSHOT</version>
+    <version>0.3.0-SNAPSHOT</version>
     <packaging>jar</packaging>
 
     <name>Mosaic</name>
     <description>Mosaic file format for Java (backed by Rust via JNI)</description>
     <url>https://paimon.apache.org</url>
-    <inceptionYear>2025</inceptionYear>
+    <inceptionYear>2026</inceptionYear>
 
     <licenses>
         <license>
@@ -64,6 +64,8 @@
     <properties>
         <maven.compiler.source>1.8</maven.compiler.source>
         <maven.compiler.target>1.8</maven.compiler.target>
+        <!-- Used by maven-remote-resources-plugin when generating META-INF/NOTICE. -->
+        <project.build.outputTimestamp>2026-01-01T00:00:00Z</project.build.outputTimestamp>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <arrow.version>15.0.0</arrow.version>
     </properties>
@@ -145,6 +147,11 @@
                                 </goals>
                             </execution>
                         </executions>
+                        <configuration>
+                            <excludes>
+                                <exclude>native/**</exclude>
+                            </excludes>
+                        </configuration>
                     </plugin>
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
@@ -183,6 +190,17 @@
                                 </configuration>
                             </execution>
                         </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.sonatype.plugins</groupId>
+                        <artifactId>nexus-staging-maven-plugin</artifactId>
+                        <version>1.7.0</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <serverId>apache.releases.https</serverId>
+                            <nexusUrl>https://repository.apache.org/</nexusUrl>
+                            <autoReleaseAfterClose>false</autoReleaseAfterClose>
+                        </configuration>
                     </plugin>
                 </plugins>
             </build>
