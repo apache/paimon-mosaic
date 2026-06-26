@@ -179,21 +179,54 @@ fn read_merged_ranges<I: InputFile + ?Sized>(
     Ok((merged, fetched))
 }
 
+/// Column encoding, as surfaced for inspection. Non-exhaustive: new encodings
+/// may be added without breaking downstream `match`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Encoding {
+    Plain,
+    Const,
+    Dict,
+    AllNull,
+    Other(u8),
+}
+
+impl Encoding {
+    fn from_code(c: u8) -> Self {
+        match c {
+            ENCODING_PLAIN => Encoding::Plain,
+            ENCODING_CONST => Encoding::Const,
+            ENCODING_DICT => Encoding::Dict,
+            ENCODING_ALL_NULL => Encoding::AllNull,
+            other => Encoding::Other(other),
+        }
+    }
+}
+
+/// Bucket storage mode, as surfaced for inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BucketKind {
+    Empty,
+    Monolithic,
+    Paged,
+}
+
 /// Physical placement of one column within one row group.
+#[non_exhaustive]
 pub struct PageInfo {
     pub column_index: usize,
     pub bucket: usize,
-    /// `spec::ENCODING_*`: plain / const / dict / all_null.
-    pub encoding: u8,
+    pub encoding: Encoding,
     /// Paged-bucket on-disk slot size in bytes; 0 for monolithic/empty buckets.
     pub slot_size: usize,
 }
 
 /// Layout of one bucket within one row group.
+#[non_exhaustive]
 pub struct BucketInfo {
     pub bucket: usize,
-    /// "empty" | "monolithic" | "paged".
-    pub kind: &'static str,
+    pub kind: BucketKind,
     /// On-disk compressed size in bytes (0 for empty buckets).
     pub size: usize,
     /// Uncompressed size in bytes; 0 when unknown (paged buckets store only the
@@ -481,19 +514,31 @@ impl<I: InputFile> MosaicReader<I> {
     /// the `buckets` command.
     pub fn bucket_infos(&self, rg_index: usize) -> io::Result<Vec<BucketInfo>> {
         if rg_index >= self.row_group_metas.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "row group index out of range"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "row group index out of range",
+            ));
         }
         let meta = &self.row_group_metas[rg_index];
-        Ok((0..self.num_buckets).map(|b| {
-            let (kind, size, uncompressed) = match meta.bucket_layouts[b] {
-                BucketLayout::Empty => ("empty", 0, 0),
-                BucketLayout::Monolithic { compressed_size, uncompressed_size } => {
-                    ("monolithic", compressed_size, uncompressed_size)
+        Ok((0..self.num_buckets)
+            .map(|b| {
+                let (kind, size, uncompressed) = match meta.bucket_layouts[b] {
+                    BucketLayout::Empty => (BucketKind::Empty, 0, 0),
+                    BucketLayout::Monolithic {
+                        compressed_size,
+                        uncompressed_size,
+                    } => (BucketKind::Monolithic, compressed_size, uncompressed_size),
+                    BucketLayout::Paged { total_size } => (BucketKind::Paged, total_size, 0),
+                };
+                BucketInfo {
+                    bucket: b,
+                    kind,
+                    size,
+                    uncompressed,
+                    columns: self.schema.bucket_to_global[b].clone(),
                 }
-                BucketLayout::Paged { total_size } => ("paged", total_size, 0),
-            };
-            BucketInfo { bucket: b, kind, size, uncompressed, columns: self.schema.bucket_to_global[b].clone() }
-        }).collect())
+            })
+            .collect())
     }
 
     /// Dictionary entries for one column in one row group, or `None` if that
@@ -520,21 +565,42 @@ impl<I: InputFile> MosaicReader<I> {
             match meta.bucket_layouts[b] {
                 BucketLayout::Empty => {
                     for &gi in globals {
-                        out.push(PageInfo { column_index: gi, bucket: b, encoding: ENCODING_ALL_NULL, slot_size: 0 });
+                        out.push(PageInfo {
+                            column_index: gi,
+                            bucket: b,
+                            encoding: Encoding::AllNull,
+                            slot_size: 0,
+                        });
                     }
                 }
-                BucketLayout::Monolithic { compressed_size, uncompressed_size } => {
+                BucketLayout::Monolithic {
+                    compressed_size,
+                    uncompressed_size,
+                } => {
                     let buf = read_range(&self.input, meta.bucket_offsets[b], compressed_size)?;
                     let data = match self.compression {
                         COMPRESSION_NONE => buf,
                         COMPRESSION_ZSTD => zstd::bulk::decompress(&buf, uncompressed_size)
                             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-                        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported compression")),
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "unsupported compression",
+                            ))
+                        }
                     };
-                    let col_types: Vec<DataType> = globals.iter().map(|&gi| self.schema.columns[gi].data_type.clone()).collect();
+                    let col_types: Vec<DataType> = globals
+                        .iter()
+                        .map(|&gi| self.schema.columns[gi].data_type.clone())
+                        .collect();
                     let reader = BucketReader::new(col_types, data, meta.num_rows)?;
                     for (local, &gi) in globals.iter().enumerate() {
-                        out.push(PageInfo { column_index: gi, bucket: b, encoding: reader.encodings()[local], slot_size: 0 });
+                        out.push(PageInfo {
+                            column_index: gi,
+                            bucket: b,
+                            encoding: Encoding::from_code(reader.encodings()[local]),
+                            slot_size: 0,
+                        });
                     }
                 }
                 BucketLayout::Paged { total_size } => {
@@ -542,14 +608,21 @@ impl<I: InputFile> MosaicReader<I> {
                     let dir = read_range(&self.input, meta.bucket_offsets[b], dir_size)?;
                     let mut sizes = Vec::with_capacity(globals.len());
                     for i in 0..globals.len() {
-                        sizes.push(u32::from_le_bytes(dir[i * 4..i * 4 + 4].try_into().unwrap()) as usize);
+                        sizes.push(
+                            u32::from_le_bytes(dir[i * 4..i * 4 + 4].try_into().unwrap()) as usize,
+                        );
                     }
                     // Directory + slots must equal the bucket total, else a forged
                     // slot size could drive a huge read_range allocation.
                     let slot_sum = sizes.iter().try_fold(dir_size, |a, &s| a.checked_add(s));
                     if slot_sum != Some(total_size) {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData,
-                            format!("paged bucket {}: slot sizes do not sum to total {}", b, total_size)));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "paged bucket {}: slot sizes do not sum to total {}",
+                                b, total_size
+                            ),
+                        ));
                     }
                     let mut foff = meta.bucket_offsets[b] + dir_size as u64;
                     for (local, &gi) in globals.iter().enumerate() {
@@ -560,7 +633,12 @@ impl<I: InputFile> MosaicReader<I> {
                             let ct = self.schema.columns[gi].data_type.clone();
                             Self::parse_column_slot(&slot, &ct, meta.num_rows)?.encoding()
                         };
-                        out.push(PageInfo { column_index: gi, bucket: b, encoding: enc, slot_size: sizes[local] });
+                        out.push(PageInfo {
+                            column_index: gi,
+                            bucket: b,
+                            encoding: Encoding::from_code(enc),
+                            slot_size: sizes[local],
+                        });
                         foff += sizes[local] as u64;
                     }
                     let _ = total_size;
@@ -1092,15 +1170,25 @@ impl RowGroupReader {
     /// Dictionary entries for a projected column, or `None` if not dict-encoded.
     pub fn take_dictionary(&self, global_col: usize) -> Option<Vec<Value>> {
         let bucket = self.schema.columns[global_col].bucket_id;
-        let local = self.bucket_to_global[bucket].iter().position(|&g| g == global_col)?;
+        let local = self.bucket_to_global[bucket]
+            .iter()
+            .position(|&g| g == global_col)?;
         match self.bucket_states[bucket].as_ref()? {
             BucketState::Paged { column_readers } => {
                 let d = column_readers[local].as_ref()?.dict_values();
-                if d.is_empty() { None } else { Some(d.to_vec()) }
+                if d.is_empty() {
+                    None
+                } else {
+                    Some(d.to_vec())
+                }
             }
             BucketState::Monolithic { reader } => {
                 let d = reader.dict_values(local);
-                if d.is_empty() { None } else { Some(d.to_vec()) }
+                if d.is_empty() {
+                    None
+                } else {
+                    Some(d.to_vec())
+                }
             }
         }
     }

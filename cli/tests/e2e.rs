@@ -53,13 +53,20 @@ fn fixture(name: &str) -> String {
 /// Like `fixture` but with an explicit `page_size_threshold`; threshold 1 forces
 /// paged buckets, the default (32 KiB) keeps small files monolithic.
 fn fixture_threshold(name: &str, threshold: usize) -> String {
-    let path = format!("{}/mosaic_e2e_{}.mosaic", std::env::temp_dir().display(), name);
+    let path = format!(
+        "{}/mosaic_e2e_{}.mosaic",
+        std::env::temp_dir().display(),
+        name
+    );
     let schema = Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("kind", DataType::Utf8, true),
         Field::new("flag", DataType::Int32, true),
     ]);
-    let out = FileOut { f: File::create(&path).unwrap(), pos: 0 };
+    let out = FileOut {
+        f: File::create(&path).unwrap(),
+        pos: 0,
+    };
     let opts = WriterOptions {
         num_buckets: 3,
         page_size_threshold: threshold,
@@ -86,7 +93,10 @@ fn fixture_threshold(name: &str, threshold: usize) -> String {
 }
 
 fn run(args: &[&str]) -> (String, String, bool) {
-    let out = Command::new(env!("CARGO_BIN_EXE_mosaic")).args(args).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_mosaic"))
+        .args(args)
+        .output()
+        .unwrap();
     (
         String::from_utf8(out.stdout).unwrap(),
         String::from_utf8(out.stderr).unwrap(),
@@ -152,7 +162,7 @@ fn count_reports_total() {
 #[test]
 fn cat_all_overrides_limit() {
     let f = fixture("all");
-    let (out, _, ok) = run(&["cat", &f, "--all", "--json"]);
+    let (out, _, ok) = run(&["cat", &f, "--json"]);
     assert!(ok);
     assert_eq!(out.lines().count(), 200); // every row, not the -n default
 }
@@ -160,9 +170,9 @@ fn cat_all_overrides_limit() {
 #[test]
 fn cat_where_filters_rows() {
     let f = fixture("where");
-    let (num, _, ok) = run(&["cat", &f, "--all", "--where", "id>197", "--json"]);
+    let (num, _, ok) = run(&["cat", &f, "--where", "id>197", "--json"]);
     assert!(ok && num.lines().count() == 2); // 198, 199
-    let (str_eq, _, _) = run(&["cat", &f, "--all", "--where", "kind=b", "--json"]);
+    let (str_eq, _, _) = run(&["cat", &f, "--where", "kind=b", "--json"]);
     assert!(str_eq.lines().count() > 0 && str_eq.lines().all(|l| l.contains("\"kind\":\"b\"")));
     let (none, _, _) = run(&["cat", &f, "--where", "id>9999"]);
     assert!(none.contains("(no rows)"));
@@ -170,9 +180,12 @@ fn cat_where_filters_rows() {
     assert!(!bad); // unparseable filter fails
     let (_, _, str_ord) = run(&["cat", &f, "--where", "kind>5"]);
     assert!(!str_ord); // ordering on a string column errors, not silent drop
-    // Filtering a column dropped by -c works and doesn't leak into output.
+                       // Filtering a column dropped by -c works and doesn't leak into output.
     let (hid, _, ok) = run(&["cat", &f, "-c", "kind", "--where", "id>197", "--json"]);
-    assert!(ok && hid.lines().count() == 2 && !hid.contains("\"id\""), "{hid}");
+    assert!(
+        ok && hid.lines().count() == 2 && !hid.contains("\"id\""),
+        "{hid}"
+    );
 }
 
 #[test]
@@ -180,7 +193,7 @@ fn convert_csv_then_inspect() {
     let csv = format!("{}/mosaic_e2e_in.csv", std::env::temp_dir().display());
     std::fs::write(&csv, "id,kind,score\n1,a,10.5\n2,b,20\n3,a,30.5\n").unwrap();
     let out = format!("{}/mosaic_e2e_conv.mosaic", std::env::temp_dir().display());
-    let (msg, _, ok) = run(&["convert", &csv, "-o", &out, "--stats", "id"]);
+    let (msg, _, ok) = run(&["convert", &csv, "-o", &out, "--stats", "id", "--overwrite"]);
     assert!(ok && msg.contains("3 rows"));
     let (c, _, _) = run(&["count", &out]);
     assert_eq!(c.trim(), "3");
@@ -191,11 +204,15 @@ fn convert_csv_then_inspect() {
 #[test]
 fn convert_json_then_inspect() {
     let js = format!("{}/mosaic_e2e_in.ndjson", std::env::temp_dir().display());
-    std::fs::write(&js, "{\"id\":1,\"kind\":\"a\"}\n{\"id\":2,\"kind\":\"b\"}\n").unwrap();
+    std::fs::write(
+        &js,
+        "{\"id\":1,\"kind\":\"a\"}\n{\"id\":2,\"kind\":\"b\"}\n",
+    )
+    .unwrap();
     let out = format!("{}/mosaic_e2e_jconv.mosaic", std::env::temp_dir().display());
-    let (msg, _, ok) = run(&["convert", &js, "-o", &out]);
+    let (msg, _, ok) = run(&["convert", &js, "-o", &out, "--overwrite"]);
     assert!(ok && msg.contains("2 rows"), "{msg}");
-    let (j, _, _) = run(&["cat", &out, "--all", "--json"]);
+    let (j, _, _) = run(&["cat", &out, "--json"]);
     assert_eq!(j.lines().count(), 2);
     assert!(j.contains("\"kind\":\"a\""));
 }
@@ -206,10 +223,10 @@ fn where_pushdown_keeps_correct_rows() {
     let csv = format!("{}/mosaic_e2e_pd.csv", std::env::temp_dir().display());
     std::fs::write(&csv, "id,kind\n1,a\n2,b\n3,a\n").unwrap();
     let out = format!("{}/mosaic_e2e_pd.mosaic", std::env::temp_dir().display());
-    run(&["convert", &csv, "-o", &out, "--stats", "id"]);
-    let (none, _, _) = run(&["cat", &out, "--all", "--where", "id>100"]);
+    run(&["convert", &csv, "-o", &out, "--stats", "id", "--overwrite"]);
+    let (none, _, _) = run(&["cat", &out, "--where", "id>100"]);
     assert!(none.contains("(no rows)"));
-    let (keep, _, _) = run(&["cat", &out, "--all", "--where", "id>=3", "--json"]);
+    let (keep, _, _) = run(&["cat", &out, "--where", "id>=3", "--json"]);
     assert_eq!(keep.lines().count(), 1); // boundary kept, not skipped
 }
 
@@ -219,8 +236,8 @@ fn bigint_where_is_exact() {
     let csv = format!("{}/mosaic_e2e_sf.csv", std::env::temp_dir().display());
     std::fs::write(&csv, "id\n1700000000000000001\n1700000000000000003\n").unwrap();
     let out = format!("{}/mosaic_e2e_sf.mosaic", std::env::temp_dir().display());
-    run(&["convert", &csv, "-o", &out, "--stats", "id"]);
-    let (j, _, ok) = run(&["cat", &out, "--all", "--where", "id=1700000000000000003", "--json"]);
+    run(&["convert", &csv, "-o", &out, "--stats", "id", "--overwrite"]);
+    let (j, _, ok) = run(&["cat", &out, "--where", "id=1700000000000000003", "--json"]);
     assert!(ok && j.lines().count() == 1 && j.contains("003"), "{j}");
 }
 
@@ -231,9 +248,12 @@ fn date_column_pushdown_keeps_match() {
     let csv = format!("{}/mosaic_e2e_date.csv", std::env::temp_dir().display());
     std::fs::write(&csv, "d\n2020-01-01\n2021-01-01\n").unwrap();
     let out = format!("{}/mosaic_e2e_date.mosaic", std::env::temp_dir().display());
-    run(&["convert", &csv, "-o", &out, "--stats", "d"]);
-    let (j, _, ok) = run(&["cat", &out, "--all", "--where", "d>18627", "--json"]);
-    assert!(ok && j.lines().count() == 1 && j.contains("2021-01-01"), "{j}");
+    run(&["convert", &csv, "-o", &out, "--stats", "d", "--overwrite"]);
+    let (j, _, ok) = run(&["cat", &out, "--where", "d>18627", "--json"]);
+    assert!(
+        ok && j.lines().count() == 1 && j.contains("2021-01-01"),
+        "{j}"
+    );
 }
 
 #[test]
@@ -241,7 +261,10 @@ fn cat_json_is_ndjson() {
     let f = fixture("json");
     let (out, _, ok) = run(&["cat", &f, "-n", "2", "--json"]);
     assert!(ok);
-    assert_eq!(out, "{\"id\":0,\"kind\":\"a\",\"flag\":7}\n{\"id\":1,\"kind\":\"b\",\"flag\":7}\n");
+    assert_eq!(
+        out,
+        "{\"id\":0,\"kind\":\"a\",\"flag\":7}\n{\"id\":1,\"kind\":\"b\",\"flag\":7}\n"
+    );
 }
 
 #[test]
@@ -273,7 +296,10 @@ fn dictionary_dumps_entries() {
     assert!(out.contains("a") && out.contains("b") && out.contains("c"));
     let (j, _, ok) = run(&["dictionary", &f, "-c", "kind", "--json"]);
     assert!(ok);
-    assert_eq!(j, "{\"column\":\"kind\",\"row_groups\":[[\"a\",\"b\",\"c\"]]}\n");
+    assert_eq!(
+        j,
+        "{\"column\":\"kind\",\"row_groups\":[[\"a\",\"b\",\"c\"]]}\n"
+    );
 }
 
 #[test]
@@ -285,7 +311,10 @@ fn column_size_sums_bytes() {
     // Every column attributes its on-disk bucket bytes (even the const flag bucket).
     assert!(out.contains("flag: 15 B") && !out.contains(": 0 B"));
     // Paged buckets lack uncompressed sizes, so no (misleading) total ratio.
-    assert!(!out.contains("uncompressed"), "paged total must omit ratio: {out}");
+    assert!(
+        !out.contains("uncompressed"),
+        "paged total must omit ratio: {out}"
+    );
 }
 
 #[test]
@@ -294,13 +323,25 @@ fn column_size_nonzero_on_monolithic() {
     // (regression: monolithic buckets previously reported 0 B everywhere).
     let f = fixture_threshold("size_mono", 32 * 1024);
     let (b, _, _) = run(&["buckets", &f]);
-    assert!(b.contains("monolithic"), "default file should be monolithic: {b}");
+    assert!(
+        b.contains("monolithic"),
+        "default file should be monolithic: {b}"
+    );
     let (out, _, ok) = run(&["column-size", &f]);
     assert!(ok);
-    assert!(out.contains("id: ") && !out.contains("id: 0 B"), "id must be non-zero: {out}");
-    assert!(out.contains("kind: ") && !out.contains("kind: 0 B"), "kind must be non-zero: {out}");
+    assert!(
+        out.contains("id: ") && !out.contains("id: 0 B"),
+        "id must be non-zero: {out}"
+    );
+    assert!(
+        out.contains("kind: ") && !out.contains("kind: 0 B"),
+        "kind must be non-zero: {out}"
+    );
     // Single-column buckets are exact, so nothing is flagged approximate.
-    assert!(out.contains("total:") && !out.contains("approx"), "single-col exact: {out}");
+    assert!(
+        out.contains("total:") && !out.contains("approx"),
+        "single-col exact: {out}"
+    );
 }
 
 #[test]
@@ -313,7 +354,12 @@ fn buckets_show_layout() {
     assert!(out.contains("monolithic") || out.contains("paged"));
     let (j, _, ok) = run(&["buckets", &f, "--json"]);
     assert!(ok);
-    assert!(j.contains("\"bucket\":0") && j.contains("\"columns\":") && j.contains("\"uncompressed\":"));
+    assert!(
+        j.contains("\"bucket\":0") && j.contains("\"columns\":") && j.contains("\"uncompressed\":")
+    );
     // const flag bucket is monolithic, so its uncompressed size + ratio show.
-    assert!(out.contains("uncompressed") && out.contains("x)"), "ratio: {out}");
+    assert!(
+        out.contains("uncompressed") && out.contains("x)"),
+        "ratio: {out}"
+    );
 }

@@ -77,12 +77,12 @@ mosaic schema data.mosaic</code></pre>
                     <tr><td><code>pages</code></td><td>per-column encoding + slot size</td><td>bucket data</td></tr>
                     <tr><td><code>dictionary</code></td><td>dictionary entries of a dict column</td><td>bucket data</td></tr>
                     <tr><td><code>column-size</code></td><td>on-disk bytes per column</td><td>footer + index</td></tr>
-                    <tr><td><code>cat</code> / <code>head</code></td><td>first N rows as a table; <code>--all</code>, <code>--where</code></td><td>column data</td></tr>
+                    <tr><td><code>cat</code> / <code>head</code></td><td>cat: all rows (<code>-n</code> to limit); head: first 10; <code>-c</code>, <code>--where</code></td><td>column data</td></tr>
                     <tr><td><code>count</code></td><td>total row count</td><td>footer + index</td></tr>
                     <tr><td><code>convert</code></td><td>import a CSV into a new Mosaic file</td><td>writes file</td></tr>
                 </tbody>
             </table>
-            <p>Inspection and query commands accept <code>--json</code> (<code>convert</code> writes a file). <code>cat</code>/<code>head</code> take <code>-n &lt;N&gt;</code>, <code>--all</code>, <code>-c a,b</code> (projection) and <code>--where</code>; <code>dictionary</code> takes <code>-c &lt;col&gt;</code>.</p>
+            <p>Inspection and query commands accept <code>--json</code> (<code>convert</code> writes a file). <code>cat</code> prints all rows (<code>-n</code> to limit); <code>head</code> prints 10 by default. <code>cat</code>/<code>head</code>/<code>pages</code>/<code>column-size</code> take <code>-c a,b</code>; <code>dictionary</code> takes <code>-c &lt;col&gt;</code>.</p>
 
             <h2>schema</h2>
             <p>Columns, Arrow types, nullability and bucket assignment, in original input order. Footer only.</p>
@@ -149,7 +149,7 @@ row group 0: 3 entries
   total: 593 B</code></pre>
 
             <h2>cat / head</h2>
-            <p>Read the first N rows as a table. <code>-n</code> sets the count, <code>--all</code> prints every row, <code>-c</code> projects columns, <code>--where</code> filters rows (one condition: <code>=</code> <code>!=</code> <code>&gt;</code> <code>&gt;=</code> <code>&lt;</code> <code>&lt;=</code>; integers compare exactly, floats compare exactly so <code>=0.3</code> only matches a stored 0.3; row groups whose stats exclude the predicate are skipped), <code>--json</code> emits newline-delimited JSON. <code>head</code> is an alias of <code>cat</code>.</p>
+            <p><code>cat</code> prints all rows by default (<code>-n</code> to limit); <code>head</code> prints the first 10. <code>-c</code> projects columns, <code>--where</code> filters rows (one condition: <code>=</code> <code>!=</code> <code>&gt;</code> <code>&gt;=</code> <code>&lt;</code> <code>&lt;=</code>; integers and floats compare exactly so <code>=0.3</code> only matches a stored 0.3; row groups whose stats exclude the predicate are skipped), <code>--json</code> emits newline-delimited JSON.</p>
 <pre><code><span class="cmt">$ mosaic cat data.mosaic -n 2</span>
 +----+--------+------+-------+------+
 | id | name   | kind | score | flag |
@@ -172,7 +172,7 @@ row group 0: 3 entries
 200</code></pre>
 
             <h2>convert</h2>
-            <p>Import a CSV (with header) or JSON lines (one object per line) into a new Mosaic file; the schema is inferred. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups.</p>
+            <p>Import a CSV (with header) or JSON lines (one object per line) into a new Mosaic file; the schema is inferred. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups. Refuses to replace an existing output unless <code>--overwrite</code> is given.</p>
 <pre><code><span class="cmt">$ mosaic convert data.csv -o data.mosaic --stats id</span>
 wrote data.mosaic (200 rows, 5 columns)
 <span class="cmt">$ mosaic convert data.ndjson -o data.mosaic</span>

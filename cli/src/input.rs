@@ -54,9 +54,14 @@ impl InputFile for FileInput {
             use std::os::windows::fs::FileExt;
             let mut read = 0;
             while read < buf.len() {
-                let n = self.file.seek_read(&mut buf[read..], offset + read as u64)?;
+                let n = self
+                    .file
+                    .seek_read(&mut buf[read..], offset + read as u64)?;
                 if n == 0 {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read past end"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "read past end",
+                    ));
                 }
                 read += n;
             }

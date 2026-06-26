@@ -45,7 +45,8 @@ All inspection and query commands accept `--json`; `convert` writes a file.
 | `pages` | per-column encoding + on-disk slot size | bucket data |
 | `dictionary` | dictionary entries of a dict column | bucket data |
 | `column-size` | bytes per column + total compression ratio | footer + index |
-| `cat` / `head` | rows as a table | column data |
+| `cat` | all rows as a table (`-n` to limit) | column data |
+| `head` | first N rows (default 10) | column data |
 | `count` | total row count | footer + index |
 | `convert` | import CSV or JSON into a new file | writes file |
 
@@ -76,7 +77,8 @@ row group 0:
 
 ## Query
 
-`cat`/`head` take `-n <N>`, `--all`, `-c a,b` (projection) and
+`cat` shows all rows (`-n` to limit); `head` shows 10 by default. Both take
+`-c a,b` (projection), `pages`/`column-size` take `-c` too, and
 `--where "col op val"` (one condition: `=` `!=` `>` `>=` `<` `<=`; integers and
 floats compare exactly, so `=0.3` only matches a stored 0.3).
 
@@ -94,6 +96,7 @@ $ mosaic cat data.mosaic --all --where "id>100" -c id,kind
 ## Convert
 
 Import CSV or JSON lines into a new Mosaic file; the schema is inferred.
+An existing output is kept unless `--overwrite` is given.
 `--stats id` builds min/max for those columns, which `cat --where` then uses to
 skip row groups that cannot match.
 
