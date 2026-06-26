@@ -632,7 +632,8 @@ impl<I: InputFile> MosaicReader<I> {
                 BucketLayout::Paged { total_size } => {
                     // Physical layout: optional child header + one slot per
                     // physical column (primaries first, then ARRAY children).
-                    let (dir_size, sizes) = self.paged_dir(b, meta.bucket_offsets[b], total_size)?;
+                    let (dir_size, sizes) =
+                        self.paged_dir(b, meta.bucket_offsets[b], total_size)?;
                     let mut foff = meta.bucket_offsets[b] + dir_size as u64;
                     for (local, &gi) in globals.iter().enumerate() {
                         let enc = if sizes[local] == 0 {
@@ -680,8 +681,10 @@ impl<I: InputFile> MosaicReader<I> {
                 for (local, &gi) in globals.iter().enumerate() {
                     out[gi] += sizes[local];
                 }
-                let refs: Vec<&DataType> =
-                    globals.iter().map(|&gi| &self.schema.columns[gi].data_type).collect();
+                let refs: Vec<&DataType> = globals
+                    .iter()
+                    .map(|&gi| &self.schema.columns[gi].data_type)
+                    .collect();
                 let (_, children) = crate::bucket_writer::expand_col_types(&refs);
                 for c in &children {
                     out[globals[c.parent_logical_col]] += sizes[c.physical_index];
@@ -695,14 +698,23 @@ impl<I: InputFile> MosaicReader<I> {
     /// phys_slot_sizes)` where `dir_size` includes the optional ARRAY child
     /// header and `phys_slot_sizes` has one entry per physical column
     /// (logical primaries first, then expanded ARRAY children).
-    fn paged_dir(&self, b: usize, offset: u64, total_size: usize) -> io::Result<(usize, Vec<usize>)> {
+    fn paged_dir(
+        &self,
+        b: usize,
+        offset: u64,
+        total_size: usize,
+    ) -> io::Result<(usize, Vec<usize>)> {
         let refs: Vec<&DataType> = self.schema.bucket_to_global[b]
             .iter()
             .map(|&gi| &self.schema.columns[gi].data_type)
             .collect();
         let (phys, children) = crate::bucket_writer::expand_col_types(&refs);
         let nphys = phys.len();
-        let hdr_len = if children.is_empty() { 0 } else { 2 + children.len() * 4 };
+        let hdr_len = if children.is_empty() {
+            0
+        } else {
+            2 + children.len() * 4
+        };
         let dir_size = hdr_len + nphys * 4;
         let dir = read_range(&self.input, offset, dir_size)?;
         let sizes = Self::paged_slot_sizes(&dir[hdr_len..], nphys);

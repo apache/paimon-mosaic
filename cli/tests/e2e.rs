@@ -189,10 +189,10 @@ fn cat_where_filters_rows() {
     assert!(!bad); // unparseable filter fails
     let (_, _, str_ord) = run(&["cat", &f, "--where", "kind>5"]);
     assert!(!str_ord); // ordering on a string column errors, not silent drop
-    // != with a non-numeric value matches all rows (nothing equals it).
+                       // != with a non-numeric value matches all rows (nothing equals it).
     let (ne, _, _) = run(&["cat", &f, "--where", "id!=abc", "--json"]);
     assert_eq!(ne.lines().count(), 200);
-                       // Filtering a column dropped by -c works and doesn't leak into output.
+    // Filtering a column dropped by -c works and doesn't leak into output.
     let (hid, _, ok) = run(&["cat", &f, "-c", "kind", "--where", "id>197", "--json"]);
     assert!(
         ok && hid.lines().count() == 2 && !hid.contains("\"id\""),
@@ -202,20 +202,34 @@ fn cat_where_filters_rows() {
 
 /// Fixture with a Boolean column so `--where` on bools can be exercised.
 fn fixture_bool(name: &str) -> String {
-    let path = format!("{}/mosaic_e2e_{}.mosaic", std::env::temp_dir().display(), name);
+    let path = format!(
+        "{}/mosaic_e2e_{}.mosaic",
+        std::env::temp_dir().display(),
+        name
+    );
     let schema = Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("active", DataType::Boolean, true),
     ]);
-    let out = FileOut { f: File::create(&path).unwrap(), pos: 0 };
-    let opts = WriterOptions { num_buckets: 1, stats_columns: vec!["id".into()], ..Default::default() };
+    let out = FileOut {
+        f: File::create(&path).unwrap(),
+        pos: 0,
+    };
+    let opts = WriterOptions {
+        num_buckets: 1,
+        stats_columns: vec!["id".into()],
+        ..Default::default()
+    };
     let mut w = MosaicWriter::new(out, &schema, opts).unwrap();
     let n = 10;
     let ids: Vec<i32> = (0..n).collect();
     let active: Vec<bool> = (0..n).map(|i| i % 2 == 0).collect();
     let batch = RecordBatch::try_new(
         Arc::new(schema),
-        vec![Arc::new(Int32Array::from(ids)), Arc::new(BooleanArray::from(active))],
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(BooleanArray::from(active)),
+        ],
     )
     .unwrap();
     w.write_batch(&batch).unwrap();

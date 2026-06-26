@@ -277,9 +277,8 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
     let row_ok = |r: usize| !col.is_null(r);
     // When the RHS can't parse for a numeric column, `=` matches nothing and
     // `!=` matches every non-null row (nulls never match, either way).
-    let no_match = |keep_nonnull: bool| -> Vec<bool> {
-        (0..n).map(|r| keep_nonnull && row_ok(r)).collect()
-    };
+    let no_match =
+        |keep_nonnull: bool| -> Vec<bool> { (0..n).map(|r| keep_nonnull && row_ok(r)).collect() };
     // Downcast the column once and return a per-row value accessor; avoids
     // re-downcasting inside the row loop.
     macro_rules! d {
@@ -317,10 +316,12 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
         let rhs = match w.value.as_str() {
             "true" => true,
             "false" => false,
-            _ => return Err(format!(
-                "--where: boolean column '{}' needs true/false (got '{}')",
-                w.column, w.value
-            )),
+            _ => {
+                return Err(format!(
+                    "--where: boolean column '{}' needs true/false (got '{}')",
+                    w.column, w.value
+                ))
+            }
         };
         let a = col.as_any().downcast_ref::<BooleanArray>().unwrap();
         (0..n)
