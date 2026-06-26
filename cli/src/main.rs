@@ -645,8 +645,9 @@ fn column_size(file: &Path, columns: Option<String>, json: bool) -> std::io::Res
     let mut approx = vec![false; s.columns.len()];
     for rg in 0..reader.num_row_groups() {
         // Paged buckets store each column in its own slot → exact per-column bytes.
-        for p in reader.page_infos(rg)? {
-            bytes[p.column_index] += p.slot_size;
+        // Read slot sizes from the directory only (no slot decode/decompress).
+        for (ci, sz) in reader.slot_sizes(rg)?.into_iter().enumerate() {
+            bytes[ci] += sz;
         }
         // Monolithic buckets are one blob; split evenly and mark approximate when
         // more than one column shares the bucket (a single-column bucket is exact).

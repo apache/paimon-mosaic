@@ -659,6 +659,34 @@ impl<I: InputFile> MosaicReader<I> {
         Ok(out)
     }
 
+    /// Per-column paged slot sizes for a row group, read from the bucket
+    /// directory only — no slot reads, no decompression. Monolithic/empty
+    /// columns report 0 (size is recovered via [`Self::bucket_infos`]).
+    /// Cheaper than [`Self::page_infos`] when only sizes are needed.
+    pub fn slot_sizes(&self, rg_index: usize) -> io::Result<Vec<usize>> {
+        if rg_index >= self.row_group_metas.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "row group index out of range",
+            ));
+        }
+        let meta = &self.row_group_metas[rg_index];
+        let mut out = vec![0usize; self.schema.columns.len()];
+        for b in 0..self.num_buckets {
+            let globals = &self.schema.bucket_to_global[b];
+            if let BucketLayout::Paged { total_size } = meta.bucket_layouts[b] {
+                let dir_size = globals.len() * 4;
+                let dir = read_range(&self.input, meta.bucket_offsets[b], dir_size)?;
+                let sizes = Self::paged_slot_sizes(&dir, globals.len());
+                Self::validate_paged_total(b, dir_size, &sizes, total_size)?;
+                for (local, &gi) in globals.iter().enumerate() {
+                    out[gi] = sizes[local];
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Decode the paged-bucket directory: `ncols` little-endian u32 slot sizes.
     fn paged_slot_sizes(dir: &[u8], ncols: usize) -> Vec<usize> {
         (0..ncols)
