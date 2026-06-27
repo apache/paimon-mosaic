@@ -31,7 +31,7 @@ pub fn render_value(v: &Value) -> String {
         Value::Double(x) => x.to_string(),
         Value::Date(x) => format!("{} (epoch-day)", x),
         Value::Time(x) => format!("{} (ms)", x),
-        Value::String(b) => String::from_utf8_lossy(b).into_owned(),
+        Value::String(b) => safe(&String::from_utf8_lossy(b)),
         Value::Bytes(b) | Value::DecimalLarge(b) => format!("0x{}", hex(b)),
         Value::DecimalCompact(x) => x.to_string(),
         Value::TimestampMillis(x) => format!("{} (ms)", x),
@@ -47,6 +47,15 @@ pub fn render_value(v: &Value) -> String {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+/// Strip control chars so a crafted file can't inject ANSI escapes into the
+/// inspector's terminal. Use on any file-derived string sent to text output;
+/// JSON output is escaped by `json_str`/the writer instead.
+pub fn safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect()
 }
 
 /// Human-readable encoding name.
@@ -111,7 +120,7 @@ pub fn pretty_table(batches: &[RecordBatch], max_rows: usize) -> String {
         return String::new();
     }
     let schema = batches[0].schema();
-    let headers: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let headers: Vec<String> = schema.fields().iter().map(|f| safe(f.name())).collect();
     let ncols = headers.len();
 
     let mut rows: Vec<Vec<String>> = Vec::new();
@@ -218,14 +227,7 @@ fn cell(arr: &dyn Array, row: usize) -> String {
         Date32 => d!(Date32Array),
         // Strip control chars so a crafted file can't inject ANSI escapes into
         // the inspector's terminal; the JSON path is escaped by the writer.
-        Utf8 => arr
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .value(row)
-            .chars()
-            .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-            .collect(),
+        Utf8 => safe(arr.as_any().downcast_ref::<StringArray>().unwrap().value(row)),
         // Text rendering for types cat doesn't format yet — show the type, not "?".
         other => format!("<{other:?}>"),
     }
@@ -478,6 +480,12 @@ mod tests {
         assert_eq!(render_value(&Value::Integer(5)), "5");
         assert_eq!(render_value(&Value::String(b"hi".to_vec())), "hi");
         assert_eq!(render_value(&Value::Null), "null");
+    }
+
+    #[test]
+    fn render_value_strips_control_chars() {
+        let s = render_value(&Value::String(b"\x1b[31mred".to_vec()));
+        assert!(!s.contains('\x1b'), "ANSI escape must not survive: {s:?}");
     }
 
     #[test]

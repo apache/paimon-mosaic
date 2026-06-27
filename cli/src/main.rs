@@ -281,7 +281,7 @@ fn schema(file: &Path, json: bool) -> std::io::Result<()> {
         let null = if c.nullable { "" } else { " not null" };
         println!(
             "  {}: {:?}{} [bucket {}]",
-            c.name, c.data_type, null, c.bucket_id
+            fmt::safe(&c.name), c.data_type, null, c.bucket_id
         );
     }
     Ok(())
@@ -352,7 +352,7 @@ fn meta(file: &Path, json: bool) -> std::io::Result<()> {
             };
             println!(
                 "    {}: nulls={} {}",
-                s.columns[st.column_index].name, st.null_count, mm
+                fmt::safe(&s.columns[st.column_index].name), st.null_count, mm
             );
         }
     }
@@ -398,7 +398,7 @@ fn pages(file: &Path, columns: Option<String>, json: bool) -> std::io::Result<()
             }
             println!(
                 "    {}: bucket {} encoding={} slot={}B",
-                c.name,
+                fmt::safe(&c.name),
                 p.bucket,
                 fmt::encoding_name(p.encoding),
                 p.slot_size
@@ -691,7 +691,7 @@ fn column_size(file: &Path, columns: Option<String>, json: bool) -> std::io::Res
         for i in cols {
             println!(
                 "  {}: {} B{}",
-                s.columns[i].name,
+                fmt::safe(&s.columns[i].name),
                 bytes[i],
                 if approx[i] { " (approx)" } else { "" }
             );
@@ -760,7 +760,7 @@ fn dictionary(file: &Path, column: &str, json: bool) -> std::io::Result<()> {
 fn buckets(file: &Path, json: bool) -> std::io::Result<()> {
     let reader = open(file)?;
     let s = reader.schema();
-    let name = |i: usize| s.columns[i].name.clone();
+    let name = |i: usize| fmt::safe(&s.columns[i].name);
     let mut rgs = Vec::new();
     for rg in 0..reader.num_row_groups() {
         let infos = reader.bucket_infos(rg)?;
