@@ -305,9 +305,14 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
         let Ok(rhs) = w.value.parse::<f64>() else {
             return finish(batch, no_match(w.op == "!="));
         };
-        let at: Box<dyn Fn(usize) -> f64 + '_> = match col.data_type() {
-            Float32 => d!(Float32Array, v, r => v.value(r) as f64),
-            _ => d!(Float64Array, v, r => v.value(r)),
+        // Parse the RHS at the column's own precision so an f32 cell compares
+        // against an f32-rounded value (stored 0.1f32 == "0.1", not the f64 0.1).
+        let (rhs, at): (f64, Box<dyn Fn(usize) -> f64 + '_>) = match col.data_type() {
+            Float32 => (
+                w.value.parse::<f32>().unwrap_or(f32::NAN) as f64,
+                d!(Float32Array, v, r => v.value(r) as f64),
+            ),
+            _ => (rhs, d!(Float64Array, v, r => v.value(r))),
         };
         (0..n)
             .map(|r| row_ok(r) && cmp_op(w.op, &at(r), &rhs))

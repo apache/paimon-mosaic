@@ -23,7 +23,7 @@ use std::io::Write;
 use std::process::Command;
 use std::sync::Arc;
 
-use arrow::array::{BooleanArray, Int32Array, RecordBatch, StringArray};
+use arrow::array::{BooleanArray, Float32Array, Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
 
@@ -249,6 +249,52 @@ fn cat_where_boolean_filters() {
     // A non-bool literal on a bool column errors instead of returning nothing.
     let (_, _, bad) = run(&["cat", &f, "--where", "active=yes"]);
     assert!(!bad);
+}
+
+/// Fixture with a Float32 column whose value is 0.1 — the f64 literal 0.1 does
+/// not equal 0.1f32 widened, so `--where price=0.1` must round the RHS to f32.
+fn fixture_f32(name: &str) -> String {
+    let path = format!(
+        "{}/mosaic_e2e_{}.mosaic",
+        std::env::temp_dir().display(),
+        name
+    );
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("price", DataType::Float32, false),
+    ]);
+    let out = FileOut {
+        f: File::create(&path).unwrap(),
+        pos: 0,
+    };
+    let mut w = MosaicWriter::new(
+        out,
+        &schema,
+        WriterOptions {
+            num_buckets: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Float32Array::from(vec![0.1f32, 0.2f32])),
+        ],
+    )
+    .unwrap();
+    w.write_batch(&batch).unwrap();
+    w.close().unwrap();
+    path
+}
+
+#[test]
+fn cat_where_float32_precision() {
+    let f = fixture_f32("wheref32");
+    // RHS must be compared at f32 precision; stored 0.1f32 should match "0.1".
+    let (m, _, ok) = run(&["cat", &f, "--where", "price=0.1", "--json"]);
+    assert!(ok && m.lines().count() == 1, "expected 1 match, got: {m}");
 }
 
 #[test]
