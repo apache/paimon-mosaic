@@ -315,7 +315,7 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
         // against an f32-rounded value (stored 0.1f32 == "0.1", not the f64 0.1).
         let (rhs, at): (f64, Box<dyn Fn(usize) -> f64 + '_>) = match col.data_type() {
             Float32 => (
-                w.value.parse::<f32>().unwrap_or(f32::NAN) as f64,
+                rhs as f32 as f64,
                 d!(Float32Array, v, r => v.value(r) as f64),
             ),
             _ => (rhs, d!(Float64Array, v, r => v.value(r))),
@@ -480,6 +480,19 @@ mod tests {
         assert_eq!(render_value(&Value::Integer(5)), "5");
         assert_eq!(render_value(&Value::String(b"hi".to_vec())), "hi");
         assert_eq!(render_value(&Value::Null), "null");
+    }
+
+    #[test]
+    fn where_f32_rhs_overflow_does_not_nan_match() {
+        // RHS beyond f32 range saturates to +inf (not NaN), so id<1e40 keeps all.
+        let schema = Schema::new(vec![Field::new("v", DataType::Float32, false)]);
+        let b = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(arrow::array::Float32Array::from(vec![1.0f32, 2.0]))],
+        )
+        .unwrap();
+        let w = parse_where("v<1e40").unwrap();
+        assert_eq!(apply_where(&b, &w).unwrap().num_rows(), 2);
     }
 
     #[test]
