@@ -636,7 +636,7 @@ impl<I: InputFile> MosaicReader<I> {
                 BucketLayout::Paged { total_size } => {
                     // Physical layout: optional child header + one slot per
                     // physical column (primaries first, then ARRAY children).
-                    let (dir_size, sizes) =
+                    let (dir_size, sizes, _) =
                         self.paged_dir(b, meta.bucket_offsets[b], total_size)?;
                     let mut foff = meta.bucket_offsets[b] + dir_size as u64;
                     for (local, &gi) in globals.iter().enumerate() {
@@ -679,17 +679,13 @@ impl<I: InputFile> MosaicReader<I> {
         for b in 0..self.num_buckets {
             let globals = &self.schema.bucket_to_global[b];
             if let BucketLayout::Paged { total_size } = meta.bucket_layouts[b] {
-                let (_dir_size, sizes) = self.paged_dir(b, meta.bucket_offsets[b], total_size)?;
+                let (_dir_size, sizes, children) =
+                    self.paged_dir(b, meta.bucket_offsets[b], total_size)?;
                 // Primary slots map 1:1 to the bucket's logical columns; any
                 // trailing ARRAY child slots are attributed to their parent.
                 for (local, &gi) in globals.iter().enumerate() {
                     out[gi] += sizes[local];
                 }
-                let refs: Vec<&DataType> = globals
-                    .iter()
-                    .map(|&gi| &self.schema.columns[gi].data_type)
-                    .collect();
-                let (_, children) = crate::bucket_writer::expand_col_types(&refs);
                 for c in &children {
                     out[globals[c.parent_logical_col]] += sizes[c.physical_index];
                 }
@@ -699,15 +695,16 @@ impl<I: InputFile> MosaicReader<I> {
     }
 
     /// Read+validate a paged bucket's directory. Returns `(dir_size,
-    /// phys_slot_sizes)` where `dir_size` includes the optional ARRAY child
-    /// header and `phys_slot_sizes` has one entry per physical column
-    /// (logical primaries first, then expanded ARRAY children).
+    /// phys_slot_sizes, children)` where `dir_size` includes the optional ARRAY
+    /// child header, `phys_slot_sizes` has one entry per physical column
+    /// (logical primaries first, then expanded ARRAY children), and `children`
+    /// is the expanded ARRAY mapping so callers need not re-run expand_col_types.
     fn paged_dir(
         &self,
         b: usize,
         offset: u64,
         total_size: usize,
-    ) -> io::Result<(usize, Vec<usize>)> {
+    ) -> io::Result<(usize, Vec<usize>, Vec<crate::bucket_writer::ChildColumnMeta>)> {
         let refs: Vec<&DataType> = self.schema.bucket_to_global[b]
             .iter()
             .map(|&gi| &self.schema.columns[gi].data_type)
@@ -723,7 +720,7 @@ impl<I: InputFile> MosaicReader<I> {
         let dir = read_range(&self.input, offset, dir_size)?;
         let sizes = Self::paged_slot_sizes(&dir[hdr_len..], nphys);
         Self::validate_paged_total(b, dir_size, &sizes, total_size)?;
-        Ok((dir_size, sizes))
+        Ok((dir_size, sizes, children))
     }
 
     /// Decode the paged-bucket directory: `ncols` little-endian u32 slot sizes.
