@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod filter;
 mod fmt;
 mod input;
 
@@ -510,7 +511,7 @@ fn cat(
     let mut reader = open(file)?;
     let pred = filter
         .as_deref()
-        .map(fmt::parse_where)
+        .map(filter::parse_where)
         .transpose()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     // The display columns; the filter column is read even if projected out, then
@@ -547,14 +548,14 @@ fn cat(
                 .iter()
                 .find(|s| s.column_index == ci)
             {
-                if fmt::stats_exclude(p, &st.min, &st.max) {
+                if filter::stats_exclude(p, &st.min, &st.max) {
                     continue;
                 }
             }
         }
         let mut batch = reader.row_group_reader(rg)?.read_columns()?;
         if let Some(p) = &pred {
-            batch = fmt::apply_where(&batch, p)
+            batch = filter::apply_where(&batch, p)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         }
         // Drop the filter-only column so it isn't printed when -c excluded it.
