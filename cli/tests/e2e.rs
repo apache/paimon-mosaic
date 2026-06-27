@@ -272,6 +272,7 @@ fn fixture_f32(name: &str) -> String {
         &schema,
         WriterOptions {
             num_buckets: 1,
+            stats_columns: vec!["price".into()], // exercise pushdown (stats_exclude) too
             ..Default::default()
         },
     )

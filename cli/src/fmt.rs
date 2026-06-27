@@ -416,8 +416,16 @@ pub fn stats_exclude(w: &Where, min: &Option<Value>, max: &Option<Value>) -> boo
     if let (Some(lo), Some(hi), Ok(v)) = (to_i128(min), to_i128(max), w.value.parse::<i128>()) {
         return excl(w.op, lo, hi, v);
     }
-    if let (Some(lo), Some(hi), Ok(v)) = (to_f64(min), to_f64(max), w.value.parse::<f64>()) {
-        return excl(w.op, lo, hi, v);
+    if let (Some(lo), Some(hi)) = (to_f64(min), to_f64(max)) {
+        // Round the RHS to the stat's own width so the bound matches apply_where:
+        // an f32 group min/max compares against an f32-rounded value, not f64 0.1.
+        let v = match min {
+            Value::Float(_) => w.value.parse::<f32>().map(|x| x as f64),
+            _ => w.value.parse::<f64>(),
+        };
+        if let Ok(v) = v {
+            return excl(w.op, lo, hi, v);
+        }
     }
     false
 }
