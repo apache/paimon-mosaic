@@ -41,6 +41,38 @@ pub trait OutputFile {
     fn pos(&self) -> u64;
 }
 
+/// File-backed [`OutputFile`] sink that tracks its own write position. The
+/// standard sink for writing a Mosaic file to disk; shared by the CLI and tests.
+pub struct FileSink {
+    f: std::fs::File,
+    pos: u64,
+}
+
+impl FileSink {
+    /// Create or truncate `path` for writing.
+    pub fn create(path: &std::path::Path) -> io::Result<Self> {
+        Ok(Self {
+            f: std::fs::File::create(path)?,
+            pos: 0,
+        })
+    }
+}
+
+impl OutputFile for FileSink {
+    fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        use io::Write;
+        self.pos += data.len() as u64;
+        self.f.write_all(data)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        use io::Write;
+        self.f.flush()
+    }
+    fn pos(&self) -> u64 {
+        self.pos
+    }
+}
+
 pub struct WriterOptions {
     pub compression: u8,
     pub zstd_level: i32,

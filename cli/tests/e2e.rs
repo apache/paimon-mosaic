@@ -18,32 +18,12 @@
 //! End-to-end tests: drive the `mosaic` binary against a fixture file and
 //! assert stdout. Zero external dev-deps — uses CARGO_BIN_EXE and std only.
 
-use std::fs::File;
-use std::io::Write;
 use std::process::Command;
 use std::sync::Arc;
 
 use arrow::array::{BooleanArray, Float32Array, Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
-
-struct FileOut {
-    f: File,
-    pos: u64,
-}
-impl OutputFile for FileOut {
-    fn write(&mut self, d: &[u8]) -> std::io::Result<()> {
-        self.f.write_all(d)?;
-        self.pos += d.len() as u64;
-        Ok(())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.f.flush()
-    }
-    fn pos(&self) -> u64 {
-        self.pos
-    }
-}
+use paimon_mosaic_core::writer::{FileSink, MosaicWriter, WriterOptions};
 
 /// Write a small fixture and return its path under the test temp dir.
 fn fixture(name: &str) -> String {
@@ -63,10 +43,7 @@ fn fixture_threshold(name: &str, threshold: usize) -> String {
         Field::new("kind", DataType::Utf8, true),
         Field::new("flag", DataType::Int32, true),
     ]);
-    let out = FileOut {
-        f: File::create(&path).unwrap(),
-        pos: 0,
-    };
+    let out = FileSink::create(std::path::Path::new(&path)).unwrap();
     let opts = WriterOptions {
         num_buckets: 3,
         page_size_threshold: threshold,
@@ -211,10 +188,7 @@ fn fixture_bool(name: &str) -> String {
         Field::new("id", DataType::Int32, false),
         Field::new("active", DataType::Boolean, true),
     ]);
-    let out = FileOut {
-        f: File::create(&path).unwrap(),
-        pos: 0,
-    };
+    let out = FileSink::create(std::path::Path::new(&path)).unwrap();
     let opts = WriterOptions {
         num_buckets: 1,
         stats_columns: vec!["id".into()],
@@ -263,10 +237,7 @@ fn fixture_f32(name: &str) -> String {
         Field::new("id", DataType::Int32, false),
         Field::new("price", DataType::Float32, false),
     ]);
-    let out = FileOut {
-        f: File::create(&path).unwrap(),
-        pos: 0,
-    };
+    let out = FileSink::create(std::path::Path::new(&path)).unwrap();
     let mut w = MosaicWriter::new(
         out,
         &schema,

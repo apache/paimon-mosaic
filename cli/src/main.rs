@@ -421,26 +421,6 @@ fn count(file: &Path, json: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Output sink writing a Mosaic file to disk, tracking its own position.
-struct FileOut {
-    f: std::fs::File,
-    pos: u64,
-}
-impl paimon_mosaic_core::writer::OutputFile for FileOut {
-    fn write(&mut self, d: &[u8]) -> std::io::Result<()> {
-        use std::io::Write;
-        self.pos += d.len() as u64;
-        self.f.write_all(d)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        use std::io::Write;
-        self.f.flush()
-    }
-    fn pos(&self) -> u64 {
-        self.pos
-    }
-}
-
 fn convert(
     input: &Path,
     out: &Path,
@@ -489,10 +469,7 @@ fn convert(
     let tmp = out.with_extension("mosaic.tmp");
     let mut rows = 0;
     let res = (|| {
-        let sink = FileOut {
-            f: std::fs::File::create(&tmp)?,
-            pos: 0,
-        };
+        let sink = paimon_mosaic_core::writer::FileSink::create(&tmp)?;
         let mut w = MosaicWriter::new(sink, &schema, opts)?;
         for batch in reader {
             let batch = batch
