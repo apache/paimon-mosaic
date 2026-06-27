@@ -292,8 +292,8 @@ fn meta(file: &Path, json: bool) -> std::io::Result<()> {
     let s = reader.schema();
     let nrg = reader.num_row_groups();
     let total: usize = (0..nrg)
-        .map(|i| reader.row_group_num_rows(i).unwrap_or(0))
-        .sum();
+        .map(|i| reader.row_group_num_rows(i))
+        .sum::<std::io::Result<usize>>()?;
     if json {
         let mut rgs = Vec::new();
         for rg in 0..nrg {
@@ -304,8 +304,8 @@ fn meta(file: &Path, json: bool) -> std::io::Result<()> {
                     let mm = match (&x.min, &x.max) {
                         (Some(lo), Some(hi)) => format!(
                             ",\"min\":{},\"max\":{}",
-                            fmt::json_str(&fmt::render_value(lo)),
-                            fmt::json_str(&fmt::render_value(hi))
+                            fmt::json_str(&fmt::render_json(lo)),
+                            fmt::json_str(&fmt::render_json(hi))
                         ),
                         _ => String::new(),
                     };
@@ -411,8 +411,8 @@ fn pages(file: &Path, columns: Option<String>, json: bool) -> std::io::Result<()
 fn count(file: &Path, json: bool) -> std::io::Result<()> {
     let reader = open(file)?;
     let n: usize = (0..reader.num_row_groups())
-        .map(|i| reader.row_group_num_rows(i).unwrap_or(0))
-        .sum();
+        .map(|i| reader.row_group_num_rows(i))
+        .sum::<std::io::Result<usize>>()?;
     if json {
         println!("{{\"rows\":{}}}", n);
     } else {
@@ -729,7 +729,7 @@ fn dictionary(file: &Path, column: &str, json: bool) -> std::io::Result<()> {
                 Some(vals) => {
                     let e: Vec<String> = vals
                         .iter()
-                        .map(|v| fmt::json_str(&fmt::render_value(v)))
+                        .map(|v| fmt::json_str(&fmt::render_json(v)))
                         .collect();
                     rgs.push(format!("[{}]", e.join(",")));
                 }

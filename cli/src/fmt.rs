@@ -45,6 +45,22 @@ pub fn render_value(v: &Value) -> String {
     }
 }
 
+/// Render a stats min/max [`Value`] for JSON: same as [`render_value`] but
+/// without the human-only unit suffixes (`(epoch-day)`, `(ms)`, `ms+ns`), so
+/// the value stays machine-parseable. Bytes/decimal keep hex; nanos collapse to
+/// a single nanosecond count.
+pub fn render_json(v: &Value) -> String {
+    match v {
+        Value::Date(x) | Value::Time(x) => x.to_string(),
+        Value::TimestampMillis(x) | Value::TimestampMicros(x) => x.to_string(),
+        Value::TimestampNanos {
+            millis,
+            nanos_of_milli,
+        } => (*millis as i128 * 1_000_000 + *nanos_of_milli as i128).to_string(),
+        _ => render_value(v),
+    }
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
@@ -493,6 +509,15 @@ mod tests {
         .unwrap();
         let w = parse_where("v<1e40").unwrap();
         assert_eq!(apply_where(&b, &w).unwrap().num_rows(), 2);
+    }
+
+    #[test]
+    fn render_json_drops_human_units() {
+        // JSON gets the bare machine value; text keeps the unit suffix.
+        assert_eq!(render_json(&Value::Date(18627)), "18627");
+        assert_eq!(render_value(&Value::Date(18627)), "18627 (epoch-day)");
+        assert_eq!(render_json(&Value::TimestampMillis(5)), "5");
+        assert_eq!(render_json(&Value::Integer(5)), "5");
     }
 
     #[test]
