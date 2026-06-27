@@ -141,15 +141,15 @@ pub fn pretty_table(batches: &[RecordBatch], max_rows: usize) -> String {
 
     let mut rows: Vec<Vec<String>> = Vec::new();
     'outer: for batch in batches {
+        // Downcast each column once per batch, not once per cell.
+        let fmts: Vec<_> = (0..ncols)
+            .map(|c| col_formatter(batch.column(c).as_ref()))
+            .collect();
         for r in 0..batch.num_rows() {
             if rows.len() >= max_rows {
                 break 'outer;
             }
-            let mut row = Vec::with_capacity(ncols);
-            for c in 0..ncols {
-                row.push(cell(batch.column(c).as_ref(), r));
-            }
-            rows.push(row);
+            rows.push((0..ncols).map(|c| fmts[c](r)).collect());
         }
     }
 
@@ -216,21 +216,17 @@ pub fn ndjson(batches: &[RecordBatch], max_rows: usize) -> std::io::Result<Strin
     String::from_utf8(w.into_inner()).map_err(|e| io::Error::other(e.to_string()))
 }
 
-/// Render one Arrow cell to a string by downcasting on the column type.
-fn cell(arr: &dyn Array, row: usize) -> String {
+/// Build a per-column cell formatter, downcasting once instead of per cell.
+/// Nulls render empty; control chars are stripped so a crafted file can't inject
+/// ANSI into the terminal (JSON is escaped by the writer instead).
+fn col_formatter(arr: &dyn Array) -> Box<dyn Fn(usize) -> String + '_> {
     use arrow::array::*;
     use arrow::datatypes::DataType::*;
-    if arr.is_null(row) {
-        return "".to_string();
-    }
     macro_rules! d {
-        ($ty:ty) => {
-            arr.as_any()
-                .downcast_ref::<$ty>()
-                .unwrap()
-                .value(row)
-                .to_string()
-        };
+        ($ty:ty) => {{
+            let a = arr.as_any().downcast_ref::<$ty>().unwrap();
+            Box::new(move |r| if a.is_null(r) { String::new() } else { a.value(r).to_string() })
+        }};
     }
     match arr.data_type() {
         Boolean => d!(BooleanArray),
@@ -241,11 +237,15 @@ fn cell(arr: &dyn Array, row: usize) -> String {
         Float32 => d!(Float32Array),
         Float64 => d!(Float64Array),
         Date32 => d!(Date32Array),
-        // Strip control chars so a crafted file can't inject ANSI escapes into
-        // the inspector's terminal; the JSON path is escaped by the writer.
-        Utf8 => safe(arr.as_any().downcast_ref::<StringArray>().unwrap().value(row)),
+        Utf8 => {
+            let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
+            Box::new(move |r| if a.is_null(r) { String::new() } else { safe(a.value(r)) })
+        }
         // Text rendering for types cat doesn't format yet — show the type, not "?".
-        other => format!("<{other:?}>"),
+        other => {
+            let t = format!("<{other:?}>");
+            Box::new(move |r| if arr.is_null(r) { String::new() } else { t.clone() })
+        }
     }
 }
 
