@@ -67,7 +67,7 @@ fn hex(b: &[u8]) -> String {
 
 /// Strip control chars so a crafted file can't inject ANSI escapes into the
 /// inspector's terminal. Use on any file-derived string sent to text output;
-/// JSON output is escaped by `json_str`/the writer instead.
+/// JSON output is escaped by serde (`jsonout`)/the Arrow writer instead.
 pub fn safe(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { '\u{fffd}' } else { c })
