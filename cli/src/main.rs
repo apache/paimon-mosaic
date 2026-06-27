@@ -17,6 +17,7 @@
 
 mod filter;
 mod fmt;
+mod jsonout;
 mod input;
 
 use std::path::{Path, PathBuf};
@@ -255,24 +256,25 @@ fn schema(file: &Path, json: bool) -> std::io::Result<()> {
     let s = reader.schema();
     let cols = original_order(s);
     if json {
-        let items: Vec<String> = cols
+        let fields = cols
             .iter()
             .map(|&i| {
                 let c = &s.columns[i];
-                format!(
-                    "{{\"name\":{},\"type\":{},\"nullable\":{},\"bucket\":{}}}",
-                    fmt::json_str(&c.name),
-                    fmt::json_str(&format!("{:?}", c.data_type)),
-                    c.nullable,
-                    c.bucket_id
-                )
+                jsonout::SchemaField {
+                    name: c.name.clone(),
+                    ty: format!("{:?}", c.data_type),
+                    nullable: c.nullable,
+                    bucket: c.bucket_id as u32,
+                }
             })
             .collect();
         println!(
-            "{{\"columns\":{},\"buckets\":{},\"fields\":[{}]}}",
-            s.columns.len(),
-            s.num_buckets,
-            items.join(",")
+            "{}",
+            jsonout::line(&jsonout::Schema {
+                columns: s.columns.len(),
+                buckets: s.num_buckets,
+                fields,
+            })
         );
         return Ok(());
     }
@@ -296,40 +298,39 @@ fn meta(file: &Path, json: bool) -> std::io::Result<()> {
         .map(|i| reader.row_group_num_rows(i))
         .sum::<std::io::Result<usize>>()?;
     if json {
-        let mut rgs = Vec::new();
+        let mut row_groups = Vec::new();
         for rg in 0..nrg {
-            let st: Vec<String> = reader
+            let stats = reader
                 .row_group_stats(rg)?
                 .iter()
                 .map(|x| {
-                    let mm = match (&x.min, &x.max) {
-                        (Some(lo), Some(hi)) => format!(
-                            ",\"min\":{},\"max\":{}",
-                            fmt::json_str(&fmt::render_json(lo)),
-                            fmt::json_str(&fmt::render_json(hi))
-                        ),
-                        _ => String::new(),
+                    let (min, max) = match (&x.min, &x.max) {
+                        (Some(lo), Some(hi)) => {
+                            (Some(fmt::render_json(lo)), Some(fmt::render_json(hi)))
+                        }
+                        _ => (None, None),
                     };
-                    format!(
-                        "{{\"column\":{},\"nulls\":{}{}}}",
-                        fmt::json_str(&s.columns[x.column_index].name),
-                        x.null_count,
-                        mm
-                    )
+                    jsonout::Stat {
+                        column: s.columns[x.column_index].name.clone(),
+                        nulls: x.null_count,
+                        min,
+                        max,
+                    }
                 })
                 .collect();
-            rgs.push(format!(
-                "{{\"rows\":{},\"stats\":[{}]}}",
-                reader.row_group_num_rows(rg)?,
-                st.join(",")
-            ));
+            row_groups.push(jsonout::MetaRg {
+                rows: reader.row_group_num_rows(rg)?,
+                stats,
+            });
         }
         println!(
-            "{{\"rows\":{},\"columns\":{},\"buckets\":{},\"row_groups\":[{}]}}",
-            total,
-            s.columns.len(),
-            s.num_buckets,
-            rgs.join(",")
+            "{}",
+            jsonout::line(&jsonout::Meta {
+                rows: total,
+                columns: s.columns.len(),
+                buckets: s.num_buckets,
+                row_groups,
+            })
         );
         return Ok(());
     }
@@ -366,28 +367,25 @@ fn pages(file: &Path, columns: Option<String>, json: bool) -> std::io::Result<()
     let want = col_filter(&columns, s)?;
     let nrg = reader.num_row_groups();
     if json {
-        let mut rgs = Vec::new();
+        let mut row_groups = Vec::new();
         for rg in 0..nrg {
-            let items: Vec<String> = reader
+            let pgs = reader
                 .page_infos(rg)?
                 .iter()
                 .filter(|p| {
                     want.as_ref()
                         .is_none_or(|w| w.contains(&s.columns[p.column_index].name))
                 })
-                .map(|p| {
-                    format!(
-                        "{{\"column\":{},\"bucket\":{},\"encoding\":{},\"slot_size\":{}}}",
-                        fmt::json_str(&s.columns[p.column_index].name),
-                        p.bucket,
-                        fmt::json_str(&fmt::encoding_name(p.encoding)),
-                        p.slot_size
-                    )
+                .map(|p| jsonout::Page {
+                    column: s.columns[p.column_index].name.clone(),
+                    bucket: p.bucket,
+                    encoding: fmt::encoding_name(p.encoding),
+                    slot_size: p.slot_size,
                 })
                 .collect();
-            rgs.push(format!("[{}]", items.join(",")));
+            row_groups.push(pgs);
         }
-        println!("{{\"row_groups\":[{}]}}", rgs.join(","));
+        println!("{}", jsonout::line(&jsonout::Pages { row_groups }));
         return Ok(());
     }
     for rg in 0..nrg {
@@ -415,7 +413,7 @@ fn count(file: &Path, json: bool) -> std::io::Result<()> {
         .map(|i| reader.row_group_num_rows(i))
         .sum::<std::io::Result<usize>>()?;
     if json {
-        println!("{{\"rows\":{}}}", n);
+        println!("{}", jsonout::line(&jsonout::Count { rows: n }));
     } else {
         println!("{}", n);
     }
@@ -601,12 +599,14 @@ fn footer(file: &Path, json: bool) -> std::io::Result<()> {
     let magic = std::str::from_utf8(&MAGIC).unwrap_or("MOSA");
     if json {
         println!(
-            "{{\"magic\":{},\"version\":{},\"buckets\":{},\"row_groups\":{},\"compression\":{}}}",
-            fmt::json_str(magic),
-            VERSION,
-            s.num_buckets,
-            reader.num_row_groups(),
-            fmt::json_str(comp)
+            "{}",
+            jsonout::line(&jsonout::Footer {
+                magic: magic.to_string(),
+                version: VERSION as u32,
+                buckets: s.num_buckets,
+                row_groups: reader.num_row_groups(),
+                compression: comp.to_string(),
+            })
         );
     } else {
         println!(
@@ -655,21 +655,20 @@ fn column_size(file: &Path, columns: Option<String>, json: bool) -> std::io::Res
     let comp: usize = cols.iter().map(|&i| bytes[i]).sum();
     let any_approx = cols.iter().any(|&i| approx[i]);
     if json {
-        let items: Vec<String> = cols
+        let columns = cols
             .iter()
-            .map(|&i| {
-                format!(
-                    "{{\"column\":{},\"bytes\":{},\"approximate\":{}}}",
-                    fmt::json_str(&s.columns[i].name),
-                    bytes[i],
-                    approx[i]
-                )
+            .map(|&i| jsonout::ColumnBytes {
+                column: s.columns[i].name.clone(),
+                bytes: bytes[i],
+                approximate: approx[i],
             })
             .collect();
         println!(
-            "{{\"columns\":[{}],\"total_bytes\":{}}}",
-            items.join(","),
-            comp
+            "{}",
+            jsonout::line(&jsonout::ColumnSize {
+                columns,
+                total_bytes: comp,
+            })
         );
     } else {
         for i in cols {
@@ -707,23 +706,20 @@ fn dictionary(file: &Path, column: &str, json: bool) -> std::io::Result<()> {
             )
         })?;
     if json {
-        let mut rgs = Vec::new();
+        let mut row_groups = Vec::new();
         for rg in 0..reader.num_row_groups() {
-            match reader.dictionary(rg, col)? {
-                Some(vals) => {
-                    let e: Vec<String> = vals
-                        .iter()
-                        .map(|v| fmt::json_str(&fmt::render_json(v)))
-                        .collect();
-                    rgs.push(format!("[{}]", e.join(",")));
-                }
-                None => rgs.push("null".to_string()),
-            }
+            row_groups.push(
+                reader
+                    .dictionary(rg, col)?
+                    .map(|vals| vals.iter().map(fmt::render_json).collect()),
+            );
         }
         println!(
-            "{{\"column\":{},\"row_groups\":[{}]}}",
-            fmt::json_str(column),
-            rgs.join(",")
+            "{}",
+            jsonout::line(&jsonout::Dictionary {
+                column: column.to_string(),
+                row_groups,
+            })
         );
         return Ok(());
     }
@@ -749,11 +745,17 @@ fn buckets(file: &Path, json: bool) -> std::io::Result<()> {
     for rg in 0..reader.num_row_groups() {
         let infos = reader.bucket_infos(rg)?;
         if json {
-            let items: Vec<String> = infos.iter().map(|b| {
-                let cols: Vec<String> = b.columns.iter().map(|&i| fmt::json_str(&name(i))).collect();
-                format!("{{\"bucket\":{},\"kind\":{},\"size\":{},\"uncompressed\":{},\"columns\":[{}]}}", b.bucket, fmt::json_str(fmt::bucket_kind(b.kind)), b.size, b.uncompressed, cols.join(","))
-            }).collect();
-            rgs.push(format!("[{}]", items.join(",")));
+            let items = infos
+                .iter()
+                .map(|b| jsonout::Bucket {
+                    bucket: b.bucket,
+                    kind: fmt::bucket_kind(b.kind).to_string(),
+                    size: b.size,
+                    uncompressed: b.uncompressed,
+                    columns: b.columns.iter().map(|&i| name(i)).collect(),
+                })
+                .collect();
+            rgs.push(items);
         } else {
             println!("row group {rg}:");
             for b in &infos {
@@ -770,7 +772,7 @@ fn buckets(file: &Path, json: bool) -> std::io::Result<()> {
         }
     }
     if json {
-        println!("{{\"row_groups\":[{}]}}", rgs.join(","));
+        println!("{}", jsonout::line(&jsonout::Buckets { row_groups: rgs }));
     }
     Ok(())
 }

@@ -111,25 +111,6 @@ pub fn ratio(compressed: usize, uncompressed: usize) -> String {
     )
 }
 
-/// Escape a string as a JSON string literal (quotes included).
-pub fn json_str(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    o.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\r' => o.push_str("\\r"),
-            '\t' => o.push_str("\\t"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o.push('"');
-    o
-}
-
 /// Pretty-print a slice of record batches as an aligned ASCII table.
 pub fn pretty_table(batches: &[RecordBatch], max_rows: usize) -> String {
     if batches.is_empty() {
@@ -270,12 +251,6 @@ mod tests {
             ],
         )
         .unwrap()
-    }
-
-    #[test]
-    fn json_str_escapes() {
-        assert_eq!(json_str("a\"b\n"), "\"a\\\"b\\n\"");
-        assert_eq!(json_str("x"), "\"x\"");
     }
 
     #[test]
