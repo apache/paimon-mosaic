@@ -216,12 +216,16 @@ fn cell(arr: &dyn Array, row: usize) -> String {
         Float32 => d!(Float32Array),
         Float64 => d!(Float64Array),
         Date32 => d!(Date32Array),
+        // Strip control chars so a crafted file can't inject ANSI escapes into
+        // the inspector's terminal; the JSON path is escaped by the writer.
         Utf8 => arr
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap()
             .value(row)
-            .to_string(),
+            .chars()
+            .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+            .collect(),
         // Text rendering for types cat doesn't format yet — show the type, not "?".
         other => format!("<{other:?}>"),
     }
@@ -491,5 +495,20 @@ mod tests {
         assert!(t.contains("| id "));
         assert!(t.contains("| 1  "));
         assert!(!t.contains("| 2 "));
+    }
+
+    #[test]
+    fn pretty_table_strips_control_chars() {
+        let schema = Schema::new(vec![Field::new("name", DataType::Utf8, false)]);
+        let b = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(StringArray::from(vec!["\x1b[31mred"]))],
+        )
+        .unwrap();
+        let t = pretty_table(&[b], 1);
+        assert!(
+            !t.contains('\x1b'),
+            "ANSI escape must not reach the terminal: {t:?}"
+        );
     }
 }
