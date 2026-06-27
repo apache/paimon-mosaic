@@ -249,19 +249,54 @@ fn col_formatter(arr: &dyn Array) -> Box<dyn Fn(usize) -> String + '_> {
     }
 }
 
+/// Comparison operator for a `--where` filter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
+
+impl Op {
+    /// The source token, for error messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Op::Eq => "=",
+            Op::Ne => "!=",
+            Op::Gt => ">",
+            Op::Ge => ">=",
+            Op::Lt => "<",
+            Op::Le => "<=",
+        }
+    }
+    fn ordered(self) -> bool {
+        matches!(self, Op::Gt | Op::Ge | Op::Lt | Op::Le)
+    }
+}
+
 /// A single `column op value` filter. Ops: `=` `!=` `>` `>=` `<` `<=`.
 pub struct Where {
     pub column: String,
-    pub op: &'static str,
+    pub op: Op,
     pub value: String,
 }
 
 /// Parse one condition like `id>100` or `kind=a`. Longest operators first.
 pub fn parse_where(s: &str) -> Result<Where, String> {
-    for op in [">=", "<=", "!=", "=", ">", "<"] {
-        if let Some(i) = s.find(op) {
+    for (tok, op) in [
+        (">=", Op::Ge),
+        ("<=", Op::Le),
+        ("!=", Op::Ne),
+        ("=", Op::Eq),
+        (">", Op::Gt),
+        ("<", Op::Lt),
+    ] {
+        if let Some(i) = s.find(tok) {
             let column = s[..i].trim().to_string();
-            let value = s[i + op.len()..].trim().to_string();
+            let value = s[i + tok.len()..].trim().to_string();
             if column.is_empty() || value.is_empty() {
                 return Err(format!("bad --where: {s}"));
             }
@@ -284,12 +319,15 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
     let boolean = matches!(col.data_type(), Boolean);
     // Integer columns compare in i128 (exact for full i64 range); float columns
     // in f64; everything else as exact strings. Ordering is numeric-only.
-    if matches!(w.op, ">" | ">=" | "<" | "<=")
+    if w.op.ordered()
         && !((int && w.value.parse::<i128>().is_ok()) || (float && w.value.parse::<f64>().is_ok()))
     {
         return Err(format!(
             "--where: '{}' needs a numeric column and value (got '{}' {} '{}')",
-            w.op, w.column, w.op, w.value
+            w.op.as_str(),
+            w.column,
+            w.op.as_str(),
+            w.value
         ));
     }
     // Downcast the column once and compare per row directly, instead of
@@ -311,7 +349,7 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
     }
     let mask: Vec<bool> = if int {
         let Ok(rhs) = w.value.parse::<i128>() else {
-            return finish(batch, no_match(w.op == "!="));
+            return finish(batch, no_match(w.op == Op::Ne));
         };
         let at: Box<dyn Fn(usize) -> i128 + '_> = match col.data_type() {
             Int8 => d!(Int8Array, v, r => v.value(r) as i128),
@@ -325,7 +363,7 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
             .collect()
     } else if float {
         let Ok(rhs) = w.value.parse::<f64>() else {
-            return finish(batch, no_match(w.op == "!="));
+            return finish(batch, no_match(w.op == Op::Ne));
         };
         // Parse the RHS at the column's own precision so an f32 cell compares
         // against an f32-rounded value (stored 0.1f32 == "0.1", not the f64 0.1).
@@ -355,8 +393,8 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
             .map(|r| {
                 row_ok(r)
                     && match w.op {
-                        "=" => a.value(r) == rhs,
-                        "!=" => a.value(r) != rhs,
+                        Op::Eq => a.value(r) == rhs,
+                        Op::Ne => a.value(r) != rhs,
                         _ => false,
                     }
             })
@@ -366,8 +404,8 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
             .map(|r| {
                 row_ok(r)
                     && match w.op {
-                        "=" => a.value(r) == w.value,
-                        "!=" => a.value(r) != w.value,
+                        Op::Eq => a.value(r) == w.value,
+                        Op::Ne => a.value(r) != w.value,
                         _ => false,
                     }
             })
@@ -391,15 +429,14 @@ fn finish(batch: &RecordBatch, mask: Vec<bool>) -> Result<RecordBatch, String> {
 }
 
 /// Apply a comparison operator to any ordered pair.
-fn cmp_op<T: PartialOrd>(op: &str, a: &T, b: &T) -> bool {
+fn cmp_op<T: PartialOrd>(op: Op, a: &T, b: &T) -> bool {
     match op {
-        "=" => a == b,
-        "!=" => a != b,
-        ">" => a > b,
-        ">=" => a >= b,
-        "<" => a < b,
-        "<=" => a <= b,
-        _ => false,
+        Op::Eq => a == b,
+        Op::Ne => a != b,
+        Op::Gt => a > b,
+        Op::Ge => a >= b,
+        Op::Lt => a < b,
+        Op::Le => a <= b,
     }
 }
 
@@ -452,14 +489,14 @@ pub fn stats_exclude(w: &Where, min: &Option<Value>, max: &Option<Value>) -> boo
     false
 }
 
-fn excl<T: PartialOrd>(op: &str, lo: T, hi: T, v: T) -> bool {
+fn excl<T: PartialOrd>(op: Op, lo: T, hi: T, v: T) -> bool {
     match op {
-        ">" => hi <= v,
-        ">=" => hi < v,
-        "<" => lo >= v,
-        "<=" => lo > v,
-        "=" => v < lo || v > hi,
-        _ => false,
+        Op::Gt => hi <= v,
+        Op::Ge => hi < v,
+        Op::Lt => lo >= v,
+        Op::Le => lo > v,
+        Op::Eq => v < lo || v > hi,
+        Op::Ne => false,
     }
 }
 
