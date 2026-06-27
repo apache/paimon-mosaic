@@ -39,12 +39,16 @@ const COALESCE_MAX_RANGE: u64 = 32 * 1024 * 1024;
 /// declaring gigabytes). The floor keeps tiny-but-genuine blocks working.
 const MAX_DECOMPRESS_RATIO: usize = 65536;
 const MIN_DECOMPRESS_CAP: usize = 1024 * 1024;
+/// Absolute ceiling so the ratio alone can't authorize a giant pre-alloc: a ~1
+/// MiB block would otherwise be allowed 64 GiB. A single decompressed slot/page
+/// is far below this, so it bounds the worst case without rejecting real data.
+const MAX_DECOMPRESS_CAP: usize = 512 * 1024 * 1024;
 
 fn decompress_zstd(compressed: &[u8], uncompressed_size: usize) -> io::Result<Vec<u8>> {
     let cap = compressed
         .len()
         .saturating_mul(MAX_DECOMPRESS_RATIO)
-        .max(MIN_DECOMPRESS_CAP);
+        .clamp(MIN_DECOMPRESS_CAP, MAX_DECOMPRESS_CAP);
     if uncompressed_size > cap {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

@@ -4243,6 +4243,15 @@ fn decompress_zstd_caps_forged_size() {
     // The floor keeps small-but-genuine blocks (1 byte -> ~64KB) working.
     let small = zstd::bulk::compress(&vec![0u8; 64 * 1024], 3).unwrap();
     assert_eq!(decompress_zstd(&small, 64 * 1024).unwrap().len(), 64 * 1024);
+    // Absolute ceiling: a ~16KB incompressible block would pass the 65536x ratio
+    // (1 GiB) but must still be rejected by the 512 MiB hard cap.
+    let big: Vec<u8> = (0..256 * 1024usize)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    let blob2 = zstd::bulk::compress(&big, 3).unwrap();
+    assert!(blob2.len() * MAX_DECOMPRESS_RATIO > MAX_DECOMPRESS_CAP);
+    let err = decompress_zstd(&blob2, 600 * 1024 * 1024).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 }
 
 // A paged bucket containing an ARRAY column stores its child slots after the
