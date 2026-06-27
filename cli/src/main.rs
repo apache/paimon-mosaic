@@ -567,15 +567,21 @@ fn cat(
                 .project(&keep)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
-        got += batch.num_rows();
-        batches.push(batch);
-    }
-    if batches.iter().all(|b| b.num_rows() == 0) {
-        if !json {
-            println!("(no rows)");
+        let batch_rows = batch.num_rows();
+        // JSON rows are independent, so stream each group out instead of holding
+        // every batch — `cat --json` on a huge file stays bounded. The table path
+        // must buffer: column widths need all rows before the first line prints.
+        if json {
+            print!("{}", fmt::ndjson(&[batch], num - got)?);
+        } else {
+            batches.push(batch);
         }
-    } else if json {
-        print!("{}", fmt::ndjson(&batches, num)?);
+        got += batch_rows;
+    }
+    if json {
+        // (no rows) stays silent for JSON; nothing to print.
+    } else if batches.iter().all(|b| b.num_rows() == 0) {
+        println!("(no rows)");
     } else {
         print!("{}", fmt::pretty_table(&batches, num));
     }
