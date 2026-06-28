@@ -87,14 +87,15 @@ pub fn encoding_name(e: paimon_mosaic_core::reader::Encoding) -> String {
     }
 }
 
-/// Human-readable bucket kind name.
-pub fn bucket_kind(k: paimon_mosaic_core::reader::BucketKind) -> &'static str {
+/// Human-readable bucket kind name. Returns `String` to match [`encoding_name`]
+/// (whose `enc{c}` fallback needs an allocation), so callers handle one type.
+pub fn bucket_kind(k: paimon_mosaic_core::reader::BucketKind) -> String {
     use paimon_mosaic_core::reader::BucketKind::*;
     match k {
-        Empty => "empty",
-        Monolithic => "monolithic",
-        Paged => "paged",
-        _ => "unknown",
+        Empty => "empty".into(),
+        Monolithic => "monolithic".into(),
+        Paged => "paged".into(),
+        _ => "unknown".into(),
     }
 }
 

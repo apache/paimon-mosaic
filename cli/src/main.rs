@@ -233,6 +233,11 @@ fn col_filter(
     Ok(Some(set))
 }
 
+/// True when `name` is selected by a `-c` set (`None` = all columns).
+fn selected(want: &Option<std::collections::HashSet<String>>, name: &str) -> bool {
+    want.as_ref().is_none_or(|w| w.contains(name))
+}
+
 /// Add `total` across `cols`, distributing the remainder so the parts sum exactly.
 fn split_evenly(total: usize, cols: &[usize], acc: &mut [usize]) {
     if cols.is_empty() {
@@ -372,10 +377,7 @@ fn pages(file: &Path, columns: Option<String>, json: bool) -> std::io::Result<()
             let pgs = reader
                 .page_infos(rg)?
                 .iter()
-                .filter(|p| {
-                    want.as_ref()
-                        .is_none_or(|w| w.contains(&s.columns[p.column_index].name))
-                })
+                .filter(|p| selected(&want, &s.columns[p.column_index].name))
                 .map(|p| jsonout::Page {
                     column: s.columns[p.column_index].name.clone(),
                     bucket: p.bucket,
@@ -392,7 +394,7 @@ fn pages(file: &Path, columns: Option<String>, json: bool) -> std::io::Result<()
         println!("row group {rg}:");
         for p in reader.page_infos(rg)? {
             let c = &s.columns[p.column_index];
-            if want.as_ref().is_some_and(|w| !w.contains(&c.name)) {
+            if !selected(&want, &c.name) {
                 continue;
             }
             println!(
@@ -441,21 +443,23 @@ fn convert(
     );
     // Infer schema, then build a batch iterator — CSV (header) or JSON (one object per line).
     type Batches = Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>>>;
+    // Schema inference and the data reader each need their own pass over the
+    // file (inference consumes a reader), so open it twice via one helper.
+    let open = || -> std::io::Result<_> { Ok(std::io::BufReader::new(std::fs::File::open(input)?)) };
     let (schema, reader): (arrow::datatypes::Schema, Batches) = if is_json {
-        let mut r = std::io::BufReader::new(std::fs::File::open(input)?);
-        let (schema, _) = arrow::json::reader::infer_json_schema(&mut r, None).map_err(bad)?;
+        let (schema, _) = arrow::json::reader::infer_json_schema(&mut open()?, None).map_err(bad)?;
         let rd = arrow::json::ReaderBuilder::new(std::sync::Arc::new(schema.clone()))
-            .build(std::io::BufReader::new(std::fs::File::open(input)?))
+            .build(open()?)
             .map_err(bad)?;
         (schema, Box::new(rd))
     } else {
         let (schema, _) = arrow::csv::reader::Format::default()
             .with_header(true)
-            .infer_schema(std::io::BufReader::new(std::fs::File::open(input)?), None)
+            .infer_schema(open()?, None)
             .map_err(bad)?;
         let rd = arrow::csv::ReaderBuilder::new(std::sync::Arc::new(schema.clone()))
             .with_header(true)
-            .build(std::io::BufReader::new(std::fs::File::open(input)?))
+            .build(open()?)
             .map_err(bad)?;
         (schema, Box::new(rd))
     };
@@ -650,7 +654,7 @@ fn column_size(file: &Path, columns: Option<String>, json: bool) -> std::io::Res
     }
     let cols: Vec<usize> = original_order(s)
         .into_iter()
-        .filter(|&i| want.as_ref().is_none_or(|w| w.contains(&s.columns[i].name)))
+        .filter(|&i| selected(&want, &s.columns[i].name))
         .collect();
     let comp: usize = cols.iter().map(|&i| bytes[i]).sum();
     let any_approx = cols.iter().any(|&i| approx[i]);
@@ -749,7 +753,7 @@ fn buckets(file: &Path, json: bool) -> std::io::Result<()> {
                 .iter()
                 .map(|b| jsonout::Bucket {
                     bucket: b.bucket,
-                    kind: fmt::bucket_kind(b.kind).to_string(),
+                    kind: fmt::bucket_kind(b.kind),
                     size: b.size,
                     uncompressed: b.uncompressed,
                     columns: b.columns.iter().map(|&i| name(i)).collect(),
