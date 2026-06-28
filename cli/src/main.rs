@@ -17,8 +17,8 @@
 
 mod filter;
 mod fmt;
-mod jsonout;
 mod input;
+mod jsonout;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -289,7 +289,10 @@ fn schema(file: &Path, json: bool) -> std::io::Result<()> {
         let null = if c.nullable { "" } else { " not null" };
         println!(
             "  {}: {:?}{} [bucket {}]",
-            fmt::safe(&c.name), c.data_type, null, c.bucket_id
+            fmt::safe(&c.name),
+            c.data_type,
+            null,
+            c.bucket_id
         );
     }
     Ok(())
@@ -359,7 +362,9 @@ fn meta(file: &Path, json: bool) -> std::io::Result<()> {
             };
             println!(
                 "    {}: nulls={} {}",
-                fmt::safe(&s.columns[st.column_index].name), st.null_count, mm
+                fmt::safe(&s.columns[st.column_index].name),
+                st.null_count,
+                mm
             );
         }
     }
@@ -445,9 +450,11 @@ fn convert(
     type Batches = Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>>>;
     // Schema inference and the data reader each need their own pass over the
     // file (inference consumes a reader), so open it twice via one helper.
-    let open = || -> std::io::Result<_> { Ok(std::io::BufReader::new(std::fs::File::open(input)?)) };
+    let open =
+        || -> std::io::Result<_> { Ok(std::io::BufReader::new(std::fs::File::open(input)?)) };
     let (schema, reader): (arrow::datatypes::Schema, Batches) = if is_json {
-        let (schema, _) = arrow::json::reader::infer_json_schema(&mut open()?, None).map_err(bad)?;
+        let (schema, _) =
+            arrow::json::reader::infer_json_schema(&mut open()?, None).map_err(bad)?;
         let rd = arrow::json::ReaderBuilder::new(std::sync::Arc::new(schema.clone()))
             .build(open()?)
             .map_err(bad)?;

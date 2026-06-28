@@ -704,7 +704,11 @@ impl<I: InputFile> MosaicReader<I> {
         b: usize,
         offset: u64,
         total_size: usize,
-    ) -> io::Result<(usize, Vec<usize>, Vec<crate::bucket_writer::ChildColumnMeta>)> {
+    ) -> io::Result<(
+        usize,
+        Vec<usize>,
+        Vec<crate::bucket_writer::ChildColumnMeta>,
+    )> {
         let refs: Vec<&DataType> = self.schema.bucket_to_global[b]
             .iter()
             .map(|&gi| &self.schema.columns[gi].data_type)

@@ -207,7 +207,13 @@ fn col_formatter(arr: &dyn Array) -> Box<dyn Fn(usize) -> String + '_> {
     macro_rules! d {
         ($ty:ty) => {{
             let a = arr.as_any().downcast_ref::<$ty>().unwrap();
-            Box::new(move |r| if a.is_null(r) { String::new() } else { a.value(r).to_string() })
+            Box::new(move |r| {
+                if a.is_null(r) {
+                    String::new()
+                } else {
+                    a.value(r).to_string()
+                }
+            })
         }};
     }
     match arr.data_type() {
@@ -221,16 +227,27 @@ fn col_formatter(arr: &dyn Array) -> Box<dyn Fn(usize) -> String + '_> {
         Date32 => d!(Date32Array),
         Utf8 => {
             let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
-            Box::new(move |r| if a.is_null(r) { String::new() } else { safe(a.value(r)) })
+            Box::new(move |r| {
+                if a.is_null(r) {
+                    String::new()
+                } else {
+                    safe(a.value(r))
+                }
+            })
         }
         // Text rendering for types cat doesn't format yet — show the type, not "?".
         other => {
             let t = format!("<{other:?}>");
-            Box::new(move |r| if arr.is_null(r) { String::new() } else { t.clone() })
+            Box::new(move |r| {
+                if arr.is_null(r) {
+                    String::new()
+                } else {
+                    t.clone()
+                }
+            })
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

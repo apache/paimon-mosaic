@@ -139,7 +139,10 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
         // Parse the RHS at the column's own precision so an f32 cell compares
         // against an f32-rounded value (stored 0.1f32 == "0.1", not the f64 0.1).
         let (rhs, at): (f64, Box<dyn Fn(usize) -> f64 + '_>) = match col.data_type() {
-            Float32 => (rhs as f32 as f64, d!(Float32Array, v, r => v.value(r) as f64)),
+            Float32 => (
+                rhs as f32 as f64,
+                d!(Float32Array, v, r => v.value(r) as f64),
+            ),
             _ => (rhs, d!(Float64Array, v, r => v.value(r))),
         };
         (0..n)
