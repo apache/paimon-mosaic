@@ -60,10 +60,10 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Print rows as a table (default: first 10; use --all to scan all).
+    /// Print rows as a table (default: all rows; use -n to limit).
     Cat {
         file: PathBuf,
-        /// Limit to N rows (default: 10).
+        /// Limit to N rows.
         #[arg(short = 'n', long)]
         num: Option<usize>,
         /// Print every row.
@@ -161,7 +161,11 @@ fn main() -> ExitCode {
             json,
         } => cat(
             &file,
-            if all { usize::MAX } else { num.unwrap_or(10) },
+            if all {
+                usize::MAX
+            } else {
+                num.unwrap_or(usize::MAX)
+            },
             columns,
             r#where,
             json,

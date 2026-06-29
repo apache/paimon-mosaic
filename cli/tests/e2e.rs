@@ -121,10 +121,14 @@ fn cat_truncates_and_projects() {
 }
 
 #[test]
-fn head_is_alias_of_cat() {
-    let f = fixture("headalias");
-    let (out, _, ok) = run(&["head", &f, "-n", "1"]);
-    assert!(ok && out.contains("| id | kind | flag |"));
+fn head_defaults_to_preview_rows_and_num_overrides() {
+    let f = fixture("head");
+    let (out, _, ok) = run(&["head", &f, "--json"]);
+    assert!(ok);
+    assert_eq!(out.lines().count(), 10);
+    let (limited, _, ok) = run(&["head", &f, "-n", "1", "--json"]);
+    assert!(ok);
+    assert_eq!(limited.lines().count(), 1);
 }
 
 #[test]
@@ -146,14 +150,17 @@ fn count_reports_total() {
 }
 
 #[test]
-fn cat_all_overrides_limit() {
+fn cat_defaults_to_all_rows_and_num_limits() {
     let f = fixture("all");
-    let (limited, _, ok) = run(&["cat", &f, "--json"]);
+    let (out, _, ok) = run(&["cat", &f, "--json"]);
     assert!(ok);
-    assert_eq!(limited.lines().count(), 10); // parquet-cli style default preview
-    let (out, _, ok) = run(&["cat", &f, "--all", "--json"]);
+    assert_eq!(out.lines().count(), 200); // cat scans all rows by default
+    let (limited, _, ok) = run(&["cat", &f, "-n", "10", "--json"]);
     assert!(ok);
-    assert_eq!(out.lines().count(), 200); // every row only when explicitly scanning
+    assert_eq!(limited.lines().count(), 10);
+    let (explicit_all, _, ok) = run(&["cat", &f, "--all", "--json"]);
+    assert!(ok);
+    assert_eq!(explicit_all.lines().count(), 200); // --all remains an explicit no-limit option
 }
 
 #[test]

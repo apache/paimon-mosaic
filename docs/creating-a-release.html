@@ -176,7 +176,7 @@ python3 tools/dependencies.py check
 # Generate DEPENDENCIES.rust.tsv
 python3 tools/dependencies.py generate
 
-git add DEPENDENCIES.rust.tsv core/DEPENDENCIES.rust.tsv ffi/DEPENDENCIES.rust.tsv jni/DEPENDENCIES.rust.tsv
+git add DEPENDENCIES.rust.tsv core/DEPENDENCIES.rust.tsv ffi/DEPENDENCIES.rust.tsv jni/DEPENDENCIES.rust.tsv cli/DEPENDENCIES.rust.tsv
 git commit -m "chore: update dependency list for release ${RELEASE_VERSION}"
 git push origin main</code></pre>
             <p>Fix any license violations before proceeding. The generated files must be committed before tagging because <code>create_source_release.sh</code> builds the archive from the committed Git tree.</p>
