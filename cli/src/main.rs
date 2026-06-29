@@ -483,9 +483,14 @@ fn convert(
         stats_columns: stats.map(|s| parse_comma_list(&s)).unwrap_or_default(),
         ..Default::default()
     };
-    // Write to a temp file and rename on success, so a mid-stream failure never
-    // leaves a truncated .mosaic in place.
-    let tmp = out.with_extension("mosaic.tmp");
+    // Write to a unique sibling temp file and rename on success, so a mid-stream
+    // failure never leaves a truncated .mosaic — and a process-unique suffix
+    // avoids clobbering an unrelated `out.mosaic.tmp` the user may already have.
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = out.with_extension(format!("mosaic.{}.{uniq}.tmp", std::process::id()));
     let mut rows = 0;
     let res = (|| {
         let sink = paimon_mosaic_core::writer::FileSink::create(&tmp)?;
@@ -749,6 +754,19 @@ fn dictionary(file: &Path, column: &str, json: bool) -> std::io::Result<()> {
                 format!("column '{column}' not found"),
             )
         })?;
+    // For nested columns the first physical slot is the ARRAY/MAP length column,
+    // not the logical values — its dictionary would mislead. parquet-cli only
+    // resolves primitive leaves, so reject List/Map here rather than print junk.
+    use arrow::datatypes::DataType;
+    if matches!(
+        reader.schema().columns[col].data_type,
+        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _)
+    ) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("dictionary: column '{column}' is nested; only primitive columns supported"),
+        ));
+    }
     if json {
         let mut row_groups = Vec::new();
         for rg in 0..reader.num_row_groups() {
