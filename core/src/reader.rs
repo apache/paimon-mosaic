@@ -780,6 +780,15 @@ impl<I: InputFile> MosaicReader<I> {
             2 + children.len() * 4
         };
         let dir_size = hdr_len + nphys * 4;
+        if dir_size > total_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "paged bucket {}: directory size {} exceeds total size {}",
+                    b, dir_size, total_size
+                ),
+            ));
+        }
         let dir = read_range(&self.input, offset, dir_size)?;
         let sizes = Self::paged_slot_sizes(&dir[hdr_len..], nphys);
         Self::validate_paged_total(b, dir_size, &sizes, total_size)?;

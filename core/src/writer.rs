@@ -74,8 +74,9 @@ impl FileSink {
 impl OutputFile for FileSink {
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
         use io::Write;
+        self.f.write_all(data)?;
         self.pos += data.len() as u64;
-        self.f.write_all(data)
+        Ok(())
     }
     fn flush(&mut self) -> io::Result<()> {
         use io::Write;
