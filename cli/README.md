@@ -44,8 +44,8 @@ All inspection and query commands accept `--json`; `convert` writes a file.
 | `buckets` | per-bucket layout, member columns, ratio | footer + index |
 | `pages` | per-column encoding + on-disk slot size | bucket data |
 | `dictionary` | dictionary entries of a dict column | bucket data |
-| `column-size` | bytes per column + total compression ratio | footer + index |
-| `cat` | all rows as a table (`-n` to limit) | column data |
+| `column-size` | bytes per column, exact for paged slots and approximate for shared monolithic buckets | footer + index + paged directories |
+| `cat` | first rows as a table (`-n` to limit, `--all` to scan all) | column data |
 | `head` | first N rows (default 10) | column data |
 | `count` | total row count | footer + index |
 | `convert` | import CSV or JSON into a new file | writes file |
@@ -77,10 +77,11 @@ row group 0:
 
 ## Query
 
-`cat` shows all rows (`-n` to limit); `head` shows 10 by default. Both take
-`-c a,b` (projection), `pages`/`column-size` take `-c` too, and
-`--where "col op val"` (one condition: `=` `!=` `>` `>=` `<` `<=`; integers and
-floats compare exactly, so `=0.3` only matches a stored 0.3).
+`cat` shows the first 10 rows by default (`-n` to limit, `--all` to scan all);
+`head` shows 10 by default. Both take `-c a,b` (projection),
+`pages`/`column-size` take `-c` too, and `--where "col op val"` (one condition:
+`=` `!=` `>` `>=` `<` `<=`; integers and floats compare exactly, so `=0.3`
+only matches a stored 0.3; Date32 accepts epoch-day or `YYYY-MM-DD`).
 
 ```text
 $ mosaic count data.mosaic
@@ -91,6 +92,7 @@ $ mosaic cat data.mosaic -n 2 --json
 {"id":1,"name":"user_1","kind":"b","flag":7}
 
 $ mosaic cat data.mosaic --where "id>100" -c id,kind
+$ mosaic cat data.mosaic --all --json
 ```
 
 ## Convert

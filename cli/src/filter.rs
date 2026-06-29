@@ -91,7 +91,8 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
     // Integer columns compare in i128 (exact for full i64 range); float columns
     // in f64; everything else as exact strings. Ordering is numeric-only.
     if w.op.ordered()
-        && !((int && w.value.parse::<i128>().is_ok()) || (float && w.value.parse::<f64>().is_ok()))
+        && !((int && parse_int_rhs(col.data_type(), &w.value).is_some())
+            || (float && w.value.parse::<f64>().is_ok()))
     {
         return Err(format!(
             "--where: '{}' needs a numeric column and value (got '{}' {} '{}')",
@@ -119,7 +120,7 @@ pub fn apply_where(batch: &RecordBatch, w: &Where) -> Result<RecordBatch, String
         }};
     }
     let mask: Vec<bool> = if int {
-        let Ok(rhs) = w.value.parse::<i128>() else {
+        let Some(rhs) = parse_int_rhs(col.data_type(), &w.value) else {
             return finish(batch, no_match(w.op == Op::Ne));
         };
         let at: Box<dyn Fn(usize) -> i128 + '_> = match col.data_type() {
@@ -224,6 +225,55 @@ fn to_i128(v: &Value) -> Option<i128> {
     }
 }
 
+/// Parse an integer-like filter literal for the column type. `Date32` accepts
+/// both epoch-day integers and ISO dates (`YYYY-MM-DD`) to match Arrow JSON.
+fn parse_int_rhs(dt: &arrow::datatypes::DataType, value: &str) -> Option<i128> {
+    if matches!(dt, arrow::datatypes::DataType::Date32) {
+        parse_date32(value).map(i128::from)
+    } else {
+        value.parse::<i128>().ok()
+    }
+}
+
+fn parse_date32(value: &str) -> Option<i32> {
+    if let Ok(days) = value.parse::<i32>() {
+        return Some(days);
+    }
+    let mut parts = value.split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next()?.parse::<u32>().ok()?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() || !valid_ymd(year, month, day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
+fn valid_ymd(year: i32, month: u32, day: u32) -> bool {
+    let mdays = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=mdays).contains(&day)
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
+    let year = year - if month <= 2 { 1 } else { 0 };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = month as i32;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day as i32 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
 /// Float value of a stats [`Value`], or `None` for non-numeric types.
 fn to_f64(v: &Value) -> Option<f64> {
     use Value::*;
@@ -243,8 +293,14 @@ pub fn stats_exclude(w: &Where, min: &Option<Value>, max: &Option<Value>) -> boo
     };
     // Integer columns: compare exactly in i128. Float columns: f64. Excluded
     // when the value lies strictly outside [lo, hi] for the operator.
-    if let (Some(lo), Some(hi), Ok(v)) = (to_i128(min), to_i128(max), w.value.parse::<i128>()) {
-        return excl(w.op, lo, hi, v);
+    if let (Some(lo), Some(hi)) = (to_i128(min), to_i128(max)) {
+        let v = match min {
+            Value::Date(_) => parse_date32(&w.value).map(i128::from),
+            _ => w.value.parse::<i128>().ok(),
+        };
+        if let Some(v) = v {
+            return excl(w.op, lo, hi, v);
+        }
     }
     if let (Some(lo), Some(hi)) = (to_f64(min), to_f64(max)) {
         // Round the RHS to the stat's own width so the bound matches apply_where:
@@ -289,5 +345,19 @@ mod tests {
         .unwrap();
         let w = parse_where("v<1e40").unwrap();
         assert_eq!(apply_where(&b, &w).unwrap().num_rows(), 2);
+    }
+
+    #[test]
+    fn where_date32_accepts_iso_literal() {
+        let schema = Schema::new(vec![Field::new("d", DataType::Date32, false)]);
+        let b = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(arrow::array::Date32Array::from(vec![
+                18_262, 18_628,
+            ]))],
+        )
+        .unwrap();
+        let w = parse_where("d>=2021-01-01").unwrap();
+        assert_eq!(apply_where(&b, &w).unwrap().num_rows(), 1);
     }
 }

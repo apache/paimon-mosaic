@@ -42,7 +42,7 @@ const MIN_DECOMPRESS_CAP: usize = 1024 * 1024;
 /// Absolute ceiling so the ratio alone can't authorize a giant pre-alloc: a ~1
 /// MiB block would otherwise be allowed 64 GiB. A single decompressed slot/page
 /// is far below this, so it bounds the worst case without rejecting real data.
-const MAX_DECOMPRESS_CAP: usize = 512 * 1024 * 1024;
+const MAX_DECOMPRESS_CAP: usize = MAX_ZSTD_DECOMPRESS_BLOCK_SIZE;
 
 fn decompress_zstd(compressed: &[u8], uncompressed_size: usize) -> io::Result<Vec<u8>> {
     let cap = compressed
@@ -583,19 +583,79 @@ impl<I: InputFile> MosaicReader<I> {
     /// slot size. Reads and decompresses each non-empty bucket; used by tooling
     /// (the `pages` command). Columns are reported in global (name-sorted) order.
     pub fn page_infos(&self, rg_index: usize) -> io::Result<Vec<PageInfo>> {
+        let columns: Vec<usize> = (0..self.schema.columns.len()).collect();
+        self.page_infos_projected(rg_index, &columns)
+    }
+
+    /// Like [`Self::page_infos_projected`], but selects columns by name so callers
+    /// do not need to depend on Mosaic's internal name-sorted column indices.
+    pub fn page_infos_by_names(
+        &self,
+        rg_index: usize,
+        column_names: &[&str],
+    ) -> io::Result<Vec<PageInfo>> {
+        let mut indices = Vec::with_capacity(column_names.len());
+        for name in column_names {
+            let idx = self
+                .schema
+                .columns
+                .iter()
+                .position(|c| c.name == *name)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("column '{}' not found in schema", name),
+                    )
+                })?;
+            indices.push(idx);
+        }
+        self.page_infos_projected(rg_index, &indices)
+    }
+
+    /// Like [`Self::page_infos`], but only inspects the requested logical
+    /// columns. Paged buckets read only the directory and selected primary
+    /// slots; nested child slot bytes are attributed to the logical parent.
+    pub fn page_infos_projected(
+        &self,
+        rg_index: usize,
+        columns: &[usize],
+    ) -> io::Result<Vec<PageInfo>> {
         if rg_index >= self.row_group_metas.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "row group index out of range",
             ));
         }
+        let mut projected = vec![false; self.schema.columns.len()];
+        for &c in columns {
+            if c >= self.schema.columns.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "projected column index {} out of range (num_columns={})",
+                        c,
+                        self.schema.columns.len()
+                    ),
+                ));
+            }
+            projected[c] = true;
+        }
+
         let meta = &self.row_group_metas[rg_index];
-        let mut out = Vec::with_capacity(self.schema.columns.len());
+        let mut out = Vec::with_capacity(columns.len());
         for b in 0..self.num_buckets {
             let globals = &self.schema.bucket_to_global[b];
+            let selected: Vec<(usize, usize)> = globals
+                .iter()
+                .enumerate()
+                .filter_map(|(local, &gi)| projected[gi].then_some((local, gi)))
+                .collect();
+            if selected.is_empty() {
+                continue;
+            }
             match meta.bucket_layouts[b] {
                 BucketLayout::Empty => {
-                    for &gi in globals {
+                    for (_, gi) in selected {
                         out.push(PageInfo {
                             column_index: gi,
                             bucket: b,
@@ -624,7 +684,7 @@ impl<I: InputFile> MosaicReader<I> {
                         .map(|&gi| self.schema.columns[gi].data_type.clone())
                         .collect();
                     let reader = BucketReader::new(col_types, data, meta.num_rows)?;
-                    for (local, &gi) in globals.iter().enumerate() {
+                    for (local, gi) in selected {
                         out.push(PageInfo {
                             column_index: gi,
                             bucket: b,
@@ -636,14 +696,15 @@ impl<I: InputFile> MosaicReader<I> {
                 BucketLayout::Paged { total_size } => {
                     // Physical layout: optional child header + one slot per
                     // physical column (primaries first, then ARRAY children).
-                    let (dir_size, sizes, _) =
+                    let (dir_size, sizes, children) =
                         self.paged_dir(b, meta.bucket_offsets[b], total_size)?;
-                    let mut foff = meta.bucket_offsets[b] + dir_size as u64;
-                    for (local, &gi) in globals.iter().enumerate() {
+                    let slot_offsets =
+                        Self::paged_slot_offsets(meta.bucket_offsets[b] + dir_size as u64, &sizes);
+                    for (local, gi) in selected {
                         let enc = if sizes[local] == 0 {
                             ENCODING_ALL_NULL
                         } else {
-                            let slot = read_range(&self.input, foff, sizes[local])?;
+                            let slot = read_range(&self.input, slot_offsets[local], sizes[local])?;
                             let ct = self.schema.columns[gi].data_type.clone();
                             Self::parse_column_slot(&slot, &ct, meta.num_rows)?.encoding()
                         };
@@ -651,11 +712,9 @@ impl<I: InputFile> MosaicReader<I> {
                             column_index: gi,
                             bucket: b,
                             encoding: Encoding::from_code(enc),
-                            slot_size: sizes[local],
+                            slot_size: Self::logical_paged_slot_size(local, &sizes, &children),
                         });
-                        foff += sizes[local] as u64;
                     }
-                    let _ = total_size;
                 }
             }
         }
@@ -732,6 +791,30 @@ impl<I: InputFile> MosaicReader<I> {
         (0..ncols)
             .map(|i| u32::from_le_bytes(dir[i * 4..i * 4 + 4].try_into().unwrap()) as usize)
             .collect()
+    }
+
+    fn paged_slot_offsets(start: u64, sizes: &[usize]) -> Vec<u64> {
+        let mut offsets = Vec::with_capacity(sizes.len());
+        let mut pos = start;
+        for &size in sizes {
+            offsets.push(pos);
+            pos += size as u64;
+        }
+        offsets
+    }
+
+    fn logical_paged_slot_size(
+        local: usize,
+        sizes: &[usize],
+        children: &[crate::bucket_writer::ChildColumnMeta],
+    ) -> usize {
+        let mut total = sizes[local];
+        for child in children {
+            if child.parent_logical_col == local {
+                total += sizes[child.physical_index];
+            }
+        }
+        total
     }
 
     /// Verify directory + slots sum exactly to the bucket total (rejects forged

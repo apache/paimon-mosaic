@@ -33,6 +33,10 @@ pub const DEFAULT_ZSTD_LEVEL: i32 = 1;
 pub const DEFAULT_DICT_MAX_TOTAL_BYTES: usize = 32 * 1024;
 pub const DEFAULT_DICT_MAX_ENTRIES: usize = 255;
 pub const DEFAULT_PAGE_SIZE_THRESHOLD: usize = 32 * 1024;
+/// Maximum decompressed size for one zstd block written by this implementation.
+/// Readers reject larger declared sizes before allocation; writers enforce the
+/// same ceiling so they do not create files this crate cannot read back.
+pub const MAX_ZSTD_DECOMPRESS_BLOCK_SIZE: usize = 512 * 1024 * 1024;
 
 // ======================== Bucket Layout Sentinel ========================
 //

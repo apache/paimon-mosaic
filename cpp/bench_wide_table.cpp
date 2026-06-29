@@ -1,3 +1,20 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // Wide-table write benchmark: Parquet vs Mosaic, in-memory and on-disk.
 //
 // Uses Google Benchmark for proper P50/P95/P99 distribution measurement.
@@ -5,7 +22,8 @@
 //   ~60% null, 79% i8, 11% f64, 4.5% i16-wide, 3% i16, ~2% i32-wide.
 // (uint8/uint16/uint32 mapped to same-byte signed types; mosaic has no unsigned.)
 //
-// Build:    cmake --build cpp/build --target bench_wide_table
+// Build:    cmake -S cpp -B cpp/build -DMOSAIC_BUILD_BENCHMARKS=ON
+//           cmake --build cpp/build --target bench_wide_table
 // Run:      ./bench_wide_table --benchmark_repetitions=5
 
 #include "bench_common.hpp"

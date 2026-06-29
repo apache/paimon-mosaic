@@ -148,9 +148,12 @@ fn count_reports_total() {
 #[test]
 fn cat_all_overrides_limit() {
     let f = fixture("all");
-    let (out, _, ok) = run(&["cat", &f, "--json"]);
+    let (limited, _, ok) = run(&["cat", &f, "--json"]);
     assert!(ok);
-    assert_eq!(out.lines().count(), 200); // every row, not the -n default
+    assert_eq!(limited.lines().count(), 10); // parquet-cli style default preview
+    let (out, _, ok) = run(&["cat", &f, "--all", "--json"]);
+    assert!(ok);
+    assert_eq!(out.lines().count(), 200); // every row only when explicitly scanning
 }
 
 #[test]
@@ -167,7 +170,7 @@ fn cat_where_filters_rows() {
     let (_, _, str_ord) = run(&["cat", &f, "--where", "kind>5"]);
     assert!(!str_ord); // ordering on a string column errors, not silent drop
                        // != with a non-numeric value matches all rows (nothing equals it).
-    let (ne, _, _) = run(&["cat", &f, "--where", "id!=abc", "--json"]);
+    let (ne, _, _) = run(&["cat", &f, "--all", "--where", "id!=abc", "--json"]);
     assert_eq!(ne.lines().count(), 200);
     // Filtering a column dropped by -c works and doesn't leak into output.
     let (hid, _, ok) = run(&["cat", &f, "-c", "kind", "--where", "id>197", "--json"]);
@@ -175,6 +178,22 @@ fn cat_where_filters_rows() {
         ok && hid.lines().count() == 2 && !hid.contains("\"id\""),
         "{hid}"
     );
+}
+
+#[test]
+fn cat_where_unknown_column_errors_before_reading_rows() {
+    let path = format!(
+        "{}/mosaic_e2e_empty_unknown_where.mosaic",
+        std::env::temp_dir().display()
+    );
+    let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+    let out = FileSink::create(std::path::Path::new(&path)).unwrap();
+    let mut w = MosaicWriter::new(out, &schema, WriterOptions::default()).unwrap();
+    w.close().unwrap();
+
+    let (_, err, ok) = run(&["cat", &path, "--where", "missing=1"]);
+    assert!(!ok);
+    assert!(err.contains("column 'missing' not found"), "{err}");
 }
 
 /// Fixture with a Boolean column so `--where` on bools can be exercised.
@@ -283,6 +302,24 @@ fn convert_csv_then_inspect() {
 }
 
 #[test]
+fn convert_refuses_existing_output_without_overwrite() {
+    let csv = format!(
+        "{}/mosaic_e2e_no_overwrite.csv",
+        std::env::temp_dir().display()
+    );
+    std::fs::write(&csv, "id\n1\n").unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_no_overwrite.mosaic",
+        std::env::temp_dir().display()
+    );
+    std::fs::write(&out, "keep me").unwrap();
+    let (_, err, ok) = run(&["convert", &csv, "-o", &out]);
+    assert!(!ok);
+    assert!(err.contains("use --overwrite"), "{err}");
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "keep me");
+}
+
+#[test]
 fn convert_json_then_inspect() {
     let js = format!("{}/mosaic_e2e_in.ndjson", std::env::temp_dir().display());
     std::fs::write(
@@ -324,13 +361,13 @@ fn bigint_where_is_exact() {
 
 #[test]
 fn date_column_pushdown_keeps_match() {
-    // Date stats are epoch-day ints; pushdown must read them numerically (no
-    // string suffix) so the filter still finds the matching row.
+    // Date filters accept ISO literals while stats pushdown still compares the
+    // stored epoch-day bounds.
     let csv = format!("{}/mosaic_e2e_date.csv", std::env::temp_dir().display());
     std::fs::write(&csv, "d\n2020-01-01\n2021-01-01\n").unwrap();
     let out = format!("{}/mosaic_e2e_date.mosaic", std::env::temp_dir().display());
     run(&["convert", &csv, "-o", &out, "--stats", "d", "--overwrite"]);
-    let (j, _, ok) = run(&["cat", &out, "--where", "d>18627", "--json"]);
+    let (j, _, ok) = run(&["cat", &out, "--where", "d>2020-12-31", "--json"]);
     assert!(
         ok && j.lines().count() == 1 && j.contains("2021-01-01"),
         "{j}"
@@ -443,4 +480,35 @@ fn buckets_show_layout() {
         out.contains("uncompressed") && out.contains("x)"),
         "ratio: {out}"
     );
+}
+
+#[test]
+fn buckets_json_keeps_column_names_lossless() {
+    let path = format!(
+        "{}/mosaic_e2e_control_name.mosaic",
+        std::env::temp_dir().display()
+    );
+    let schema = Schema::new(vec![Field::new("name\x1b", DataType::Int32, false)]);
+    let out = FileSink::create(std::path::Path::new(&path)).unwrap();
+    let mut w = MosaicWriter::new(
+        out,
+        &schema,
+        WriterOptions {
+            num_buckets: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+    )
+    .unwrap();
+    w.write_batch(&batch).unwrap();
+    w.close().unwrap();
+
+    let (j, _, ok) = run(&["buckets", &path, "--json"]);
+    assert!(ok, "{j}");
+    assert!(j.contains("name\\u001b"), "{j}");
+    assert!(!j.contains(&format!("name{}", '\u{fffd}')), "{j}");
 }

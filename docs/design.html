@@ -582,7 +582,10 @@ page_content (after decompression):
                 In monolithic mode, compression is applied to the entire bucket as one block.
                 In paged mode, the page directory is uncompressed (fixed-length, enabling direct offset computation),
                 while each column slot is independently zstd-compressed.
-                Paged mode is only used when the compression method is Zstd.
+                Paged mode is only used when the compression method is Zstd. This implementation caps
+                each decompressed zstd block (schema block, monolithic bucket, or paged column slot) at
+                512 MB so readers can reject forged sizes before allocating memory; writers enforce the
+                same limit.
             </p>
 
             <!-- ============================================================ -->

@@ -60,12 +60,15 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Print all rows as a table (use -n to limit).
+    /// Print rows as a table (default: first 10; use --all to scan all).
     Cat {
         file: PathBuf,
-        /// Limit to N rows (default: all).
+        /// Limit to N rows (default: 10).
         #[arg(short = 'n', long)]
         num: Option<usize>,
+        /// Print every row.
+        #[arg(long)]
+        all: bool,
         /// Comma-separated columns to project.
         #[arg(short, long)]
         columns: Option<String>,
@@ -152,10 +155,17 @@ fn main() -> ExitCode {
         Cmd::Cat {
             file,
             num,
+            all,
             columns,
             r#where,
             json,
-        } => cat(&file, num.unwrap_or(usize::MAX), columns, r#where, json),
+        } => cat(
+            &file,
+            if all { usize::MAX } else { num.unwrap_or(10) },
+            columns,
+            r#where,
+            json,
+        ),
         Cmd::Head {
             file,
             num,
@@ -375,14 +385,16 @@ fn pages(file: &Path, columns: Option<String>, json: bool) -> std::io::Result<()
     let reader = open(file)?;
     let s = reader.schema();
     let want = col_filter(&columns, s)?;
+    let cols: Vec<usize> = (0..s.columns.len())
+        .filter(|&i| selected(&want, &s.columns[i].name))
+        .collect();
     let nrg = reader.num_row_groups();
     if json {
         let mut row_groups = Vec::new();
         for rg in 0..nrg {
             let pgs = reader
-                .page_infos(rg)?
+                .page_infos_projected(rg, &cols)?
                 .iter()
-                .filter(|p| selected(&want, &s.columns[p.column_index].name))
                 .map(|p| jsonout::Page {
                     column: s.columns[p.column_index].name.clone(),
                     bucket: p.bucket,
@@ -397,11 +409,8 @@ fn pages(file: &Path, columns: Option<String>, json: bool) -> std::io::Result<()
     }
     for rg in 0..nrg {
         println!("row group {rg}:");
-        for p in reader.page_infos(rg)? {
+        for p in reader.page_infos_projected(rg, &cols)? {
             let c = &s.columns[p.column_index];
-            if !selected(&want, &c.name) {
-                continue;
-            }
             println!(
                 "    {}: bucket {} encoding={} slot={}B",
                 fmt::safe(&c.name),
@@ -493,6 +502,10 @@ fn convert(
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    #[cfg(windows)]
+    if out.exists() {
+        std::fs::remove_file(out)?;
+    }
     std::fs::rename(&tmp, out)?;
     let plural = |n: usize, w: &str| {
         if n == 1 {
@@ -523,6 +536,22 @@ fn cat(
         .map(filter::parse_where)
         .transpose()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let pred_col = match &pred {
+        Some(p) => Some(
+            reader
+                .schema()
+                .columns
+                .iter()
+                .position(|c| c.name == p.column)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("--where: column '{}' not found", p.column),
+                    )
+                })?,
+        ),
+        None => None,
+    };
     // The display columns; the filter column is read even if projected out, then
     // dropped before printing, so `--where` works on a hidden column.
     let mut display: Vec<String> = Vec::new();
@@ -537,15 +566,10 @@ fn cat(
         reader.project(&read)?;
     }
     // Column index of the filter target, for stats-based row-group skipping.
-    let pred_col = pred.as_ref().and_then(|p| {
-        reader
-            .schema()
-            .columns
-            .iter()
-            .position(|c| c.name == p.column)
-    });
+    let bounded_text = !json && num != usize::MAX;
     let mut batches: Vec<RecordBatch> = Vec::new();
     let mut got = 0usize;
+    let mut printed_any = false;
     for rg in 0..reader.num_row_groups() {
         if got >= num {
             break;
@@ -579,21 +603,30 @@ fn cat(
         }
         let batch_rows = batch.num_rows();
         // JSON rows are independent, so stream each group out instead of holding
-        // every batch — `cat --json` on a huge file stays bounded. The table path
-        // must buffer: column widths need all rows before the first line prints.
+        // every batch. Text output only buffers for bounded requests so global
+        // column widths can be computed; unbounded `cat` prints one table per
+        // row group and stays bounded.
         if json {
             print!("{}", fmt::ndjson(&[batch], num - got)?);
-        } else {
+            printed_any = printed_any || batch_rows > 0;
+        } else if bounded_text {
             batches.push(batch);
+        } else if batch_rows > 0 {
+            print!("{}", fmt::pretty_table(&[batch], usize::MAX));
+            printed_any = true;
         }
         got += batch_rows;
     }
     if json {
         // (no rows) stays silent for JSON; nothing to print.
-    } else if batches.iter().all(|b| b.num_rows() == 0) {
+    } else if bounded_text {
+        if batches.iter().all(|b| b.num_rows() == 0) {
+            println!("(no rows)");
+        } else {
+            print!("{}", fmt::pretty_table(&batches, num));
+        }
+    } else if !printed_any {
         println!("(no rows)");
-    } else {
-        print!("{}", fmt::pretty_table(&batches, num));
     }
     Ok(())
 }
@@ -751,7 +784,8 @@ fn dictionary(file: &Path, column: &str, json: bool) -> std::io::Result<()> {
 fn buckets(file: &Path, json: bool) -> std::io::Result<()> {
     let reader = open(file)?;
     let s = reader.schema();
-    let name = |i: usize| fmt::safe(&s.columns[i].name);
+    let raw_name = |i: usize| s.columns[i].name.clone();
+    let text_name = |i: usize| fmt::safe(&s.columns[i].name);
     let mut rgs = Vec::new();
     for rg in 0..reader.num_row_groups() {
         let infos = reader.bucket_infos(rg)?;
@@ -763,14 +797,14 @@ fn buckets(file: &Path, json: bool) -> std::io::Result<()> {
                     kind: fmt::bucket_kind(b.kind),
                     size: b.size,
                     uncompressed: b.uncompressed,
-                    columns: b.columns.iter().map(|&i| name(i)).collect(),
+                    columns: b.columns.iter().map(|&i| raw_name(i)).collect(),
                 })
                 .collect();
             rgs.push(items);
         } else {
             println!("row group {rg}:");
             for b in &infos {
-                let cols: Vec<String> = b.columns.iter().map(|&i| name(i)).collect();
+                let cols: Vec<String> = b.columns.iter().map(|&i| text_name(i)).collect();
                 println!(
                     "    bucket {}: {} {}B{} [{}]",
                     b.bucket,

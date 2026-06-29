@@ -17,7 +17,7 @@
 
 [package]
 name = "paimon-mosaic-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Mosaic file format — command line inspector (cat/meta/schema)"
 license = "Apache-2.0"
@@ -27,7 +27,7 @@ name = "mosaic"
 path = "src/main.rs"
 
 [dependencies]
-paimon-mosaic-core = { path = "../core" }
+paimon-mosaic-core = { path = "../core", version = "0.3.0" }
 arrow = { version = "58", features = ["csv", "json"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

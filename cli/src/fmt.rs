@@ -51,6 +51,7 @@ pub fn render_value(v: &Value) -> String {
 /// a single nanosecond count.
 pub fn render_json(v: &Value) -> String {
     match v {
+        Value::String(b) => String::from_utf8_lossy(b).into_owned(),
         Value::Date(x) | Value::Time(x) => x.to_string(),
         Value::TimestampMillis(x) | Value::TimestampMicros(x) => x.to_string(),
         Value::TimestampNanos {
@@ -224,7 +225,18 @@ fn col_formatter(arr: &dyn Array) -> Box<dyn Fn(usize) -> String + '_> {
         Int64 => d!(Int64Array),
         Float32 => d!(Float32Array),
         Float64 => d!(Float64Array),
-        Date32 => d!(Date32Array),
+        Date32 => {
+            let a = arr.as_any().downcast_ref::<Date32Array>().unwrap();
+            Box::new(move |r| {
+                if a.is_null(r) {
+                    String::new()
+                } else {
+                    a.value_as_date(r)
+                        .map(|d| d.to_string())
+                        .unwrap_or_else(|| a.value(r).to_string())
+                }
+            })
+        }
         Utf8 => {
             let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
             Box::new(move |r| {
@@ -252,7 +264,7 @@ fn col_formatter(arr: &dyn Array) -> Box<dyn Fn(usize) -> String + '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, StringArray};
+    use arrow::array::{Date32Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -285,6 +297,14 @@ mod tests {
         assert_eq!(render_value(&Value::Date(18627)), "18627 (epoch-day)");
         assert_eq!(render_json(&Value::TimestampMillis(5)), "5");
         assert_eq!(render_json(&Value::Integer(5)), "5");
+    }
+
+    #[test]
+    fn render_json_keeps_strings_lossless() {
+        assert_eq!(
+            render_json(&Value::String(b"\x1b[31mred".to_vec())),
+            "\x1b[31mred"
+        );
     }
 
     #[test]
@@ -323,5 +343,17 @@ mod tests {
             !t.contains('\x1b'),
             "ANSI escape must not reach the terminal: {t:?}"
         );
+    }
+
+    #[test]
+    fn pretty_table_renders_date32_logically() {
+        let schema = Schema::new(vec![Field::new("d", DataType::Date32, false)]);
+        let b = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Date32Array::from(vec![18_628]))],
+        )
+        .unwrap();
+        let t = pretty_table(&[b], 1);
+        assert!(t.contains("2021-01-01"), "{t}");
     }
 }

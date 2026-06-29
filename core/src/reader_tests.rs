@@ -4229,6 +4229,14 @@ fn test_page_infos_encodings() {
     assert_eq!(by_name("kind").encoding, Encoding::Dict);
     assert_eq!(by_name("flag").encoding, Encoding::Const);
     assert!(by_name("id").slot_size > 0);
+    let named = reader.page_infos_by_names(0, &["kind"]).unwrap();
+    assert_eq!(named.len(), 1);
+    assert_eq!(
+        reader.schema().columns[named[0].column_index].name,
+        "kind",
+        "names-based inspection avoids exposing internal sorted indices"
+    );
+    assert!(reader.page_infos_by_names(0, &["missing"]).is_err());
     assert!(reader.page_infos(999).is_err());
 }
 
@@ -4308,5 +4316,15 @@ fn test_slot_sizes_paged_array_column() {
         sizes[vals] > 0,
         "ARRAY column bytes (incl. child slots) attributed"
     );
-    assert!(reader.page_infos(0).is_ok());
+    let pages = reader.page_infos(0).unwrap();
+    let vals_page = pages.iter().find(|p| p.column_index == vals).unwrap();
+    assert_eq!(
+        vals_page.slot_size, sizes[vals],
+        "pages and column-size agree for logical ARRAY bytes"
+    );
+
+    let projected = reader.page_infos_projected(0, &[vals]).unwrap();
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].column_index, vals);
+    assert_eq!(projected[0].slot_size, sizes[vals]);
 }
