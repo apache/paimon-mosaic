@@ -22,6 +22,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Arrow REQUIRED)
+option(MOSAIC_BUILD_BENCHMARKS "Build Mosaic C++ benchmarks" OFF)
 
 set(MOSAIC_FFI_LIB "" CACHE FILEPATH "Path to libpaimon_mosaic_ffi shared library")
 if(NOT MOSAIC_FFI_LIB)
@@ -37,3 +38,28 @@ endif()
 add_executable(test_mosaic test_mosaic.cpp)
 target_include_directories(test_mosaic PRIVATE ${CMAKE_SOURCE_DIR}/../include)
 target_link_libraries(test_mosaic Arrow::arrow_shared ${MOSAIC_FFI_LIB})
+
+if(MOSAIC_BUILD_BENCHMARKS)
+    find_package(Parquet REQUIRED)
+    find_package(benchmark REQUIRED)
+
+    add_executable(bench_append bench_append.cpp)
+    target_include_directories(bench_append PRIVATE ${CMAKE_SOURCE_DIR}/../include)
+    target_link_libraries(
+        bench_append
+        Arrow::arrow_shared
+        Parquet::parquet_shared
+        benchmark::benchmark
+        ${MOSAIC_FFI_LIB}
+    )
+
+    add_executable(bench_wide_table bench_wide_table.cpp)
+    target_include_directories(bench_wide_table PRIVATE ${CMAKE_SOURCE_DIR}/../include)
+    target_link_libraries(
+        bench_wide_table
+        Arrow::arrow_shared
+        Parquet::parquet_shared
+        benchmark::benchmark
+        ${MOSAIC_FFI_LIB}
+    )
+endif()

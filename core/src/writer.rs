@@ -35,10 +35,56 @@ fn to_u32(val: usize, field: &str) -> io::Result<u32> {
     })
 }
 
+fn check_zstd_block_size(size: usize, field: &str) -> io::Result<()> {
+    if size > MAX_ZSTD_DECOMPRESS_BLOCK_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} ({}) exceeds max zstd decompressed block size ({})",
+                field, size, MAX_ZSTD_DECOMPRESS_BLOCK_SIZE
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub trait OutputFile {
     fn write(&mut self, data: &[u8]) -> io::Result<()>;
     fn flush(&mut self) -> io::Result<()>;
     fn pos(&self) -> u64;
+}
+
+/// File-backed [`OutputFile`] sink that tracks its own write position. The
+/// standard sink for writing a Mosaic file to disk; shared by the CLI and tests.
+pub struct FileSink {
+    f: std::fs::File,
+    pos: u64,
+}
+
+impl FileSink {
+    /// Create or truncate `path` for writing.
+    pub fn create(path: &std::path::Path) -> io::Result<Self> {
+        Ok(Self {
+            f: std::fs::File::create(path)?,
+            pos: 0,
+        })
+    }
+}
+
+impl OutputFile for FileSink {
+    fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        use io::Write;
+        self.f.write_all(data)?;
+        self.pos += data.len() as u64;
+        Ok(())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        use io::Write;
+        self.f.flush()
+    }
+    fn pos(&self) -> u64 {
+        self.pos
+    }
 }
 
 pub struct WriterOptions {
@@ -402,6 +448,7 @@ impl<S: OutputFile> MosaicWriter<S> {
                 Ok(raw.len())
             }
             COMPRESSION_ZSTD => {
+                check_zstd_block_size(raw.len(), "bucket uncompressed size")?;
                 let compressed =
                     zstd::bulk::compress(raw, self.zstd_level).map_err(io::Error::other)?;
                 self.out.write(&compressed)?;
@@ -451,6 +498,7 @@ impl<S: OutputFile> MosaicWriter<S> {
 
             // Compress and build on-disk slot: uncompressed_size varint + compressed data
             let uncompressed_size = page_content.len();
+            check_zstd_block_size(uncompressed_size, "page uncompressed size")?;
             let compressed =
                 zstd::bulk::compress(&page_content, self.zstd_level).map_err(io::Error::other)?;
             let mut slot = Vec::new();
@@ -513,6 +561,7 @@ impl<S: OutputFile> MosaicWriter<S> {
                 self.out.write(&schema_raw)?;
             }
             COMPRESSION_ZSTD => {
+                check_zstd_block_size(schema_raw.len(), "schema uncompressed size")?;
                 let compressed =
                     zstd::bulk::compress(&schema_raw, self.zstd_level).map_err(io::Error::other)?;
                 self.out.write(&compressed)?;

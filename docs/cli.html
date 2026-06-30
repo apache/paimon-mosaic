@@ -1,0 +1,190 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CLI - Paimon Mosaic</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="js/main.js"></script>
+</head>
+<body>
+    <button class="menu-toggle" aria-label="Menu">&#9776;</button>
+    <div class="overlay"></div>
+
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <h2>Paimon Mosaic</h2>
+            <p>Columnar-bucket hybrid format</p>
+        </div>
+        <nav>
+            <ul>
+                <li><a href="index.html">Home</a></li>
+                <li><a href="design.html">Design</a></li>
+                <li><a href="cli.html" class="active">CLI</a></li>
+                <li><a href="java-api.html">Java API</a></li>
+                <li><a href="python-api.html">Python API</a></li>
+                <li><a href="cpp-api.html">C++ API</a></li>
+                <li><a href="releases.html">Releases</a></li>
+            </ul>
+        </nav>
+        <div class="sidebar-footer">
+            <button class="theme-toggle">Dark Mode</button>
+        </div>
+    </aside>
+
+    <main class="main">
+        <div class="content">
+            <h1>CLI</h1>
+            <p class="subtitle">Inspect Mosaic files from the terminal with the <code>mosaic</code> binary. A native, JVM-free toolkit driving the read-only <code>MosaicReader</code> API.</p>
+
+            <h2>Install</h2>
+<pre><code><span class="cmt"># run from source</span>
+cargo run -p paimon-mosaic-cli -- schema data.mosaic
+
+<span class="cmt"># install the `mosaic` binary</span>
+cargo install --path cli
+mosaic schema data.mosaic</code></pre>
+
+            <h2>Commands</h2>
+            <table>
+                <thead>
+                    <tr><th>Command</th><th>Shows</th><th>Reads</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>schema</code></td><td>column names, Arrow types, nullability, bucket</td><td>footer only</td></tr>
+                    <tr><td><code>meta</code></td><td>row groups, rows, per-column stats</td><td>footer + index</td></tr>
+                    <tr><td><code>footer</code></td><td>magic, version, buckets, compression</td><td>footer only</td></tr>
+                    <tr><td><code>buckets</code></td><td>per-bucket layout and member columns</td><td>footer + index</td></tr>
+                    <tr><td><code>pages</code></td><td>per-column encoding + slot size</td><td>bucket data</td></tr>
+                    <tr><td><code>dictionary</code></td><td>dictionary entries of a dict column</td><td>bucket data</td></tr>
+                    <tr><td><code>column-size</code></td><td>on-disk bytes per column</td><td>footer + index + paged directories</td></tr>
+                    <tr><td><code>cat</code> / <code>head</code></td><td>cat: all rows by default (<code>-n</code> to limit); head: first 10; <code>-c</code>, <code>--where</code></td><td>column data</td></tr>
+                    <tr><td><code>count</code></td><td>total row count</td><td>footer + index</td></tr>
+                    <tr><td><code>convert</code></td><td>import CSV or JSON lines into a new Mosaic file</td><td>writes file</td></tr>
+                </tbody>
+            </table>
+            <p>Inspection and query commands accept <code>--json</code> (<code>convert</code> writes a file). <code>cat</code> scans all rows by default (<code>-n</code> to limit); <code>head</code> prints 10 rows by default. <code>cat</code>/<code>head</code>/<code>pages</code>/<code>column-size</code> take <code>-c a,b</code>; <code>dictionary</code> takes <code>-c &lt;col&gt;</code>.</p>
+
+            <h2>schema</h2>
+            <p>Columns, Arrow types, nullability and bucket assignment, in original input order. Footer only.</p>
+<pre><code><span class="cmt">$ mosaic schema data.mosaic</span>
+5 columns, 4 buckets
+  id: Int32 not null [bucket 0]
+  name: Utf8 [bucket 2]
+  kind: Utf8 [bucket 1]
+  score: Float64 [bucket 3]
+  flag: Int32 [bucket 0]
+
+<span class="cmt">$ mosaic schema data.mosaic --json</span>
+{"columns":5,"buckets":4,"fields":[{"name":"id","type":"Int32","nullable":false,"bucket":0}, ...]}</code></pre>
+
+            <h2>meta</h2>
+            <p>Total rows, row groups, and per-column stats (null count / min / max) for columns configured with stats.</p>
+<pre><code><span class="cmt">$ mosaic meta data.mosaic</span>
+file: 200 rows, 5 columns, 4 buckets, 1 row groups
+row group 0: 200 rows
+    id: nulls=0 min=0 max=199
+    score: nulls=0 min=0 max=298.5</code></pre>
+
+            <h2>footer</h2>
+            <p>The 32-byte file footer: magic, format version, bucket count, row groups and compression.</p>
+<pre><code><span class="cmt">$ mosaic footer data.mosaic</span>
+magic=MOSA version=1 buckets=4 row_groups=1 compression=zstd</code></pre>
+
+            <h2>buckets</h2>
+            <p>Per row group, each bucket's layout (empty / monolithic / paged), on-disk size and member columns. Mosaic groups columns into buckets by name order. Monolithic buckets also report uncompressed size and ratio.</p>
+<pre><code><span class="cmt">$ mosaic buckets data.mosaic</span>
+row group 0:
+    bucket 0: monolithic 27B (uncompressed 59 B, 2.19x) [kind]
+    bucket 1: paged 373B [flag, id]
+    bucket 2: paged 220B [name]
+    bucket 3: paged 542B [score]</code></pre>
+
+            <h2>pages</h2>
+            <p>Per-column physical encoding (<code>plain</code> / <code>const</code> / <code>dict</code> / <code>all_null</code>) and on-disk slot size.</p>
+<pre><code><span class="cmt">$ mosaic pages data.mosaic</span>
+row group 0:
+    flag: bucket 0 encoding=const slot=16B
+    id: bucket 0 encoding=plain slot=349B
+    kind: bucket 1 encoding=dict slot=28B
+    name: bucket 2 encoding=plain slot=216B
+    score: bucket 3 encoding=plain slot=538B</code></pre>
+
+            <h2>dictionary</h2>
+            <p>Dump the dictionary of a dict-encoded column. Non-dict columns report as such.</p>
+<pre><code><span class="cmt">$ mosaic dictionary data.mosaic -c kind</span>
+row group 0: 3 entries
+    0: a
+    1: b
+    2: c
+
+<span class="cmt">$ mosaic dictionary data.mosaic -c kind --json</span>
+{"column":"kind","row_groups":[["a","b","c"]]}</code></pre>
+
+            <h2>column-size</h2>
+            <p>On-disk bytes per column. Paged buckets give exact per-column sizes; a multi-column monolithic bucket is split evenly and marked <code>(approx)</code>.</p>
+<pre><code><span class="cmt">$ mosaic column-size data.mosaic</span>
+  id: 349 B
+  name: 216 B
+  kind: 28 B
+  total: 593 B</code></pre>
+
+            <h2>cat / head</h2>
+            <p><code>cat</code> scans all rows by default (<code>-n</code> to limit); <code>head</code> prints the first 10 rows by default. <code>-c</code> projects columns, <code>--where</code> filters rows (one condition: <code>=</code> <code>!=</code> <code>&gt;</code> <code>&gt;=</code> <code>&lt;</code> <code>&lt;=</code>; integers and floats compare exactly so <code>=0.3</code> only matches a stored 0.3; Date32 accepts epoch-day or <code>YYYY-MM-DD</code>; row groups whose stats exclude the predicate are skipped), <code>--json</code> emits newline-delimited JSON.</p>
+<pre><code><span class="cmt">$ mosaic cat data.mosaic -n 2</span>
++----+--------+------+-------+------+
+| id | name   | kind | score | flag |
++----+--------+------+-------+------+
+| 0  | user_0 | a    | 0     | 7    |
+| 1  | user_1 | b    | 1.5   | 7    |
++----+--------+------+-------+------+
+
+<span class="cmt">$ mosaic cat data.mosaic -n 2 -c name,score</span>   <span class="cmt"># projection</span>
+
+<span class="cmt">$ mosaic cat data.mosaic -n 2 --json</span>
+{"id":0,"name":"user_0","kind":"a","score":0,"flag":7}
+{"id":1,"name":"user_1","kind":"b","score":1.5,"flag":7}
+
+<span class="cmt">$ mosaic cat data.mosaic --where "kind=a"</span>   <span class="cmt"># all matching rows</span>
+<span class="cmt">$ mosaic head data.mosaic --json</span>             <span class="cmt"># preview rows</span></code></pre>
+
+            <h2>count</h2>
+            <p>Total row count across all row groups.</p>
+<pre><code><span class="cmt">$ mosaic count data.mosaic</span>
+200</code></pre>
+
+            <h2>convert</h2>
+            <p>Import a CSV (with header) or JSON lines (one object per line) into a new Mosaic file; the schema is inferred. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups. Refuses to replace an existing output unless <code>--overwrite</code> is given.</p>
+<pre><code><span class="cmt">$ mosaic convert data.csv -o data.mosaic --stats id</span>
+wrote data.mosaic (200 rows, 5 columns)
+<span class="cmt">$ mosaic convert data.ndjson -o data.mosaic</span>
+wrote data.mosaic (200 rows, 5 columns)</code></pre>
+
+            <div class="tip">
+                <strong>Embedding instead</strong>
+                For C/C++ or Java callers, embed the format directly via the <code>ffi</code>
+                (<code>mosaic.h</code>) or <code>jni</code> crates rather than shelling out to this CLI.
+            </div>
+        </div>
+    </main>
+</body>
+</html>

@@ -737,6 +737,16 @@ impl BucketReader {
         col_rows - null_count
     }
 
+    /// Per-column encoding ids (in this bucket's column order). See `spec::ENCODING_*`.
+    pub fn encodings(&self) -> &[u8] {
+        &self.encodings
+    }
+
+    /// Dictionary entries for one column (empty if it is not dict-encoded).
+    pub fn dict_values(&self, col: usize) -> &[Value] {
+        &self.dict_values[col]
+    }
+
     pub fn read_all_columns(&self) -> io::Result<Vec<ArrayRef>> {
         // Read all N+C physical columns
         let mut all_arrays: Vec<ArrayRef> = Vec::with_capacity(self.total_columns);
@@ -1006,6 +1016,16 @@ impl ColumnPageReader {
         } else {
             read_variable_value(&self.col_type, &self.data, pos)
         }
+    }
+
+    /// Encoding id of this column page. See `spec::ENCODING_*`.
+    pub fn encoding(&self) -> u8 {
+        self.encoding
+    }
+
+    /// Dictionary entries for a dict-encoded page (empty for other encodings).
+    pub fn dict_values(&self) -> &[Value] {
+        &self.dict_values
     }
 
     pub fn read_all(&self) -> io::Result<ArrayRef> {

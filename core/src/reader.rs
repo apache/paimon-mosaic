@@ -32,6 +32,38 @@ use crate::varint;
 const COALESCE_GAP: u64 = 1024 * 1024;
 const COALESCE_MAX_RANGE: u64 = 32 * 1024 * 1024;
 
+/// A forged `uncompressed_size` would otherwise make `zstd::bulk::decompress`
+/// pre-allocate an arbitrarily large buffer before it ever sees the data.
+/// Highly repetitive data really does compress thousands-fold, so the ratio is
+/// deliberately generous; it only exists to reject absurd claims (a tiny block
+/// declaring gigabytes). The floor keeps tiny-but-genuine blocks working.
+const MAX_DECOMPRESS_RATIO: usize = 65536;
+const MIN_DECOMPRESS_CAP: usize = 1024 * 1024;
+/// Absolute ceiling so the ratio alone can't authorize a giant pre-alloc: a ~1
+/// MiB block would otherwise be allowed 64 GiB. A single decompressed slot/page
+/// is far below this, so it bounds the worst case without rejecting real data.
+const MAX_DECOMPRESS_CAP: usize = MAX_ZSTD_DECOMPRESS_BLOCK_SIZE;
+
+fn decompress_zstd(compressed: &[u8], uncompressed_size: usize) -> io::Result<Vec<u8>> {
+    let cap = compressed
+        .len()
+        .saturating_mul(MAX_DECOMPRESS_RATIO)
+        .clamp(MIN_DECOMPRESS_CAP, MAX_DECOMPRESS_CAP);
+    if uncompressed_size > cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "declared uncompressed size {} exceeds cap {} for {}-byte block",
+                uncompressed_size,
+                cap,
+                compressed.len()
+            ),
+        ));
+    }
+    zstd::bulk::decompress(compressed, uncompressed_size)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 #[derive(Clone)]
 pub struct ReadRangeBuffer {
     data: Arc<Vec<u8>>,
@@ -179,6 +211,63 @@ fn read_merged_ranges<I: InputFile + ?Sized>(
     Ok((merged, fetched))
 }
 
+/// Column encoding, as surfaced for inspection. Non-exhaustive: new encodings
+/// may be added without breaking downstream `match`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Encoding {
+    Plain,
+    Const,
+    Dict,
+    AllNull,
+    Other(u8),
+}
+
+impl Encoding {
+    fn from_code(c: u8) -> Self {
+        match c {
+            ENCODING_PLAIN => Encoding::Plain,
+            ENCODING_CONST => Encoding::Const,
+            ENCODING_DICT => Encoding::Dict,
+            ENCODING_ALL_NULL => Encoding::AllNull,
+            other => Encoding::Other(other),
+        }
+    }
+}
+
+/// Bucket storage mode, as surfaced for inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BucketKind {
+    Empty,
+    Monolithic,
+    Paged,
+}
+
+/// Physical placement of one column within one row group.
+#[non_exhaustive]
+pub struct PageInfo {
+    pub column_index: usize,
+    pub bucket: usize,
+    pub encoding: Encoding,
+    /// Paged-bucket on-disk slot size in bytes; 0 for monolithic/empty buckets.
+    pub slot_size: usize,
+}
+
+/// Layout of one bucket within one row group.
+#[non_exhaustive]
+pub struct BucketInfo {
+    pub bucket: usize,
+    pub kind: BucketKind,
+    /// On-disk compressed size in bytes (0 for empty buckets).
+    pub size: usize,
+    /// Uncompressed size in bytes; 0 when unknown (paged buckets store only the
+    /// on-disk total). Exact for monolithic buckets — enough for a ratio.
+    pub uncompressed: usize,
+    /// Member column indices (global, name-sorted order).
+    pub columns: Vec<usize>,
+}
+
 pub struct RowGroupMeta {
     pub num_rows: usize,
     pub bucket_offsets: Vec<u64>,
@@ -311,8 +400,7 @@ impl<I: InputFile> MosaicReader<I> {
 
         let schema_raw = match compression {
             COMPRESSION_NONE => schema_compressed.to_vec(),
-            COMPRESSION_ZSTD => zstd::bulk::decompress(schema_compressed, schema_uncompressed_size)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            COMPRESSION_ZSTD => decompress_zstd(schema_compressed, schema_uncompressed_size)?,
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -447,6 +535,318 @@ impl<I: InputFile> MosaicReader<I> {
         &self.input
     }
 
+    /// Footer compression code (`spec::COMPRESSION_*`).
+    pub fn compression(&self) -> u8 {
+        self.compression
+    }
+
+    /// Per-bucket layout for a row group: kind, on-disk size and member columns
+    /// (global indices). The bucket is Mosaic's defining structure — exposed for
+    /// the `buckets` command.
+    pub fn bucket_infos(&self, rg_index: usize) -> io::Result<Vec<BucketInfo>> {
+        if rg_index >= self.row_group_metas.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "row group index out of range",
+            ));
+        }
+        let meta = &self.row_group_metas[rg_index];
+        Ok((0..self.num_buckets)
+            .map(|b| {
+                let (kind, size, uncompressed) = match meta.bucket_layouts[b] {
+                    BucketLayout::Empty => (BucketKind::Empty, 0, 0),
+                    BucketLayout::Monolithic {
+                        compressed_size,
+                        uncompressed_size,
+                    } => (BucketKind::Monolithic, compressed_size, uncompressed_size),
+                    BucketLayout::Paged { total_size } => (BucketKind::Paged, total_size, 0),
+                };
+                BucketInfo {
+                    bucket: b,
+                    kind,
+                    size,
+                    uncompressed,
+                    columns: self.schema.bucket_to_global[b].clone(),
+                }
+            })
+            .collect())
+    }
+
+    /// Dictionary entries for one column in one row group, or `None` if that
+    /// column is not dict-encoded there. Used by the `dictionary` command.
+    pub fn dictionary(&self, rg_index: usize, col: usize) -> io::Result<Option<Vec<Value>>> {
+        let rg = self.row_group_reader_projected(rg_index, &[col])?;
+        Ok(rg.take_dictionary(col))
+    }
+
+    /// Per-column physical layout for a row group: bucket, encoding and on-disk
+    /// slot size. Reads and decompresses each non-empty bucket; used by tooling
+    /// (the `pages` command). Columns are reported in global (name-sorted) order.
+    pub fn page_infos(&self, rg_index: usize) -> io::Result<Vec<PageInfo>> {
+        let columns: Vec<usize> = (0..self.schema.columns.len()).collect();
+        self.page_infos_projected(rg_index, &columns)
+    }
+
+    /// Like [`Self::page_infos_projected`], but selects columns by name so callers
+    /// do not need to depend on Mosaic's internal name-sorted column indices.
+    pub fn page_infos_by_names(
+        &self,
+        rg_index: usize,
+        column_names: &[&str],
+    ) -> io::Result<Vec<PageInfo>> {
+        let mut indices = Vec::with_capacity(column_names.len());
+        for name in column_names {
+            let idx = self
+                .schema
+                .columns
+                .iter()
+                .position(|c| c.name == *name)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("column '{}' not found in schema", name),
+                    )
+                })?;
+            indices.push(idx);
+        }
+        self.page_infos_projected(rg_index, &indices)
+    }
+
+    /// Like [`Self::page_infos`], but only inspects the requested logical
+    /// columns. Paged buckets read only the directory and selected primary
+    /// slots; nested child slot bytes are attributed to the logical parent.
+    pub fn page_infos_projected(
+        &self,
+        rg_index: usize,
+        columns: &[usize],
+    ) -> io::Result<Vec<PageInfo>> {
+        if rg_index >= self.row_group_metas.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "row group index out of range",
+            ));
+        }
+        let mut projected = vec![false; self.schema.columns.len()];
+        for &c in columns {
+            if c >= self.schema.columns.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "projected column index {} out of range (num_columns={})",
+                        c,
+                        self.schema.columns.len()
+                    ),
+                ));
+            }
+            projected[c] = true;
+        }
+
+        let meta = &self.row_group_metas[rg_index];
+        let mut out = Vec::with_capacity(columns.len());
+        for b in 0..self.num_buckets {
+            let globals = &self.schema.bucket_to_global[b];
+            let selected: Vec<(usize, usize)> = globals
+                .iter()
+                .enumerate()
+                .filter_map(|(local, &gi)| projected[gi].then_some((local, gi)))
+                .collect();
+            if selected.is_empty() {
+                continue;
+            }
+            match meta.bucket_layouts[b] {
+                BucketLayout::Empty => {
+                    for (_, gi) in selected {
+                        out.push(PageInfo {
+                            column_index: gi,
+                            bucket: b,
+                            encoding: Encoding::AllNull,
+                            slot_size: 0,
+                        });
+                    }
+                }
+                BucketLayout::Monolithic {
+                    compressed_size,
+                    uncompressed_size,
+                } => {
+                    let buf = read_range(&self.input, meta.bucket_offsets[b], compressed_size)?;
+                    let data = match self.compression {
+                        COMPRESSION_NONE => buf,
+                        COMPRESSION_ZSTD => decompress_zstd(&buf, uncompressed_size)?,
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "unsupported compression",
+                            ))
+                        }
+                    };
+                    let col_types: Vec<DataType> = globals
+                        .iter()
+                        .map(|&gi| self.schema.columns[gi].data_type.clone())
+                        .collect();
+                    let reader = BucketReader::new(col_types, data, meta.num_rows)?;
+                    for (local, gi) in selected {
+                        out.push(PageInfo {
+                            column_index: gi,
+                            bucket: b,
+                            encoding: Encoding::from_code(reader.encodings()[local]),
+                            slot_size: 0,
+                        });
+                    }
+                }
+                BucketLayout::Paged { total_size } => {
+                    // Physical layout: optional child header + one slot per
+                    // physical column (primaries first, then ARRAY children).
+                    let (dir_size, sizes, children) =
+                        self.paged_dir(b, meta.bucket_offsets[b], total_size)?;
+                    let slot_offsets =
+                        Self::paged_slot_offsets(meta.bucket_offsets[b] + dir_size as u64, &sizes);
+                    for (local, gi) in selected {
+                        let enc = if sizes[local] == 0 {
+                            ENCODING_ALL_NULL
+                        } else {
+                            let slot = read_range(&self.input, slot_offsets[local], sizes[local])?;
+                            let ct = self.schema.columns[gi].data_type.clone();
+                            Self::parse_column_slot(&slot, &ct, meta.num_rows)?.encoding()
+                        };
+                        out.push(PageInfo {
+                            column_index: gi,
+                            bucket: b,
+                            encoding: Encoding::from_code(enc),
+                            slot_size: Self::logical_paged_slot_size(local, &sizes, &children),
+                        });
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|p| p.column_index);
+        Ok(out)
+    }
+
+    /// Per-column paged slot sizes for a row group, read from the bucket
+    /// directory only — no slot reads, no decompression. Monolithic/empty
+    /// columns report 0 (size is recovered via [`Self::bucket_infos`]).
+    /// Cheaper than [`Self::page_infos`] when only sizes are needed.
+    pub fn slot_sizes(&self, rg_index: usize) -> io::Result<Vec<usize>> {
+        if rg_index >= self.row_group_metas.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "row group index out of range",
+            ));
+        }
+        let meta = &self.row_group_metas[rg_index];
+        let mut out = vec![0usize; self.schema.columns.len()];
+        for b in 0..self.num_buckets {
+            let globals = &self.schema.bucket_to_global[b];
+            if let BucketLayout::Paged { total_size } = meta.bucket_layouts[b] {
+                let (_dir_size, sizes, children) =
+                    self.paged_dir(b, meta.bucket_offsets[b], total_size)?;
+                // Primary slots map 1:1 to the bucket's logical columns; any
+                // trailing ARRAY child slots are attributed to their parent.
+                for (local, &gi) in globals.iter().enumerate() {
+                    out[gi] += sizes[local];
+                }
+                for c in &children {
+                    out[globals[c.parent_logical_col]] += sizes[c.physical_index];
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read+validate a paged bucket's directory. Returns `(dir_size,
+    /// phys_slot_sizes, children)` where `dir_size` includes the optional ARRAY
+    /// child header, `phys_slot_sizes` has one entry per physical column
+    /// (logical primaries first, then expanded ARRAY children), and `children`
+    /// is the expanded ARRAY mapping so callers need not re-run expand_col_types.
+    fn paged_dir(
+        &self,
+        b: usize,
+        offset: u64,
+        total_size: usize,
+    ) -> io::Result<(
+        usize,
+        Vec<usize>,
+        Vec<crate::bucket_writer::ChildColumnMeta>,
+    )> {
+        let refs: Vec<&DataType> = self.schema.bucket_to_global[b]
+            .iter()
+            .map(|&gi| &self.schema.columns[gi].data_type)
+            .collect();
+        let (phys, children) = crate::bucket_writer::expand_col_types(&refs);
+        let nphys = phys.len();
+        let hdr_len = if children.is_empty() {
+            0
+        } else {
+            2 + children.len() * 4
+        };
+        let dir_size = hdr_len + nphys * 4;
+        if dir_size > total_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "paged bucket {}: directory size {} exceeds total size {}",
+                    b, dir_size, total_size
+                ),
+            ));
+        }
+        let dir = read_range(&self.input, offset, dir_size)?;
+        let sizes = Self::paged_slot_sizes(&dir[hdr_len..], nphys);
+        Self::validate_paged_total(b, dir_size, &sizes, total_size)?;
+        Ok((dir_size, sizes, children))
+    }
+
+    /// Decode the paged-bucket directory: `ncols` little-endian u32 slot sizes.
+    fn paged_slot_sizes(dir: &[u8], ncols: usize) -> Vec<usize> {
+        (0..ncols)
+            .map(|i| u32::from_le_bytes(dir[i * 4..i * 4 + 4].try_into().unwrap()) as usize)
+            .collect()
+    }
+
+    fn paged_slot_offsets(start: u64, sizes: &[usize]) -> Vec<u64> {
+        let mut offsets = Vec::with_capacity(sizes.len());
+        let mut pos = start;
+        for &size in sizes {
+            offsets.push(pos);
+            pos += size as u64;
+        }
+        offsets
+    }
+
+    fn logical_paged_slot_size(
+        local: usize,
+        sizes: &[usize],
+        children: &[crate::bucket_writer::ChildColumnMeta],
+    ) -> usize {
+        let mut total = sizes[local];
+        for child in children {
+            if child.parent_logical_col == local {
+                total += sizes[child.physical_index];
+            }
+        }
+        total
+    }
+
+    /// Verify directory + slots sum exactly to the bucket total (rejects forged
+    /// slot sizes that could drive a huge allocation). Uses checked addition.
+    fn validate_paged_total(
+        b: usize,
+        dir_size: usize,
+        sizes: &[usize],
+        total: usize,
+    ) -> io::Result<()> {
+        let sum = sizes.iter().try_fold(dir_size, |a, &s| a.checked_add(s));
+        if sum != Some(total) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "paged bucket {}: slot sizes do not sum to total {}",
+                    b, total
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn parse_column_slot(
         slot_data: &[u8],
         col_type: &DataType,
@@ -455,8 +855,7 @@ impl<I: InputFile> MosaicReader<I> {
         let mut spos = 0usize;
         let uncompressed_size = varint::decode(slot_data, &mut spos)? as usize;
         let compressed_data = &slot_data[spos..];
-        let page_content = zstd::bulk::decompress(compressed_data, uncompressed_size)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let page_content = decompress_zstd(compressed_data, uncompressed_size)?;
 
         Self::parse_simple_column_slot(page_content, col_type, num_rows)
     }
@@ -692,8 +1091,7 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                     let global_indices = &self.schema.bucket_to_global[b];
                     let bucket_data = match self.compression {
                         COMPRESSION_NONE => buf.to_vec(),
-                        COMPRESSION_ZSTD => zstd::bulk::decompress(buf, uncompressed_size)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                        COMPRESSION_ZSTD => decompress_zstd(buf, uncompressed_size)?,
                         _ => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -1072,6 +1470,32 @@ impl RowGroupReader {
             num_columns,
             projected_columns,
             output_order,
+        }
+    }
+
+    /// Dictionary entries for a projected column, or `None` if not dict-encoded.
+    pub fn take_dictionary(&self, global_col: usize) -> Option<Vec<Value>> {
+        let bucket = self.schema.columns[global_col].bucket_id;
+        let local = self.bucket_to_global[bucket]
+            .iter()
+            .position(|&g| g == global_col)?;
+        match self.bucket_states[bucket].as_ref()? {
+            BucketState::Paged { column_readers } => {
+                let d = column_readers[local].as_ref()?.dict_values();
+                if d.is_empty() {
+                    None
+                } else {
+                    Some(d.to_vec())
+                }
+            }
+            BucketState::Monolithic { reader } => {
+                let d = reader.dict_values(local);
+                if d.is_empty() {
+                    None
+                } else {
+                    Some(d.to_vec())
+                }
+            }
         }
     }
 
