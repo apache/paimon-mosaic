@@ -66,9 +66,6 @@ enum Cmd {
         /// Limit to N rows.
         #[arg(short = 'n', long)]
         num: Option<usize>,
-        /// Print every row.
-        #[arg(long)]
-        all: bool,
         /// Comma-separated columns to project.
         #[arg(short, long)]
         columns: Option<String>,
@@ -155,21 +152,10 @@ fn main() -> ExitCode {
         Cmd::Cat {
             file,
             num,
-            all,
             columns,
             r#where,
             json,
-        } => cat(
-            &file,
-            if all {
-                usize::MAX
-            } else {
-                num.unwrap_or(usize::MAX)
-            },
-            columns,
-            r#where,
-            json,
-        ),
+        } => cat(&file, num.unwrap_or(usize::MAX), columns, r#where, json),
         Cmd::Head {
             file,
             num,

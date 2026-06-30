@@ -77,7 +77,7 @@ row group 0:
 
 ## Query
 
-`cat` scans all rows by default (`-n` to limit; `--all` is an explicit no-limit option);
+`cat` scans all rows by default (`-n` to limit);
 `head` shows 10 rows by default. Both take `-c a,b` (projection),
 `pages`/`column-size` take `-c` too, and `--where "col op val"` (one condition:
 `=` `!=` `>` `>=` `<` `<=`; integers and floats compare exactly, so `=0.3`

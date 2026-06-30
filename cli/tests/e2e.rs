@@ -158,9 +158,6 @@ fn cat_defaults_to_all_rows_and_num_limits() {
     let (limited, _, ok) = run(&["cat", &f, "-n", "10", "--json"]);
     assert!(ok);
     assert_eq!(limited.lines().count(), 10);
-    let (explicit_all, _, ok) = run(&["cat", &f, "--all", "--json"]);
-    assert!(ok);
-    assert_eq!(explicit_all.lines().count(), 200); // --all remains an explicit no-limit option
 }
 
 #[test]
@@ -177,7 +174,7 @@ fn cat_where_filters_rows() {
     let (_, _, str_ord) = run(&["cat", &f, "--where", "kind>5"]);
     assert!(!str_ord); // ordering on a string column errors, not silent drop
                        // != with a non-numeric value matches all rows (nothing equals it).
-    let (ne, _, _) = run(&["cat", &f, "--all", "--where", "id!=abc", "--json"]);
+    let (ne, _, _) = run(&["cat", &f, "--where", "id!=abc", "--json"]);
     assert_eq!(ne.lines().count(), 200);
     // Filtering a column dropped by -c works and doesn't leak into output.
     let (hid, _, ok) = run(&["cat", &f, "-c", "kind", "--where", "id>197", "--json"]);
