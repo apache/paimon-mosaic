@@ -34,7 +34,7 @@ mosaic <command> <file>
 
 ## Commands
 
-All inspection and query commands accept `--json`; `convert` writes a file.
+All inspection and query commands accept `--json`; `convert` and `convert-csv` write files.
 
 | Command | Shows | Reads |
 |---------|-------|-------|
@@ -48,7 +48,8 @@ All inspection and query commands accept `--json`; `convert` writes a file.
 | `cat` | rows as a table (all rows by default; `-n` to limit) | column data |
 | `head` | first N rows (default 10) | column data |
 | `count` | total row count | footer + index |
-| `convert` | import CSV or JSON into a new file | writes file |
+| `convert` | import JSON into a new file | writes file |
+| `convert-csv` | import CSV into a new file | writes file |
 
 ## Inspect
 
@@ -97,12 +98,32 @@ $ mosaic head data.mosaic --json
 
 ## Convert
 
-Import CSV or JSON lines into a new Mosaic file; the schema is inferred.
+Import a JSON data file into a new Mosaic file; the schema is inferred from the
+first 20 records unless `--schema` is provided.
 An existing output is kept unless `--overwrite` is given.
-`--stats id` builds min/max for those columns, which `cat --where` then uses to
-skip row groups that cannot match.
+`--schema` accepts an Avro record schema file, matching parquet-cli's
+generic `convert --schema schema.avsc` option.
+Use `-c`/`--column`/`--columns` to project top-level fields.
 
 ```text
-$ mosaic convert data.csv -o data.mosaic --stats id
-wrote data.mosaic (200 rows, 5 columns)
+$ mosaic convert data.json -o data.mosaic
+$ mosaic convert data.json -o data.mosaic --schema schema.avsc
+$ mosaic convert data.json -o data.mosaic -c id --columns name
+```
+
+## Convert CSV
+
+Import CSV into a new Mosaic file. This is the CSV-specific path, matching
+parquet-cli's `convert-csv`: it accepts an Avro record schema file with
+`--schema`, or infers a schema from CSV data. CSV columns inferred as Arrow
+`Null` (for example, all-empty columns) fall back to nullable `Utf8`, matching
+parquet-cli's nullable string fallback for unknown CSV types. When a CSV schema
+is inferred, `--require col` marks an inferred field as not null; repeat it for
+multiple fields.
+
+```text
+$ mosaic convert-csv data.csv -o data.mosaic
+
+$ mosaic convert-csv data.csv -o data.mosaic --schema schema.avsc
+$ mosaic convert-csv data.csv -o data.mosaic --require id --require ts
 ```

@@ -22,10 +22,13 @@ mod jsonout;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::array::{new_null_array, ArrayRef, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use clap::{Parser, Subcommand};
 use paimon_mosaic_core::reader::{MosaicReader, ReaderAccess};
+use serde_json::Value;
 
 use crate::input::FileInput;
 
@@ -123,16 +126,54 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Import a CSV or JSON file into a new Mosaic file (schema inferred).
+    /// Create a Mosaic file from a JSON data file.
     Convert {
-        /// Input: CSV (.csv, header row) or JSON lines (.json/.ndjson/.jsonl).
+        /// Input JSON data file (filename ending with json).
         input: PathBuf,
         /// Output .mosaic path.
-        #[arg(short, long)]
+        #[arg(short = 'o', long = "output")]
         out: PathBuf,
-        /// Columns to build min/max stats for (comma-separated).
+        /// Avro schema file, matching parquet-cli's --schema option.
+        #[arg(short = 's', long)]
+        schema: Option<PathBuf>,
+        /// List of columns.
+        #[arg(short = 'c', long = "column", visible_alias = "columns")]
+        columns: Vec<String>,
+        /// Overwrite the output file if it already exists.
         #[arg(long)]
-        stats: Option<String>,
+        overwrite: bool,
+    },
+    /// Create a Mosaic file from CSV data.
+    ConvertCsv {
+        /// Input CSV path(s).
+        inputs: Vec<PathBuf>,
+        /// Output .mosaic path.
+        #[arg(short = 'o', long = "output")]
+        out: PathBuf,
+        /// Avro schema file, matching parquet-cli convert-csv --schema.
+        #[arg(short = 's', long)]
+        schema: Option<PathBuf>,
+        /// Do not allow null values for inferred fields; repeat for multiple fields.
+        #[arg(long)]
+        require: Vec<String>,
+        /// Delimiter character.
+        #[arg(long, default_value = ",")]
+        delimiter: String,
+        /// Escape character.
+        #[arg(long, default_value = "\\")]
+        escape: String,
+        /// Quote character.
+        #[arg(long, default_value = "\"")]
+        quote: String,
+        /// Don't use first line as CSV header.
+        #[arg(long)]
+        no_header: bool,
+        /// Line to use as a header. Must match the CSV settings.
+        #[arg(long)]
+        header: Option<String>,
+        /// Lines to skip before CSV start.
+        #[arg(long, default_value_t = 0)]
+        skip_lines: usize,
         /// Overwrite the output file if it already exists.
         #[arg(long)]
         overwrite: bool,
@@ -175,9 +216,40 @@ fn main() -> ExitCode {
         Cmd::Convert {
             input,
             out,
-            stats,
+            schema,
+            columns,
             overwrite,
-        } => convert(&input, &out, stats, overwrite),
+        } => convert(&input, &out, schema.as_deref(), &columns, overwrite),
+        Cmd::ConvertCsv {
+            inputs,
+            out,
+            schema,
+            require,
+            delimiter,
+            escape,
+            quote,
+            no_header,
+            header,
+            skip_lines,
+            overwrite,
+        } => {
+            let options = CsvConvertOptions {
+                delimiter,
+                escape,
+                quote,
+                no_header,
+                header,
+                skip_lines,
+            };
+            convert_csv(
+                &inputs,
+                &out,
+                schema.as_deref(),
+                &require,
+                options,
+                overwrite,
+            )
+        }
     };
     match res {
         Ok(()) => ExitCode::SUCCESS,
@@ -429,50 +501,134 @@ fn count(file: &Path, json: bool) -> std::io::Result<()> {
 fn convert(
     input: &Path,
     out: &Path,
-    stats: Option<String>,
+    schema: Option<&Path>,
+    columns: &[String],
     overwrite: bool,
 ) -> std::io::Result<()> {
+    use arrow::error::ArrowError;
+    let bad = |e: ArrowError| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
+    if !is_json_input(input) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "convert only supports JSON inputs; use convert-csv for CSV data",
+        ));
+    }
+    let explicit_schema = schema.map(load_convert_schema).transpose()?;
+    let open =
+        || -> std::io::Result<_> { Ok(std::io::BufReader::new(std::fs::File::open(input)?)) };
+    let schema = match explicit_schema {
+        Some(schema) => schema,
+        None => arrow::json::reader::infer_json_schema(&mut open()?, Some(20))
+            .map(|(schema, _)| schema)
+            .map_err(bad)?,
+    };
+    let schema = project_convert_schema(schema, columns)?;
+    let reader = arrow::json::ReaderBuilder::new(Arc::new(schema.clone()))
+        .build(open()?)
+        .map_err(bad)?;
+    write_mosaic(out, overwrite, &schema, |writer, rows| {
+        for batch in reader {
+            let batch = batch
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            *rows += batch.num_rows();
+            writer.write_batch(&batch)?;
+        }
+        Ok(())
+    })
+}
+
+struct CsvConvertOptions {
+    delimiter: String,
+    escape: String,
+    quote: String,
+    no_header: bool,
+    header: Option<String>,
+    skip_lines: usize,
+}
+
+fn convert_csv(
+    inputs: &[PathBuf],
+    out: &Path,
+    schema: Option<&Path>,
+    required_fields: &[String],
+    options: CsvConvertOptions,
+    overwrite: bool,
+) -> std::io::Result<()> {
+    if inputs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CSV path is required",
+        ));
+    }
+    use arrow::error::ArrowError;
+    let bad = |e: ArrowError| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
+    let format = csv_format(&options)?;
+    let explicit_schema = schema.map(load_convert_schema).transpose()?;
+    let schema = match explicit_schema {
+        Some(schema) => schema,
+        None => {
+            let mut inferred = None;
+            for input in inputs {
+                let (schema, _) = format
+                    .infer_schema(open_csv(input, options.skip_lines)?, None)
+                    .map_err(bad)?;
+                let schema = apply_required_fields(
+                    csv_schema_with_csv_names(csv_schema_with_null_fallback(schema), &options)?,
+                    required_fields,
+                )?;
+                if let Some(prev) = &inferred {
+                    if prev != &schema {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "{} seems to have a different schema from others. Please specify the correct schema explicitly with the --schema option.",
+                                input.display()
+                            ),
+                        ));
+                    }
+                } else {
+                    inferred = Some(schema);
+                }
+            }
+            inferred.expect("inputs is not empty")
+        }
+    };
+    write_mosaic(out, overwrite, &schema, |writer, rows| {
+        for input in inputs {
+            let layout = csv_input_layout(input, &options)?;
+            let reader_schema = csv_reader_schema(&schema, &layout);
+            let mapping = csv_output_mapping(&schema, &layout);
+            let reader = arrow::csv::ReaderBuilder::new(Arc::new(reader_schema))
+                .with_format(format.clone().with_truncated_rows(true))
+                .build(open_csv(input, options.skip_lines)?)
+                .map_err(bad)?;
+            for batch in reader {
+                let batch = batch.map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
+                let batch = align_csv_batch_to_schema(batch, &schema, &mapping)?;
+                *rows += batch.num_rows();
+                writer.write_batch(&batch)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+fn write_mosaic<F>(out: &Path, overwrite: bool, schema: &Schema, write: F) -> std::io::Result<()>
+where
+    F: FnOnce(
+        &mut paimon_mosaic_core::writer::MosaicWriter<paimon_mosaic_core::writer::FileSink>,
+        &mut usize,
+    ) -> std::io::Result<()>,
+{
+    use paimon_mosaic_core::writer::{FileSink, MosaicWriter, WriterOptions};
     if out.exists() && !overwrite {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!("{} exists (use --overwrite to replace)", out.display()),
         ));
     }
-    use arrow::error::ArrowError;
-    use paimon_mosaic_core::writer::{MosaicWriter, WriterOptions};
-    let bad = |e: ArrowError| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
-    let is_json = matches!(
-        input.extension().and_then(|e| e.to_str()),
-        Some("json") | Some("ndjson") | Some("jsonl")
-    );
-    // Infer schema, then build a batch iterator — CSV (header) or JSON (one object per line).
-    type Batches = Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>>>;
-    // Schema inference and the data reader each need their own pass over the
-    // file (inference consumes a reader), so open it twice via one helper.
-    let open =
-        || -> std::io::Result<_> { Ok(std::io::BufReader::new(std::fs::File::open(input)?)) };
-    let (schema, reader): (arrow::datatypes::Schema, Batches) = if is_json {
-        let (schema, _) =
-            arrow::json::reader::infer_json_schema(&mut open()?, None).map_err(bad)?;
-        let rd = arrow::json::ReaderBuilder::new(std::sync::Arc::new(schema.clone()))
-            .build(open()?)
-            .map_err(bad)?;
-        (schema, Box::new(rd))
-    } else {
-        let (schema, _) = arrow::csv::reader::Format::default()
-            .with_header(true)
-            .infer_schema(open()?, None)
-            .map_err(bad)?;
-        let rd = arrow::csv::ReaderBuilder::new(std::sync::Arc::new(schema.clone()))
-            .with_header(true)
-            .build(open()?)
-            .map_err(bad)?;
-        (schema, Box::new(rd))
-    };
-    let opts = WriterOptions {
-        stats_columns: stats.map(|s| parse_comma_list(&s)).unwrap_or_default(),
-        ..Default::default()
-    };
     // Write to a unique sibling temp file and rename on success, so a mid-stream
     // failure never leaves a truncated .mosaic — and a process-unique suffix
     // avoids clobbering an unrelated `out.mosaic.tmp` the user may already have.
@@ -483,14 +639,9 @@ fn convert(
     let tmp = out.with_extension(format!("mosaic.{}.{uniq}.tmp", std::process::id()));
     let mut rows = 0;
     let res = (|| {
-        let sink = paimon_mosaic_core::writer::FileSink::create(&tmp)?;
-        let mut w = MosaicWriter::new(sink, &schema, opts)?;
-        for batch in reader {
-            let batch = batch
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-            rows += batch.num_rows();
-            w.write_batch(&batch)?;
-        }
+        let sink = FileSink::create(&tmp)?;
+        let mut w = MosaicWriter::new(sink, schema, WriterOptions::default())?;
+        write(&mut w, &mut rows)?;
         w.close()
     })();
     if let Err(e) = res {
@@ -516,6 +667,418 @@ fn convert(
         plural(schema.fields().len(), "column")
     );
     Ok(())
+}
+
+fn project_convert_schema(schema: Schema, columns: &[String]) -> std::io::Result<Schema> {
+    if columns.is_empty() {
+        return Ok(schema);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut fields = Vec::new();
+    for name in columns {
+        if name.is_empty() {
+            return Err(invalid_schema("--column field name cannot be empty"));
+        }
+        let index = schema
+            .index_of(name)
+            .map_err(|_| invalid_schema(format!("--column '{name}' not found in schema")))?;
+        if seen.insert(index) {
+            fields.push(schema.fields()[index].as_ref().clone());
+        }
+    }
+    Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+fn is_json_input(input: &Path) -> bool {
+    input
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with("json"))
+}
+
+fn csv_format(options: &CsvConvertOptions) -> std::io::Result<arrow::csv::reader::Format> {
+    let delimiter = parse_csv_byte(&options.delimiter, "delimiter")?;
+    let escape = parse_csv_byte(&options.escape, "escape")?;
+    let quote = parse_csv_byte(&options.quote, "quote")?;
+    Ok(arrow::csv::reader::Format::default()
+        .with_header(!options.no_header && options.header.is_none())
+        .with_delimiter(delimiter)
+        .with_escape(escape)
+        .with_quote(quote))
+}
+
+fn parse_csv_byte(value: &str, name: &str) -> std::io::Result<u8> {
+    let bytes = value.as_bytes();
+    if bytes.len() == 1 {
+        Ok(bytes[0])
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("--{name} must be exactly one byte"),
+        ))
+    }
+}
+
+fn open_csv(path: &Path, skip_lines: usize) -> std::io::Result<std::io::BufReader<std::fs::File>> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut line = String::new();
+    for _ in 0..skip_lines {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+    }
+    Ok(reader)
+}
+
+struct CsvInputLayout {
+    header: Option<Vec<String>>,
+    columns: usize,
+}
+
+fn csv_input_layout(path: &Path, options: &CsvConvertOptions) -> std::io::Result<CsvInputLayout> {
+    let delimiter = parse_csv_byte(&options.delimiter, "delimiter")?;
+    let escape = parse_csv_byte(&options.escape, "escape")?;
+    let quote = parse_csv_byte(&options.quote, "quote")?;
+    let mut builder = csv::ReaderBuilder::new();
+    builder
+        .has_headers(false)
+        .flexible(true)
+        .delimiter(delimiter)
+        .quote(quote)
+        .escape(Some(escape));
+    let mut reader = builder.from_reader(open_csv(path, options.skip_lines)?);
+    let mut records = reader.records();
+    let header = if let Some(header) = &options.header {
+        Some(parse_csv_header(header, options)?)
+    } else if options.no_header {
+        None
+    } else {
+        match records.next() {
+            Some(record) => {
+                let record =
+                    record.map_err(|e| invalid_schema(format!("invalid CSV header: {e}")))?;
+                Some(record.iter().map(ToString::to_string).collect())
+            }
+            None => Some(Vec::new()),
+        }
+    };
+    let mut columns = header.as_ref().map_or(0, Vec::len);
+    for record in records {
+        let record = record.map_err(|e| invalid_schema(format!("invalid CSV record: {e}")))?;
+        columns = columns.max(record.len());
+    }
+    Ok(CsvInputLayout { header, columns })
+}
+
+fn csv_reader_schema(output_schema: &Schema, layout: &CsvInputLayout) -> Schema {
+    let positional = layout.header.is_none();
+    let columns = if positional {
+        layout.columns.max(output_schema.fields().len())
+    } else {
+        layout.columns
+    };
+    let fields: Vec<Field> = (0..columns)
+        .map(|i| {
+            let source = if let Some(header) = &layout.header {
+                header
+                    .get(i)
+                    .and_then(|name| output_schema.index_of(name).ok())
+            } else {
+                (i < output_schema.fields().len()).then_some(i)
+            };
+            if let Some(source) = source {
+                output_schema.fields()[source]
+                    .as_ref()
+                    .clone()
+                    .with_name(format!("field_{i}"))
+            } else {
+                Field::new(format!("field_{i}"), DataType::Utf8, true)
+            }
+        })
+        .collect();
+    Schema::new(fields)
+}
+
+fn csv_output_mapping(output_schema: &Schema, layout: &CsvInputLayout) -> Vec<Option<usize>> {
+    if let Some(header) = &layout.header {
+        let mut mapping = vec![None; output_schema.fields().len()];
+        for (csv_index, name) in header.iter().enumerate() {
+            if let Ok(field_index) = output_schema.index_of(name) {
+                mapping[field_index] = Some(csv_index);
+            }
+        }
+        mapping
+    } else {
+        (0..output_schema.fields().len()).map(Some).collect()
+    }
+}
+
+fn align_csv_batch_to_schema(
+    batch: RecordBatch,
+    schema: &Schema,
+    mapping: &[Option<usize>],
+) -> std::io::Result<RecordBatch> {
+    let columns: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .zip(mapping)
+        .map(|(field, index)| match index {
+            Some(index) => batch.column(*index).clone(),
+            None => new_null_array(field.data_type(), batch.num_rows()),
+        })
+        .collect();
+    RecordBatch::try_new(Arc::new(schema.clone()), columns)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+}
+
+fn csv_schema_with_csv_names(
+    schema: Schema,
+    options: &CsvConvertOptions,
+) -> std::io::Result<Schema> {
+    let names = if let Some(header) = &options.header {
+        Some(parse_csv_header(header, options)?)
+    } else if options.no_header {
+        Some(
+            (0..schema.fields().len())
+                .map(|i| format!("field_{i}"))
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let Some(names) = names else {
+        return Ok(schema);
+    };
+    if names.len() != schema.fields().len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "CSV header has {} fields but inferred schema has {} fields",
+                names.len(),
+                schema.fields().len()
+            ),
+        ));
+    }
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .zip(names)
+        .map(|(field, name)| field.as_ref().clone().with_name(name))
+        .collect();
+    Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+fn parse_csv_header(header: &str, options: &CsvConvertOptions) -> std::io::Result<Vec<String>> {
+    let delimiter = parse_csv_byte(&options.delimiter, "delimiter")?;
+    let escape = parse_csv_byte(&options.escape, "escape")?;
+    let quote = parse_csv_byte(&options.quote, "quote")?;
+    let mut builder = csv::ReaderBuilder::new();
+    builder
+        .has_headers(false)
+        .delimiter(delimiter)
+        .quote(quote)
+        .escape(Some(escape));
+    let mut reader = builder.from_reader(header.as_bytes());
+    let mut records = reader.records();
+    let record = records
+        .next()
+        .ok_or_else(|| invalid_schema("--header must contain at least one field"))?
+        .map_err(|e| invalid_schema(format!("invalid --header CSV: {e}")))?;
+    if let Some(next) = records.next() {
+        next.map_err(|e| invalid_schema(format!("invalid --header CSV: {e}")))?;
+        return Err(invalid_schema(
+            "--header must contain exactly one CSV record",
+        ));
+    }
+    Ok(record.iter().map(ToString::to_string).collect())
+}
+
+fn csv_schema_with_null_fallback(schema: Schema) -> Schema {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let field = field.as_ref().clone();
+            if matches!(field.data_type(), DataType::Null) {
+                field.with_data_type(DataType::Utf8)
+            } else {
+                field
+            }
+        })
+        .collect();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
+fn load_convert_schema(path: &Path) -> std::io::Result<Schema> {
+    let text = std::fs::read_to_string(path)?;
+    parse_avro_schema(&text)
+}
+
+fn parse_avro_schema(spec: &str) -> std::io::Result<Schema> {
+    let value: Value = serde_json::from_str(spec)
+        .map_err(|e| invalid_schema(format!("invalid Avro schema JSON: {e}")))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid_schema("Avro schema must be a record object"))?;
+    let schema_type = obj
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_schema("Avro schema must have type: \"record\""))?;
+    if schema_type != "record" {
+        return Err(invalid_schema(format!(
+            "Avro schema type must be record, got '{schema_type}'"
+        )));
+    }
+    let avro_fields = obj
+        .get("fields")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_schema("Avro record schema must contain a fields array"))?;
+    let mut fields = Vec::with_capacity(avro_fields.len());
+    for field in avro_fields {
+        let field_obj = field
+            .as_object()
+            .ok_or_else(|| invalid_schema("Avro field must be an object"))?;
+        let name = field_obj
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_schema("Avro field must contain a string name"))?;
+        let avro_type = field_obj
+            .get("type")
+            .ok_or_else(|| invalid_schema(format!("Avro field '{name}' is missing type")))?;
+        let (data_type, nullable) = parse_avro_type(avro_type)
+            .map_err(|e| invalid_schema(format!("Avro field '{name}': {e}")))?;
+        fields.push(Field::new(name, data_type, nullable));
+    }
+    if fields.is_empty() {
+        return Err(invalid_schema(
+            "Avro record schema must contain at least one field",
+        ));
+    }
+    Ok(Schema::new(fields))
+}
+
+fn parse_avro_type(value: &Value) -> Result<(DataType, bool), String> {
+    match value {
+        Value::String(name) => parse_avro_named_type(name, None).map(|dt| (dt, false)),
+        Value::Object(obj) => {
+            let name = obj
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Avro type object must contain a string type".to_string())?;
+            parse_avro_named_type(name, Some(value)).map(|dt| (dt, false))
+        }
+        Value::Array(types) => parse_avro_union(types),
+        _ => Err("Avro type must be a string, object, or union array".to_string()),
+    }
+}
+
+fn parse_avro_union(types: &[Value]) -> Result<(DataType, bool), String> {
+    let mut has_null = false;
+    let mut non_null = None;
+    for ty in types {
+        if matches!(ty, Value::String(s) if s == "null") {
+            has_null = true;
+            continue;
+        }
+        let (dt, nullable) = parse_avro_type(ty)?;
+        if nullable {
+            return Err("nested nullable unions are not supported".to_string());
+        }
+        if non_null.replace(dt).is_some() {
+            return Err("Avro unions with multiple non-null types are not supported".to_string());
+        }
+    }
+    let dt = non_null.ok_or_else(|| "pure null Avro fields are not supported".to_string())?;
+    Ok((dt, has_null))
+}
+
+fn parse_avro_named_type(name: &str, full_type: Option<&Value>) -> Result<DataType, String> {
+    let logical_type = full_type
+        .and_then(|value| value.get("logicalType"))
+        .and_then(Value::as_str);
+    if let Some(logical_type) = logical_type {
+        return parse_avro_logical_type(name, logical_type, full_type.unwrap());
+    }
+    match name {
+        "boolean" => Ok(DataType::Boolean),
+        "int" => Ok(DataType::Int32),
+        "long" => Ok(DataType::Int64),
+        "float" => Ok(DataType::Float32),
+        "double" => Ok(DataType::Float64),
+        "string" => Ok(DataType::Utf8),
+        "bytes" => Ok(DataType::Binary),
+        "null" => Err("null is not a supported schema type; use a nullable union".to_string()),
+        other => Err(format!("unsupported Avro type '{other}'")),
+    }
+}
+
+fn parse_avro_logical_type(
+    physical_type: &str,
+    logical_type: &str,
+    full_type: &Value,
+) -> Result<DataType, String> {
+    match (physical_type, logical_type) {
+        ("int", "date") => Ok(DataType::Date32),
+        ("int", "time-millis") => Ok(DataType::Time32(TimeUnit::Millisecond)),
+        ("long", "timestamp-millis") => Ok(DataType::Timestamp(TimeUnit::Millisecond, None)),
+        ("long", "timestamp-micros") => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        ("long", "timestamp-nanos") => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        ("bytes" | "fixed", "decimal") => parse_avro_decimal(full_type),
+        ("string", "uuid") => Ok(DataType::Utf8),
+        _ => Err(format!(
+            "unsupported Avro logical type '{logical_type}' on '{physical_type}'"
+        )),
+    }
+}
+
+fn parse_avro_decimal(full_type: &Value) -> Result<DataType, String> {
+    let precision = full_type
+        .get("precision")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "decimal logical type must contain precision".to_string())?;
+    let scale = full_type.get("scale").and_then(Value::as_i64).unwrap_or(0);
+    let precision = u8::try_from(precision)
+        .map_err(|_| format!("decimal precision must be in 1..38, got {precision}"))?;
+    if precision == 0 || precision > 38 {
+        return Err(format!(
+            "decimal precision must be in 1..38, got {precision}"
+        ));
+    }
+    let scale = i8::try_from(scale).map_err(|_| format!("invalid decimal scale {scale}"))?;
+    Ok(DataType::Decimal128(precision, scale))
+}
+
+fn apply_required_fields(schema: Schema, required_fields: &[String]) -> std::io::Result<Schema> {
+    if required_fields.is_empty() {
+        return Ok(schema);
+    }
+    for name in required_fields {
+        if name.is_empty() {
+            return Err(invalid_schema("--require field name cannot be empty"));
+        }
+        schema.index_of(name).map_err(|_| {
+            invalid_schema(format!("--require column '{name}' not found in schema"))
+        })?;
+    }
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let field = field.as_ref().clone();
+            if required_fields.iter().any(|name| name == field.name()) {
+                field.with_nullable(false)
+            } else {
+                field
+            }
+        })
+        .collect();
+    Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+fn invalid_schema(msg: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.into())
 }
 
 fn cat(
@@ -828,4 +1391,49 @@ fn buckets(file: &Path, json: bool) -> std::io::Result<()> {
         println!("{}", jsonout::line(&jsonout::Buckets { row_groups: rgs }));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_avro_schema_accepts_nullable_and_logical_types() {
+        let schema = parse_avro_schema(
+            r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "id", "type": "int"},
+    {"name": "name", "type": ["null", "string"], "default": null},
+    {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}},
+    {"name": "ts", "type": {"type": "long", "logicalType": "timestamp-nanos"}}
+  ]
+}"#,
+        )
+        .unwrap();
+        assert_eq!(schema.fields().len(), 4);
+        assert_eq!(schema.fields()[0].data_type(), &DataType::Int32);
+        assert!(!schema.fields()[0].is_nullable());
+        assert_eq!(schema.fields()[1].data_type(), &DataType::Utf8);
+        assert!(schema.fields()[1].is_nullable());
+        assert_eq!(schema.fields()[2].data_type(), &DataType::Decimal128(10, 2));
+        assert_eq!(
+            schema.fields()[3].data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+    }
+
+    #[test]
+    fn parse_avro_schema_rejects_pure_null_type() {
+        let err = parse_avro_schema(
+            r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [{"name": "empty", "type": "null"}]
+}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("null is not a supported"));
+    }
 }

@@ -30,5 +30,6 @@ path = "src/main.rs"
 paimon-mosaic-core = { path = "../core", version = "0.3.0" }
 arrow = { version = "58", features = ["csv", "json"] }
 clap = { version = "4", features = ["derive"] }
+csv = "1.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

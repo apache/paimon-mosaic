@@ -21,7 +21,9 @@
 use std::process::Command;
 use std::sync::Arc;
 
-use arrow::array::{BooleanArray, Float32Array, Int32Array, RecordBatch, StringArray};
+use arrow::array::{
+    BooleanArray, Date32Array, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use paimon_mosaic_core::writer::{FileSink, MosaicWriter, WriterOptions};
 
@@ -284,6 +286,65 @@ fn fixture_f32(name: &str) -> String {
     path
 }
 
+fn fixture_i64(name: &str) -> String {
+    let path = format!(
+        "{}/mosaic_e2e_{}.mosaic",
+        std::env::temp_dir().display(),
+        name
+    );
+    let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+    let out = FileSink::create(std::path::Path::new(&path)).unwrap();
+    let mut w = MosaicWriter::new(
+        out,
+        &schema,
+        WriterOptions {
+            num_buckets: 1,
+            stats_columns: vec!["id".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(Int64Array::from(vec![
+            1_700_000_000_000_000_001i64,
+            1_700_000_000_000_000_003i64,
+        ]))],
+    )
+    .unwrap();
+    w.write_batch(&batch).unwrap();
+    w.close().unwrap();
+    path
+}
+
+fn fixture_date32(name: &str) -> String {
+    let path = format!(
+        "{}/mosaic_e2e_{}.mosaic",
+        std::env::temp_dir().display(),
+        name
+    );
+    let schema = Schema::new(vec![Field::new("d", DataType::Date32, false)]);
+    let out = FileSink::create(std::path::Path::new(&path)).unwrap();
+    let mut w = MosaicWriter::new(
+        out,
+        &schema,
+        WriterOptions {
+            num_buckets: 1,
+            stats_columns: vec!["d".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(Date32Array::from(vec![18_262, 18_628]))],
+    )
+    .unwrap();
+    w.write_batch(&batch).unwrap();
+    w.close().unwrap();
+    path
+}
+
 #[test]
 fn cat_where_float32_precision() {
     let f = fixture_f32("wheref32");
@@ -297,12 +358,143 @@ fn convert_csv_then_inspect() {
     let csv = format!("{}/mosaic_e2e_in.csv", std::env::temp_dir().display());
     std::fs::write(&csv, "id,kind,score\n1,a,10.5\n2,b,20\n3,a,30.5\n").unwrap();
     let out = format!("{}/mosaic_e2e_conv.mosaic", std::env::temp_dir().display());
-    let (msg, _, ok) = run(&["convert", &csv, "-o", &out, "--stats", "id", "--overwrite"]);
+    let (msg, _, ok) = run(&["convert-csv", &csv, "-o", &out, "--overwrite"]);
     assert!(ok && msg.contains("3 rows"));
     let (c, _, _) = run(&["count", &out]);
     assert_eq!(c.trim(), "3");
     let (s, _, _) = run(&["schema", &out]);
     assert!(s.contains("id:") && s.contains("score:")); // inferred schema
+}
+
+#[test]
+fn convert_csv_all_null_column_falls_back_to_utf8() {
+    let csv = format!(
+        "{}/mosaic_e2e_all_null_col.csv",
+        std::env::temp_dir().display()
+    );
+    std::fs::write(&csv, "id,empty\n1,\n2,\n").unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_all_null_col.mosaic",
+        std::env::temp_dir().display()
+    );
+    let (msg, err, ok) = run(&["convert-csv", &csv, "-o", &out, "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (s, _, _) = run(&["schema", &out]);
+    assert!(s.contains("empty: Utf8"), "{s}");
+    let (rows, _, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "{rows}");
+    assert!(
+        rows.lines().all(|line| line.contains("\"empty\":null")),
+        "{rows}"
+    );
+}
+
+#[test]
+fn convert_csv_uses_explicit_schema_file() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_explicit_schema.csv", dir.display());
+    std::fs::write(&csv, "id,empty\n1,\n2,\n").unwrap();
+    let schema = format!("{}/mosaic_e2e_explicit_schema.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "id", "type": "int"},
+    {"name": "empty", "type": ["null", "string"], "default": null}
+  ]
+}"#,
+    )
+    .unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_explicit_schema.mosaic",
+        std::env::temp_dir().display()
+    );
+    let (msg, err, ok) = run(&[
+        "convert-csv",
+        &csv,
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (s, _, _) = run(&["schema", &out]);
+    assert!(s.contains("id: Int32 not null"), "{s}");
+    assert!(s.contains("empty: Utf8"), "{s}");
+}
+
+#[test]
+fn convert_csv_explicit_schema_maps_header_by_name() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_explicit_schema_reordered.csv", dir.display());
+    std::fs::write(&csv, "name,id,extra\nalice,1,ignored\nbob,2,ignored\n").unwrap();
+    let schema = format!(
+        "{}/mosaic_e2e_explicit_schema_reordered.avsc",
+        dir.display()
+    );
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "id", "type": "int"},
+    {"name": "name", "type": "string"},
+    {"name": "missing", "type": ["null", "string"], "default": null}
+  ]
+}"#,
+    )
+    .unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_explicit_schema_reordered.mosaic",
+        dir.display()
+    );
+    let (msg, err, ok) = run(&[
+        "convert-csv",
+        &csv,
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, _, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "{rows}");
+    assert!(
+        rows.contains(r#"{"id":1,"name":"alice","missing":null}"#),
+        "{rows}"
+    );
+    assert!(
+        rows.contains(r#"{"id":2,"name":"bob","missing":null}"#),
+        "{rows}"
+    );
+}
+
+#[test]
+fn convert_csv_require_marks_inferred_field_not_null() {
+    let csv = format!("{}/mosaic_e2e_require.csv", std::env::temp_dir().display());
+    std::fs::write(&csv, "id,name\n1,a\n2,b\n").unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_require.mosaic",
+        std::env::temp_dir().display()
+    );
+    let (msg, err, ok) = run(&[
+        "convert-csv",
+        &csv,
+        "-o",
+        &out,
+        "--require",
+        "id",
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (s, _, _) = run(&["schema", &out]);
+    assert!(s.contains("id: Int64 not null"), "{s}");
+    assert!(s.contains("name: Utf8"), "{s}");
 }
 
 #[test]
@@ -317,15 +509,47 @@ fn convert_refuses_existing_output_without_overwrite() {
         std::env::temp_dir().display()
     );
     std::fs::write(&out, "keep me").unwrap();
-    let (_, err, ok) = run(&["convert", &csv, "-o", &out]);
+    let (_, err, ok) = run(&["convert-csv", &csv, "-o", &out]);
     assert!(!ok);
     assert!(err.contains("use --overwrite"), "{err}");
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "keep me");
 }
 
 #[test]
+fn convert_rejects_csv_input() {
+    let csv = format!(
+        "{}/mosaic_e2e_convert_rejects_csv.csv",
+        std::env::temp_dir().display()
+    );
+    std::fs::write(&csv, "id\n1\n").unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_convert_rejects_csv.mosaic",
+        std::env::temp_dir().display()
+    );
+    let (_, err, ok) = run(&["convert", &csv, "-o", &out, "--overwrite"]);
+    assert!(!ok);
+    assert!(err.contains("use convert-csv for CSV data"), "{err}");
+}
+
+#[test]
+fn convert_rejects_jsonl_input() {
+    let js = format!(
+        "{}/mosaic_e2e_convert_rejects_jsonl.jsonl",
+        std::env::temp_dir().display()
+    );
+    std::fs::write(&js, "{\"id\":1}\n").unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_convert_rejects_jsonl.mosaic",
+        std::env::temp_dir().display()
+    );
+    let (_, err, ok) = run(&["convert", &js, "-o", &out, "--overwrite"]);
+    assert!(!ok);
+    assert!(err.contains("convert only supports JSON inputs"), "{err}");
+}
+
+#[test]
 fn convert_json_then_inspect() {
-    let js = format!("{}/mosaic_e2e_in.ndjson", std::env::temp_dir().display());
+    let js = format!("{}/mosaic_e2e_in.json", std::env::temp_dir().display());
     std::fs::write(
         &js,
         "{\"id\":1,\"kind\":\"a\"}\n{\"id\":2,\"kind\":\"b\"}\n",
@@ -340,26 +564,53 @@ fn convert_json_then_inspect() {
 }
 
 #[test]
+fn convert_json_projects_columns() {
+    let js = format!(
+        "{}/mosaic_e2e_json_project.json",
+        std::env::temp_dir().display()
+    );
+    std::fs::write(
+        &js,
+        "{\"id\":1,\"kind\":\"a\",\"drop\":\"x\"}\n{\"id\":2,\"kind\":\"b\",\"drop\":\"y\"}\n",
+    )
+    .unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_json_project.mosaic",
+        std::env::temp_dir().display()
+    );
+    let (msg, err, ok) = run(&[
+        "convert",
+        &js,
+        "-o",
+        &out,
+        "-c",
+        "kind",
+        "--columns",
+        "id",
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, _, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "{rows}");
+    assert!(rows.contains(r#"{"kind":"a","id":1}"#), "{rows}");
+    assert!(!rows.contains("drop"), "{rows}");
+}
+
+#[test]
 fn where_pushdown_keeps_correct_rows() {
     // stats on id let id>100 skip the row group; boundaries must not drop matches.
-    let csv = format!("{}/mosaic_e2e_pd.csv", std::env::temp_dir().display());
-    std::fs::write(&csv, "id,kind\n1,a\n2,b\n3,a\n").unwrap();
-    let out = format!("{}/mosaic_e2e_pd.mosaic", std::env::temp_dir().display());
-    run(&["convert", &csv, "-o", &out, "--stats", "id", "--overwrite"]);
-    let (none, _, _) = run(&["cat", &out, "--where", "id>100"]);
+    let f = fixture("pd");
+    let (none, _, _) = run(&["cat", &f, "--where", "id>1000"]);
     assert!(none.contains("(no rows)"));
-    let (keep, _, _) = run(&["cat", &out, "--where", "id>=3", "--json"]);
+    let (keep, _, _) = run(&["cat", &f, "--where", "id>=199", "--json"]);
     assert_eq!(keep.lines().count(), 1); // boundary kept, not skipped
 }
 
 #[test]
 fn bigint_where_is_exact() {
     // Snowflake-scale ids differ below f64 precision; equality must be exact.
-    let csv = format!("{}/mosaic_e2e_sf.csv", std::env::temp_dir().display());
-    std::fs::write(&csv, "id\n1700000000000000001\n1700000000000000003\n").unwrap();
-    let out = format!("{}/mosaic_e2e_sf.mosaic", std::env::temp_dir().display());
-    run(&["convert", &csv, "-o", &out, "--stats", "id", "--overwrite"]);
-    let (j, _, ok) = run(&["cat", &out, "--where", "id=1700000000000000003", "--json"]);
+    let f = fixture_i64("sf");
+    let (j, _, ok) = run(&["cat", &f, "--where", "id=1700000000000000003", "--json"]);
     assert!(ok && j.lines().count() == 1 && j.contains("003"), "{j}");
 }
 
@@ -367,11 +618,8 @@ fn bigint_where_is_exact() {
 fn date_column_pushdown_keeps_match() {
     // Date filters accept ISO literals while stats pushdown still compares the
     // stored epoch-day bounds.
-    let csv = format!("{}/mosaic_e2e_date.csv", std::env::temp_dir().display());
-    std::fs::write(&csv, "d\n2020-01-01\n2021-01-01\n").unwrap();
-    let out = format!("{}/mosaic_e2e_date.mosaic", std::env::temp_dir().display());
-    run(&["convert", &csv, "-o", &out, "--stats", "d", "--overwrite"]);
-    let (j, _, ok) = run(&["cat", &out, "--where", "d>2020-12-31", "--json"]);
+    let f = fixture_date32("date");
+    let (j, _, ok) = run(&["cat", &f, "--where", "d>2020-12-31", "--json"]);
     assert!(
         ok && j.lines().count() == 1 && j.contains("2021-01-01"),
         "{j}"
