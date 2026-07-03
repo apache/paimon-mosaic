@@ -599,12 +599,12 @@ fn convert_csv(
         None => {
             let mut inferred = None;
             for input in inputs {
-                let (schema, _) = format
+                let (schema, rows) = format
                     .infer_schema(open_csv(input, options.skip_lines)?, None)
                     .map_err(bad)?;
-                // A 0-byte shard has nothing to infer from; it is skipped when
-                // reading too.
-                if schema.fields().is_empty() {
+                // A shard with no data rows has nothing to infer from; it is
+                // skipped when reading too.
+                if rows == 0 || schema.fields().is_empty() {
                     continue;
                 }
                 let schema = apply_required_fields(
@@ -833,7 +833,9 @@ fn csv_input_layout(
             Some(record) => {
                 let record =
                     record.map_err(|e| invalid_schema(format!("invalid CSV header: {e}")))?;
-                Some(record.iter().map(ToString::to_string).collect())
+                let header: Vec<String> = record.iter().map(ToString::to_string).collect();
+                validate_csv_header_names(&header)?;
+                Some(header)
             }
             None => Some(Vec::new()),
         }
@@ -1000,7 +1002,24 @@ fn parse_csv_header(header: &str, options: &CsvConvertOptions) -> std::io::Resul
             "--header must contain exactly one CSV record",
         ));
     }
-    Ok(record.iter().map(ToString::to_string).collect())
+    let header: Vec<String> = record.iter().map(ToString::to_string).collect();
+    validate_csv_header_names(&header)?;
+    Ok(header)
+}
+
+fn validate_csv_header_names(header: &[String]) -> std::io::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for name in header {
+        if name.is_empty() {
+            return Err(invalid_schema("empty column name"));
+        }
+        if !seen.insert(name.as_str()) {
+            return Err(invalid_schema(format!(
+                "duplicate CSV header field '{name}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn csv_schema_with_null_fallback(schema: Schema) -> Schema {

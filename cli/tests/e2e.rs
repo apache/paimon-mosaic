@@ -390,6 +390,19 @@ fn convert_csv_all_null_column_falls_back_to_utf8() {
 }
 
 #[test]
+fn convert_csv_rejects_empty_header_field() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_empty_header_field.csv", dir.display());
+    std::fs::write(&csv, ",id\nx,1\n").unwrap();
+    let out = format!("{}/mosaic_e2e_empty_header_field.mosaic", dir.display());
+    let _ = std::fs::remove_file(&out);
+    let (_, err, ok) = run(&["convert-csv", &csv, "-o", &out, "--overwrite"]);
+    assert!(!ok);
+    assert!(err.contains("empty column name"), "{err}");
+    assert!(!std::path::Path::new(&out).exists());
+}
+
+#[test]
 fn convert_csv_uses_explicit_schema_file() {
     let dir = std::env::temp_dir();
     let csv = format!("{}/mosaic_e2e_explicit_schema.csv", dir.display());
@@ -472,6 +485,35 @@ fn convert_csv_explicit_schema_maps_header_by_name() {
         rows.contains(r#"{"id":2,"name":"bob","missing":null}"#),
         "{rows}"
     );
+}
+
+#[test]
+fn convert_csv_errors_on_duplicate_header_field() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_duplicate_header.csv", dir.display());
+    std::fs::write(&csv, "id,id\n1,2\n3,4\n").unwrap();
+    let schema = format!("{}/mosaic_e2e_duplicate_header.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [{"name": "id", "type": "int"}]
+}"#,
+    )
+    .unwrap();
+    let out = format!("{}/mosaic_e2e_duplicate_header.mosaic", dir.display());
+    let (_, err, ok) = run(&[
+        "convert-csv",
+        &csv,
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("duplicate CSV header field 'id'"), "{err}");
 }
 
 #[test]
@@ -567,6 +609,27 @@ fn convert_csv_skips_empty_inputs_and_rejects_all_empty() {
     let (_, err, ok) = run(&["convert-csv", &empty, "-o", &out, "--overwrite"]);
     assert!(!ok);
     assert!(err.contains("no CSV data"), "{err}");
+}
+
+#[test]
+fn convert_csv_skips_header_only_inputs() {
+    let dir = std::env::temp_dir();
+    let header_only = format!("{}/mosaic_e2e_header_only_shard_a.csv", dir.display());
+    let data = format!("{}/mosaic_e2e_header_only_shard_b.csv", dir.display());
+    std::fs::write(&header_only, "id,kind\n").unwrap();
+    std::fs::write(&data, "id,kind\n1,a\n2,b\n").unwrap();
+    let out = format!("{}/mosaic_e2e_header_only_shard.mosaic", dir.display());
+    let (msg, err, ok) = run(&[
+        "convert-csv",
+        &header_only,
+        &data,
+        "-o",
+        &out,
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (c, _, _) = run(&["count", &out]);
+    assert_eq!(c.trim(), "2");
 }
 
 #[test]
