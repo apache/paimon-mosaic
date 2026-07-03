@@ -32,7 +32,7 @@ use serde_json::Value;
 
 use crate::input::FileInput;
 
-/// Mosaic file inspector — the cat/meta/schema/pages toolkit (cf. parquet-cli).
+/// Mosaic file inspector — the cat/meta/schema/pages toolkit.
 #[derive(Parser)]
 #[command(name = "mosaic", version, about)]
 struct Cli {
@@ -128,17 +128,21 @@ enum Cmd {
     },
     /// Create a Mosaic file from a JSON data file.
     Convert {
-        /// Input JSON data file (filename ending with json).
+        /// Input JSON data file (.json/.ndjson/.jsonl).
         input: PathBuf,
         /// Output .mosaic path.
         #[arg(short = 'o', long = "output")]
         out: PathBuf,
-        /// Avro schema file, matching parquet-cli's --schema option.
+        /// Avro record schema file to use instead of inferring one.
         #[arg(short = 's', long)]
         schema: Option<PathBuf>,
         /// List of columns.
         #[arg(short = 'c', long = "column", visible_alias = "columns")]
         columns: Vec<String>,
+        /// Columns to build min/max stats for (comma-separated); `cat --where`
+        /// uses them to skip row groups.
+        #[arg(long)]
+        stats: Option<String>,
         /// Overwrite the output file if it already exists.
         #[arg(long)]
         overwrite: bool,
@@ -150,7 +154,7 @@ enum Cmd {
         /// Output .mosaic path.
         #[arg(short = 'o', long = "output")]
         out: PathBuf,
-        /// Avro schema file, matching parquet-cli convert-csv --schema.
+        /// Avro record schema file to use instead of inferring one.
         #[arg(short = 's', long)]
         schema: Option<PathBuf>,
         /// Do not allow null values for inferred fields; repeat for multiple fields.
@@ -174,6 +178,10 @@ enum Cmd {
         /// Lines to skip before CSV start.
         #[arg(long, default_value_t = 0)]
         skip_lines: usize,
+        /// Columns to build min/max stats for (comma-separated); `cat --where`
+        /// uses them to skip row groups.
+        #[arg(long)]
+        stats: Option<String>,
         /// Overwrite the output file if it already exists.
         #[arg(long)]
         overwrite: bool,
@@ -218,8 +226,16 @@ fn main() -> ExitCode {
             out,
             schema,
             columns,
+            stats,
             overwrite,
-        } => convert(&input, &out, schema.as_deref(), &columns, overwrite),
+        } => convert(
+            &input,
+            &out,
+            schema.as_deref(),
+            &columns,
+            stats.as_deref(),
+            overwrite,
+        ),
         Cmd::ConvertCsv {
             inputs,
             out,
@@ -231,6 +247,7 @@ fn main() -> ExitCode {
             no_header,
             header,
             skip_lines,
+            stats,
             overwrite,
         } => {
             let options = CsvConvertOptions {
@@ -247,6 +264,7 @@ fn main() -> ExitCode {
                 schema.as_deref(),
                 &require,
                 options,
+                stats.as_deref(),
                 overwrite,
             )
         }
@@ -503,6 +521,7 @@ fn convert(
     out: &Path,
     schema: Option<&Path>,
     columns: &[String],
+    stats: Option<&str>,
     overwrite: bool,
 ) -> std::io::Result<()> {
     use arrow::error::ArrowError;
@@ -510,7 +529,7 @@ fn convert(
     if !is_json_input(input) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "convert only supports JSON inputs; use convert-csv for CSV data",
+            "convert only supports JSON inputs (.json/.ndjson/.jsonl); use convert-csv for CSV data",
         ));
     }
     let explicit_schema = schema.map(load_convert_schema).transpose()?;
@@ -523,10 +542,11 @@ fn convert(
             .map_err(bad)?,
     };
     let schema = project_convert_schema(schema, columns)?;
+    reject_null_inferred_fields(&schema)?;
     let reader = arrow::json::ReaderBuilder::new(Arc::new(schema.clone()))
         .build(open()?)
         .map_err(bad)?;
-    write_mosaic(out, overwrite, &schema, |writer, rows| {
+    write_mosaic(out, overwrite, &schema, stats, |writer, rows| {
         for batch in reader {
             let batch = batch
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -552,6 +572,7 @@ fn convert_csv(
     schema: Option<&Path>,
     required_fields: &[String],
     options: CsvConvertOptions,
+    stats: Option<&str>,
     overwrite: bool,
 ) -> std::io::Result<()> {
     if inputs.is_empty() {
@@ -560,10 +581,19 @@ fn convert_csv(
             "CSV path is required",
         ));
     }
+    if schema.is_some() && !required_fields.is_empty() {
+        return Err(invalid_schema(
+            "--require applies only when the schema is inferred; set nullability in the --schema file instead",
+        ));
+    }
     use arrow::error::ArrowError;
     let bad = |e: ArrowError| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
     let format = csv_format(&options)?;
     let explicit_schema = schema.map(load_convert_schema).transpose()?;
+    // Arrow schema inference rejects ragged rows, so once inference succeeds
+    // every row is as wide as the header; only an explicit schema needs the
+    // row widths scanned to size the reader for extra CSV columns.
+    let scan_widths = explicit_schema.is_some();
     let schema = match explicit_schema {
         Some(schema) => schema,
         None => {
@@ -572,6 +602,11 @@ fn convert_csv(
                 let (schema, _) = format
                     .infer_schema(open_csv(input, options.skip_lines)?, None)
                     .map_err(bad)?;
+                // A 0-byte shard has nothing to infer from; it is skipped when
+                // reading too.
+                if schema.fields().is_empty() {
+                    continue;
+                }
                 let schema = apply_required_fields(
                     csv_schema_with_csv_names(csv_schema_with_null_fallback(schema), &options)?,
                     required_fields,
@@ -590,14 +625,22 @@ fn convert_csv(
                     inferred = Some(schema);
                 }
             }
-            inferred.expect("inputs is not empty")
+            inferred.ok_or_else(|| {
+                invalid_schema("no CSV data to infer a schema from; provide --schema")
+            })?
         }
     };
-    write_mosaic(out, overwrite, &schema, |writer, rows| {
+    write_mosaic(out, overwrite, &schema, stats, |writer, rows| {
         for input in inputs {
-            let layout = csv_input_layout(input, &options)?;
+            let layout = csv_input_layout(input, &options, scan_widths)?;
+            // An empty file read in header mode yields an empty header: nothing
+            // to read, and no header names to complain about.
+            if layout.header.as_ref().is_some_and(|h| h.is_empty()) {
+                continue;
+            }
             let reader_schema = csv_reader_schema(&schema, &layout);
             let mapping = csv_output_mapping(&schema, &layout);
+            validate_csv_mapping(&schema, &layout, &mapping, input)?;
             let reader = arrow::csv::ReaderBuilder::new(Arc::new(reader_schema))
                 .with_format(format.clone().with_truncated_rows(true))
                 .build(open_csv(input, options.skip_lines)?)
@@ -615,7 +658,13 @@ fn convert_csv(
     })
 }
 
-fn write_mosaic<F>(out: &Path, overwrite: bool, schema: &Schema, write: F) -> std::io::Result<()>
+fn write_mosaic<F>(
+    out: &Path,
+    overwrite: bool,
+    schema: &Schema,
+    stats: Option<&str>,
+    write: F,
+) -> std::io::Result<()>
 where
     F: FnOnce(
         &mut paimon_mosaic_core::writer::MosaicWriter<paimon_mosaic_core::writer::FileSink>,
@@ -629,6 +678,10 @@ where
             format!("{} exists (use --overwrite to replace)", out.display()),
         ));
     }
+    let opts = WriterOptions {
+        stats_columns: stats.map(parse_comma_list).unwrap_or_default(),
+        ..Default::default()
+    };
     // Write to a unique sibling temp file and rename on success, so a mid-stream
     // failure never leaves a truncated .mosaic — and a process-unique suffix
     // avoids clobbering an unrelated `out.mosaic.tmp` the user may already have.
@@ -640,7 +693,7 @@ where
     let mut rows = 0;
     let res = (|| {
         let sink = FileSink::create(&tmp)?;
-        let mut w = MosaicWriter::new(sink, schema, WriterOptions::default())?;
+        let mut w = MosaicWriter::new(sink, schema, opts)?;
         write(&mut w, &mut rows)?;
         w.close()
     })();
@@ -689,11 +742,28 @@ fn project_convert_schema(schema: Schema, columns: &[String]) -> std::io::Result
     Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
+/// Mosaic cannot store Arrow `Null` columns, and sampled JSON inference
+/// produces `Null` for a field with no non-null value in the sample — fail
+/// with the column name instead of the writer's late "unsupported DataType".
+fn reject_null_inferred_fields(schema: &Schema) -> std::io::Result<()> {
+    for field in schema.fields() {
+        if matches!(field.data_type(), DataType::Null) {
+            return Err(invalid_schema(format!(
+                "cannot infer a type for column '{}' (no non-null value in the sampled records); provide --schema",
+                field.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn is_json_input(input: &Path) -> bool {
+    // Any name ending in "json" (covers .json and .ndjson), plus the ".jsonl"
+    // spelling of JSON lines.
     input
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with("json"))
+        .is_some_and(|name| name.ends_with("json") || name.ends_with("jsonl"))
 }
 
 fn csv_format(options: &CsvConvertOptions) -> std::io::Result<arrow::csv::reader::Format> {
@@ -737,7 +807,11 @@ struct CsvInputLayout {
     columns: usize,
 }
 
-fn csv_input_layout(path: &Path, options: &CsvConvertOptions) -> std::io::Result<CsvInputLayout> {
+fn csv_input_layout(
+    path: &Path,
+    options: &CsvConvertOptions,
+    scan_widths: bool,
+) -> std::io::Result<CsvInputLayout> {
     let delimiter = parse_csv_byte(&options.delimiter, "delimiter")?;
     let escape = parse_csv_byte(&options.escape, "escape")?;
     let quote = parse_csv_byte(&options.quote, "quote")?;
@@ -765,9 +839,11 @@ fn csv_input_layout(path: &Path, options: &CsvConvertOptions) -> std::io::Result
         }
     };
     let mut columns = header.as_ref().map_or(0, Vec::len);
-    for record in records {
-        let record = record.map_err(|e| invalid_schema(format!("invalid CSV record: {e}")))?;
-        columns = columns.max(record.len());
+    if scan_widths {
+        for record in records {
+            let record = record.map_err(|e| invalid_schema(format!("invalid CSV record: {e}")))?;
+            columns = columns.max(record.len());
+        }
     }
     Ok(CsvInputLayout { header, columns })
 }
@@ -789,10 +865,14 @@ fn csv_reader_schema(output_schema: &Schema, layout: &CsvInputLayout) -> Schema 
                 (i < output_schema.fields().len()).then_some(i)
             };
             if let Some(source) = source {
+                // Read as nullable: not-null enforcement happens when the batch
+                // is re-attached to the output schema, where the error carries
+                // the real column name rather than a positional one.
                 output_schema.fields()[source]
                     .as_ref()
                     .clone()
                     .with_name(format!("field_{i}"))
+                    .with_nullable(true)
             } else {
                 Field::new(format!("field_{i}"), DataType::Utf8, true)
             }
@@ -813,6 +893,34 @@ fn csv_output_mapping(output_schema: &Schema, layout: &CsvInputLayout) -> Vec<Op
     } else {
         (0..output_schema.fields().len()).map(Some).collect()
     }
+}
+
+/// A schema field absent from the CSV header becomes an all-null column, so
+/// refuse the conversions that can only be mistakes: a header matching no
+/// schema field at all, and a required field that the data cannot supply.
+fn validate_csv_mapping(
+    schema: &Schema,
+    layout: &CsvInputLayout,
+    mapping: &[Option<usize>],
+    input: &Path,
+) -> std::io::Result<()> {
+    if layout.header.is_some() && !schema.fields().is_empty() && mapping.iter().all(Option::is_none)
+    {
+        return Err(invalid_schema(format!(
+            "none of the schema fields were found in the CSV header of {}; use --no-header if the file has no header row",
+            input.display()
+        )));
+    }
+    for (field, index) in schema.fields().iter().zip(mapping) {
+        if index.is_none() && !field.is_nullable() {
+            return Err(invalid_schema(format!(
+                "required field '{}' was not found in the CSV header of {}",
+                field.name(),
+                input.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn align_csv_batch_to_schema(
@@ -1047,6 +1155,13 @@ fn parse_avro_decimal(full_type: &Value) -> Result<DataType, String> {
         ));
     }
     let scale = i8::try_from(scale).map_err(|_| format!("invalid decimal scale {scale}"))?;
+    // Avro requires 0 <= scale <= precision; catch it here rather than as an
+    // Arrow error halfway through a conversion.
+    if scale < 0 || scale as u8 > precision {
+        return Err(format!(
+            "decimal scale must be in 0..={precision}, got {scale}"
+        ));
+    }
     Ok(DataType::Decimal128(precision, scale))
 }
 
@@ -1308,8 +1423,8 @@ fn dictionary(file: &Path, column: &str, json: bool) -> std::io::Result<()> {
             )
         })?;
     // For nested columns the first physical slot is the ARRAY/MAP length column,
-    // not the logical values — its dictionary would mislead. parquet-cli only
-    // resolves primitive leaves, so reject List/Map here rather than print junk.
+    // not the logical values — its dictionary would mislead. Only primitive
+    // leaves have a meaningful one, so reject List/Map rather than print junk.
     use arrow::datatypes::DataType;
     if matches!(
         reader.schema().columns[col].data_type,
@@ -1422,6 +1537,24 @@ mod tests {
             schema.fields()[3].data_type(),
             &DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
+    }
+
+    #[test]
+    fn parse_avro_schema_rejects_out_of_range_decimal_scale() {
+        for scale in ["-1", "11"] {
+            let err = parse_avro_schema(&format!(
+                r#"{{
+  "type": "record",
+  "name": "T",
+  "fields": [{{"name": "a", "type": {{"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": {scale}}}}}]
+}}"#,
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("decimal scale must be in 0..=10"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

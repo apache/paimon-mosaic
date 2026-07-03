@@ -98,32 +98,46 @@ $ mosaic head data.mosaic --json
 
 ## Convert
 
-Import a JSON data file into a new Mosaic file; the schema is inferred from the
-first 20 records unless `--schema` is provided.
+Import a JSON data file (`.json`/`.ndjson`/`.jsonl`, one object per line) into
+a new Mosaic file; the schema is inferred from the first 20 records unless
+`--schema` is provided. A field with no non-null value in the sampled records
+cannot be inferred and is reported as an error, and a field that first appears
+after the sampled records is not part of the inferred schema — pass `--schema`
+for such data.
 An existing output is kept unless `--overwrite` is given.
-`--schema` accepts an Avro record schema file, matching parquet-cli's
-generic `convert --schema schema.avsc` option.
+`--schema` accepts an Avro record schema file.
 Use `-c`/`--column`/`--columns` to project top-level fields.
+`--stats id` builds min/max for those columns, which `cat --where` then uses
+to skip row groups that cannot match.
 
 ```text
 $ mosaic convert data.json -o data.mosaic
 $ mosaic convert data.json -o data.mosaic --schema schema.avsc
 $ mosaic convert data.json -o data.mosaic -c id --columns name
+$ mosaic convert data.json -o data.mosaic --stats id
 ```
 
 ## Convert CSV
 
-Import CSV into a new Mosaic file. This is the CSV-specific path, matching
-parquet-cli's `convert-csv`: it accepts an Avro record schema file with
-`--schema`, or infers a schema from CSV data. CSV columns inferred as Arrow
-`Null` (for example, all-empty columns) fall back to nullable `Utf8`, matching
-parquet-cli's nullable string fallback for unknown CSV types. When a CSV schema
-is inferred, `--require col` marks an inferred field as not null; repeat it for
-multiple fields.
+Import CSV into a new Mosaic file, either with an Avro record schema file
+given via `--schema`, or with a schema inferred from the CSV data. Multiple
+input files are allowed when they share one schema; empty files are skipped.
+CSV cannot say what type an all-empty column is, so columns inferred as Arrow
+`Null` fall back to nullable `Utf8`. When a CSV schema is inferred,
+`--require col` marks an inferred field as not null (repeat it for multiple
+fields); combining `--require` with `--schema` is rejected.
+
+With `--schema`, fields are matched to CSV columns by header name (by position
+with `--no-header`); a schema field absent from the header is filled with
+nulls, but the conversion fails if the field is required or if no schema field
+matches the header at all.
+`--stats id` builds min/max for those columns, which `cat --where` then uses
+to skip row groups that cannot match.
 
 ```text
 $ mosaic convert-csv data.csv -o data.mosaic
 
 $ mosaic convert-csv data.csv -o data.mosaic --schema schema.avsc
 $ mosaic convert-csv data.csv -o data.mosaic --require id --require ts
+$ mosaic convert-csv data.csv -o data.mosaic --stats id
 ```

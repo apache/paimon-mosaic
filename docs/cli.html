@@ -79,10 +79,11 @@ mosaic schema data.mosaic</code></pre>
                     <tr><td><code>column-size</code></td><td>on-disk bytes per column</td><td>footer + index + paged directories</td></tr>
                     <tr><td><code>cat</code> / <code>head</code></td><td>cat: all rows by default (<code>-n</code> to limit); head: first 10; <code>-c</code>, <code>--where</code></td><td>column data</td></tr>
                     <tr><td><code>count</code></td><td>total row count</td><td>footer + index</td></tr>
-                    <tr><td><code>convert</code></td><td>import CSV or JSON lines into a new Mosaic file</td><td>writes file</td></tr>
+                    <tr><td><code>convert</code></td><td>import JSON into a new Mosaic file</td><td>writes file</td></tr>
+                    <tr><td><code>convert-csv</code></td><td>import CSV into a new Mosaic file</td><td>writes file</td></tr>
                 </tbody>
             </table>
-            <p>Inspection and query commands accept <code>--json</code> (<code>convert</code> writes a file). <code>cat</code> scans all rows by default (<code>-n</code> to limit); <code>head</code> prints 10 rows by default. <code>cat</code>/<code>head</code>/<code>pages</code>/<code>column-size</code> take <code>-c a,b</code>; <code>dictionary</code> takes <code>-c &lt;col&gt;</code>.</p>
+            <p>Inspection and query commands accept <code>--json</code> (<code>convert</code> and <code>convert-csv</code> write files). <code>cat</code> scans all rows by default (<code>-n</code> to limit); <code>head</code> prints 10 rows by default. <code>cat</code>/<code>head</code>/<code>pages</code>/<code>column-size</code> take <code>-c a,b</code>; <code>dictionary</code> takes <code>-c &lt;col&gt;</code>.</p>
 
             <h2>schema</h2>
             <p>Columns, Arrow types, nullability and bucket assignment, in original input order. Footer only.</p>
@@ -173,10 +174,17 @@ row group 0: 3 entries
 200</code></pre>
 
             <h2>convert</h2>
-            <p>Import a CSV (with header) or JSON lines (one object per line) into a new Mosaic file; the schema is inferred. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups. Refuses to replace an existing output unless <code>--overwrite</code> is given.</p>
-<pre><code><span class="cmt">$ mosaic convert data.csv -o data.mosaic --stats id</span>
+            <p>Import a JSON data file (<code>.json</code>/<code>.ndjson</code>/<code>.jsonl</code>, one object per line) into a new Mosaic file; the schema is inferred from the first 20 records unless an Avro record schema file is given with <code>--schema</code>. <code>-c</code>/<code>--column</code> projects top-level fields. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups. Refuses to replace an existing output unless <code>--overwrite</code> is given.</p>
+<pre><code><span class="cmt">$ mosaic convert data.ndjson -o data.mosaic --stats id</span>
 wrote data.mosaic (200 rows, 5 columns)
-<span class="cmt">$ mosaic convert data.ndjson -o data.mosaic</span>
+<span class="cmt">$ mosaic convert data.json -o data.mosaic --schema schema.avsc</span>
+wrote data.mosaic (200 rows, 5 columns)</code></pre>
+
+            <h2>convert-csv</h2>
+            <p>Import CSV into a new Mosaic file, either with an Avro record schema file (<code>--schema</code>) or with a schema inferred from the CSV data; multiple inputs sharing one schema are allowed, and empty files are skipped. All-empty columns fall back to nullable <code>Utf8</code>, and <code>--require col</code> marks an inferred field as not null. <code>--delimiter</code>/<code>--quote</code>/<code>--escape</code>/<code>--no-header</code>/<code>--header</code>/<code>--skip-lines</code> control parsing; <code>--stats</code> and <code>--overwrite</code> work as for <code>convert</code>.</p>
+<pre><code><span class="cmt">$ mosaic convert-csv data.csv -o data.mosaic --stats id</span>
+wrote data.mosaic (200 rows, 5 columns)
+<span class="cmt">$ mosaic convert-csv data.csv -o data.mosaic --schema schema.avsc</span>
 wrote data.mosaic (200 rows, 5 columns)</code></pre>
 
             <div class="tip">
