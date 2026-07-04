@@ -174,7 +174,7 @@ row group 0: 3 entries
 200</code></pre>
 
             <h2>convert</h2>
-            <p>Import a JSON data file (<code>.json</code>/<code>.ndjson</code>/<code>.jsonl</code>, one object per line) into a new Mosaic file; the schema is inferred from the first 20 records unless an Avro record schema file is given with <code>--schema</code>. <code>-c</code>/<code>--column</code> projects top-level fields. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups. Refuses to replace an existing output unless <code>--overwrite</code> is given.</p>
+            <p>Import a JSON data file (<code>.json</code>/<code>.ndjson</code>/<code>.jsonl</code>, one object per line) into a new Mosaic file; the schema is inferred from the input unless an Avro record schema file is given with <code>--schema</code>. <code>-c</code>/<code>--column</code> projects top-level fields. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups. Refuses to replace an existing output unless <code>--overwrite</code> is given.</p>
 <pre><code><span class="cmt">$ mosaic convert data.ndjson -o data.mosaic --stats id</span>
 wrote data.mosaic (200 rows, 5 columns)
 <span class="cmt">$ mosaic convert data.json -o data.mosaic --schema schema.avsc</span>

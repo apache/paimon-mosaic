@@ -99,11 +99,9 @@ $ mosaic head data.mosaic --json
 ## Convert
 
 Import a JSON data file (`.json`/`.ndjson`/`.jsonl`, one object per line) into
-a new Mosaic file; the schema is inferred from the first 20 records unless
-`--schema` is provided. A field with no non-null value in the sampled records
-cannot be inferred and is reported as an error, and a field that first appears
-after the sampled records is not part of the inferred schema — pass `--schema`
-for such data.
+a new Mosaic file; the schema is inferred from the input unless `--schema` is
+provided. A field with no non-null value cannot be inferred and is reported as
+an error — pass `--schema` for such data.
 An existing output is kept unless `--overwrite` is given.
 `--schema` accepts an Avro record schema file.
 Use `-c`/`--column`/`--columns` to project top-level fields.

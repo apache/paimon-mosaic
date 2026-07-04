@@ -537,7 +537,7 @@ fn convert(
         || -> std::io::Result<_> { Ok(std::io::BufReader::new(std::fs::File::open(input)?)) };
     let schema = match explicit_schema {
         Some(schema) => schema,
-        None => arrow::json::reader::infer_json_schema(&mut open()?, Some(20))
+        None => arrow::json::reader::infer_json_schema(&mut open()?, None)
             .map(|(schema, _)| schema)
             .map_err(bad)?,
     };
@@ -597,7 +597,7 @@ fn convert_csv(
     let schema = match explicit_schema {
         Some(schema) => schema,
         None => {
-            let mut inferred = None;
+            let mut inferred: Option<Schema> = None;
             for input in inputs {
                 let (schema, rows) = format
                     .infer_schema(open_csv(input, options.skip_lines)?, None)
@@ -607,27 +607,16 @@ fn convert_csv(
                 if rows == 0 || schema.fields().is_empty() {
                     continue;
                 }
-                let schema = apply_required_fields(
-                    csv_schema_with_csv_names(csv_schema_with_null_fallback(schema), &options)?,
-                    required_fields,
-                )?;
-                if let Some(prev) = &inferred {
-                    if prev != &schema {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!(
-                                "{} seems to have a different schema from others. Please specify the correct schema explicitly with the --schema option.",
-                                input.display()
-                            ),
-                        ));
-                    }
-                } else {
-                    inferred = Some(schema);
-                }
+                let schema = csv_schema_with_csv_names(schema, &options)?;
+                inferred = Some(match inferred.take() {
+                    Some(prev) => merge_csv_inferred_schema(prev, schema, input)?,
+                    None => schema,
+                });
             }
-            inferred.ok_or_else(|| {
+            let schema = inferred.ok_or_else(|| {
                 invalid_schema("no CSV data to infer a schema from; provide --schema")
-            })?
+            })?;
+            apply_required_fields(csv_schema_with_null_fallback(schema), required_fields)?
         }
     };
     write_mosaic(out, overwrite, &schema, stats, |writer, rows| {
@@ -742,14 +731,14 @@ fn project_convert_schema(schema: Schema, columns: &[String]) -> std::io::Result
     Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
-/// Mosaic cannot store Arrow `Null` columns, and sampled JSON inference
-/// produces `Null` for a field with no non-null value in the sample — fail
+/// Mosaic cannot store Arrow `Null` columns, and JSON inference produces
+/// `Null` for a field with no non-null value in the input — fail
 /// with the column name instead of the writer's late "unsupported DataType".
 fn reject_null_inferred_fields(schema: &Schema) -> std::io::Result<()> {
     for field in schema.fields() {
         if matches!(field.data_type(), DataType::Null) {
             return Err(invalid_schema(format!(
-                "cannot infer a type for column '{}' (no non-null value in the sampled records); provide --schema",
+                "cannot infer a type for column '{}' (no non-null value in the records); provide --schema",
                 field.name()
             )));
         }
@@ -1036,6 +1025,43 @@ fn csv_schema_with_null_fallback(schema: Schema) -> Schema {
         })
         .collect();
     Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
+fn merge_csv_inferred_schema(prev: Schema, next: Schema, input: &Path) -> std::io::Result<Schema> {
+    if prev.fields().len() != next.fields().len() {
+        return Err(csv_schema_mismatch(input));
+    }
+    let fields: Vec<Field> = prev
+        .fields()
+        .iter()
+        .zip(next.fields())
+        .map(|(left, right)| merge_csv_inferred_field(left.as_ref(), right.as_ref(), input))
+        .collect::<std::io::Result<_>>()?;
+    Ok(Schema::new_with_metadata(fields, prev.metadata().clone()))
+}
+
+fn merge_csv_inferred_field(left: &Field, right: &Field, input: &Path) -> std::io::Result<Field> {
+    if left.name() != right.name() {
+        return Err(csv_schema_mismatch(input));
+    }
+    let nullable = left.is_nullable() || right.is_nullable();
+    let field = match (left.data_type(), right.data_type()) {
+        (left_type, right_type) if left_type == right_type => left.clone().with_nullable(nullable),
+        (DataType::Null, _) => right.clone().with_nullable(true),
+        (_, DataType::Null) => left.clone().with_nullable(true),
+        _ => return Err(csv_schema_mismatch(input)),
+    };
+    Ok(field)
+}
+
+fn csv_schema_mismatch(input: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{} seems to have a different schema from others. Please specify the correct schema explicitly with the --schema option.",
+            input.display()
+        ),
+    )
 }
 
 fn load_convert_schema(path: &Path) -> std::io::Result<Schema> {

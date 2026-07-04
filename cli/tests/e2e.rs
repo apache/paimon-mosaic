@@ -595,6 +595,25 @@ fn convert_csv_multiple_inputs_share_schema() {
 }
 
 #[test]
+fn convert_csv_multiple_inputs_merges_null_and_typed_columns() {
+    let dir = std::env::temp_dir();
+    let a = format!("{}/mosaic_e2e_multi_null_a.csv", dir.display());
+    let b = format!("{}/mosaic_e2e_multi_null_b.csv", dir.display());
+    std::fs::write(&a, "id,value\n1,\n2,\n").unwrap();
+    std::fs::write(&b, "id,value\n3,9\n4,10\n").unwrap();
+    let out = format!("{}/mosaic_e2e_multi_null.mosaic", dir.display());
+    let (msg, err, ok) = run(&["convert-csv", &a, &b, "-o", &out, "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (schema, _, ok) = run(&["schema", &out]);
+    assert!(ok, "{schema}");
+    assert!(schema.contains("value: Int64"), "{schema}");
+    let (rows, _, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "{rows}");
+    assert!(rows.contains(r#"{"id":1,"value":null}"#), "{rows}");
+    assert!(rows.contains(r#"{"id":4,"value":10}"#), "{rows}");
+}
+
+#[test]
 fn convert_csv_skips_empty_inputs_and_rejects_all_empty() {
     let dir = std::env::temp_dir();
     let a = format!("{}/mosaic_e2e_empty_shard_a.csv", dir.display());
@@ -867,6 +886,29 @@ fn convert_json_all_null_column_errors_with_column_name() {
     // Projecting the unusable column away converts the rest.
     let (msg, err, ok) = run(&["convert", &js, "-o", &out, "-c", "id", "--overwrite"]);
     assert!(ok, "stdout: {msg}\nstderr: {err}");
+}
+
+#[test]
+fn convert_json_infers_fields_after_initial_records() {
+    let dir = std::env::temp_dir();
+    let js = format!("{}/mosaic_e2e_json_late_field.json", dir.display());
+    let mut text = String::new();
+    for id in 0..20 {
+        text.push_str(&format!(r#"{{"id":{id}}}"#));
+        text.push('\n');
+    }
+    text.push_str(r#"{"id":20,"late":"present"}"#);
+    text.push('\n');
+    std::fs::write(&js, text).unwrap();
+    let out = format!("{}/mosaic_e2e_json_late_field.mosaic", dir.display());
+    let (msg, err, ok) = run(&["convert", &js, "-o", &out, "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (schema, _, ok) = run(&["schema", &out]);
+    assert!(ok, "{schema}");
+    assert!(schema.contains("late: Utf8"), "{schema}");
+    let (rows, _, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "{rows}");
+    assert!(rows.contains(r#"{"id":20,"late":"present"}"#), "{rows}");
 }
 
 #[test]
