@@ -844,6 +844,35 @@ fn convert_refuses_existing_output_without_overwrite() {
 }
 
 #[test]
+fn convert_refuses_existing_output_before_opening_input() {
+    let dir = std::env::temp_dir();
+
+    let csv_out = format!(
+        "{}/mosaic_e2e_existing_before_input_csv.mosaic",
+        dir.display()
+    );
+    std::fs::write(&csv_out, "keep csv").unwrap();
+    let missing_csv = format!("{}/mosaic_e2e_missing_before_existing.csv", dir.display());
+    let _ = std::fs::remove_file(&missing_csv);
+    let (_, err, ok) = run(&["convert-csv", &missing_csv, "-o", &csv_out]);
+    assert!(!ok);
+    assert!(err.contains("use --overwrite"), "{err}");
+    assert_eq!(std::fs::read_to_string(&csv_out).unwrap(), "keep csv");
+
+    let json_out = format!(
+        "{}/mosaic_e2e_existing_before_input_json.mosaic",
+        dir.display()
+    );
+    std::fs::write(&json_out, "keep json").unwrap();
+    let missing_json = format!("{}/mosaic_e2e_missing_before_existing.json", dir.display());
+    let _ = std::fs::remove_file(&missing_json);
+    let (_, err, ok) = run(&["convert", &missing_json, "-o", &json_out]);
+    assert!(!ok);
+    assert!(err.contains("use --overwrite"), "{err}");
+    assert_eq!(std::fs::read_to_string(&json_out).unwrap(), "keep json");
+}
+
+#[test]
 fn convert_rejects_csv_input() {
     let csv = format!(
         "{}/mosaic_e2e_convert_rejects_csv.csv",
@@ -867,6 +896,18 @@ fn convert_accepts_jsonl_and_rejects_other_extensions() {
     let out = format!("{}/mosaic_e2e_convert_jsonl.mosaic", dir.display());
     let (msg, err, ok) = run(&["convert", &js, "-o", &out, "--overwrite"]);
     assert!(ok, "stdout: {msg}\nstderr: {err}");
+
+    let upper = format!("{}/mosaic_e2e_convert_upper.JSON", dir.display());
+    std::fs::write(&upper, "{\"id\":1}\n").unwrap();
+    let (msg, err, ok) = run(&["convert", &upper, "-o", &out, "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+
+    let not_json = format!("{}/mosaic_e2e_convert_rejects.notjson", dir.display());
+    std::fs::write(&not_json, "{\"id\":1}\n").unwrap();
+    let (_, err, ok) = run(&["convert", &not_json, "-o", &out, "--overwrite"]);
+    assert!(!ok);
+    assert!(err.contains("convert only supports JSON inputs"), "{err}");
+
     let txt = format!("{}/mosaic_e2e_convert_rejects.txt", dir.display());
     std::fs::write(&txt, "{\"id\":1}\n").unwrap();
     let (_, err, ok) = run(&["convert", &txt, "-o", &out, "--overwrite"]);

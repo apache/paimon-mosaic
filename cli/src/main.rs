@@ -532,6 +532,7 @@ fn convert(
             "convert only supports JSON inputs (.json/.ndjson/.jsonl); use convert-csv for CSV data",
         ));
     }
+    ensure_can_write(out, overwrite)?;
     let explicit_schema = schema.map(load_convert_schema).transpose()?;
     let open =
         || -> std::io::Result<_> { Ok(std::io::BufReader::new(std::fs::File::open(input)?)) };
@@ -586,6 +587,7 @@ fn convert_csv(
             "--require applies only when the schema is inferred; set nullability in the --schema file instead",
         ));
     }
+    ensure_can_write(out, overwrite)?;
     use arrow::error::ArrowError;
     let bad = |e: ArrowError| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
     let format = csv_format(&options)?;
@@ -661,12 +663,7 @@ where
     ) -> std::io::Result<()>,
 {
     use paimon_mosaic_core::writer::{FileSink, MosaicWriter, WriterOptions};
-    if out.exists() && !overwrite {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("{} exists (use --overwrite to replace)", out.display()),
-        ));
-    }
+    ensure_can_write(out, overwrite)?;
     let opts = WriterOptions {
         stats_columns: stats.map(parse_comma_list).unwrap_or_default(),
         ..Default::default()
@@ -747,12 +744,25 @@ fn reject_null_inferred_fields(schema: &Schema) -> std::io::Result<()> {
 }
 
 fn is_json_input(input: &Path) -> bool {
-    // Any name ending in "json" (covers .json and .ndjson), plus the ".jsonl"
-    // spelling of JSON lines.
     input
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with("json") || name.ends_with("jsonl"))
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "json" | "ndjson" | "jsonl"
+            )
+        })
+}
+
+fn ensure_can_write(out: &Path, overwrite: bool) -> std::io::Result<()> {
+    if out.exists() && !overwrite {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} exists (use --overwrite to replace)", out.display()),
+        ));
+    }
+    Ok(())
 }
 
 fn csv_format(options: &CsvConvertOptions) -> std::io::Result<arrow::csv::reader::Format> {
@@ -1191,7 +1201,12 @@ fn parse_avro_decimal(full_type: &Value) -> Result<DataType, String> {
         .get("precision")
         .and_then(Value::as_u64)
         .ok_or_else(|| "decimal logical type must contain precision".to_string())?;
-    let scale = full_type.get("scale").and_then(Value::as_i64).unwrap_or(0);
+    let scale = match full_type.get("scale") {
+        Some(scale) => scale
+            .as_i64()
+            .ok_or_else(|| "decimal scale must be an integer".to_string())?,
+        None => 0,
+    };
     let precision = u8::try_from(precision)
         .map_err(|_| format!("decimal precision must be in 1..38, got {precision}"))?;
     if precision == 0 || precision > 38 {
@@ -1597,6 +1612,24 @@ mod tests {
             .unwrap_err();
             assert!(
                 err.to_string().contains("decimal scale must be in 0..=10"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_avro_schema_rejects_non_integer_decimal_scale() {
+        for scale in [r#""2""#, "2.5", "null"] {
+            let err = parse_avro_schema(&format!(
+                r#"{{
+  "type": "record",
+  "name": "T",
+  "fields": [{{"name": "a", "type": {{"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": {scale}}}}}]
+}}"#,
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("decimal scale must be an integer"),
                 "{err}"
             );
         }
