@@ -393,17 +393,6 @@ impl<S: OutputFile> MosaicWriter<S> {
                     ),
                 ));
             }
-            if batch_field.is_nullable() != col.nullable {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "field nullability mismatch for column '{}': schema has {} but batch has {}",
-                        col.name,
-                        col.nullable,
-                        batch_field.is_nullable()
-                    ),
-                ));
-            }
         }
         Ok(())
     }
@@ -898,7 +887,7 @@ mod tests {
 
         let batch2 = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int32, false),
+                Field::new("id", DataType::Int32, true),
                 Field::new("name", DataType::Utf8, true),
             ])),
             vec![
@@ -908,6 +897,20 @@ mod tests {
         )
         .unwrap();
         let result = writer.write_batch(&batch2);
+        assert!(result.is_ok());
+
+        let batch3 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![None, Some("world")])),
+            ],
+        )
+        .unwrap();
+        let result = writer.write_batch(&batch3);
         assert!(result.is_ok());
     }
 
