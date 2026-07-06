@@ -18,7 +18,7 @@
 use std::io;
 
 use arrow_array::*;
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Field, Schema};
 
 use crate::bucket_writer::{BucketWriter, PagedBucketOutput};
 use crate::schema::MosaicSchema;
@@ -46,6 +46,31 @@ fn check_zstd_block_size(size: usize, field: &str) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn data_types_match(expected: &DataType, actual: &DataType) -> bool {
+    match (expected, actual) {
+        (DataType::List(expected_field), DataType::List(actual_field)) => {
+            fields_match(expected_field, actual_field)
+        }
+        (
+            DataType::Map(expected_field, expected_sorted),
+            DataType::Map(actual_field, actual_sorted),
+        ) => expected_sorted == actual_sorted && fields_match(expected_field, actual_field),
+        (DataType::Struct(expected_fields), DataType::Struct(actual_fields)) => {
+            expected_fields.len() == actual_fields.len()
+                && expected_fields.iter().zip(actual_fields.iter()).all(
+                    |(expected_field, actual_field)| fields_match(expected_field, actual_field),
+                )
+        }
+        _ => expected == actual,
+    }
+}
+
+fn fields_match(expected: &Field, actual: &Field) -> bool {
+    expected.name() == actual.name()
+        && expected.is_nullable() == actual.is_nullable()
+        && data_types_match(expected.data_type(), actual.data_type())
 }
 
 pub trait OutputFile {
@@ -299,6 +324,7 @@ impl<S: OutputFile> MosaicWriter<S> {
                 ),
             ));
         }
+        self.validate_batch_schema(batch)?;
 
         for (i, col) in self.schema.columns.iter().enumerate() {
             if !col.nullable && batch.column(self.batch_col_map[i]).null_count() > 0 {
@@ -337,6 +363,47 @@ impl<S: OutputFile> MosaicWriter<S> {
 
         if self.current_buffered_size >= self.row_group_max_size {
             self.flush_row_group()?;
+        }
+        Ok(())
+    }
+
+    fn validate_batch_schema(&self, batch: &RecordBatch) -> io::Result<()> {
+        let batch_schema = batch.schema();
+        for (i, col) in self.schema.columns.iter().enumerate() {
+            let batch_field = batch_schema.field(self.batch_col_map[i]);
+            if batch_field.name() != &col.name {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "field name mismatch at column {}: schema has '{}' but batch has '{}'",
+                        i,
+                        col.name,
+                        batch_field.name()
+                    ),
+                ));
+            }
+            if !data_types_match(&col.data_type, batch_field.data_type()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "field type mismatch for column '{}': schema has {:?} but batch has {:?}",
+                        col.name,
+                        col.data_type,
+                        batch_field.data_type()
+                    ),
+                ));
+            }
+            if batch_field.is_nullable() != col.nullable {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "field nullability mismatch for column '{}': schema has {} but batch has {}",
+                        col.name,
+                        col.nullable,
+                        batch_field.is_nullable()
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -842,6 +909,43 @@ mod tests {
         .unwrap();
         let result = writer.write_batch(&batch2);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_write_batch_rejects_reordered_schema() {
+        let arrow_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let out = MemOutputFile::new();
+        let mut writer = MosaicWriter::new(out, &arrow_schema, WriterOptions::default()).unwrap();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        writer.write_batch(&batch).unwrap();
+
+        let reordered_schema = Schema::new(vec![
+            Field::new("b", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
+        ]);
+        let reordered_batch = RecordBatch::try_new(
+            Arc::new(reordered_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![30, 40])),
+                Arc::new(Int32Array::from(vec![3, 4])),
+            ],
+        )
+        .unwrap();
+
+        let err = writer.write_batch(&reordered_batch).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("field name mismatch"));
     }
 
     #[test]
