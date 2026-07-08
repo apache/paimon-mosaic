@@ -44,7 +44,6 @@ jobs:
   java:
     name: Java release
     uses: ./.github/workflows/release-java.yml
-    secrets: inherit
 
   python-wheels:
     name: Python wheels
