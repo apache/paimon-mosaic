@@ -76,12 +76,13 @@
                     <tr><th>Component</th><th>Tag Pattern</th><th>Published To</th><th>Pre-release (<code>-rc</code>) Behavior</th><th>Ordering</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td>Rust crate</td><td><code>v0.1.0</code></td><td>crates.io</td><td>Dry-run only</td><td>Runs in parallel</td></tr>
-                    <tr><td>Java binding</td><td><code>v0.1.0</code></td><td>Apache Nexus staging</td><td>Deploys to staging</td><td>Runs in parallel</td></tr>
-                    <tr><td>Python binding</td><td><code>v0.1.0</code></td><td>PyPI</td><td>Publishes to TestPyPI</td><td>Publishes only after Rust and Java jobs succeed</td></tr>
+                    <tr><td>Rust crate</td><td><code>v0.1.0</code></td><td>crates.io</td><td>Dry-run only</td><td>Final publication starts only after Java and all wheel jobs succeed</td></tr>
+                    <tr><td>Java binding</td><td><code>v0.1.0-rc1</code></td><td>Apache Nexus staging (Release Manager)</td><td>CI verifies and exports the native inputs; the Release Manager signs and stages locally</td><td>Final tags verify the artifacts but do not create a second staging repository</td></tr>
+                    <tr><td>Python binding</td><td><code>v0.1.0</code></td><td>PyPI</td><td>Publishes a unique RC version to TestPyPI</td><td>Final PyPI publication follows successful Rust publication</td></tr>
                 </tbody>
             </table>
-            <p>The Release Manager's primary responsibility is managing the <strong>source release</strong> (tarball + signature) and coordinating the community vote. Language artifact publishing is handled by CI once the tag is pushed.</p>
+            <p>Only the top-level <code>Release</code> workflow authorizes automated registry publication. Manually dispatching a leaf workflow is a safe build/dry-run and cannot bypass the top-level preflight. Java signing and Nexus staging are never authorized to CI and remain explicit Release Manager operations.</p>
+            <p>The Release Manager is responsible for the <strong>source release</strong> (tarball + signature), local Java signing and Nexus staging, and coordination of the community vote. CI handles Rust and Python publication only after their release gates pass.</p>
 
             <!-- ============================================================ -->
             <h2 id="decide-to-release">Decide to Release</h2>
@@ -132,7 +133,7 @@ svn ci -m "Add &lt;YOUR_NAME&gt;'s public key"</code></pre>
                 </li>
             </ol>
 
-            <h4>GitHub Actions Secrets</h4>
+            <h4>GitHub Actions Publication Secrets</h4>
             <p>Ensure the following repository secrets are configured:</p>
             <table>
                 <thead>
@@ -140,18 +141,16 @@ svn ci -m "Add &lt;YOUR_NAME&gt;'s public key"</code></pre>
                 </thead>
                 <tbody>
                     <tr><td><code>CARGO_REGISTRY_TOKEN</code></td><td>crates.io publishing</td></tr>
-                    <tr><td><code>NEXUS_STAGE_DEPLOYER_USER</code></td><td>Apache Nexus staging</td></tr>
-                    <tr><td><code>NEXUS_STAGE_DEPLOYER_PW</code></td><td>Apache Nexus staging</td></tr>
-                    <tr><td><code>GPG_SECRET_KEY</code></td><td>Java artifact signing</td></tr>
-                    <tr><td><code>GPG_PASSPHRASE</code></td><td>Java artifact signing</td></tr>
                     <tr><td><code>PYPI_API_TOKEN</code></td><td>PyPI publishing</td></tr>
                     <tr><td><code>TEST_PYPI_API_TOKEN</code></td><td>TestPyPI publishing</td></tr>
                 </tbody>
             </table>
+            <p>Do <strong>not</strong> upload a release manager's personal GPG private key or Nexus credentials to GitHub Actions. Java artifacts are signed and staged from a trusted local machine after downloading the verified native inputs from the exact RC workflow run.</p>
 
             <h3>Clone into a Fresh Workspace</h3>
 <pre><code>git clone https://github.com/apache/paimon-mosaic.git
 cd paimon-mosaic</code></pre>
+            <p>The release automation requires <strong>Python 3.11+</strong> because its lockfile and license tools use <code>tomllib</code>. The published <code>paimon-mosaic</code> Python package itself continues to support Python 3.9+.</p>
 
             <h3>Set Up Environment Variables</h3>
 <pre><code>RELEASE_VERSION="0.1.0"
@@ -164,19 +163,23 @@ RELEASE_TAG="v${RELEASE_VERSION}"</code></pre>
 
             <h3>Generate Dependency License Manifests</h3>
             <p>ASF releases must include a declaration of third-party dependency licenses. Generate and commit dependency manifests on <code>main</code> <strong>before</strong> creating the release branch, so the release branch and source archive contain the same reviewed manifests.</p>
-<pre><code># Install cargo-deny (one-time)
-cargo install cargo-deny
+<pre><code># Install the pinned release tooling (one-time)
+cargo install cargo-deny --version 0.19.0 --locked
+cargo install cargo-about --version 0.9.1 --locked
 
 git checkout main
 git pull --ff-only origin main
 
-# Check all dependency licenses are approved
-python3 tools/dependencies.py check
-
-# Generate DEPENDENCIES.rust.tsv
+# Refresh all lockfile-derived legal metadata
+cargo fetch --locked
 python3 tools/dependencies.py generate
+python3 tools/generate_license_reports.py
 
-git add DEPENDENCIES.rust.tsv core/DEPENDENCIES.rust.tsv ffi/DEPENDENCIES.rust.tsv jni/DEPENDENCIES.rust.tsv cli/DEPENDENCIES.rust.tsv
+# Verify licenses and report freshness
+python3 tools/dependencies.py check
+python3 tools/generate_license_reports.py --check
+
+git add Cargo.lock DEPENDENCIES.rust.tsv core/DEPENDENCIES.rust.tsv ffi/DEPENDENCIES.rust.tsv jni/DEPENDENCIES.rust.tsv cli/DEPENDENCIES.rust.tsv java/src/main/binary-resources python/licenses
 git commit -m "chore: update dependency list for release ${RELEASE_VERSION}"
 git push origin main</code></pre>
             <p>Fix any license violations before proceeding. The generated files must be committed before tagging because <code>create_source_release.sh</code> builds the archive from the committed Git tree.</p>
@@ -196,7 +199,7 @@ cd tools
 OLD_VERSION=${RELEASE_VERSION} NEW_VERSION=${NEXT_VERSION}-SNAPSHOT ./update_branch_version.sh
 cd ..
 git push origin main</code></pre>
-            <p>The script updates version strings in all <code>pom.xml</code> (matching both <code>${OLD_VERSION}</code> and <code>${OLD_VERSION}-SNAPSHOT</code>), <code>Cargo.toml</code> (excluding <code>target/</code>), and <code>python/pyproject.toml</code> files, then creates a commit.</p>
+            <p>The script updates version strings in all <code>pom.xml</code> (matching both <code>${OLD_VERSION}</code> and <code>${OLD_VERSION}-SNAPSHOT</code>), <code>Cargo.toml</code> (excluding <code>target/</code>), and <code>python/pyproject.toml</code> files. It also refreshes <code>Cargo.lock</code>, dependency manifests, and generated binary legal reports before creating the commit.</p>
 
             <!-- ============================================================ -->
             <h2 id="build-a-release-candidate">Build a Release Candidate</h2>
@@ -208,7 +211,7 @@ git pull --ff-only origin ${RELEASE_BRANCH}
 cd tools
 OLD_VERSION=${RELEASE_VERSION}-SNAPSHOT NEW_VERSION=${RELEASE_VERSION} ./update_branch_version.sh
 cd ..</code></pre>
-            <p>This ensures the Java artifacts deployed from the RC tag carry the final release version (e.g. <code>0.1.0</code>) rather than a SNAPSHOT suffix.</p>
+            <p>This ensures the Java artifacts staged for the RC carry the final release version (e.g. <code>0.1.0</code>) rather than a SNAPSHOT suffix. The release workflows and source packaging script independently reject a tag whose Java, Rust, Python, or lockfile versions do not match.</p>
 
             <h3>Create the RC Tag</h3>
             <p>Push a signed RC tag to trigger CI workflows:</p>
@@ -216,14 +219,70 @@ cd ..</code></pre>
 git tag -v ${RC_TAG}
 git push origin ${RELEASE_BRANCH}
 git push origin ${RC_TAG}</code></pre>
+            <p>The tag must use the canonical <code>vX.Y.Z-rcN</code> form and its OpenPGP signer must be present in the Apache Paimon <a href="https://downloads.apache.org/paimon/KEYS">KEYS</a> file. Every RC number maps to a distinct TestPyPI version; if that version already exists, create a new RC tag instead of overwriting or skipping files.</p>
             <p>After pushing, verify in <a href="https://github.com/apache/paimon-mosaic/actions">GitHub Actions</a> that the <code>Release</code> workflow succeeds:</p>
             <ul>
+                <li><strong>Release preflight</strong> &mdash; runs license, advisory, formatting, Clippy, Rust, C++, Java, Python, and artifact checks before any staging or publication job starts</li>
                 <li><strong>Rust release</strong> &mdash; dry-run check (does not publish for RC tags)</li>
-                <li><strong>Java release</strong> &mdash; builds native JNI libraries for 4 platforms, deploys JAR to Apache Nexus staging</li>
+                <li><strong>Java release</strong> &mdash; builds native JNI libraries for 4 platforms, verifies the combined JARs, and uploads one <code>java-release-native-inputs</code> artifact for the release manager</li>
                 <li><strong>Python wheels</strong> &mdash; builds wheels for 4 platforms</li>
                 <li><strong>Python publish</strong> &mdash; publishes to TestPyPI only after the Rust, Java, and Python wheel jobs succeed</li>
             </ul>
+            <p>The PyPI flow intentionally publishes binary wheels only. The signed ASF source archive is the authoritative source release; do not upload a Python sdist that lacks a target native library.</p>
             <p>If only the Python publish job fails due to a transient PyPI or TestPyPI issue, use <strong>Re-run failed jobs</strong> on the <code>Release</code> workflow. The successful Rust, Java, and Python wheel jobs do not need to be repeated.</p>
+
+            <h3>Sign and Stage Java Artifacts Locally</h3>
+            <p>Use the exact successful <code>Release</code> workflow run for the RC tag. Confirm that the run's head SHA is the signed RC commit, then download its already verified four-platform native input bundle:</p>
+<pre><code>RELEASE_RUN_ID="&lt;successful Release workflow run ID&gt;"
+RC_COMMIT_SHA="$(git rev-parse "${RC_TAG}^{commit}")"
+
+test "$(gh run view "${RELEASE_RUN_ID}" \
+  --repo apache/paimon-mosaic --json headSha --jq .headSha)" = "${RC_COMMIT_SHA}"
+test "$(gh run view "${RELEASE_RUN_ID}" \
+  --repo apache/paimon-mosaic --json conclusion --jq .conclusion)" = "success"
+test "$(gh run view "${RELEASE_RUN_ID}" \
+  --repo apache/paimon-mosaic --json workflowName --jq .workflowName)" = "Release"
+test "$(gh run view "${RELEASE_RUN_ID}" \
+  --repo apache/paimon-mosaic --json event --jq .event)" = "push"
+test "$(gh run view "${RELEASE_RUN_ID}" \
+  --repo apache/paimon-mosaic --json headBranch --jq .headBranch)" = "${RC_TAG}"
+
+git checkout --detach "${RC_TAG}"
+mkdir -p java/src/main/resources/native
+gh run download "${RELEASE_RUN_ID}" \
+  --repo apache/paimon-mosaic \
+  --name java-release-native-inputs \
+  --dir java/src/main/resources/native
+find java/src/main/resources/native -type f | sort</code></pre>
+            <p>Build and verify the unsigned JARs before signing. The verifier requires all four native libraries and artifact-exact legal metadata:</p>
+<pre><code>mvn -f java/pom.xml clean verify -Prelease -Dgpg.skip=true -DskipTests
+
+MAIN_JAR="$(find java/target -maxdepth 1 -name 'mosaic-*.jar' \
+  ! -name '*-sources.jar' ! -name '*-javadoc.jar' -print -quit)"
+SOURCES_JAR="$(find java/target -maxdepth 1 -name '*-sources.jar' -print -quit)"
+JAVADOC_JAR="$(find java/target -maxdepth 1 -name '*-javadoc.jar' -print -quit)"
+python3 tools/verify_java_jars.py \
+  --main "${MAIN_JAR}" \
+  --sources "${SOURCES_JAR}" \
+  --javadoc "${JAVADOC_JAR}" \
+  --require-all-natives</code></pre>
+            <p>Keep the personal signing key on this trusted machine. Run signing and deployment in a strict subshell so the short-lived GPG passphrase and Nexus credentials disappear on both success and failure, while any Maven failure remains visible to the caller:</p>
+<pre><code>(
+  set -euo pipefail
+  export NEXUS_STAGE_DEPLOYER_USER="&lt;ASF Nexus username&gt;"
+  read -rsp "Nexus password: " NEXUS_STAGE_DEPLOYER_PW; echo
+  read -rsp "GPG passphrase: " MAVEN_GPG_PASSPHRASE; echo
+  export NEXUS_STAGE_DEPLOYER_PW MAVEN_GPG_PASSPHRASE
+
+  cd java
+  mvn deploy \
+    --settings ../deploysettings.xml \
+    -Prelease \
+    -DskipTests \
+    -Dgpg.keyname="&lt;FULL_GPG_FINGERPRINT&gt;" \
+    -DstagingDescription="Apache Paimon Mosaic ${RELEASE_VERSION} RC${RC_NUM}"
+)</code></pre>
+            <p>Record the closed <code>orgapachepaimon-XXXX</code> repository URL and verify its artifacts before including it in the vote email. If local signing, deployment, or verification fails, drop that staging repository and do not start the vote.</p>
 
             <h3>Create Source Release Artifacts</h3>
             <p>Create source release artifacts from the same commit as the RC tag:</p>
@@ -238,10 +297,13 @@ RELEASE_VERSION=${RELEASE_VERSION} ./create_source_release.sh</code></pre>
             </ul>
 
             <h3>Stage Artifacts to SVN</h3>
-<pre><code>svn checkout https://dist.apache.org/repos/dist/dev/paimon/ paimon-dist-dev --depth=immediates
-cd paimon-dist-dev
+<pre><code>SOURCE_REPO="$(git rev-parse --show-toplevel)"
+DIST_DEV_DIR="$(dirname "${SOURCE_REPO}")/paimon-dist-dev"
+svn checkout https://dist.apache.org/repos/dist/dev/paimon/ \
+  "${DIST_DEV_DIR}" --depth=immediates
+cd "${DIST_DEV_DIR}"
 mkdir paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}
-cp ../paimon-mosaic/tools/release/apache-paimon-mosaic-${RELEASE_VERSION}-src.* \
+cp "${SOURCE_REPO}"/tools/release/apache-paimon-mosaic-${RELEASE_VERSION}-src.* \
    paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}/
 svn add paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}
 svn commit -m "Add paimon-mosaic ${RELEASE_VERSION} RC${RC_NUM}"</code></pre>
@@ -250,7 +312,7 @@ svn commit -m "Add paimon-mosaic ${RELEASE_VERSION} RC${RC_NUM}"</code></pre>
             <ul>
                 <li>RC tag pushed and the CI release workflow succeeded</li>
                 <li>Source tarball, signature, and checksum staged to <a href="https://dist.apache.org/repos/dist/dev/paimon/">dist.apache.org dev</a></li>
-                <li>Java artifacts deployed to Nexus staging repository</li>
+                <li>Java artifacts are present in a closed Nexus staging repository</li>
                 <li>Python wheels published to TestPyPI</li>
             </ul>
 
@@ -275,6 +337,9 @@ https://github.com/apache/paimon-mosaic/releases/tag/${RC_TAG}
 Git commit:
 &lt;RC_COMMIT_SHA&gt;
 
+Exact successful GitHub Actions Release run:
+https://github.com/apache/paimon-mosaic/actions/runs/&lt;RELEASE_RUN_ID&gt;
+
 KEYS for signature verification:
 https://downloads.apache.org/paimon/KEYS
 
@@ -285,13 +350,31 @@ Python wheels (TestPyPI):
 https://test.pypi.org/project/paimon-mosaic/${RELEASE_VERSION}rc${RC_NUM}/
 
 Verification guide:
-https://github.com/apache/paimon-mosaic/blob/main/docs/verifying-a-release-candidate.html
+https://github.com/apache/paimon-mosaic/blob/${RC_TAG}/docs/verifying-a-release-candidate.html
 
 The vote will be open for at least 72 hours.
 
 Thanks,
 Release Manager</code></pre>
-            <p>After the vote passes, send a result email with subject: <code>[RESULT][VOTE] Release Apache Paimon Mosaic ${RELEASE_VERSION} (RC${RC_NUM})</code></p>
+            <p>The vote passes only after at least 72 hours, with at least three binding <code>+1</code> votes from PMC members and more binding <code>+1</code> than binding <code>-1</code> votes. After it passes, send a result email with subject <code>[RESULT][VOTE] Release Apache Paimon Mosaic ${RELEASE_VERSION} (RC${RC_NUM})</code> and summarize the named votes and vote thread:</p>
+<pre><code>The vote has passed with:
+
+Binding +1:
+- &lt;PMC member name&gt;
+- &lt;PMC member name&gt;
+- &lt;PMC member name&gt;
+
+Binding 0:
+- &lt;name or none&gt;
+
+Binding -1:
+- &lt;name or none&gt;
+
+Non-binding votes:
+- &lt;vote and name, or none&gt;
+
+Vote thread:
+&lt;mailing-list archive URL&gt;</code></pre>
 
             <!-- ============================================================ -->
             <h2 id="fix-any-issues">Fix Any Issues</h2>
@@ -310,24 +393,34 @@ svn commit -m "Remove paimon-mosaic ${RELEASE_VERSION} RC${RC_NUM} (superseded)"
             <!-- ============================================================ -->
             <h2 id="finalize-the-release">Finalize the Release</h2>
 
+            <h3>Move Source Artifacts to the Release Repository</h3>
+            <p>After the vote passes, promote the approved source candidate to the ASF release area <strong>before</strong> pushing the final tag. The final publication workflow refuses to publish crates or wheels until the archive, signature, and checksum are available from <code>downloads.apache.org</code> and pass checksum and signature verification.</p>
+<pre><code>svn mv -m "Release paimon-mosaic ${RELEASE_VERSION}" \
+  https://dist.apache.org/repos/dist/dev/paimon/paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM} \
+  https://dist.apache.org/repos/dist/release/paimon/paimon-mosaic-${RELEASE_VERSION}
+
+for suffix in "" ".asc" ".sha512"; do
+  curl --fail --location --silent --show-error \
+    --output /dev/null \
+    "https://downloads.apache.org/paimon/paimon-mosaic-${RELEASE_VERSION}/apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz${suffix}"
+done</code></pre>
+
             <h3>Push the Release Tag</h3>
-            <p>Once the vote passes, create and push the final release tag. This triggers CI to publish to crates.io and PyPI automatically; PyPI publishing runs only after the Rust and Java release jobs succeed.</p>
-<pre><code>git checkout ${RC_TAG}
+            <p>Once the vote passes, create the final release tag on the <strong>exact approved RC commit</strong>. The final and RC tags must both be signed by a key in the Apache Paimon KEYS file. CI rejects a final tag that does not match at least one signed <code>vX.Y.Z-rcN</code> tag.</p>
+<pre><code>git fetch origin ${RC_TAG}
+git checkout --detach ${RC_TAG}
+test "$(git rev-parse HEAD)" = "$(git rev-parse ${RC_TAG}^{commit})"
 git tag -s ${RELEASE_TAG} -m "Release Apache Paimon Mosaic ${RELEASE_VERSION}"
 git tag -v ${RELEASE_TAG}
 git push origin ${RELEASE_TAG}</code></pre>
-
-            <h3>Move Source Artifacts to the Release Repository</h3>
-<pre><code>svn mv -m "Release paimon-mosaic ${RELEASE_VERSION}" \
-  https://dist.apache.org/repos/dist/dev/paimon/paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM} \
-  https://dist.apache.org/repos/dist/release/paimon/paimon-mosaic-${RELEASE_VERSION}</code></pre>
+            <p>The final workflow completes the full preflight, Java verification, and target-runner wheel build/import checks. It verifies the promoted ASF source release and confirms that the crates.io and PyPI versions are absent, publishes the Rust crate, and finally publishes the wheels to PyPI. It does not deploy or release Java artifacts from the final tag.</p>
 
             <h3>Release the Java Artifacts</h3>
             <ol>
                 <li>Go to <a href="https://repository.apache.org/#stagingRepositories">Apache Nexus Staging Repositories</a>.</li>
-                <li>Find the staging repository for <code>orgapachepaimon-XXXX</code>.</li>
-                <li><strong>Close</strong> the repository (runs validation rules).</li>
-                <li>Once closed, <strong>Release</strong> the repository to Maven Central.</li>
+                <li>Find the <strong>closed</strong> <code>orgapachepaimon-XXXX</code> repository created by the trusted local RC staging step.</li>
+                <li>Confirm its description and contents still identify the approved RC.</li>
+                <li>Click <strong>Release</strong> to promote it to Maven Central; do not create or close a second repository from the final tag.</li>
             </ol>
 
             <h3>Verify Published Artifacts</h3>
@@ -347,8 +440,8 @@ git push origin ${RELEASE_TAG}</code></pre>
 
             <p><strong>Checklist:</strong></p>
             <ul>
-                <li>Release tag pushed; CI published to crates.io and PyPI</li>
                 <li>Source artifacts moved to <a href="https://dist.apache.org/repos/dist/release/paimon/">dist release</a></li>
+                <li>Release tag pushed; CI published to crates.io and PyPI</li>
                 <li>Java artifacts released to Maven Central via Nexus</li>
                 <li>GitHub Release created</li>
             </ul>
@@ -375,6 +468,9 @@ Java:   &lt;dependency&gt;
           &lt;version&gt;${RELEASE_VERSION}&lt;/version&gt;
         &lt;/dependency&gt;
 Python: pip install paimon-mosaic
+
+Downloads:
+https://paimon.apache.org/docs/mosaic/releases.html
 
 Release notes:
 https://github.com/apache/paimon-mosaic/releases/tag/v${RELEASE_VERSION}

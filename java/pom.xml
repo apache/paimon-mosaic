@@ -70,6 +70,65 @@
         <arrow.version>15.0.0</arrow.version>
     </properties>
 
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <version>3.3.1</version>
+                <executions>
+                    <execution>
+                        <id>copy-classifier-legal-resources</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>copy-resources</goal>
+                        </goals>
+                        <configuration>
+                            <!-- The Apache parent generates generic legal files in this
+                                 shared archive directory. Sources and javadoc JARs read
+                                 from it, so replace only LICENSE and NOTICE with exact,
+                                 unfiltered copies from the repository root. -->
+                            <outputDirectory>
+                                ${project.build.directory}/maven-shared-archive-resources/META-INF
+                            </outputDirectory>
+                            <overwrite>true</overwrite>
+                            <resources>
+                                <resource>
+                                    <directory>${project.basedir}/..</directory>
+                                    <filtering>false</filtering>
+                                    <includes>
+                                        <include>LICENSE</include>
+                                        <include>NOTICE</include>
+                                    </includes>
+                                </resource>
+                            </resources>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>copy-binary-only-legal-resources</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>copy-resources</goal>
+                        </goals>
+                        <configuration>
+                            <!-- Run after the Apache parent has generated its generic
+                                 META-INF files. These resources describe the native
+                                 libraries and therefore belong only in the main JAR. -->
+                            <outputDirectory>${project.build.outputDirectory}</outputDirectory>
+                            <overwrite>true</overwrite>
+                            <resources>
+                                <resource>
+                                    <directory>src/main/binary-resources</directory>
+                                    <filtering>false</filtering>
+                                </resource>
+                            </resources>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
     <dependencyManagement>
         <dependencies>
             <dependency>
@@ -148,6 +207,9 @@
                             </execution>
                         </executions>
                         <configuration>
+                            <!-- Binary-only native and legal resources are not Maven
+                                 source roots. Keep the explicit native exclusion as a
+                                 guard for downloaded release inputs. -->
                             <excludes>
                                 <exclude>native/**</exclude>
                             </excludes>

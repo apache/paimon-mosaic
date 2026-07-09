@@ -25,13 +25,13 @@ under the License.
   <servers>
     <server>
       <id>apache.snapshots.https</id>
-      <username>${sonatype_user}</username>
-      <password>${sonatype_pw}</password>
+      <username>${env.NEXUS_STAGE_DEPLOYER_USER}</username>
+      <password>${env.NEXUS_STAGE_DEPLOYER_PW}</password>
     </server>
     <server>
       <id>apache.releases.https</id>
-      <username>${sonatype_user}</username>
-      <password>${sonatype_pw}</password>
+      <username>${env.NEXUS_STAGE_DEPLOYER_USER}</username>
+      <password>${env.NEXUS_STAGE_DEPLOYER_PW}</password>
     </server>
   </servers>
 </settings>

@@ -26,7 +26,10 @@ license = "Apache-2.0"
 crate-type = ["rlib"]
 
 [dependencies]
-zstd = "0.13"
+# Mosaic only uses modern frame compression/decompression. Disable zstd's
+# legacy decoder so obsolete v0.1-v0.7 C sources and their separate license
+# are not linked into release binaries.
+zstd = { version = "0.13", default-features = false }
 arrow-schema = "58"
 arrow-array = "58"
 arrow-buffer = "58"

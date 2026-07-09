@@ -18,6 +18,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches:
       - main
@@ -31,7 +32,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Keep this distinct from the caller's release concurrency group when CI is
+  # invoked as a reusable release preflight.
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -43,19 +46,40 @@ jobs:
       - name: Validate .asf.yaml
         run: pip install pyyaml -q && python3 tools/validate_asf_yaml.py
 
+      - name: Check ASF license headers
+        run: python3 tools/check_license_headers.py
+
+      - name: Test release tooling
+        run: |
+          python3 -m pip install pytest==8.4.2
+          python3 -m pytest -q tools/tests
+
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny@0.19.0
 
-      - name: Check dependency licenses (Apache-compatible)
-        run: cargo deny check licenses
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.1
+
+      - name: Check dependency licenses and generated reports
+        run: python3 tools/dependencies.py check
+
+      - name: Check Rust security advisories
+        run: cargo deny --locked check advisories
+
+      - name: Verify artifact-exact license reports
+        run: |
+          cargo fetch --locked
+          python3 tools/generate_license_reports.py --check
 
       - name: Format
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --workspace -- -D warnings
+        run: cargo clippy --all-targets --workspace --locked -- -D warnings
 
   rust-test:
     runs-on: ubuntu-latest
@@ -74,13 +98,13 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --all-targets --locked
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Test with coverage
-        run: cargo llvm-cov --summary-only -- --skip test_read_java_written_file --skip test_read_python_written_file
+        run: cargo llvm-cov --locked --summary-only -- --skip test_read_java_written_file --skip test_read_python_written_file
 
   cpp-test:
     runs-on: ubuntu-latest
@@ -108,7 +132,7 @@ jobs:
           sudo apt-get install -y libarrow-dev
 
       - name: Build FFI library
-        run: cargo build --release -p paimon-mosaic-ffi
+        run: cargo build --release --locked -p paimon-mosaic-ffi
 
       - name: Build C++ test
         run: |
@@ -144,17 +168,33 @@ jobs:
           distribution: 'temurin'
 
       - name: Build JNI library
-        run: cargo build -p paimon-mosaic-jni --release
+        run: cargo build -p paimon-mosaic-jni --release --locked
 
       - name: Write interop files (Rust)
-        run: cargo test --release -p paimon-mosaic-core --test interop_write_test
+        run: cargo test --release --locked -p paimon-mosaic-core --test interop_write_test
 
       - name: Run Java tests
         working-directory: java
         run: mvn test "-DargLine=-Djava.library.path=${{ github.workspace }}/target/release"
 
       - name: Read Java-written interop file (Rust)
-        run: cargo test --release -p paimon-mosaic-core --test interop_read_test test_read_java_written_file
+        run: cargo test --release --locked -p paimon-mosaic-core --test interop_read_test test_read_java_written_file
+
+      - name: Verify Java classifier licensing
+        run: |
+          mvn -q -f java/pom.xml clean verify -Prelease -Dgpg.skip=true -DskipTests
+          main_jar="$(find java/target -maxdepth 1 -type f \
+            -name 'mosaic-*.jar' \
+            ! -name '*-sources.jar' ! -name '*-javadoc.jar' -print -quit)"
+          sources_jar="$(find java/target -maxdepth 1 -type f \
+            -name 'mosaic-*-sources.jar' -print -quit)"
+          javadoc_jar="$(find java/target -maxdepth 1 -type f \
+            -name 'mosaic-*-javadoc.jar' -print -quit)"
+          test -n "$main_jar" && test -n "$sources_jar" && test -n "$javadoc_jar"
+          python3 tools/verify_java_jars.py \
+            --main "$main_jar" \
+            --sources "$sources_jar" \
+            --javadoc "$javadoc_jar"
 
   python-test:
     runs-on: ubuntu-latest
@@ -178,10 +218,10 @@ jobs:
           python-version: '3.12'
 
       - name: Build FFI library
-        run: cargo build --release -p paimon-mosaic-ffi
+        run: cargo build --release --locked -p paimon-mosaic-ffi
 
       - name: Write interop files (Rust)
-        run: cargo test --release -p paimon-mosaic-core --test interop_write_test
+        run: cargo test --release --locked -p paimon-mosaic-core --test interop_write_test
 
       - name: Install Python dependencies
         working-directory: python
@@ -194,4 +234,4 @@ jobs:
           MOSAIC_LIB_PATH: ${{ github.workspace }}/target/release
 
       - name: Read Python-written interop file (Rust)
-        run: cargo test --release -p paimon-mosaic-core --test interop_read_test test_read_python_written_file
+        run: cargo test --release --locked -p paimon-mosaic-core --test interop_read_test test_read_python_written_file

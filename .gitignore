@@ -17,7 +17,6 @@
 
 # Rust
 /target/
-Cargo.lock
 
 # Java
 java/target/
@@ -36,6 +35,12 @@ python/build/
 .pytest_cache/
 python/mosaic/libpaimon_mosaic_ffi.*
 python/mosaic/paimon_mosaic_ffi.dll
+python/mosaic/LICENSE
+python/mosaic/NOTICE
+python/mosaic/THIRD-PARTY-LICENSES.html
+
+# Release artifacts
+tools/release/
 
 # IDE
 .idea/

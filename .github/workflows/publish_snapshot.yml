@@ -96,7 +96,7 @@ jobs:
           rustup target add "${{ matrix.target }}"
           unset ZSTD_SYS_USE_PKG_CONFIG
 
-          cargo zigbuild --release -p paimon-mosaic-jni --target "${{ matrix.target }}.2.17"
+          cargo zigbuild --release --locked -p paimon-mosaic-jni --target "${{ matrix.target }}.2.17"
 
           artifact="target/${{ matrix.target }}/release/${{ matrix.lib_name }}"
           test -f "$artifact"
@@ -124,7 +124,7 @@ jobs:
         if: matrix.os_name != 'linux'
         run: |
           rustup target add "${{ matrix.target }}"
-          cargo build --release -p paimon-mosaic-jni --target "${{ matrix.target }}"
+          cargo build --release --locked -p paimon-mosaic-jni --target "${{ matrix.target }}"
 
       - name: Upload native library
         uses: actions/upload-artifact@v5

@@ -15,8 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Orchestrate the full release while keeping each language release workflow
-# independently runnable through workflow_dispatch.
+# Orchestrate the full release. Directly dispatched leaf workflows are build-only.
+# Registry publication is authorized only after the top-level preflight; Maven
+# signing and Nexus staging remain explicit release-manager operations.
 
 name: Release
 
@@ -36,24 +37,262 @@ permissions:
   contents: read
 
 jobs:
+  tag-validation:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate signed release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --fail \
+            --location \
+            --retry 3 \
+            --show-error \
+            --silent \
+            https://downloads.apache.org/paimon/KEYS \
+            --output "$RUNNER_TEMP/paimon-KEYS"
+          python3 tools/validate_release_tag.py \
+            "$TAG_NAME" \
+            --keys-file "$RUNNER_TEMP/paimon-KEYS"
+
+      - name: Require an unused TestPyPI RC version
+        if: github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          TEST_PYPI_API_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$TEST_PYPI_API_TOKEN" || {
+            echo "TEST_PYPI_API_TOKEN is not configured" >&2
+            exit 1
+          }
+
+          version="${TAG_NAME#v}"
+          version="${version/-rc/rc}"
+          response="$RUNNER_TEMP/testpypi-version.json"
+          status="$(
+            curl \
+              --proto '=https' \
+              --tlsv1.2 \
+              --location \
+              --retry 3 \
+              --show-error \
+              --silent \
+              --output "$response" \
+              --write-out '%{http_code}' \
+              "https://test.pypi.org/pypi/paimon-mosaic/${version}/json"
+          )"
+          case "$status" in
+            404) echo "TestPyPI version ${version} is available" ;;
+            200)
+              echo "TestPyPI version ${version} already exists; use a new RC tag" >&2
+              exit 1
+              ;;
+            *)
+              cat "$response" >&2
+              echo "Unexpected TestPyPI response: HTTP ${status}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Confirm branch dispatch is build-only
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: echo "No release tag is selected; all leaf workflows will run without staging or publication."
+
+  preflight:
+    name: Release preflight
+    needs: [tag-validation]
+    uses: ./.github/workflows/ci.yml
+
   rust:
-    name: Rust release
+    name: Rust package verification
+    needs: [preflight]
     uses: ./.github/workflows/release-rust.yml
     secrets: inherit
 
   java:
-    name: Java release
+    name: Java release verification
+    needs: [preflight]
     uses: ./.github/workflows/release-java.yml
-    secrets: inherit
 
   python-wheels:
     name: Python wheels
+    needs: [preflight]
     uses: ./.github/workflows/release-python.yml
     secrets: inherit
 
-  python-publish:
-    name: Python publish
+  python-rc-publish:
+    name: Publish RC wheels to TestPyPI
     needs: [rust, java, python-wheels]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
     uses: ./.github/workflows/release-python-publish.yml
+    with:
+      publish_authorized: true
+    secrets: inherit
+
+  final-publication-preflight:
+    name: Final publication preflight
+    needs: [rust, java, python-wheels]
+    if: github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require promoted and valid ASF source release
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${TAG_NAME#v}"
+          archive="apache-paimon-mosaic-${version}-src.tgz"
+          release_url="https://downloads.apache.org/paimon/paimon-mosaic-${version}"
+          release_dir="$RUNNER_TEMP/source-release"
+          mkdir -p "$release_dir"
+
+          for file in "$archive" "$archive.asc" "$archive.sha512"; do
+            curl \
+              --proto '=https' \
+              --tlsv1.2 \
+              --fail \
+              --location \
+              --retry 3 \
+              --show-error \
+              --silent \
+              --output "$release_dir/$file" \
+              "$release_url/$file"
+          done
+
+          checksum=""
+          checksum_file=""
+          extra_checksum_field=""
+          read -r checksum checksum_file extra_checksum_field \
+            < "$release_dir/$archive.sha512"
+          checksum_file="${checksum_file#\*}"
+          if [[ ! "$checksum" =~ ^[0-9A-Fa-f]{128}$ \
+             || "$checksum_file" != "$archive" \
+             || -n "$extra_checksum_field" \
+             || "$(wc -l < "$release_dir/$archive.sha512")" -ne 1 ]]; then
+            echo "Invalid SHA-512 file for promoted source release" >&2
+            cat "$release_dir/$archive.sha512" >&2
+            exit 1
+          fi
+          (
+            cd "$release_dir"
+            sha512sum --check "$archive.sha512"
+          )
+
+          gzip -dc "$release_dir/$archive" > "$release_dir/source.tar"
+          source_commit="$(
+            git get-tar-commit-id < "$release_dir/source.tar"
+          )"
+          if [[ "$source_commit" != "$GITHUB_SHA" ]]; then
+            echo "Promoted source release embeds commit $source_commit, expected $GITHUB_SHA" >&2
+            exit 1
+          fi
+
+          curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --fail \
+            --location \
+            --retry 3 \
+            --show-error \
+            --silent \
+            --output "$release_dir/KEYS" \
+            https://downloads.apache.org/paimon/KEYS
+          export GNUPGHOME="$RUNNER_TEMP/source-release-gpg"
+          mkdir -m 700 "$GNUPGHOME"
+          gpg --batch --no-tty --import "$release_dir/KEYS"
+          gpg --batch --no-tty \
+            --verify "$release_dir/$archive.asc" "$release_dir/$archive"
+
+      - name: Require publication credentials
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$CARGO_REGISTRY_TOKEN" || {
+            echo "CARGO_REGISTRY_TOKEN is not configured" >&2
+            exit 1
+          }
+          test -n "$PYPI_API_TOKEN" || {
+            echo "PYPI_API_TOKEN is not configured" >&2
+            exit 1
+          }
+
+      - name: Require unused crates.io and PyPI versions
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+
+          check_absent() {
+            local registry="$1"
+            local url="$2"
+            local response="$RUNNER_TEMP/${registry}.json"
+            local status
+            status="$(
+              curl \
+                --proto '=https' \
+                --tlsv1.2 \
+                --location \
+                --retry 3 \
+                --show-error \
+                --silent \
+                --user-agent 'Apache Paimon Mosaic release workflow' \
+                --output "$response" \
+                --write-out '%{http_code}' \
+                "$url"
+            )"
+            case "$status" in
+              404) echo "${registry} version ${version} is available" ;;
+              200)
+                echo "${registry} version ${version} already exists" >&2
+                exit 1
+                ;;
+              *)
+                cat "$response" >&2
+                echo "Unexpected ${registry} response: HTTP ${status}" >&2
+                exit 1
+                ;;
+            esac
+          }
+
+          check_absent \
+            "crates-io" \
+            "https://crates.io/api/v1/crates/paimon-mosaic-core/${version}"
+          check_absent \
+            "pypi" \
+            "https://pypi.org/pypi/paimon-mosaic/${version}/json"
+
+  rust-final-publish:
+    name: Publish final Rust crate
+    needs: [final-publication-preflight]
+    uses: ./.github/workflows/release-rust.yml
+    with:
+      publish: true
+    secrets: inherit
+
+  python-final-publish:
+    name: Publish final wheels to PyPI
+    needs: [rust-final-publish]
+    uses: ./.github/workflows/release-python-publish.yml
+    with:
+      publish_authorized: true
     secrets: inherit
