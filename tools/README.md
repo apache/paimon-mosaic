@@ -22,6 +22,7 @@ runs Maven locally.
 ### Required local setup
 
 - `gh` GitHub CLI, authenticated with access to `apache/paimon-mosaic`;
+- Bash 3.2 or newer;
 - JDK and Maven;
 - local GPG setup for the release signing key;
 - Maven credentials for server id `apache.releases.https`.
@@ -88,8 +89,8 @@ The run id is:
 ```
 
 Do not use the job id, artifact id, PR number, or commit SHA. The script checks
-that this run completed successfully and that the run's commit matches the RC tag
-checked out locally.
+that this run completed successfully and that both the run's tag ref and commit
+match the RC tag checked out locally.
 
 ### Parameters
 
@@ -112,7 +113,8 @@ Common options:
 
 Less common options:
 
-- `--tag TAG`: use an explicit RC tag instead of deriving `vVERSION-rcN`.
+- `--tag TAG`: explicitly provide the RC tag. When used, it must exactly equal
+  `vVERSION-rcN` derived from `--release-version` and `--rc`.
 - `--repo OWNER/REPO`: GitHub repository for `gh`; defaults to
   `apache/paimon-mosaic`.
 - `--no-cleanup`: keep `java/src/main/resources/native` after the script exits.
@@ -136,16 +138,19 @@ Dry-run mode validates the GitHub Actions run id, downloads the native
 libraries, and runs:
 
 ```bash
-mvn clean verify -Prelease -Dgpg.skip=true -DskipTests
+mvn clean verify -Prelease -Dgpg.skip=true -DskipTests \
+  -DstagingValidationScript=/absolute/path/to/validate_java_staging_artifacts.sh
 ```
 
 It does not sign and does not deploy to Nexus. It verifies:
 
 - `java/pom.xml` version matches `--release-version`;
 - current checkout matches the RC tag, such as `v0.3.0-rc1`;
-- Java package inputs have no local changes;
+- Java package and release-tool inputs have no tracked, untracked, or ignored
+  local files, except for the managed native resource directory and Maven's
+  `target` directory;
 - the GitHub Actions run is a successful tag-push `Release` workflow run and its
-  commit matches the RC tag;
+  tag ref and commit both match the RC tag;
 - all four native libraries are present;
 - native library file formats match their target platforms;
 - the Java jar, sources jar, and javadoc jar are produced;
@@ -162,19 +167,18 @@ After the dry-run succeeds, run the same command without `--dry-run`:
   --run-id 12345678901
 ```
 
-The script repeats the local preflight before creating any remote staging
-artifacts:
+The real deployment uses one Maven lifecycle:
 
 ```bash
-mvn clean verify -Prelease -Dgpg.skip=true -DskipTests
+mvn clean deploy -Prelease -DskipTests \
+  -DstagingDescription="Apache Paimon Mosaic, version 0.3.0, release candidate 1" \
+  -DstagingValidationScript=/absolute/path/to/validate_java_staging_artifacts.sh
 ```
 
-After that passes, it runs the local Nexus staging deploy:
-
-```bash
-mvn deploy -Prelease -DskipTests \
-  -DstagingDescription="Apache Paimon Mosaic, version 0.3.0, release candidate 1"
-```
+The validation script is bound to Maven's `verify` phase. It checks the main,
+sources, and javadoc JARs and all four native entries before that same lifecycle
+continues to `install` and `deploy`; Maven does not perform a second build between
+preflight validation and the Nexus upload.
 
 The Maven output contains the Nexus staging repository id, for example:
 

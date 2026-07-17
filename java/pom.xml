@@ -205,5 +205,38 @@
                 </plugins>
             </build>
         </profile>
+        <profile>
+            <id>staging-artifact-validation</id>
+            <activation>
+                <property>
+                    <name>stagingValidationScript</name>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.5.0</version>
+                        <executions>
+                            <execution>
+                                <id>validate-staging-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>${stagingValidationScript}</executable>
+                                    <arguments>
+                                        <argument>${project.build.directory}</argument>
+                                        <argument>${project.version}</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
     </profiles>
 </project>

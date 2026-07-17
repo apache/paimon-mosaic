@@ -54,7 +54,7 @@ Required:
   --run-id RUN_ID            GitHub Actions run id containing native-* artifacts.
 
 Options:
-  --tag TAG                  RC tag. Defaults to vVERSION-rcN.
+  --tag TAG                  RC tag. Must equal vVERSION-rcN; defaults to it.
   --repo REPO                GitHub repository. Defaults to apache/paimon-mosaic.
   --dry-run                  Build and verify release artifacts locally only.
                              Does not sign or deploy to Nexus.
@@ -88,8 +88,8 @@ EOF
 require_option_value() {
   local option=$1
   local value=${2-}
-  if [[ $# -lt 2 || -z "$value" ]]; then
-    echo "$option requires a value" >&2
+  if [[ $# -lt 2 || -z "$value" || "$value" == -* ]]; then
+    echo "$option requires a value that is not another option" >&2
     usage >&2
     exit 1
   fi
@@ -173,31 +173,46 @@ require_value() {
 REPO=${REPO:-apache/paimon-mosaic}
 
 require_value "--release-version" "$RELEASE_VERSION"
+require_value "--rc" "$RC_NUMBER"
+require_value "--run-id" "$RUN_ID"
 
+if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "--release-version must use X.Y.Z numeric form: $RELEASE_VERSION" >&2
+  exit 1
+fi
+
+if [[ ! "$RC_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--rc must be a positive integer: $RC_NUMBER" >&2
+  exit 1
+fi
+
+if [[ ! "$RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--run-id must be a positive integer: $RUN_ID" >&2
+  exit 1
+fi
+
+EXPECTED_TAG="v${RELEASE_VERSION}-rc${RC_NUMBER}"
 if [[ -z "$TAG" ]]; then
-  require_value "--rc" "$RC_NUMBER"
-  TAG="v${RELEASE_VERSION}-rc${RC_NUMBER}"
+  TAG=$EXPECTED_TAG
+elif [[ "$TAG" != "$EXPECTED_TAG" ]]; then
+  echo "--tag must match --release-version and --rc." >&2
+  echo "tag:      $TAG" >&2
+  echo "expected: $EXPECTED_TAG" >&2
+  exit 1
 fi
 
 if [[ -z "$STAGING_DESCRIPTION" ]]; then
-  if [[ -n "$RC_NUMBER" ]]; then
-    STAGING_DESCRIPTION="Apache Paimon Mosaic, version ${RELEASE_VERSION}, release candidate ${RC_NUMBER}"
-  else
-    STAGING_DESCRIPTION="Apache Paimon Mosaic, version ${RELEASE_VERSION}, release candidate ${TAG#*-rc}"
-  fi
-fi
-
-if [[ -z "$RUN_ID" ]]; then
-  echo "--run-id is required" >&2
-  usage >&2
-  exit 1
+  STAGING_DESCRIPTION="Apache Paimon Mosaic, version ${RELEASE_VERSION}, release candidate ${RC_NUMBER}"
 fi
 
 NATIVE_DIR="$SCRIPT_DIR/release/java-native-${TAG}"
 
-if [[ -n "$MAVEN_SETTINGS" && ! -f "$MAVEN_SETTINGS" ]]; then
-  echo "--maven-settings does not exist: $MAVEN_SETTINGS" >&2
-  exit 1
+if [[ -n "$MAVEN_SETTINGS" ]]; then
+  if [[ ! -f "$MAVEN_SETTINGS" ]]; then
+    echo "--maven-settings does not exist: $MAVEN_SETTINGS" >&2
+    exit 1
+  fi
+  MAVEN_SETTINGS=$(cd "$(dirname "$MAVEN_SETTINGS")" && pwd)/$(basename "$MAVEN_SETTINGS")
 fi
 
 POM_VERSION=$(
@@ -225,20 +240,41 @@ else
 fi
 
 check_java_package_inputs_clean() {
-  local paths=(java DEPENDENCIES.rust.tsv)
+  local paths=(
+    java
+    DEPENDENCIES.rust.tsv
+    tools/deploy_java_staging.sh
+    tools/validate_java_staging_artifacts.sh
+  )
+  local ignored
   local untracked
 
   if ! git -C "$REPO_DIR" diff --quiet -- "${paths[@]}" ||
      ! git -C "$REPO_DIR" diff --cached --quiet -- "${paths[@]}"; then
-    echo "Java package inputs have local changes. Commit or revert them before publishing." >&2
+    echo "Java package or release tool inputs have local changes." >&2
+    echo "Commit or revert them before publishing." >&2
     git -C "$REPO_DIR" status --short -- "${paths[@]}" >&2
     exit 1
   fi
 
   untracked=$(git -C "$REPO_DIR" ls-files --others --exclude-standard -- "${paths[@]}")
   if [[ -n "$untracked" ]]; then
-    echo "Java package inputs contain untracked files. Remove or commit them before publishing." >&2
+    echo "Java package or release tool inputs contain untracked files." >&2
+    echo "Remove or commit them before publishing." >&2
     printf '%s\n' "$untracked" >&2
+    exit 1
+  fi
+
+  ignored=$(
+    git -C "$REPO_DIR" ls-files --others --ignored --exclude-standard -- "${paths[@]}" |
+      sed \
+        -e '\#^java/target/#d' \
+        -e '\#^java/src/main/resources/native/#d'
+  )
+  if [[ -n "$ignored" ]]; then
+    echo "Java package inputs contain ignored files that could enter release artifacts." >&2
+    echo "Remove these files before publishing:" >&2
+    printf '%s\n' "$ignored" >&2
     exit 1
   fi
 }
@@ -247,7 +283,12 @@ check_java_package_inputs_clean
 
 validate_github_run() {
   local run_output
-  local run_info
+  local run_status
+  local run_conclusion
+  local run_head_sha
+  local run_head_branch
+  local run_workflow_name
+  local run_event
   if ! run_output=$(
     gh run view "$RUN_ID" \
       --repo "$REPO" \
@@ -257,14 +298,12 @@ validate_github_run() {
     echo "Failed to read GitHub Actions run: $RUN_ID" >&2
     exit 1
   fi
-  mapfile -t run_info <<<"$run_output"
-
-  local run_status=${run_info[0]:-}
-  local run_conclusion=${run_info[1]:-}
-  local run_head_sha=${run_info[2]:-}
-  local run_head_branch=${run_info[3]:-}
-  local run_workflow_name=${run_info[4]:-}
-  local run_event=${run_info[5]:-}
+  run_status=$(printf '%s\n' "$run_output" | sed -n '1p')
+  run_conclusion=$(printf '%s\n' "$run_output" | sed -n '2p')
+  run_head_sha=$(printf '%s\n' "$run_output" | sed -n '3p')
+  run_head_branch=$(printf '%s\n' "$run_output" | sed -n '4p')
+  run_workflow_name=$(printf '%s\n' "$run_output" | sed -n '5p')
+  run_event=$(printf '%s\n' "$run_output" | sed -n '6p')
 
   if [[ "$run_status" != "completed" || "$run_conclusion" != "success" ]]; then
     echo "GitHub Actions run $RUN_ID is not a successful completed run." >&2
@@ -279,6 +318,11 @@ validate_github_run() {
 
   if [[ "$run_event" != "push" ]]; then
     echo "GitHub Actions run $RUN_ID was triggered by '$run_event', expected a tag push." >&2
+    exit 1
+  fi
+
+  if [[ "$run_head_branch" != "$TAG" ]]; then
+    echo "GitHub Actions run $RUN_ID is for '$run_head_branch', expected '$TAG'." >&2
     exit 1
   fi
 
@@ -482,69 +526,46 @@ if [[ -n "$MAVEN_SETTINGS" ]]; then
   MVN_BASE_CMD+=("-s" "$MAVEN_SETTINGS")
 fi
 
-VERIFY_CMD=("${MVN_BASE_CMD[@]}" clean verify -Prelease -Dgpg.skip=true)
-if [[ "$SKIP_TESTS" == "true" ]]; then
-  VERIFY_CMD+=(-DskipTests)
+ARTIFACT_VALIDATOR="$SCRIPT_DIR/validate_java_staging_artifacts.sh"
+if [[ ! -x "$ARTIFACT_VALIDATOR" ]]; then
+  echo "Java staging artifact validator is not executable: $ARTIFACT_VALIDATOR" >&2
+  exit 1
 fi
 
-validate_maven_artifacts() {
-  local jar_file="$REPO_DIR/java/target/mosaic-${RELEASE_VERSION}.jar"
-  local sources_jar="$REPO_DIR/java/target/mosaic-${RELEASE_VERSION}-sources.jar"
-  local javadoc_jar="$REPO_DIR/java/target/mosaic-${RELEASE_VERSION}-javadoc.jar"
-  local artifact
-  local native_entry
-
-  for artifact in "$jar_file" "$sources_jar" "$javadoc_jar"; do
-    if [[ ! -f "$artifact" ]]; then
-      echo "Expected Maven artifact is missing: $artifact" >&2
-      exit 1
-    fi
-  done
-
-  for native_entry in \
-    native/linux/x86_64/libpaimon_mosaic_jni.so \
-    native/linux/aarch64/libpaimon_mosaic_jni.so \
-    native/macos/aarch64/libpaimon_mosaic_jni.dylib \
-    native/windows/x86_64/paimon_mosaic_jni.dll
-  do
-    if ! jar tf "$jar_file" | grep -qx "$native_entry"; then
-      echo "Packaged jar is missing native entry: $native_entry" >&2
-      exit 1
-    fi
-  done
-}
+VALIDATION_PROPERTY="-DstagingValidationScript=$ARTIFACT_VALIDATOR"
 
 if [[ "$DRY_RUN" == "true" ]]; then
   echo "Dry-running Java staging build. No artifacts will be deployed to Nexus."
+  MAVEN_CMD=("${MVN_BASE_CMD[@]}" clean verify -Prelease -Dgpg.skip=true "$VALIDATION_PROPERTY")
 else
-  echo "Running Java staging preflight before deploying to Apache Nexus."
+  echo "Running one validated Maven lifecycle before deploying to Apache Nexus."
   echo "Staging description: $STAGING_DESCRIPTION"
+  MAVEN_CMD=(
+    "${MVN_BASE_CMD[@]}" clean deploy -Prelease
+    "-DstagingDescription=$STAGING_DESCRIPTION"
+    "$VALIDATION_PROPERTY"
+  )
 fi
+
+if [[ "$SKIP_TESTS" == "true" ]]; then
+  MAVEN_CMD+=(-DskipTests)
+fi
+
+# Recheck immediately before Maven. The managed native directory and Maven's
+# target directory are the only ignored paths allowed under Java package inputs.
+check_java_package_inputs_clean
 
 (
   cd "$REPO_DIR/java"
-  "${VERIFY_CMD[@]}"
+  "${MAVEN_CMD[@]}"
 )
 
-validate_maven_artifacts
+"$ARTIFACT_VALIDATOR" "$REPO_DIR/java/target" "$RELEASE_VERSION"
 
 echo ""
 if [[ "$DRY_RUN" == "true" ]]; then
   echo "Java staging dry run finished successfully."
 else
-  DEPLOY_CMD=("${MVN_BASE_CMD[@]}" deploy -Prelease "-DstagingDescription=$STAGING_DESCRIPTION")
-  if [[ "$SKIP_TESTS" == "true" ]]; then
-    DEPLOY_CMD+=(-DskipTests)
-  fi
-
-  echo "Preflight passed. Deploying Java artifacts to Apache Nexus staging."
-  (
-    cd "$REPO_DIR/java"
-    "${DEPLOY_CMD[@]}"
-  )
-  validate_maven_artifacts
-
-  echo ""
   echo "Java staging deploy finished."
   echo "Check the Maven output for the orgapachepaimon-XXXX staging repository id."
 fi
