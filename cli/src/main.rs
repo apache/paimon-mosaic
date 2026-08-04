@@ -25,7 +25,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use arrow::array::{new_null_array, ArrayRef, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use clap::{Parser, Subcommand};
 use paimon_mosaic_core::reader::{MosaicReader, ReaderAccess};
 use serde_json::Value;
@@ -136,7 +136,7 @@ enum Cmd {
         /// Avro record schema file to use instead of inferring one.
         #[arg(short = 's', long)]
         schema: Option<PathBuf>,
-        /// List of columns.
+        /// Columns to keep; each occurrence accepts a comma-separated list.
         #[arg(short = 'c', long = "column", visible_alias = "columns")]
         columns: Vec<String>,
         /// Columns to build min/max stats for (comma-separated); `cat --where`
@@ -154,7 +154,7 @@ enum Cmd {
         /// Output .mosaic path.
         #[arg(short = 'o', long = "output")]
         out: PathBuf,
-        /// Avro record schema file to use instead of inferring one.
+        /// Avro record schema file to use instead of inferring one (scalar fields only).
         #[arg(short = 's', long)]
         schema: Option<PathBuf>,
         /// Do not allow null values for inferred fields; repeat for multiple fields.
@@ -163,9 +163,9 @@ enum Cmd {
         /// Delimiter character.
         #[arg(long, default_value = ",")]
         delimiter: String,
-        /// Escape character.
-        #[arg(long, default_value = "\\")]
-        escape: String,
+        /// Escape character (disabled by default).
+        #[arg(long)]
+        escape: Option<String>,
         /// Quote character.
         #[arg(long, default_value = "\"")]
         quote: String,
@@ -532,17 +532,19 @@ fn convert(
             "convert only supports JSON inputs (.json/.ndjson/.jsonl); use convert-csv for CSV data",
         ));
     }
+    let columns = parse_convert_columns(columns)?;
     ensure_can_write(out, overwrite)?;
     let explicit_schema = schema.map(load_convert_schema).transpose()?;
     let open =
         || -> std::io::Result<_> { Ok(std::io::BufReader::new(std::fs::File::open(input)?)) };
     let schema = match explicit_schema {
         Some(schema) => schema,
-        None => arrow::json::reader::infer_json_schema(&mut open()?, None)
+        None if columns.is_empty() => arrow::json::reader::infer_json_schema(&mut open()?, None)
             .map(|(schema, _)| schema)
             .map_err(bad)?,
+        None => infer_projected_json_schema(open()?, &columns).map_err(bad)?,
     };
-    let schema = project_convert_schema(schema, columns)?;
+    let schema = project_convert_schema(schema, &columns)?;
     reject_null_inferred_fields(&schema)?;
     let reader = arrow::json::ReaderBuilder::new(Arc::new(schema.clone()))
         .build(open()?)
@@ -560,7 +562,7 @@ fn convert(
 
 struct CsvConvertOptions {
     delimiter: String,
-    escape: String,
+    escape: Option<String>,
     quote: String,
     no_header: bool,
     header: Option<String>,
@@ -621,6 +623,7 @@ fn convert_csv(
             apply_required_fields(csv_schema_with_null_fallback(schema), required_fields)?
         }
     };
+    reject_csv_unsupported_fields(&schema)?;
     write_mosaic(out, overwrite, &schema, stats, |writer, rows| {
         for input in inputs {
             let layout = csv_input_layout(input, &options, scan_widths)?;
@@ -630,10 +633,14 @@ fn convert_csv(
                 continue;
             }
             let reader_schema = csv_reader_schema(&schema, &layout);
-            let mapping = csv_output_mapping(&schema, &layout);
-            validate_csv_mapping(&schema, &layout, &mapping, input)?;
+            let source_mapping = csv_output_mapping(&schema, &layout);
+            validate_csv_mapping(&schema, &layout, &source_mapping, input)?;
+            let (projection, mapping) = csv_projection(&source_mapping);
+            let batch_size = csv_batch_size(reader_schema.fields().len());
             let reader = arrow::csv::ReaderBuilder::new(Arc::new(reader_schema))
                 .with_format(format.clone().with_truncated_rows(true))
+                .with_batch_size(batch_size)
+                .with_projection(projection)
                 .build(open_csv(input, options.skip_lines)?)
                 .map_err(bad)?;
             for batch in reader {
@@ -728,6 +735,44 @@ fn project_convert_schema(schema: Schema, columns: &[String]) -> std::io::Result
     Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
+fn parse_convert_columns(arguments: &[String]) -> std::io::Result<Vec<String>> {
+    if arguments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let columns: Vec<String> = arguments
+        .iter()
+        .flat_map(|argument| parse_comma_list(argument))
+        .collect();
+    if columns.is_empty() {
+        return Err(invalid_schema("--column field name cannot be empty"));
+    }
+    Ok(columns)
+}
+
+fn infer_projected_json_schema<R: std::io::Read>(
+    reader: R,
+    columns: &[String],
+) -> Result<Schema, arrow::error::ArrowError> {
+    use arrow::error::ArrowError;
+
+    let values = serde_json::Deserializer::from_reader(reader)
+        .into_iter::<Value>()
+        .map(|value| {
+            let value = value.map_err(|e| ArrowError::JsonError(e.to_string()))?;
+            Ok(match value {
+                Value::Object(mut object) => {
+                    let projected = columns
+                        .iter()
+                        .filter_map(|name| object.remove(name).map(|value| (name.clone(), value)))
+                        .collect();
+                    Value::Object(projected)
+                }
+                value => value,
+            })
+        });
+    arrow::json::reader::infer_json_schema_from_iterator(values)
+}
+
 /// Mosaic cannot store Arrow `Null` columns, and JSON inference produces
 /// `Null` for a field with no non-null value in the input — fail
 /// with the column name instead of the writer's late "unsupported DataType".
@@ -767,13 +812,16 @@ fn ensure_can_write(out: &Path, overwrite: bool) -> std::io::Result<()> {
 
 fn csv_format(options: &CsvConvertOptions) -> std::io::Result<arrow::csv::reader::Format> {
     let delimiter = parse_csv_byte(&options.delimiter, "delimiter")?;
-    let escape = parse_csv_byte(&options.escape, "escape")?;
+    let escape = parse_optional_csv_byte(options.escape.as_deref(), "escape")?;
     let quote = parse_csv_byte(&options.quote, "quote")?;
-    Ok(arrow::csv::reader::Format::default()
+    let format = arrow::csv::reader::Format::default()
         .with_header(!options.no_header && options.header.is_none())
         .with_delimiter(delimiter)
-        .with_escape(escape)
-        .with_quote(quote))
+        .with_quote(quote);
+    Ok(match escape {
+        Some(escape) => format.with_escape(escape),
+        None => format,
+    })
 }
 
 fn parse_csv_byte(value: &str, name: &str) -> std::io::Result<u8> {
@@ -786,6 +834,10 @@ fn parse_csv_byte(value: &str, name: &str) -> std::io::Result<u8> {
             format!("--{name} must be exactly one byte"),
         ))
     }
+}
+
+fn parse_optional_csv_byte(value: Option<&str>, name: &str) -> std::io::Result<Option<u8>> {
+    value.map(|value| parse_csv_byte(value, name)).transpose()
 }
 
 fn open_csv(path: &Path, skip_lines: usize) -> std::io::Result<std::io::BufReader<std::fs::File>> {
@@ -806,13 +858,26 @@ struct CsvInputLayout {
     columns: usize,
 }
 
+const DEFAULT_CSV_BATCH_SIZE: usize = 1024;
+// Arrow's CSV RecordDecoder reserves roughly one data byte range and one
+// offset per cell before projection is applied. Keep that eager allocation
+// bounded for very wide records by reducing the number of rows per batch.
+const TARGET_CSV_DECODE_CELLS: usize = 64 * 1024;
+
+fn csv_batch_size(columns: usize) -> usize {
+    if columns == 0 {
+        return DEFAULT_CSV_BATCH_SIZE;
+    }
+    (TARGET_CSV_DECODE_CELLS / columns).clamp(1, DEFAULT_CSV_BATCH_SIZE)
+}
+
 fn csv_input_layout(
     path: &Path,
     options: &CsvConvertOptions,
     scan_widths: bool,
 ) -> std::io::Result<CsvInputLayout> {
     let delimiter = parse_csv_byte(&options.delimiter, "delimiter")?;
-    let escape = parse_csv_byte(&options.escape, "escape")?;
+    let escape = parse_optional_csv_byte(options.escape.as_deref(), "escape")?;
     let quote = parse_csv_byte(&options.quote, "quote")?;
     let mut builder = csv::ReaderBuilder::new();
     builder
@@ -820,7 +885,7 @@ fn csv_input_layout(
         .flexible(true)
         .delimiter(delimiter)
         .quote(quote)
-        .escape(Some(escape));
+        .escape(escape);
     let mut reader = builder.from_reader(open_csv(path, options.skip_lines)?);
     let mut records = reader.records();
     let header = if let Some(header) = &options.header {
@@ -894,6 +959,21 @@ fn csv_output_mapping(output_schema: &Schema, layout: &CsvInputLayout) -> Vec<Op
     } else {
         (0..output_schema.fields().len()).map(Some).collect()
     }
+}
+
+fn csv_projection(mapping: &[Option<usize>]) -> (Vec<usize>, Vec<Option<usize>>) {
+    let mut projection = Vec::new();
+    let projected_mapping = mapping
+        .iter()
+        .map(|source| {
+            source.map(|source| {
+                let projected = projection.len();
+                projection.push(source);
+                projected
+            })
+        })
+        .collect();
+    (projection, projected_mapping)
 }
 
 /// A schema field absent from the CSV header becomes an all-null column, so
@@ -981,14 +1061,14 @@ fn csv_schema_with_csv_names(
 
 fn parse_csv_header(header: &str, options: &CsvConvertOptions) -> std::io::Result<Vec<String>> {
     let delimiter = parse_csv_byte(&options.delimiter, "delimiter")?;
-    let escape = parse_csv_byte(&options.escape, "escape")?;
+    let escape = parse_optional_csv_byte(options.escape.as_deref(), "escape")?;
     let quote = parse_csv_byte(&options.quote, "quote")?;
     let mut builder = csv::ReaderBuilder::new();
     builder
         .has_headers(false)
         .delimiter(delimiter)
         .quote(quote)
-        .escape(Some(escape));
+        .escape(escape);
     let mut reader = builder.from_reader(header.as_bytes());
     let mut records = reader.records();
     let record = records
@@ -1035,6 +1115,24 @@ fn csv_schema_with_null_fallback(schema: Schema) -> Schema {
         })
         .collect();
     Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
+fn reject_csv_unsupported_fields(schema: &Schema) -> std::io::Result<()> {
+    for field in schema.fields() {
+        let avro_type = match field.data_type() {
+            DataType::Binary => Some("bytes"),
+            DataType::List(_) => Some("array"),
+            DataType::Map(_, _) => Some("map"),
+            _ => None,
+        };
+        if let Some(avro_type) = avro_type {
+            return Err(invalid_schema(format!(
+                "CSV conversion does not support Avro '{avro_type}' field '{}'; use a scalar type or a JSON input",
+                field.name(),
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn merge_csv_inferred_schema(prev: Schema, next: Schema, input: &Path) -> std::io::Result<Schema> {
@@ -1172,9 +1270,41 @@ fn parse_avro_named_type(name: &str, full_type: Option<&Value>) -> Result<DataTy
         "double" => Ok(DataType::Float64),
         "string" => Ok(DataType::Utf8),
         "bytes" => Ok(DataType::Binary),
+        "array" => parse_avro_array(
+            full_type.ok_or_else(|| "Avro array type must contain items".to_string())?,
+        ),
+        "map" => parse_avro_map(
+            full_type.ok_or_else(|| "Avro map type must contain values".to_string())?,
+        ),
         "null" => Err("null is not a supported schema type; use a nullable union".to_string()),
         other => Err(format!("unsupported Avro type '{other}'")),
     }
+}
+
+fn parse_avro_array(full_type: &Value) -> Result<DataType, String> {
+    let items = full_type
+        .get("items")
+        .ok_or_else(|| "Avro array type must contain items".to_string())?;
+    let (data_type, nullable) = parse_avro_type(items)?;
+    Ok(DataType::List(Arc::new(Field::new(
+        "item", data_type, nullable,
+    ))))
+}
+
+fn parse_avro_map(full_type: &Value) -> Result<DataType, String> {
+    let values = full_type
+        .get("values")
+        .ok_or_else(|| "Avro map type must contain values".to_string())?;
+    let (value_type, value_nullable) = parse_avro_type(values)?;
+    let entries = Field::new(
+        "entries",
+        DataType::Struct(Fields::from(vec![
+            Field::new("keys", DataType::Utf8, false),
+            Field::new("values", value_type, value_nullable),
+        ])),
+        false,
+    );
+    Ok(DataType::Map(Arc::new(entries), false))
 }
 
 fn parse_avro_logical_type(
@@ -1185,9 +1315,21 @@ fn parse_avro_logical_type(
     match (physical_type, logical_type) {
         ("int", "date") => Ok(DataType::Date32),
         ("int", "time-millis") => Ok(DataType::Time32(TimeUnit::Millisecond)),
-        ("long", "timestamp-millis") => Ok(DataType::Timestamp(TimeUnit::Millisecond, None)),
-        ("long", "timestamp-micros") => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
-        ("long", "timestamp-nanos") => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        ("long", "timestamp-millis") => Ok(DataType::Timestamp(
+            TimeUnit::Millisecond,
+            Some("+00:00".into()),
+        )),
+        ("long", "timestamp-micros") => Ok(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("+00:00".into()),
+        )),
+        ("long", "timestamp-nanos") => Ok(DataType::Timestamp(
+            TimeUnit::Nanosecond,
+            Some("+00:00".into()),
+        )),
+        ("long", "local-timestamp-millis") => Ok(DataType::Timestamp(TimeUnit::Millisecond, None)),
+        ("long", "local-timestamp-micros") => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        ("long", "local-timestamp-nanos") => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
         ("bytes" | "fixed", "decimal") => parse_avro_decimal(full_type),
         ("string", "uuid") => Ok(DataType::Utf8),
         _ => Err(format!(
@@ -1582,12 +1724,13 @@ mod tests {
     {"name": "id", "type": "int"},
     {"name": "name", "type": ["null", "string"], "default": null},
     {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}},
-    {"name": "ts", "type": {"type": "long", "logicalType": "timestamp-nanos"}}
+    {"name": "ts", "type": {"type": "long", "logicalType": "timestamp-nanos"}},
+    {"name": "local_ts", "type": {"type": "long", "logicalType": "local-timestamp-nanos"}}
   ]
 }"#,
         )
         .unwrap();
-        assert_eq!(schema.fields().len(), 4);
+        assert_eq!(schema.fields().len(), 5);
         assert_eq!(schema.fields()[0].data_type(), &DataType::Int32);
         assert!(!schema.fields()[0].is_nullable());
         assert_eq!(schema.fields()[1].data_type(), &DataType::Utf8);
@@ -1595,8 +1738,74 @@ mod tests {
         assert_eq!(schema.fields()[2].data_type(), &DataType::Decimal128(10, 2));
         assert_eq!(
             schema.fields()[3].data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into()))
+        );
+        assert_eq!(
+            schema.fields()[4].data_type(),
             &DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
+    }
+
+    #[test]
+    fn parse_avro_schema_supports_recursive_array_and_map_types() {
+        let schema = parse_avro_schema(
+            r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "tags", "type": {"type": "array", "items": ["null", "string"]}},
+    {"name": "props", "type": {"type": "map", "values": {"type": "array", "items": "long"}}}
+  ]
+}"#,
+        )
+        .unwrap();
+        let DataType::List(items) = schema.fields()[0].data_type() else {
+            panic!("expected List");
+        };
+        assert_eq!(items.data_type(), &DataType::Utf8);
+        assert!(items.is_nullable());
+
+        let DataType::Map(entries, false) = schema.fields()[1].data_type() else {
+            panic!("expected unsorted Map");
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("expected Map entries struct");
+        };
+        assert_eq!(fields[0].data_type(), &DataType::Utf8);
+        assert!(!fields[0].is_nullable());
+        let DataType::List(items) = fields[1].data_type() else {
+            panic!("expected List map values");
+        };
+        assert_eq!(items.data_type(), &DataType::Int64);
+        assert!(!items.is_nullable());
+    }
+
+    #[test]
+    fn convert_columns_split_each_comma_separated_occurrence() {
+        assert_eq!(
+            parse_convert_columns(&["id, kind".into(), "name".into()]).unwrap(),
+            ["id", "kind", "name"]
+        );
+        assert!(parse_convert_columns(&[", ".into()]).is_err());
+    }
+
+    #[test]
+    fn wide_csv_batch_size_bounds_decoder_preallocation() {
+        assert_eq!(csv_batch_size(0), DEFAULT_CSV_BATCH_SIZE);
+        assert_eq!(csv_batch_size(64), DEFAULT_CSV_BATCH_SIZE);
+        assert_eq!(csv_batch_size(80_000), 1);
+        for columns in [1, 64, 1_000, TARGET_CSV_DECODE_CELLS] {
+            let batch_size = csv_batch_size(columns);
+            assert!((1..=DEFAULT_CSV_BATCH_SIZE).contains(&batch_size));
+            assert!(batch_size * columns <= TARGET_CSV_DECODE_CELLS);
+        }
+    }
+
+    #[test]
+    fn csv_projection_remaps_output_columns() {
+        let (projection, mapping) = csv_projection(&[Some(5), None, Some(1)]);
+        assert_eq!(projection, [5, 1]);
+        assert_eq!(mapping, [Some(0), None, Some(1)]);
     }
 
     #[test]

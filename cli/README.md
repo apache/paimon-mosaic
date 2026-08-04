@@ -104,14 +104,17 @@ provided. A field with no non-null value cannot be inferred and is reported as
 an error — pass `--schema` for such data.
 An existing output is kept unless `--overwrite` is given.
 `--schema` accepts an Avro record schema file.
-Use `-c`/`--column`/`--columns` to project top-level fields.
+Avro arrays and maps are converted recursively. Avro `timestamp-*` logical
+types remain UTC instants, while `local-timestamp-*` remains timezone-free.
+Use `-c`/`--column`/`--columns` to project top-level fields; each occurrence
+accepts a comma-separated list.
 `--stats id` builds min/max for those columns, which `cat --where` then uses
 to skip row groups that cannot match.
 
 ```text
 $ mosaic convert data.json -o data.mosaic
 $ mosaic convert data.json -o data.mosaic --schema schema.avsc
-$ mosaic convert data.json -o data.mosaic -c id --columns name
+$ mosaic convert data.json -o data.mosaic -c id,kind
 $ mosaic convert data.json -o data.mosaic --stats id
 ```
 
@@ -121,14 +124,19 @@ Import CSV into a new Mosaic file, either with an Avro record schema file
 given via `--schema`, or with a schema inferred from the CSV data. Multiple
 input files are allowed when they share one schema; empty files are skipped.
 CSV cannot say what type an all-empty column is, so columns inferred as Arrow
-`Null` fall back to nullable `Utf8`. When a CSV schema is inferred,
-`--require col` marks an inferred field as not null (repeat it for multiple
-fields); combining `--require` with `--schema` is rejected.
+`Null` fall back to nullable `Utf8` and their values remain null. Use
+`--schema` when such a column should have another type. When a CSV schema is
+inferred, `--require col` marks an inferred field as not null (repeat it for
+multiple fields); combining `--require` with `--schema` is rejected.
 
 With `--schema`, fields are matched to CSV columns by header name (by position
 with `--no-header`); a schema field absent from the header is filled with
 nulls, but the conversion fails if the field is required or if no schema field
 matches the header at all.
+Backslash escaping is disabled by default so literal values such as
+`C:\temp\file` are preserved; pass `--escape '\'` only for CSV dialects that
+use a separate escape character. Avro `bytes`, `array`, and `map` fields are
+rejected because the CSV decoder supports scalar text fields only.
 `--stats id` builds min/max for those columns, which `cat --where` then uses
 to skip row groups that cannot match.
 

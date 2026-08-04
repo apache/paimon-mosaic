@@ -367,6 +367,25 @@ fn convert_csv_then_inspect() {
 }
 
 #[test]
+fn convert_csv_preserves_backslashes_by_default() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_backslashes.csv", dir.display());
+    std::fs::write(
+        &csv,
+        r#"path
+"C:\temp\file"
+"#,
+    )
+    .unwrap();
+    let out = format!("{}/mosaic_e2e_backslashes.mosaic", dir.display());
+    let (msg, err, ok) = run(&["convert-csv", &csv, "-o", &out, "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert!(rows.contains(r#"{"path":"C:\\temp\\file"}"#), "{rows}");
+}
+
+#[test]
 fn convert_csv_all_null_column_falls_back_to_utf8() {
     let csv = format!(
         "{}/mosaic_e2e_all_null_col.csv",
@@ -440,6 +459,37 @@ fn convert_csv_uses_explicit_schema_file() {
 }
 
 #[test]
+fn convert_csv_rejects_bytes_schema_before_reading_rows() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_bytes_schema.csv", dir.display());
+    std::fs::write(&csv, "payload\nabc\n").unwrap();
+    let schema = format!("{}/mosaic_e2e_bytes_schema.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [{"name": "payload", "type": "bytes"}]
+}"#,
+    )
+    .unwrap();
+    let out = format!("{}/mosaic_e2e_bytes_schema.mosaic", dir.display());
+    let _ = std::fs::remove_file(&out);
+    let (_, err, ok) = run(&[
+        "convert-csv",
+        &csv,
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("Avro 'bytes' field 'payload'"), "{err}");
+    assert!(!std::path::Path::new(&out).exists());
+}
+
+#[test]
 fn convert_csv_explicit_schema_maps_header_by_name() {
     let dir = std::env::temp_dir();
     let csv = format!("{}/mosaic_e2e_explicit_schema_reordered.csv", dir.display());
@@ -485,6 +535,89 @@ fn convert_csv_explicit_schema_maps_header_by_name() {
         rows.contains(r#"{"id":2,"name":"bob","missing":null}"#),
         "{rows}"
     );
+}
+
+#[test]
+fn convert_csv_explicit_schema_projects_very_wide_input() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_wide_projection.csv", dir.display());
+    const COLUMNS: usize = 4096;
+    let mut names: Vec<String> = (0..COLUMNS - 1).map(|i| format!("unused_{i}")).collect();
+    names.push("target".to_string());
+    let mut values = vec!["x"; COLUMNS];
+    values[COLUMNS - 1] = "7";
+    std::fs::write(&csv, format!("{}\n{}\n", names.join(","), values.join(","))).unwrap();
+    let schema = format!("{}/mosaic_e2e_wide_projection.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [{"name": "target", "type": "long"}]
+}"#,
+    )
+    .unwrap();
+    let out = format!("{}/mosaic_e2e_wide_projection.mosaic", dir.display());
+    let (msg, err, ok) = run(&[
+        "convert-csv",
+        &csv,
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(rows.trim(), r#"{"target":7}"#);
+}
+
+#[test]
+fn convert_csv_rejects_avro_array_and_map_schemas() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_nested_schema.csv", dir.display());
+    std::fs::write(&csv, "nested\nvalue\n").unwrap();
+    for (avro_type, definition) in [
+        ("array", r#"{"type": "array", "items": "string"}"#),
+        ("map", r#"{"type": "map", "values": "string"}"#),
+    ] {
+        let schema = format!(
+            "{}/mosaic_e2e_nested_schema_{avro_type}.avsc",
+            dir.display()
+        );
+        std::fs::write(
+            &schema,
+            format!(
+                r#"{{
+  "type": "record",
+  "name": "T",
+  "fields": [{{"name": "nested", "type": {definition}}}]
+}}"#
+            ),
+        )
+        .unwrap();
+        let out = format!(
+            "{}/mosaic_e2e_nested_schema_{avro_type}.mosaic",
+            dir.display()
+        );
+        let _ = std::fs::remove_file(&out);
+        let (_, err, ok) = run(&[
+            "convert-csv",
+            &csv,
+            "-o",
+            &out,
+            "--schema",
+            &schema,
+            "--overwrite",
+        ]);
+        assert!(!ok);
+        assert!(
+            err.contains(&format!("Avro '{avro_type}' field 'nested'")),
+            "{err}"
+        );
+        assert!(!std::path::Path::new(&out).exists());
+    }
 }
 
 #[test]
@@ -989,7 +1122,7 @@ fn convert_json_projects_columns() {
         "-o",
         &out,
         "-c",
-        "kind",
+        "kind,id",
         "--columns",
         "id",
         "--overwrite",
@@ -999,6 +1132,118 @@ fn convert_json_projects_columns() {
     assert!(ok, "{rows}");
     assert!(rows.contains(r#"{"kind":"a","id":1}"#), "{rows}");
     assert!(!rows.contains("drop"), "{rows}");
+}
+
+#[test]
+fn convert_json_projection_ignores_unselected_type_conflicts() {
+    let dir = std::env::temp_dir();
+    let js = format!("{}/mosaic_e2e_json_project_conflict.json", dir.display());
+    std::fs::write(
+        &js,
+        "{\"id\":1,\"drop\":7}\n{\"id\":2,\"drop\":{\"nested\":true}}\n",
+    )
+    .unwrap();
+    let out = format!("{}/mosaic_e2e_json_project_conflict.mosaic", dir.display());
+    let (msg, err, ok) = run(&["convert", &js, "-o", &out, "-c", "id", "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(rows.lines().count(), 2, "{rows}");
+    assert!(rows.contains(r#"{"id":1}"#), "{rows}");
+    assert!(rows.contains(r#"{"id":2}"#), "{rows}");
+}
+
+#[test]
+fn convert_json_preserves_avro_timestamp_semantics() {
+    let dir = std::env::temp_dir();
+    let js = format!("{}/mosaic_e2e_avro_timestamps.json", dir.display());
+    std::fs::write(
+        &js,
+        concat!(
+            r#"{"instant":"2026-08-04T12:34:56+08:00","#,
+            r#""local":"2026-08-04T12:34:56"}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let schema = format!("{}/mosaic_e2e_avro_timestamps.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "instant", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+    {"name": "local", "type": {"type": "long", "logicalType": "local-timestamp-millis"}}
+  ]
+}"#,
+    )
+    .unwrap();
+    let out = format!("{}/mosaic_e2e_avro_timestamps.mosaic", dir.display());
+    let (msg, err, ok) = run(&[
+        "convert",
+        &js,
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (schema, err, ok) = run(&["schema", &out]);
+    assert!(ok, "stdout: {schema}\nstderr: {err}");
+    assert!(
+        schema.contains(r#"Timestamp(Millisecond, Some("+00:00"))"#),
+        "{schema}"
+    );
+    assert!(schema.contains("Timestamp(Millisecond, None)"), "{schema}");
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert!(rows.contains(r#""instant":"2026-08-04T04:34:56"#), "{rows}");
+    assert!(rows.contains(r#""local":"2026-08-04T12:34:56""#), "{rows}");
+}
+
+#[test]
+fn convert_json_supports_avro_array_and_map_schema() {
+    let dir = std::env::temp_dir();
+    let js = format!("{}/mosaic_e2e_avro_nested.json", dir.display());
+    std::fs::write(
+        &js,
+        "{\"tags\":[\"a\",null,\"b\"],\"props\":{\"x\":[1,2],\"y\":[]}}\n",
+    )
+    .unwrap();
+    let schema = format!("{}/mosaic_e2e_avro_nested.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "tags", "type": {"type": "array", "items": ["null", "string"]}},
+    {"name": "props", "type": {"type": "map", "values": {"type": "array", "items": "long"}}}
+  ]
+}"#,
+    )
+    .unwrap();
+    let out = format!("{}/mosaic_e2e_avro_nested.mosaic", dir.display());
+    let (msg, err, ok) = run(&[
+        "convert",
+        &js,
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (schema, err, ok) = run(&["schema", &out]);
+    assert!(ok, "stdout: {schema}\nstderr: {err}");
+    assert!(schema.contains("tags: List("), "{schema}");
+    assert!(schema.contains("props: Map("), "{schema}");
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert!(rows.contains(r#""tags":["a",null,"b"]"#), "{rows}");
+    assert!(rows.contains(r#""props":{"x":[1,2],"y":[]}"#), "{rows}");
 }
 
 #[test]
