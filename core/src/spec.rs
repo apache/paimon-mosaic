@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub const MAGIC: [u8; 4] = [b'M', b'O', b'S', b'A'];
+pub const MAGIC: [u8; 4] = *b"MOSA";
 pub const VERSION: u8 = 1;
 pub const FOOTER_SIZE: usize = 32;
 
