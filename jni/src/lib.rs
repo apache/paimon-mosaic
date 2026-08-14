@@ -537,15 +537,12 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterWrite
     array_addr: jlong,
     schema_addr: jlong,
 ) {
-    let raw_env = env.get_raw();
-    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+    let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
         if writer_handle == 0 {
-            throw(&mut env, "null writer handle");
-            return;
+            return Err("null writer handle".to_string());
         }
         if array_addr == 0 || schema_addr == 0 {
-            throw(&mut env, "null ArrowArray or ArrowSchema address");
-            return;
+            return Err("null ArrowArray or ArrowSchema address".to_string());
         }
         let writer = unsafe { &mut *(writer_handle as *mut WriterHandle) };
 
@@ -554,24 +551,25 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterWrite
 
         let arr_owned = unsafe { FFI_ArrowArray::from_raw(ffi_array) };
         let schema_owned = unsafe { FFI_ArrowSchema::from_raw(ffi_schema) };
-        let arr_data = match unsafe { arrow_array::ffi::from_ffi(arr_owned, &schema_owned) } {
-            Ok(d) => d,
-            Err(e) => {
-                throw(&mut env, &format!("Arrow import failed: {}", e));
-                return;
-            }
-        };
+        let arr_data = unsafe { arrow_array::ffi::from_ffi(arr_owned, &schema_owned) }
+            .map_err(|e| format!("Arrow import failed: {}", e))?;
 
         let struct_array = StructArray::from(arr_data);
         let batch = RecordBatch::from(struct_array);
-        if let Err(e) = writer.inner.write_batch(&batch) {
-            throw(&mut env, &format!("write_batch failed: {}", e));
-        }
+        writer
+            .inner
+            .write_batch(&batch)
+            .map_err(|e| format!("write_batch failed: {}", e))
     }));
-    if let Err(e) = result {
-        let mut env = unsafe { JNIEnv::from_raw(raw_env).unwrap() };
-        throw(&mut env, &panic_message(&e));
-    }
+
+    let error = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(e)) => e,
+        Err(e) => panic_message(&e),
+    };
+    // Arrow's Java release callbacks may clear a pending JNI exception. Defer throwing until all
+    // Rust-owned Arrow C Data objects above have been dropped and their callbacks have completed.
+    throw(&mut env, &error);
 }
 
 // ======================== Reader ========================

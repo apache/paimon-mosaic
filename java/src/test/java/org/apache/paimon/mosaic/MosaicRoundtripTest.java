@@ -430,6 +430,68 @@ public class MosaicRoundtripTest {
     }
 
     @Test
+    public void testCrossRootNativeWriteFailurePropagatesAndCanRetryWithoutLeak() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+
+        byte[] data;
+        try (RootAllocator writerRoot = new RootAllocator(16L * 1024 * 1024);
+             RootAllocator inputRoot = new RootAllocator(16L * 1024 * 1024);
+             BufferAllocator writerAllocator =
+                     writerRoot.newChildAllocator("writer", 0, 16L * 1024 * 1024);
+             BufferAllocator inputAllocator =
+                     inputRoot.newChildAllocator("input", 0, 16L * 1024 * 1024);
+             VectorSchemaRoot root =
+                     VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            ids.allocateNew(1);
+            root.setRowCount(1);
+
+            long inputBytes = inputAllocator.getAllocatedMemory();
+            List<ArrowBuf> fieldBuffers = ids.getFieldBuffers();
+            int[] refCounts = new int[fieldBuffers.size()];
+            for (int i = 0; i < fieldBuffers.size(); i++) {
+                refCounts[i] = fieldBuffers.get(i).refCnt();
+            }
+
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (MosaicWriter writer =
+                    new MosaicWriter(output, arrowSchema, writerAllocator)) {
+                long writerBytes = writerAllocator.getAllocatedMemory();
+                RuntimeException error =
+                        assertThrows(RuntimeException.class, () -> writer.write(root));
+                assertTrue(error.getMessage().contains("non-nullable column 'id' has 1 nulls"));
+                assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+                for (int i = 0; i < fieldBuffers.size(); i++) {
+                    assertEquals(refCounts[i], fieldBuffers.get(i).refCnt());
+                }
+
+                ids.set(0, 7);
+                writer.write(root);
+                assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+                for (int i = 0; i < fieldBuffers.size(); i++) {
+                    assertEquals(refCounts[i], fieldBuffers.get(i).refCnt());
+                }
+            }
+            data = output.toByteArray();
+        }
+
+        int totalRows = 0;
+        try (MosaicReader reader = readerFromBytes(data)) {
+            for (int rg = 0; rg < reader.numRowGroups(); rg++) {
+                try (VectorSchemaRoot batch = reader.readRowGroup(rg, allocator)) {
+                    totalRows += batch.getRowCount();
+                    assertEquals(7, ((IntVector) batch.getVector("id")).get(0));
+                }
+            }
+        }
+        assertEquals(1, totalRows);
+    }
+
+    @Test
     public void testCrossRootPartialExportFailureCanRetryWithoutLeak() {
         byte[] data;
         try (RootAllocator writerRoot = new RootAllocator(16L * 1024 * 1024);
