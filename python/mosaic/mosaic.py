@@ -255,8 +255,13 @@ class MosaicWriter:
     def __enter__(self):
         return self
 
-    def __exit__(self, *args):
-        self.close()
+    def __exit__(self, exc_type, _exc_value, _traceback):
+        try:
+            self.close()
+        except Exception:
+            if exc_type is None:
+                raise
+            # Keep the exception raised inside the with block as the primary error.
 
     def __del__(self):
         self.close()

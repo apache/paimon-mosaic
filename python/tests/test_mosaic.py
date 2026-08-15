@@ -781,6 +781,36 @@ class TestWriter:
         with pytest.raises(RuntimeError, match="writer is closed"):
             writer.write(batch)
 
+    def test_context_manager_preserves_write_failure(self):
+        class FailOnceOutput(io.BytesIO):
+            def __init__(self):
+                super().__init__()
+                self.fail = True
+
+            def write(self, data):
+                if self.fail:
+                    self.fail = False
+                    raise OSError("sentinel output failure")
+                return super().write(data)
+
+        pa_schema = pa.schema([pa.field("x", pa.int32(), nullable=False)])
+        batch = pa.record_batch(
+            [pa.array([1], type=pa.int32())], schema=pa_schema
+        )
+        options = WriterOptions(
+            compression=WriterOptions.COMPRESSION_NONE,
+            num_buckets=1,
+            row_group_max_size=1,
+        )
+
+        with pytest.raises(
+            RuntimeError, match="write_batch failed: write callback failed"
+        ):
+            with MosaicWriter(FailOnceOutput(), pa_schema, options) as writer:
+                writer.write(batch)
+        assert writer._closed
+        assert writer._handle is None
+
     def test_writer_stats_basic(self):
         pa_schema = pa.schema(
             [
