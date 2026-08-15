@@ -306,53 +306,41 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
     stats_columns: JObjectArray<'_>,
     page_size_threshold: jint,
 ) -> jlong {
-    let raw_env = env.get_raw();
-    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+    let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<jlong, String> {
         if arrow_schema_addr == 0 {
-            throw(&mut env, "null Arrow schema address");
-            return 0;
+            return Err("null Arrow schema address".to_string());
         }
 
         let ffi_schema =
             unsafe { FFI_ArrowSchema::from_raw(arrow_schema_addr as *mut FFI_ArrowSchema) };
-        let arrow_schema = match Schema::try_from(&ffi_schema) {
-            Ok(s) => s,
-            Err(e) => {
-                throw(&mut env, &format!("Arrow schema import failed: {}", e));
-                return 0;
-            }
-        };
+        let arrow_schema = Schema::try_from(&ffi_schema)
+            .map_err(|e| format!("Arrow schema import failed: {}", e))?;
+        drop(ffi_schema);
 
-        let stream_global = match env.new_global_ref(&stream) {
-            Ok(g) => g,
-            Err(e) => {
-                throw(&mut env, &format!("failed to create global ref: {}", e));
-                return 0;
-            }
-        };
+        let stream_global = env
+            .new_global_ref(&stream)
+            .map_err(|e| format!("failed to create global ref: {}", e))?;
+        if env
+            .exception_check()
+            .map_err(|e| format!("failed to check global ref exception: {}", e))?
+        {
+            return Err("failed to create global ref: Java exception was thrown".to_string());
+        }
+        if stream_global.as_obj().is_null() {
+            return Err("failed to create global ref: NewGlobalRef returned null".to_string());
+        }
 
-        let write_mid = match env.get_method_id("java/io/OutputStream", "write", "([BII)V") {
-            Ok(m) => m,
-            Err(e) => {
-                throw(&mut env, &format!("cannot find OutputStream.write: {}", e));
-                return 0;
-            }
-        };
-        let flush_mid = match env.get_method_id("java/io/OutputStream", "flush", "()V") {
-            Ok(m) => m,
-            Err(e) => {
-                throw(&mut env, &format!("cannot find OutputStream.flush: {}", e));
-                return 0;
-            }
-        };
+        let write_mid = env
+            .get_method_id("java/io/OutputStream", "write", "([BII)V")
+            .map_err(|e| format!("cannot find OutputStream.write: {}", e))?;
+        let flush_mid = env
+            .get_method_id("java/io/OutputStream", "flush", "()V")
+            .map_err(|e| format!("cannot find OutputStream.flush: {}", e))?;
 
-        let jvm = match env.get_java_vm() {
-            Ok(vm) => Arc::new(vm),
-            Err(e) => {
-                throw(&mut env, &format!("cannot get JavaVM: {}", e));
-                return 0;
-            }
-        };
+        let jvm = Arc::new(
+            env.get_java_vm()
+                .map_err(|e| format!("cannot get JavaVM: {}", e))?,
+        );
 
         let jni_stream = JniOutputFile {
             jvm,
@@ -365,33 +353,27 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
             pending_exception: None,
         };
 
-        let stats_cols: Vec<String> = match env.get_array_length(&stats_columns) {
-            Ok(len) if len > 0 => {
-                let mut names = Vec::with_capacity(len as usize);
-                for i in 0..len {
-                    let obj = match env.get_object_array_element(&stats_columns, i) {
-                        Ok(o) => o,
-                        Err(_) => {
-                            throw(&mut env, "failed to read stats_columns element");
-                            return 0;
-                        }
-                    };
-                    let jstr = JString::from(obj);
-                    let s: String = match env.get_string(&jstr) {
-                        Ok(s) => s.into(),
-                        Err(_) => {
-                            throw(
-                                &mut env,
-                                "failed to convert stats_columns element to string",
-                            );
-                            return 0;
-                        }
-                    };
-                    names.push(s);
-                }
-                names
+        let stats_len = env
+            .get_array_length(&stats_columns)
+            .map_err(|e| format!("failed to read stats_columns length: {}", e))?;
+        let stats_cols: Vec<String> = if stats_len > 0 {
+            let mut names = Vec::with_capacity(stats_len as usize);
+            for i in 0..stats_len {
+                let obj = env
+                    .get_object_array_element(&stats_columns, i)
+                    .map_err(|e| format!("failed to read stats_columns element: {}", e))?;
+                let jstr = JString::from(obj);
+                let s: String = env
+                    .get_string(&jstr)
+                    .map_err(|e| {
+                        format!("failed to convert stats_columns element to string: {}", e)
+                    })?
+                    .into();
+                names.push(s);
             }
-            _ => Vec::new(),
+            names
+        } else {
+            Vec::new()
         };
 
         let buckets = if num_buckets <= 0 {
@@ -411,27 +393,28 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
             page_size_threshold: page_size_threshold as usize,
         };
 
-        let writer = match MosaicWriter::new(jni_stream, &arrow_schema, opts) {
-            Ok(w) => w,
-            Err(e) => {
-                throw(&mut env, &format!("writer open failed: {}", e));
-                return 0;
-            }
-        };
+        let writer = MosaicWriter::new(jni_stream, &arrow_schema, opts)
+            .map_err(|e| format!("writer open failed: {}", e))?;
         let handle = Box::new(WriterHandle {
             inner: writer,
             _stream_ref: stream_global,
         });
-        Box::into_raw(handle) as jlong
+        Ok(Box::into_raw(handle) as jlong)
     }));
-    match result {
-        Ok(val) => val,
-        Err(e) => {
-            let mut env = unsafe { JNIEnv::from_raw(raw_env).unwrap() };
-            throw(&mut env, &panic_message(&e));
-            0
-        }
+
+    let error = match result {
+        Ok(Ok(handle)) => return handle,
+        Ok(Err(error)) => error,
+        Err(error) => panic_message(&error),
+    };
+    // A failing JNI call can leave its original Java throwable pending. The imported Arrow schema
+    // was released before any such call, so let that throwable propagate instead of replacing it.
+    if env.exception_check().unwrap_or(false) {
+        return 0;
     }
+    // Defer throwing until Rust-owned resources above have been dropped.
+    throw(&mut env, &error);
+    0
 }
 
 #[no_mangle]

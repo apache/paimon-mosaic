@@ -590,14 +590,14 @@ public class MosaicRoundtripTest {
                         assertThrows(RuntimeException.class, () -> writer.write(root));
                 assertTrue(retryError
                         .getMessage()
-                        .contains("writer is aborted after a previous write failure"));
+                        .contains("writer is aborted after a previous failure"));
                 assertEquals(1, output.writeCalls);
 
                 RuntimeException closeError =
                         assertThrows(RuntimeException.class, writer::close);
                 assertTrue(closeError
                         .getMessage()
-                        .contains("writer is aborted after a previous write failure"));
+                        .contains("writer is aborted after a previous failure"));
                 assertEquals(1, output.writeCalls);
                 assertEquals(0, output.flushCalls);
                 assertEquals(0, output.size());
@@ -808,6 +808,30 @@ public class MosaicRoundtripTest {
             assertEquals(0, parentAllocator.getAllocatedMemory());
             assertEquals(0, nestedAllocator.getAllocatedMemory());
         }
+    }
+
+    @Test
+    public void testWriterOpenFailurePreservesNativeMessage() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+        WriterOptions options = new WriterOptions().statsColumns("missing");
+
+        RuntimeException error =
+                assertThrows(
+                        RuntimeException.class,
+                        () ->
+                                new MosaicWriter(
+                                        new ByteArrayOutputStream(),
+                                        arrowSchema,
+                                        options,
+                                        allocator));
+
+        assertTrue(
+                error.getMessage(),
+                error.getMessage()
+                        .contains(
+                                "writer open failed: stats_columns: column 'missing' not found in schema"));
     }
 
     @Test

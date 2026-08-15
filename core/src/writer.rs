@@ -294,7 +294,7 @@ impl<S: OutputFile> MosaicWriter<S> {
             WriterState::Aborted => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "writer is aborted after a previous write failure",
+                    "writer is aborted after a previous failure",
                 ));
             }
             WriterState::Closed => {
@@ -575,13 +575,22 @@ impl<S: OutputFile> MosaicWriter<S> {
             WriterState::Aborted => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "writer is aborted after a previous write failure",
+                    "writer is aborted after a previous failure",
                 ));
             }
             WriterState::Open => {}
         }
-        self.state = WriterState::Closed;
+        // Closing mutates row-group metadata and the output stream. Keep failures sticky so a
+        // retry cannot report success for a file whose footer or final flush was not completed.
+        self.state = WriterState::Aborted;
+        let result = self.close_inner();
+        if result.is_ok() {
+            self.state = WriterState::Closed;
+        }
+        result
+    }
 
+    fn close_inner(&mut self) -> io::Result<()> {
         self.flush_row_group()?;
 
         // Write schema block
@@ -767,13 +776,59 @@ mod tests {
             let retry_error = writer.write_batch(&batch).unwrap_err();
             assert!(retry_error
                 .to_string()
-                .contains("writer is aborted after a previous write failure"));
+                .contains("writer is aborted after a previous failure"));
             assert_eq!(calls_after_failure, state.lock().unwrap().write_calls);
 
             let close_error = writer.close().unwrap_err();
             assert!(close_error
                 .to_string()
-                .contains("writer is aborted after a previous write failure"));
+                .contains("writer is aborted after a previous failure"));
+            assert_eq!(calls_after_failure, state.lock().unwrap().write_calls);
+        }
+
+        let state = state.lock().unwrap();
+        assert_eq!(1, state.write_calls);
+        assert_eq!(0, state.flush_calls);
+        assert!(state.bytes.is_empty());
+    }
+
+    #[test]
+    fn test_close_failure_aborts_writer_without_retry_or_drop_flush() {
+        let arrow_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(Int32Array::from(vec![7]))],
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(FailingOutputState::default()));
+
+        {
+            let out = FailOnceOutputFile {
+                state: Arc::clone(&state),
+                fail: true,
+            };
+            let mut writer = MosaicWriter::new(
+                out,
+                &arrow_schema,
+                WriterOptions {
+                    compression: COMPRESSION_NONE,
+                    num_buckets: 1,
+                    row_group_max_size: u64::MAX,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            writer.write_batch(&batch).unwrap();
+            let error = writer.close().unwrap_err();
+            assert_eq!("sentinel output failure", error.to_string());
+            let calls_after_failure = state.lock().unwrap().write_calls;
+            assert_eq!(1, calls_after_failure);
+
+            let retry_error = writer.close().unwrap_err();
+            assert!(retry_error
+                .to_string()
+                .contains("writer is aborted after a previous failure"));
             assert_eq!(calls_after_failure, state.lock().unwrap().write_calls);
         }
 
