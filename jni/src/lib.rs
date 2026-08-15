@@ -20,8 +20,9 @@ use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
 
+use jni::errors::Error as JniError;
 use jni::objects::{
-    GlobalRef, JByteArray, JClass, JMethodID, JObject, JObjectArray, JString, JValue,
+    GlobalRef, JByteArray, JClass, JMethodID, JObject, JObjectArray, JString, JThrowable, JValue,
 };
 use jni::sys::{jint, jlong, jlongArray};
 use jni::JNIEnv;
@@ -53,14 +54,61 @@ struct JniOutputFile {
     pos: u64,
     cached_array: Option<GlobalRef>,
     cached_array_len: usize,
+    pending_exception: Option<GlobalRef>,
 }
 
 unsafe impl Send for JniOutputFile {}
 
+impl JniOutputFile {
+    fn record_jni_error(&mut self, env: &mut JNIEnv, error: JniError) -> io::Error {
+        if !matches!(error, JniError::JavaException) {
+            return io::Error::other(error.to_string());
+        }
+
+        let captured = (|| -> jni::errors::Result<Option<GlobalRef>> {
+            let exception = env.exception_occurred()?;
+            env.exception_clear()?;
+            if exception.is_null() || self.pending_exception.is_some() {
+                return Ok(None);
+            }
+            let global = env.new_global_ref(exception)?;
+            let exception_pending = env.exception_check()?;
+            if exception_pending {
+                env.exception_clear()?;
+            }
+            if global.as_obj().is_null() || exception_pending {
+                return Err(JniError::NullPtr("NewGlobalRef for pending Java exception"));
+            }
+            Ok(Some(global))
+        })();
+
+        match captured {
+            Ok(Some(exception)) => {
+                self.pending_exception = Some(exception);
+                io::Error::other(error.to_string())
+            }
+            Ok(None) => io::Error::other(error.to_string()),
+            Err(capture_error) => {
+                // Cleanup must run without a pending Java exception. If preserving the original
+                // throwable itself fails (for example due to OOM), report both JNI failures.
+                let _ = env.exception_clear();
+                io::Error::other(format!(
+                    "{} (failed to preserve Java exception: {})",
+                    error, capture_error
+                ))
+            }
+        }
+    }
+
+    fn take_pending_exception(&mut self) -> Option<GlobalRef> {
+        self.pending_exception.take()
+    }
+}
+
 impl OutputFile for JniOutputFile {
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        let mut env = self
-            .jvm
+        let jvm = Arc::clone(&self.jvm);
+        let mut env = jvm
             .attach_current_thread()
             .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -72,12 +120,26 @@ impl OutputFile for JniOutputFile {
         };
 
         if need_new {
-            let byte_array = env
-                .new_byte_array(len)
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            let global = env
-                .new_global_ref(&byte_array)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            let byte_array = match env.new_byte_array(len) {
+                Ok(array) => array,
+                Err(error) => return Err(self.record_jni_error(&mut env, error)),
+            };
+            let global = match env.new_global_ref(&byte_array) {
+                Ok(global) => global,
+                Err(error) => return Err(self.record_jni_error(&mut env, error)),
+            };
+            match env.exception_check() {
+                Ok(true) => {
+                    return Err(self.record_jni_error(&mut env, JniError::JavaException));
+                }
+                Ok(false) => {}
+                Err(error) => return Err(io::Error::other(error.to_string())),
+            }
+            if global.as_obj().is_null() {
+                return Err(io::Error::other(
+                    "failed to create global reference for output buffer",
+                ));
+            }
             self.cached_array = Some(global);
             self.cached_array_len = data.len();
         }
@@ -85,10 +147,11 @@ impl OutputFile for JniOutputFile {
         let raw = self.cached_array.as_ref().unwrap().as_raw();
         let byte_array = unsafe { JByteArray::from_raw(raw) };
 
-        env.set_byte_array_region(&byte_array, 0, bytemuck_cast(data))
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        if let Err(error) = env.set_byte_array_region(&byte_array, 0, bytemuck_cast(data)) {
+            return Err(self.record_jni_error(&mut env, error));
+        }
 
-        unsafe {
+        let call_result = unsafe {
             env.call_method_unchecked(
                 &self.stream_ref,
                 self.write_mid,
@@ -99,7 +162,9 @@ impl OutputFile for JniOutputFile {
                     jni::sys::jvalue { i: len },
                 ],
             )
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        };
+        if let Err(error) = call_result {
+            return Err(self.record_jni_error(&mut env, error));
         }
         #[allow(clippy::forget_non_drop)]
         std::mem::forget(byte_array);
@@ -108,18 +173,20 @@ impl OutputFile for JniOutputFile {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let mut env = self
-            .jvm
+        let jvm = Arc::clone(&self.jvm);
+        let mut env = jvm
             .attach_current_thread()
             .map_err(|e| io::Error::other(e.to_string()))?;
-        unsafe {
+        let call_result = unsafe {
             env.call_method_unchecked(
                 &self.stream_ref,
                 self.flush_mid,
                 jni::signature::ReturnType::Primitive(jni::signature::Primitive::Void),
                 &[],
             )
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        };
+        if let Err(error) = call_result {
+            return Err(self.record_jni_error(&mut env, error));
         }
         Ok(())
     }
@@ -186,6 +253,35 @@ fn bytemuck_cast(data: &[u8]) -> &[i8] {
 
 fn throw(env: &mut JNIEnv, msg: &str) {
     let _ = env.throw_new("java/lang/RuntimeException", msg);
+}
+
+fn rethrow(env: &mut JNIEnv, exception: &GlobalRef) {
+    if exception.as_obj().is_null() {
+        throw(env, "cannot rethrow a null Java exception reference");
+        return;
+    }
+    match env.new_local_ref(exception.as_obj()) {
+        Ok(local) if !local.is_null() => {
+            if let Err(error) = env.throw(JThrowable::from(local)) {
+                let _ = env.exception_clear();
+                throw(
+                    env,
+                    &format!("failed to rethrow preserved Java exception: {}", error),
+                );
+            }
+        }
+        Ok(_) => {
+            let _ = env.exception_clear();
+            throw(env, "failed to create local reference for Java exception");
+        }
+        Err(error) => {
+            let _ = env.exception_clear();
+            throw(
+                env,
+                &format!("failed to rethrow preserved Java exception: {}", error),
+            );
+        }
+    }
 }
 
 struct WriterHandle {
@@ -266,6 +362,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
             pos: 0,
             cached_array: None,
             cached_array_len: 0,
+            pending_exception: None,
         };
 
         let stats_cols: Vec<String> = match env.get_array_length(&stats_columns) {
@@ -343,19 +440,32 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterClose
     _class: JClass,
     handle: jlong,
 ) {
-    let raw_env = env.get_raw();
-    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+    let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
         if handle == 0 {
-            return;
+            return Ok(());
         }
         let writer = unsafe { &mut *(handle as *mut WriterHandle) };
-        if let Err(e) = writer.inner.close() {
-            throw(&mut env, &format!("close failed: {}", e));
-        }
+        writer
+            .inner
+            .close()
+            .map_err(|e| format!("close failed: {}", e))
     }));
-    if let Err(e) = result {
-        let mut env = unsafe { JNIEnv::from_raw(raw_env).unwrap() };
-        throw(&mut env, &panic_message(&e));
+
+    let pending_exception = if handle == 0 {
+        None
+    } else {
+        let writer = unsafe { &mut *(handle as *mut WriterHandle) };
+        writer.inner.output_mut().take_pending_exception()
+    };
+    if let Some(exception) = pending_exception {
+        rethrow(&mut env, &exception);
+        return;
+    }
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => throw(&mut env, &error),
+        Err(error) => throw(&mut env, &panic_message(&error)),
     }
 }
 
@@ -562,10 +672,21 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterWrite
             .map_err(|e| format!("write_batch failed: {}", e))
     }));
 
+    let pending_exception = if writer_handle == 0 {
+        None
+    } else {
+        let writer = unsafe { &mut *(writer_handle as *mut WriterHandle) };
+        writer.inner.output_mut().take_pending_exception()
+    };
+    if let Some(exception) = pending_exception {
+        rethrow(&mut env, &exception);
+        return;
+    }
+
     let error = match result {
         Ok(Ok(())) => return,
-        Ok(Err(e)) => e,
-        Err(e) => panic_message(&e),
+        Ok(Err(error)) => error,
+        Err(error) => panic_message(&error),
     };
     // Arrow's Java release callbacks may clear a pending JNI exception. Defer throwing until all
     // Rust-owned Arrow C Data objects above have been dropped and their callbacks have completed.

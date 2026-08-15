@@ -20,6 +20,8 @@
 package org.apache.paimon.mosaic;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -93,6 +95,56 @@ public class MosaicRoundtripTest {
                 throw new InjectedExportException();
             }
             return super.getFieldBuffers();
+        }
+    }
+
+    private enum FailurePoint {
+        WRITE,
+        FLUSH
+    }
+
+    private static final class FailOnceOutputStream extends OutputStream {
+
+        private final ByteArrayOutputStream delegate = new ByteArrayOutputStream();
+        private final FailurePoint failurePoint;
+        private final IllegalStateException failureCause;
+        private final IOException failure;
+        private boolean failed;
+        private int writeCalls;
+        private int flushCalls;
+
+        private FailOnceOutputStream(FailurePoint failurePoint, String message) {
+            this.failurePoint = failurePoint;
+            this.failureCause = new IllegalStateException(message + "-cause");
+            this.failure = new IOException(message, failureCause);
+        }
+
+        @Override
+        public void write(int value) throws IOException {
+            write(new byte[] {(byte) value}, 0, 1);
+        }
+
+        @Override
+        public void write(byte[] bytes, int offset, int length) throws IOException {
+            writeCalls++;
+            if (!failed && failurePoint == FailurePoint.WRITE) {
+                failed = true;
+                throw failure;
+            }
+            delegate.write(bytes, offset, length);
+        }
+
+        @Override
+        public void flush() throws IOException {
+            flushCalls++;
+            if (!failed && failurePoint == FailurePoint.FLUSH) {
+                failed = true;
+                throw failure;
+            }
+        }
+
+        private int size() {
+            return delegate.size();
         }
     }
 
@@ -430,7 +482,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testCrossRootNativeWriteFailurePropagatesAndCanRetryWithoutLeak() {
+    public void testCrossRootPreflightValidationFailureCanRetryWithoutLeak() {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.notNullable("id", new ArrowType.Int(32, true))
         ));
@@ -489,6 +541,113 @@ public class MosaicRoundtripTest {
             }
         }
         assertEquals(1, totalRows);
+    }
+
+    @Test
+    public void testOutputWriteFailureAbortsWriterAndPreservesThrowable() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+        WriterOptions options =
+                new WriterOptions()
+                        .compression(0)
+                        .numBuckets(1)
+                        .rowGroupMaxSize(1);
+
+        try (RootAllocator writerRoot = new RootAllocator(16L * 1024 * 1024);
+             RootAllocator inputRoot = new RootAllocator(16L * 1024 * 1024)) {
+            try (BufferAllocator writerAllocator =
+                         writerRoot.newChildAllocator("writer", 0, 16L * 1024 * 1024);
+                 BufferAllocator inputAllocator =
+                         inputRoot.newChildAllocator("input", 0, 16L * 1024 * 1024);
+                 VectorSchemaRoot root =
+                         VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
+                IntVector ids = (IntVector) root.getVector("id");
+                ids.allocateNew(1);
+                ids.set(0, 7);
+                root.setRowCount(1);
+
+                long inputBytes = inputAllocator.getAllocatedMemory();
+                long writerBytes = writerAllocator.getAllocatedMemory();
+                FailOnceOutputStream output =
+                        new FailOnceOutputStream(
+                                FailurePoint.WRITE, "sentinel-output-write");
+                MosaicWriter writer =
+                        new MosaicWriter(output, arrowSchema, options, writerAllocator);
+
+                RuntimeException error =
+                        assertThrows(RuntimeException.class, () -> writer.write(root));
+                assertEquals("write batch failed", error.getMessage());
+                assertSame(output.failure, error.getCause());
+                assertEquals("sentinel-output-write", error.getCause().getMessage());
+                assertSame(output.failureCause, error.getCause().getCause());
+                assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+                assertEquals(1, output.writeCalls);
+                assertEquals(0, output.size());
+
+                RuntimeException retryError =
+                        assertThrows(RuntimeException.class, () -> writer.write(root));
+                assertTrue(retryError
+                        .getMessage()
+                        .contains("writer is aborted after a previous write failure"));
+                assertEquals(1, output.writeCalls);
+
+                RuntimeException closeError =
+                        assertThrows(RuntimeException.class, writer::close);
+                assertTrue(closeError
+                        .getMessage()
+                        .contains("writer is aborted after a previous write failure"));
+                assertEquals(1, output.writeCalls);
+                assertEquals(0, output.flushCalls);
+                assertEquals(0, output.size());
+                assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+            }
+            assertEquals(0, inputRoot.getAllocatedMemory());
+            assertEquals(0, writerRoot.getAllocatedMemory());
+        }
+    }
+
+    @Test
+    public void testOutputFlushFailurePreservesThrowableWithoutFreeRetry() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+        WriterOptions options =
+                new WriterOptions()
+                        .compression(0)
+                        .numBuckets(1)
+                        .rowGroupMaxSize(1);
+
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            ids.allocateNew(1);
+            ids.set(0, 7);
+            root.setRowCount(1);
+
+            FailOnceOutputStream output =
+                    new FailOnceOutputStream(
+                            FailurePoint.FLUSH, "sentinel-output-flush");
+            MosaicWriter writer =
+                    new MosaicWriter(output, arrowSchema, options, allocator);
+            writer.write(root);
+            int writesBeforeClose = output.writeCalls;
+
+            RuntimeException error = assertThrows(RuntimeException.class, writer::close);
+            assertEquals("close failed", error.getMessage());
+            assertSame(output.failure, error.getCause());
+            assertEquals("sentinel-output-flush", error.getCause().getMessage());
+            assertSame(output.failureCause, error.getCause().getCause());
+            assertTrue(output.writeCalls > writesBeforeClose);
+            assertEquals(1, output.flushCalls);
+            assertTrue(output.size() > 0);
+
+            int writesAfterClose = output.writeCalls;
+            writer.close();
+            assertEquals(writesAfterClose, output.writeCalls);
+            assertEquals(1, output.flushCalls);
+        }
     }
 
     @Test

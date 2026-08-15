@@ -105,6 +105,8 @@ public class MosaicWriter implements AutoCloseable {
                 releaseExported(arrowArray);
                 releaseExported(arrowSchema);
             }
+        } catch (Throwable failure) {
+            throw propagateNativeFailure("write batch failed", failure);
         }
     }
 
@@ -233,6 +235,17 @@ public class MosaicWriter implements AutoCloseable {
         }
     }
 
+    private static RuntimeException propagateNativeFailure(
+            String message, Throwable failure) {
+        if (failure instanceof RuntimeException) {
+            return (RuntimeException) failure;
+        }
+        if (failure instanceof Error) {
+            throw (Error) failure;
+        }
+        return new RuntimeException(message, failure);
+    }
+
     public long estimatedFileSize() {
         return NativeLib.nativeWriterEstimatedSize(handle);
     }
@@ -261,6 +274,8 @@ public class MosaicWriter implements AutoCloseable {
             try {
                 NativeLib.nativeWriterClose(handle);
                 collectStatistics();
+            } catch (Throwable failure) {
+                throw propagateNativeFailure("close failed", failure);
             } finally {
                 NativeLib.nativeWriterFree(handle);
                 handle = 0;
