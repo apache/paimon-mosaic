@@ -29,6 +29,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
+import org.apache.arrow.c.jni.JniWrapper;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.OutOfMemoryException;
@@ -478,6 +479,77 @@ public class MosaicRoundtripTest {
              VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
             assertEquals(65_536, batch.getRowCount());
             assertEquals(65_535, ((IntVector) batch.getVector("id")).get(65_535));
+        }
+    }
+
+    @Test
+    public void testCrossRootFailureAfterRootRegistrationCanRetryWithoutLeak() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+        OutOfMemoryError injected =
+                new OutOfMemoryError("injected after root callback registration");
+        boolean[] failOnce = {true};
+        MosaicWriter.RootArrayExporter rootArrayExporter =
+                (address, privateData) -> {
+                    JniWrapper.get().exportArray(address, privateData);
+                    if (failOnce[0]) {
+                        failOnce[0] = false;
+                        throw injected;
+                    }
+                };
+
+        byte[] data;
+        try (RootAllocator writerRoot = new RootAllocator(16L * 1024 * 1024);
+             RootAllocator inputRoot = new RootAllocator(16L * 1024 * 1024);
+             BufferAllocator writerAllocator =
+                     writerRoot.newChildAllocator("writer", 0, 16L * 1024 * 1024);
+             BufferAllocator inputAllocator =
+                     inputRoot.newChildAllocator("input", 0, 16L * 1024 * 1024);
+             VectorSchemaRoot root =
+                     VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            ids.allocateNew(1);
+            ids.set(0, 7);
+            root.setRowCount(1);
+
+            long inputBytes = inputAllocator.getAllocatedMemory();
+            List<ArrowBuf> fieldBuffers = ids.getFieldBuffers();
+            int[] refCounts = new int[fieldBuffers.size()];
+            for (int i = 0; i < fieldBuffers.size(); i++) {
+                refCounts[i] = fieldBuffers.get(i).refCnt();
+            }
+
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (MosaicWriter writer =
+                    new MosaicWriter(
+                            output,
+                            arrowSchema,
+                            new WriterOptions(),
+                            writerAllocator,
+                            rootArrayExporter)) {
+                long writerBytes = writerAllocator.getAllocatedMemory();
+                assertSame(injected, assertThrows(OutOfMemoryError.class, () -> writer.write(root)));
+                assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+                for (int i = 0; i < fieldBuffers.size(); i++) {
+                    assertEquals(refCounts[i], fieldBuffers.get(i).refCnt());
+                }
+
+                writer.write(root);
+                assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+                for (int i = 0; i < fieldBuffers.size(); i++) {
+                    assertEquals(refCounts[i], fieldBuffers.get(i).refCnt());
+                }
+            }
+            data = output.toByteArray();
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+             VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+            assertEquals(1, batch.getRowCount());
+            assertEquals(7, ((IntVector) batch.getVector("id")).get(0));
         }
     }
 

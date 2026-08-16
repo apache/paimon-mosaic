@@ -39,9 +39,20 @@ import org.apache.arrow.vector.types.pojo.Schema;
 
 public class MosaicWriter implements AutoCloseable {
 
+    @FunctionalInterface
+    interface RootArrayExporter {
+
+        void export(long address, PrivateData privateData);
+    }
+
+    private static final RootArrayExporter JNI_ROOT_ARRAY_EXPORTER =
+            (address, privateData) ->
+                    JniWrapper.get().exportArray(address, privateData);
+
     private long handle;
     private boolean closed;
     private final BufferAllocator allocator;
+    private final RootArrayExporter rootArrayExporter;
     private List<Map<String, ColumnStatistics>> rowGroupStats;
 
     public MosaicWriter(OutputStream outputStream, Schema arrowSchema, BufferAllocator allocator) {
@@ -49,7 +60,17 @@ public class MosaicWriter implements AutoCloseable {
     }
 
     public MosaicWriter(OutputStream outputStream, Schema arrowSchema, WriterOptions options, BufferAllocator allocator) {
+        this(outputStream, arrowSchema, options, allocator, JNI_ROOT_ARRAY_EXPORTER);
+    }
+
+    MosaicWriter(
+            OutputStream outputStream,
+            Schema arrowSchema,
+            WriterOptions options,
+            BufferAllocator allocator,
+            RootArrayExporter rootArrayExporter) {
         this.allocator = allocator;
+        this.rootArrayExporter = rootArrayExporter;
         try (ArrowSchema cSchema = ArrowSchema.allocateNew(allocator)) {
             try {
                 Data.exportSchema(allocator, arrowSchema, null, cSchema);
@@ -98,7 +119,8 @@ public class MosaicWriter implements AutoCloseable {
                             allocator, root, null, arrowArray, arrowSchema);
                 } else {
                     Data.exportSchema(allocator, root.getSchema(), null, arrowSchema);
-                    exportCrossRootArray(allocator, root, arrowArray);
+                    exportCrossRootArray(
+                            allocator, root, arrowArray, rootArrayExporter);
                 }
                 NativeLib.nativeWriterWriteBatch(handle, arrowArray.memoryAddress(), arrowSchema.memoryAddress());
             } finally {
@@ -111,7 +133,10 @@ public class MosaicWriter implements AutoCloseable {
     }
 
     private static void exportCrossRootArray(
-            BufferAllocator exportAllocator, VectorSchemaRoot root, ArrowArray arrowArray) {
+            BufferAllocator exportAllocator,
+            VectorSchemaRoot root,
+            ArrowArray arrowArray,
+            RootArrayExporter rootArrayExporter) {
         // Data.exportVectorSchemaRoot reloads every field into a temporary StructVector. If that
         // reload fails before the root ArrowArray owns a release callback, Arrow 15 can retain
         // already-associated input buffers. Export each child directly instead: input buffers are
@@ -151,9 +176,27 @@ public class MosaicWriter implements AutoCloseable {
             snapshot.dictionary = 0;
             snapshot.release = 0;
             arrowArray.save(snapshot);
-            JniWrapper.get().exportArray(arrowArray.memoryAddress(), privateData);
+            rootArrayExporter.export(arrowArray.memoryAddress(), privateData);
         } catch (RuntimeException | Error failure) {
-            privateData.abort(failure);
+            if (arrowArray.snapshot().release != 0) {
+                // Arrow 15 may install the root callback even when NewGlobalRef leaves a pending
+                // OutOfMemoryError. Once installed, that callback owns child traversal, so keep
+                // the child pointer table alive until the callback has run.
+                try {
+                    arrowArray.release();
+                } catch (RuntimeException | Error cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+                if (arrowArray.snapshot().release == 0) {
+                    try {
+                        privateData.close();
+                    } catch (RuntimeException | Error cleanupFailure) {
+                        failure.addSuppressed(cleanupFailure);
+                    }
+                }
+            } else {
+                privateData.abort(failure);
+            }
             throw failure;
         }
     }
