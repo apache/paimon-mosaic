@@ -304,6 +304,21 @@ impl<S: OutputFile> MosaicWriter<S> {
                 ));
             }
         }
+
+        self.validate_batch(batch)?;
+
+        // From this point on, an error or panic can leave bucket, row-group, or output state
+        // partially advanced. Keep the writer aborted until the whole operation succeeds so
+        // retry, close, and Drop cannot flush a batch whose write was reported as failed.
+        self.state = WriterState::Aborted;
+        let result = self.write_batch_mutating(batch);
+        if result.is_ok() {
+            self.state = WriterState::Open;
+        }
+        result
+    }
+
+    fn validate_batch(&self, batch: &RecordBatch) -> io::Result<()> {
         let num_cols = self.schema.columns.len();
         if batch.num_columns() != num_cols {
             return Err(io::Error::new(
@@ -317,27 +332,30 @@ impl<S: OutputFile> MosaicWriter<S> {
         }
 
         for (i, col) in self.schema.columns.iter().enumerate() {
-            if !col.nullable && batch.column(self.batch_col_map[i]).null_count() > 0 {
+            let array = batch.column(self.batch_col_map[i]);
+            if array.data_type() != &col.data_type {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "column '{}' type mismatch: expected {:?}, got {:?}",
+                        col.name,
+                        col.data_type,
+                        array.data_type()
+                    ),
+                ));
+            }
+            if !col.nullable && array.null_count() > 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
                         "non-nullable column '{}' has {} nulls in batch",
                         col.name,
-                        batch.column(self.batch_col_map[i]).null_count()
+                        array.null_count()
                     ),
                 ));
             }
         }
-
-        // From this point on, an error or panic can leave bucket, row-group, or output state
-        // partially advanced. Keep the writer aborted until the whole operation succeeds so
-        // retry, close, and Drop cannot flush a batch whose write was reported as failed.
-        self.state = WriterState::Aborted;
-        let result = self.write_batch_mutating(batch);
-        if result.is_ok() {
-            self.state = WriterState::Open;
-        }
-        result
+        Ok(())
     }
 
     fn write_batch_mutating(&mut self, batch: &RecordBatch) -> io::Result<()> {
