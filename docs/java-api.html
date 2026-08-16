@@ -238,7 +238,7 @@ w.endMap();</code></pre>
                     <tr><th>Method</th><th>Return</th><th>Description</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td><code>write(VectorSchemaRoot)</code></td><td><code>void</code></td><td>Write an Arrow batch (zero-copy via C Data Interface)</td></tr>
+                    <tr><td><code>write(VectorSchemaRoot)</code></td><td><code>void</code></td><td>Write an Arrow batch synchronously (zero-copy via C Data Interface). All top-level and nested vectors must share one allocator root, which may differ from the writer allocator root; temporary export metadata is charged to the writer allocator.</td></tr>
                     <tr><td><code>estimatedFileSize()</code></td><td><code>long</code></td><td>Estimated output file size in bytes (for file rolling)</td></tr>
                     <tr><td><code>close()</code></td><td><code>void</code></td><td>Flush remaining data and write footer</td></tr>
                     <tr><td><code>numRowGroups()</code></td><td><code>int</code></td><td>Number of row groups written (available after close)</td></tr>

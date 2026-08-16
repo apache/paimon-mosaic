@@ -59,6 +59,60 @@ def _check_error(msg="operation failed"):
     raise RuntimeError(msg)
 
 
+def _visible_exception_chain(root):
+    chain = []
+    seen = set()
+    current = root
+    while current is not None:
+        if id(current) in seen:
+            return chain, True
+        seen.add(id(current))
+        chain.append(current)
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+    return chain, False
+
+
+def _remove_exception_references(root, target_ids):
+    stack = [root]
+    seen = set()
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        for attribute in ("__cause__", "__context__"):
+            linked = getattr(current, attribute)
+            if linked is not None and id(linked) in target_ids:
+                setattr(current, attribute, None)
+            elif linked is not None:
+                stack.append(linked)
+
+
+def _append_cleanup_exception(primary, secondary):
+    """Append a cleanup failure without replacing the primary exception."""
+    if primary is secondary:
+        return
+
+    primary_chain, has_cycle = _visible_exception_chain(primary)
+    if has_cycle or any(current is secondary for current in primary_chain):
+        return
+
+    # ``secondary`` was raised while ``primary`` was being handled, so Python normally links it
+    # back to the primary chain. Remove every such edge, including shared causes, before appending.
+    _remove_exception_references(secondary, {id(current) for current in primary_chain})
+
+    tail = primary_chain[-1]
+    if tail.__suppress_context__:
+        tail.__cause__ = secondary
+    else:
+        tail.__context__ = secondary
+
+
 def _fetch_rg_stats(num_stats_fn, stats_fn, handle, rg_index):
     n_out = ctypes.c_uint32(0)
     rc = num_stats_fn(handle, rg_index, ctypes.byref(n_out))
@@ -255,8 +309,15 @@ class MosaicWriter:
     def __enter__(self):
         return self
 
-    def __exit__(self, *args):
-        self.close()
+    def __exit__(self, exc_type, exc_value, _traceback):
+        try:
+            self.close()
+        except Exception as close_error:
+            if exc_type is None:
+                raise
+            # Keep the body exception primary while retaining the independent
+            # close failure for diagnostics.
+            _append_cleanup_exception(exc_value, close_error)
 
     def __del__(self):
         self.close()

@@ -505,6 +505,61 @@ fn test_roundtrip_basic() {
 }
 
 #[test]
+fn test_writer_recovers_from_batch_type_mismatch() {
+    let arrow_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+    let mut writer = MosaicWriter::new(
+        MemOutputFile::new(),
+        &arrow_schema,
+        WriterOptions {
+            compression: COMPRESSION_NONE,
+            num_buckets: 1,
+            row_group_max_size: u64::MAX,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let first_batch = RecordBatch::try_new(
+        Arc::new(arrow_schema.clone()),
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )
+    .unwrap();
+    writer.write_batch(&first_batch).unwrap();
+
+    let wrong_type_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![2]))],
+    )
+    .unwrap();
+    let error = writer.write_batch(&wrong_type_batch).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        "column 'id' type mismatch: expected Int32, got Int64",
+        error.to_string()
+    );
+
+    let second_batch = RecordBatch::try_new(
+        Arc::new(arrow_schema),
+        vec![Arc::new(Int32Array::from(vec![3]))],
+    )
+    .unwrap();
+    writer.write_batch(&second_batch).unwrap();
+    writer.close().unwrap();
+
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    let reader = MosaicReader::new(ByteArrayInputFile::new(data), len).unwrap();
+    assert_eq!(reader.num_row_groups(), 1);
+
+    let mut row_group = reader.row_group_reader(0).unwrap();
+    let batch = row_group.read_columns().unwrap();
+    let ids = batch_col_i32(&batch, "id");
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids.value(0), 1);
+    assert_eq!(ids.value(1), 3);
+}
+
+#[test]
 fn test_roundtrip_with_nulls() {
     let columns = vec![
         ("id".to_string(), DataType::Int32, true),

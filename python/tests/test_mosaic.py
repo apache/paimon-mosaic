@@ -17,6 +17,7 @@
 
 import io
 import struct
+import traceback
 
 import pyarrow as pa
 import pytest
@@ -29,6 +30,7 @@ from mosaic import (
     read_table,
     write_table,
 )
+from mosaic.mosaic import _append_cleanup_exception
 
 
 def _write_to_bytes(pa_schema, data, options=None):
@@ -780,6 +782,112 @@ class TestWriter:
 
         with pytest.raises(RuntimeError, match="writer is closed"):
             writer.write(batch)
+
+    def test_context_manager_preserves_write_failure(self):
+        class FailOnceOutput(io.BytesIO):
+            def __init__(self):
+                super().__init__()
+                self.fail = True
+
+            def write(self, data):
+                if self.fail:
+                    self.fail = False
+                    raise OSError("sentinel output failure")
+                return super().write(data)
+
+        pa_schema = pa.schema([pa.field("x", pa.int32(), nullable=False)])
+        batch = pa.record_batch(
+            [pa.array([1], type=pa.int32())], schema=pa_schema
+        )
+        options = WriterOptions(
+            compression=WriterOptions.COMPRESSION_NONE,
+            num_buckets=1,
+            row_group_max_size=1,
+        )
+
+        with pytest.raises(
+            RuntimeError, match="write_batch failed: write callback failed"
+        ) as exc_info:
+            with MosaicWriter(FailOnceOutput(), pa_schema, options) as writer:
+                writer.write(batch)
+        assert writer._closed
+        assert writer._handle is None
+        assert isinstance(exc_info.value.__context__, RuntimeError)
+        assert "writer is aborted after a previous failure" in str(
+            exc_info.value.__context__
+        )
+
+    def test_context_manager_preserves_body_and_close_failures(self):
+        class FlushFailOutput(io.BytesIO):
+            def flush(self):
+                raise OSError("sentinel flush failure")
+
+        pa_schema = pa.schema([pa.field("x", pa.int32(), nullable=False)])
+        batch = pa.record_batch(
+            [pa.array([1], type=pa.int32())], schema=pa_schema
+        )
+        options = WriterOptions(
+            compression=WriterOptions.COMPRESSION_NONE,
+            num_buckets=1,
+        )
+
+        with pytest.raises(ValueError, match="body failure") as exc_info:
+            with MosaicWriter(FlushFailOutput(), pa_schema, options) as writer:
+                writer.write(batch)
+                raise ValueError("body failure")
+
+        assert writer._closed
+        assert writer._handle is None
+        assert isinstance(exc_info.value.__context__, RuntimeError)
+        assert "close failed: flush callback failed" in str(
+            exc_info.value.__context__
+        )
+
+    @pytest.mark.parametrize("cause", [KeyError("explicit cause"), None])
+    def test_context_manager_keeps_close_failure_visible_with_suppressed_context(
+        self, cause
+    ):
+        class FlushFailOutput(io.BytesIO):
+            def flush(self):
+                raise OSError("sentinel flush failure")
+
+        pa_schema = pa.schema([pa.field("x", pa.int32(), nullable=False)])
+        batch = pa.record_batch(
+            [pa.array([1], type=pa.int32())], schema=pa_schema
+        )
+
+        try:
+            raise LookupError("hidden body context")
+        except LookupError:
+            with pytest.raises(ValueError, match="body failure") as exc_info:
+                with MosaicWriter(FlushFailOutput(), pa_schema) as writer:
+                    writer.write(batch)
+                    raise ValueError("body failure") from cause
+
+        if cause is not None:
+            assert exc_info.value.__cause__ is cause
+        rendered = "".join(
+            traceback.format_exception(
+                type(exc_info.value),
+                exc_info.value,
+                exc_info.value.__traceback__,
+            )
+        )
+        assert "close failed: flush callback failed" in rendered
+        assert "hidden body context" not in rendered
+
+    def test_cleanup_exception_chain_avoids_shared_cause_cycle(self):
+        shared_cause = KeyError("shared cause")
+        primary = ValueError("body failure")
+        primary.__cause__ = shared_cause
+        secondary = RuntimeError("close failure")
+        secondary.__cause__ = shared_cause
+
+        _append_cleanup_exception(primary, secondary)
+
+        assert primary.__cause__ is shared_cause
+        assert shared_cause.__context__ is secondary
+        assert secondary.__cause__ is None
 
     def test_writer_stats_basic(self):
         pa_schema = pa.schema(
