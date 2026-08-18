@@ -19,14 +19,18 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import io
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
+import tarfile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_SCRIPT = REPO_ROOT / "tools" / "create_source_release.sh"
+SOURCE_VERIFIER = REPO_ROOT / "tools" / "verify_source_archive.py"
 VERSION = "0.3.0"
 
 
@@ -61,6 +65,7 @@ def initialize_release_repo(tmp_path: Path) -> tuple[Path, dict[str, str], str]:
     fake_bin.mkdir()
 
     shutil.copy2(SOURCE_SCRIPT, tools / SOURCE_SCRIPT.name)
+    shutil.copy2(SOURCE_VERIFIER, tools / SOURCE_VERIFIER.name)
     for verifier in (
         "verify_release_versions.py",
         "dependencies.py",
@@ -167,3 +172,60 @@ def test_source_archive_is_commit_bound_and_reproducible(tmp_path: Path) -> None
 
     assert embedded_commit == commit
     assert first_digest == second_digest
+
+
+def test_same_length_mutation_keeps_pax_commit_but_fails_tree_verification(
+    tmp_path: Path,
+) -> None:
+    repo, env, commit = initialize_release_repo(tmp_path)
+    script = repo / "tools" / SOURCE_SCRIPT.name
+    archive = (
+        repo
+        / "tools"
+        / "release"
+        / f"apache-paimon-mosaic-{VERSION}-src.tgz"
+    )
+    prefix = f"paimon-mosaic-{VERSION}/"
+
+    run(["bash", script.name], cwd=script.parent, env=env)
+    tar_bytes = bytearray(gzip.decompress(archive.read_bytes()))
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as source:
+        member = source.getmember(f"{prefix}NOTICE")
+        original = source.extractfile(member).read()
+    replacement = bytes([original[0] ^ 1]) + original[1:]
+    assert len(replacement) == len(original)
+    tar_bytes[member.offset_data : member.offset_data + member.size] = replacement
+    archive.write_bytes(gzip.compress(bytes(tar_bytes), mtime=0))
+
+    embedded_commit = (
+        run(
+            ["git", "get-tar-commit-id"],
+            cwd=repo,
+            input_bytes=gzip.decompress(archive.read_bytes()),
+        )
+        .stdout.decode("ascii")
+        .strip()
+    )
+    assert embedded_commit == commit
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "tools/verify_source_archive.py",
+            "verify",
+            "--repository",
+            ".",
+            "--commit",
+            commit,
+            "--prefix",
+            prefix,
+            "--archive",
+            str(archive),
+        ],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert b"file content differs" in result.stderr

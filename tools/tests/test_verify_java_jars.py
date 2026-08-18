@@ -22,6 +22,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+import xml.etree.ElementTree as ET
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -30,6 +31,7 @@ from zipfile import ZipFile, ZipInfo
 
 
 TOOLS_DIRECTORY = Path(__file__).resolve().parent.parent
+REPOSITORY_ROOT = TOOLS_DIRECTORY.parent
 sys.path.insert(0, str(TOOLS_DIRECTORY))
 
 import verify_java_jars  # noqa: E402
@@ -182,6 +184,40 @@ class VerifyJavaJarsTest(unittest.TestCase):
             any_order=True,
         )
         self.assertEqual(len(verify_java_jars.NATIVE_ENTRIES), verify_native.call_count)
+
+    def test_release_profile_verifies_jars_before_gpg_signing(self) -> None:
+        namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
+        root = ET.parse(REPOSITORY_ROOT / "java/pom.xml").getroot()
+        release_profile = next(
+            profile
+            for profile in root.findall("m:profiles/m:profile", namespace)
+            if profile.findtext("m:id", namespaces=namespace) == "release"
+        )
+        plugins = release_profile.findall("m:build/m:plugins/m:plugin", namespace)
+        artifact_ids = [
+            plugin.findtext("m:artifactId", namespaces=namespace)
+            for plugin in plugins
+        ]
+
+        self.assertLess(
+            artifact_ids.index("exec-maven-plugin"),
+            artifact_ids.index("maven-gpg-plugin"),
+        )
+        exec_plugin = plugins[artifact_ids.index("exec-maven-plugin")]
+        execution = exec_plugin.find("m:executions/m:execution", namespace)
+        self.assertIsNotNone(execution)
+        self.assertEqual(
+            execution.findtext("m:phase", namespaces=namespace),
+            "verify",
+        )
+        arguments = [
+            argument.text
+            for argument in execution.findall(
+                "m:configuration/m:arguments/m:argument", namespace
+            )
+        ]
+        self.assertIn("tools/verify_java_jars.py", arguments)
+        self.assertIn("--require-all-natives", arguments)
 
 
 if __name__ == "__main__":

@@ -100,15 +100,19 @@ gpg: Good signature from "Release Manager Name (CODE SIGNING KEY) &lt;...@apache
             <!-- ============================================================ -->
             <h2>Verifying Source, Tag, Commit, and CI Identity</h2>
             <p>Confirm that the source archive, signed RC tag, vote email, and exact successful workflow run all identify one commit:</p>
-<pre><code>SOURCE_COMMIT="$(gzip -dc "${ARCHIVE}" | git get-tar-commit-id)"
-test "${SOURCE_COMMIT}" = "${RC_COMMIT_SHA}"
-
-git clone --filter=blob:none --no-checkout \
+<pre><code>ARCHIVE_PATH="$(pwd)/${ARCHIVE}"
+git clone --no-checkout \
   https://github.com/apache/paimon-mosaic.git paimon-mosaic-git
 git -C paimon-mosaic-git fetch origin \
   "refs/tags/${RC_TAG}:refs/tags/${RC_TAG}"
 git -C paimon-mosaic-git checkout --detach "${RC_TAG}"
 test "$(git -C paimon-mosaic-git rev-parse HEAD)" = "${RC_COMMIT_SHA}"
+
+python3 paimon-mosaic-git/tools/verify_source_archive.py verify \
+  --repository paimon-mosaic-git \
+  --commit "${RC_COMMIT_SHA}" \
+  --prefix "paimon-mosaic-${RELEASE_VERSION}/" \
+  --archive "${ARCHIVE_PATH}"
 
 python3 paimon-mosaic-git/tools/validate_release_tag.py \
   "${RC_TAG}" \

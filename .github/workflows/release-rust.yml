@@ -107,9 +107,59 @@ jobs:
           grep -qx LICENSE <<<"$package_files"
           grep -qx NOTICE <<<"$package_files"
           cargo publish -p paimon-mosaic-core --locked --registry crates-io --dry-run
+          # Cargo keeps dry-run archives in implementation-specific temporary
+          # paths. Repackage the same verified source into the stable path used
+          # for the registry checksum comparison.
+          cargo package -p paimon-mosaic-core --locked --no-verify
+
+      - name: Verify crates.io artifact state
+        id: registry
+        if: inputs.publish == true
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${TAG_NAME#v}"
+          crate="target/package/paimon-mosaic-core-${version}.crate"
+          test -f "$crate"
+
+          response="$RUNNER_TEMP/crates-io-version.json"
+          status="$(
+            curl \
+              --proto '=https' \
+              --tlsv1.2 \
+              --location \
+              --retry 3 \
+              --show-error \
+              --silent \
+              --user-agent 'Apache Paimon Mosaic release workflow' \
+              --output "$response" \
+              --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/paimon-mosaic-core/${version}"
+          )"
+
+          args=(
+            crates-io
+            --crate-name paimon-mosaic-core
+            --version "$version"
+            --artifact "$crate"
+            --github-output "$GITHUB_OUTPUT"
+          )
+          case "$status" in
+            200) args+=(--version-json "$response") ;;
+            404) args+=(--version-not-found) ;;
+            *)
+              cat "$response" >&2
+              echo "Unexpected crates.io response: HTTP ${status}" >&2
+              exit 1
+              ;;
+          esac
+          python3 tools/verify_registry_artifacts.py "${args[@]}"
 
       - name: Publish paimon-mosaic-core to crates.io
-        if: inputs.publish == true
+        if: inputs.publish == true && steps.registry.outputs.publish == 'true'
         run: cargo publish -p paimon-mosaic-core --locked --registry crates-io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

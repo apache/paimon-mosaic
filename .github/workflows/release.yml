@@ -148,6 +148,10 @@ jobs:
     if: github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - name: Require promoted and valid ASF source release
         env:
           TAG_NAME: ${{ github.ref_name }}
@@ -193,15 +197,6 @@ jobs:
             sha512sum --check "$archive.sha512"
           )
 
-          gzip -dc "$release_dir/$archive" > "$release_dir/source.tar"
-          source_commit="$(
-            git get-tar-commit-id < "$release_dir/source.tar"
-          )"
-          if [[ "$source_commit" != "$GITHUB_SHA" ]]; then
-            echo "Promoted source release embeds commit $source_commit, expected $GITHUB_SHA" >&2
-            exit 1
-          fi
-
           curl \
             --proto '=https' \
             --tlsv1.2 \
@@ -218,68 +213,144 @@ jobs:
           gpg --batch --no-tty \
             --verify "$release_dir/$archive.asc" "$release_dir/$archive"
 
-      - name: Require publication credentials
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "$CARGO_REGISTRY_TOKEN" || {
-            echo "CARGO_REGISTRY_TOKEN is not configured" >&2
-            exit 1
-          }
-          test -n "$PYPI_API_TOKEN" || {
-            echo "PYPI_API_TOKEN is not configured" >&2
-            exit 1
-          }
+          python3 tools/verify_source_archive.py verify \
+            --repository . \
+            --commit "$GITHUB_SHA" \
+            --prefix "paimon-mosaic-${version}/" \
+            --archive "$release_dir/$archive"
 
-      - name: Require unused crates.io and PyPI versions
+      - name: Set up Rust toolchain for registry preflight
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Download final wheel artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist-final-preflight
+
+      - name: Build and verify final registry artifacts
+        id: registry_preflight
         env:
           TAG_NAME: ${{ github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
+
           version="${TAG_NAME#v}"
+          cargo package -p paimon-mosaic-core --locked --no-verify
+          crate="target/package/paimon-mosaic-core-${version}.crate"
+          test -f "$crate"
 
-          check_absent() {
-            local registry="$1"
-            local url="$2"
-            local response="$RUNNER_TEMP/${registry}.json"
-            local status
-            status="$(
-              curl \
-                --proto '=https' \
-                --tlsv1.2 \
-                --location \
-                --retry 3 \
-                --show-error \
-                --silent \
-                --user-agent 'Apache Paimon Mosaic release workflow' \
-                --output "$response" \
-                --write-out '%{http_code}' \
-                "$url"
-            )"
-            case "$status" in
-              404) echo "${registry} version ${version} is available" ;;
-              200)
-                echo "${registry} version ${version} already exists" >&2
-                exit 1
-                ;;
-              *)
-                cat "$response" >&2
-                echo "Unexpected ${registry} response: HTTP ${status}" >&2
-                exit 1
-                ;;
-            esac
-          }
+          shopt -s nullglob
+          wheels=(dist-final-preflight/*.whl)
+          if [[ "${#wheels[@]}" -eq 0 ]]; then
+            echo "No final wheel artifacts were downloaded" >&2
+            exit 1
+          fi
+          python3 tools/verify_python_wheels.py \
+            --require-all-targets "${wheels[@]}"
 
-          check_absent \
-            "crates-io" \
-            "https://crates.io/api/v1/crates/paimon-mosaic-core/${version}"
-          check_absent \
-            "pypi" \
-            "https://pypi.org/pypi/paimon-mosaic/${version}/json"
+          crates_response="$RUNNER_TEMP/crates-io-version.json"
+          crates_status="$(
+            curl \
+              --proto '=https' \
+              --tlsv1.2 \
+              --location \
+              --retry 3 \
+              --show-error \
+              --silent \
+              --user-agent 'Apache Paimon Mosaic release workflow' \
+              --output "$crates_response" \
+              --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/paimon-mosaic-core/${version}"
+          )"
+          crates_args=(
+            crates-io
+            --crate-name paimon-mosaic-core
+            --version "$version"
+            --artifact "$crate"
+          )
+          case "$crates_status" in
+            200) crates_args+=(--version-json "$crates_response") ;;
+            404) crates_args+=(--version-not-found) ;;
+            *)
+              cat "$crates_response" >&2
+              echo "Unexpected crates.io response: HTTP ${crates_status}" >&2
+              exit 1
+              ;;
+          esac
+          crates_output="$RUNNER_TEMP/crates-registry-output"
+          python3 tools/verify_registry_artifacts.py \
+            "${crates_args[@]}" \
+            --github-output "$crates_output"
+
+          pypi_response="$RUNNER_TEMP/pypi-version.json"
+          pypi_status="$(
+            curl \
+              --proto '=https' \
+              --tlsv1.2 \
+              --location \
+              --retry 3 \
+              --show-error \
+              --silent \
+              --output "$pypi_response" \
+              --write-out '%{http_code}' \
+              "https://pypi.org/pypi/paimon-mosaic/${version}/json"
+          )"
+          pypi_args=(
+            pypi
+            --project paimon-mosaic
+            --version "$version"
+            --wheel "${wheels[@]}"
+          )
+          case "$pypi_status" in
+            200) pypi_args+=(--release-json "$pypi_response") ;;
+            404) pypi_args+=(--release-not-found) ;;
+            *)
+              cat "$pypi_response" >&2
+              echo "Unexpected PyPI response: HTTP ${pypi_status}" >&2
+              exit 1
+              ;;
+          esac
+          pypi_output="$RUNNER_TEMP/pypi-registry-output"
+          python3 tools/verify_registry_artifacts.py \
+            "${pypi_args[@]}" \
+            --github-output "$pypi_output"
+
+          crates_publish="$(sed -n 's/^publish=//p' "$crates_output")"
+          pypi_publish="$(sed -n 's/^publish=//p' "$pypi_output")"
+          if [[ ! "$crates_publish" =~ ^(true|false)$ \
+             || ! "$pypi_publish" =~ ^(true|false)$ ]]; then
+            echo "Registry preflight did not produce valid publication decisions" >&2
+            exit 1
+          fi
+          echo "crates_publish=$crates_publish" >> "$GITHUB_OUTPUT"
+          echo "pypi_publish=$pypi_publish" >> "$GITHUB_OUTPUT"
+
+      - name: Require credentials for missing registry artifacts
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+          CRATES_PUBLISH: ${{ steps.registry_preflight.outputs.crates_publish }}
+          PYPI_PUBLISH: ${{ steps.registry_preflight.outputs.pypi_publish }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$CRATES_PUBLISH" == "true" ]]; then
+            test -n "$CARGO_REGISTRY_TOKEN" || {
+              echo "CARGO_REGISTRY_TOKEN is not configured" >&2
+              exit 1
+            }
+          fi
+          if [[ "$PYPI_PUBLISH" == "true" ]]; then
+            test -n "$PYPI_API_TOKEN" || {
+              echo "PYPI_API_TOKEN is not configured" >&2
+              exit 1
+            }
+          fi
 
   rust-final-publish:
     name: Publish final Rust crate

@@ -32,6 +32,12 @@ sys.path.insert(0, str(TOOLS))
 import verify_python_wheels as verifier  # noqa: E402
 
 
+PE_SIDECAR = bytearray(132)
+PE_SIDECAR[:2] = b"MZ"
+PE_SIDECAR[0x3C:0x40] = (0x80).to_bytes(4, "little")
+PE_SIDECAR[0x80:0x84] = b"PE\0\0"
+
+
 SUPPORTED_WHEELS = (
     ("x86_64-unknown-linux-gnu", "manylinux_2_28_x86_64"),
     ("aarch64-unknown-linux-gnu", "manylinux_2_28_aarch64"),
@@ -75,6 +81,7 @@ def build_wheel(
     metadata_version="0.3.0",
     wheel_tags=None,
     mutate_record=None,
+    extra_entries=None,
     unrecorded_entries=None,
     directory_entries=None,
 ):
@@ -121,6 +128,7 @@ def build_wheel(
     }
     for name, content in legal_files.items():
         contents[f"{dist_info}/licenses/licenses/{target}/{name}"] = content
+    contents.update(extra_entries or {})
     contents[record_path] = record_bytes(contents, record_path, mutate_record)
 
     wheel = (
@@ -316,3 +324,39 @@ def test_verify_wheel_rejects_unrecorded_archive_entry(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="omits wheel entries"):
         verifier.verify_wheel(wheel, root)
+
+
+@pytest.mark.parametrize(
+    "entry,magic",
+    (
+        ("paimon_mosaic.libs/libzstd.so.1", b"\x7fELF"),
+        ("paimon_mosaic.libs/helper.bin", bytes(PE_SIDECAR)),
+        ("paimon_mosaic.libs/helper.data", b"\xcf\xfa\xed\xfe"),
+    ),
+)
+def test_verify_wheel_rejects_sidecar_native_by_magic(
+    tmp_path, monkeypatch, entry, magic
+):
+    wheel, root = build_wheel(
+        tmp_path,
+        extra_entries={entry: magic + b"sidecar native"},
+    )
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
+
+    with pytest.raises(ValueError, match="unexpected native libraries"):
+        verifier.verify_wheel(wheel, root)
+
+
+def test_verify_wheel_does_not_treat_plain_mz_resource_as_pe(
+    tmp_path, monkeypatch
+):
+    not_pe = bytearray(132)
+    not_pe[:2] = b"MZ"
+    not_pe[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    wheel, root = build_wheel(
+        tmp_path,
+        extra_entries={"mosaic/data/resource.bin": bytes(not_pe)},
+    )
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
+
+    assert verifier.verify_wheel(wheel, root) == "aarch64-unknown-linux-gnu"

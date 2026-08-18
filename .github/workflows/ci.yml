@@ -182,7 +182,8 @@ jobs:
 
       - name: Verify Java classifier licensing
         run: |
-          mvn -q -f java/pom.xml clean verify -Prelease -Dgpg.skip=true -DskipTests
+          mvn -q -f java/pom.xml clean verify \
+            -Prelease -Dgpg.skip=true -DskipTests -Dexec.skip=true
           main_jar="$(find java/target -maxdepth 1 -type f \
             -name 'mosaic-*.jar' \
             ! -name '*-sources.jar' ! -name '*-javadoc.jar' -print -quit)"

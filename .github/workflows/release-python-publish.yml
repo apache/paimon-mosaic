@@ -162,18 +162,15 @@ jobs:
               ;;
           esac
 
-      - name: Require an unused final PyPI version
+      - name: Verify final PyPI artifact state
+        id: final_registry
         if: ${{ !contains(github.ref_name, '-') }}
         env:
           TAG_NAME: ${{ github.ref_name }}
-          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$PYPI_API_TOKEN" || {
-            echo "PYPI_API_TOKEN is not configured" >&2
-            exit 1
-          }
+
           version="${TAG_NAME#v}"
           response="$RUNNER_TEMP/pypi-version.json"
           status="$(
@@ -188,18 +185,28 @@ jobs:
               --write-out '%{http_code}' \
               "https://pypi.org/pypi/paimon-mosaic/${version}/json"
           )"
+
+          args=(
+            pypi
+            --project paimon-mosaic
+            --version "$version"
+            --upload-directory dist-pypi
+            --github-output "$GITHUB_OUTPUT"
+          )
           case "$status" in
-            404) echo "PyPI version ${version} is available" ;;
-            200)
-              echo "PyPI version ${version} already exists" >&2
-              exit 1
-              ;;
+            200) args+=(--release-json "$response") ;;
+            404) args+=(--release-not-found) ;;
             *)
               cat "$response" >&2
               echo "Unexpected PyPI response: HTTP ${status}" >&2
               exit 1
               ;;
           esac
+
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          args+=(--wheel "${wheels[@]}")
+          python3 tools/verify_registry_artifacts.py "${args[@]}"
 
       - name: Publish to TestPyPI
         if: contains(github.ref_name, '-rc')
@@ -211,9 +218,9 @@ jobs:
           password: ${{ secrets.TEST_PYPI_API_TOKEN }}
 
       - name: Publish to PyPI
-        if: ${{ !contains(github.ref_name, '-') }}
+        if: ${{ !contains(github.ref_name, '-') && steps.final_registry.outputs.publish == 'true' }}
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e
         with:
           skip-existing: false
-          packages-dir: dist
+          packages-dir: dist-pypi
           password: ${{ secrets.PYPI_API_TOKEN }}

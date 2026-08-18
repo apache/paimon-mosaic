@@ -78,35 +78,11 @@ echo "Creating source package"
 
 ARCHIVE="apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz"
 ARCHIVE_PATH="tools/release/${ARCHIVE}"
-FIRST_ARCHIVE=$(mktemp "${ARCHIVE_PATH}.first.XXXXXX")
-SECOND_ARCHIVE=$(mktemp "${ARCHIVE_PATH}.second.XXXXXX")
-
-cleanup_archives() {
-  rm -f "${FIRST_ARCHIVE}" "${SECOND_ARCHIVE}"
-}
-trap cleanup_archives EXIT
-
-create_archive() {
-  local output=$1
-
-  # Archive the commit, rather than only its tree, so Git uses the commit timestamp
-  # and records the exact source commit in the tar metadata. gzip -n removes the
-  # gzip header timestamp and original filename.
-  git archive --format=tar --prefix="paimon-mosaic-${RELEASE_VERSION}/" HEAD . \
-    ':(exclude).gitignore' ':(exclude).gitattributes' \
-    ':(exclude).asf.yaml' ':(exclude).github' \
-    ':(exclude)deploysettings.xml' ':(exclude)target' \
-    ':(exclude).idea' ':(exclude)*.iml' ':(exclude).DS_Store' \
-    | gzip -n > "${output}"
-}
-
-create_archive "${FIRST_ARCHIVE}"
-create_archive "${SECOND_ARCHIVE}"
-cmp "${FIRST_ARCHIVE}" "${SECOND_ARCHIVE}"
-mv "${FIRST_ARCHIVE}" "${ARCHIVE_PATH}"
-chmod 0644 "${ARCHIVE_PATH}"
-rm -f "${SECOND_ARCHIVE}"
-trap - EXIT
+python3 tools/verify_source_archive.py create \
+  --repository . \
+  --commit HEAD \
+  --prefix "paimon-mosaic-${RELEASE_VERSION}/" \
+  --output "${ARCHIVE_PATH}"
 
 cd tools/release
 

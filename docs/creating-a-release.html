@@ -248,25 +248,29 @@ test "$(gh run view "${RELEASE_RUN_ID}" \
   --repo apache/paimon-mosaic --json headBranch --jq .headBranch)" = "${RC_TAG}"
 
 git checkout --detach "${RC_TAG}"
+test -z "$(git status --porcelain --untracked-files=all --ignored=matching)"
+test ! -e java/src/main/resources/native
 mkdir -p java/src/main/resources/native
 gh run download "${RELEASE_RUN_ID}" \
   --repo apache/paimon-mosaic \
   --name java-release-native-inputs \
   --dir java/src/main/resources/native
-find java/src/main/resources/native -type f | sort</code></pre>
-            <p>Build and verify the unsigned JARs before signing. The verifier requires all four native libraries and artifact-exact legal metadata:</p>
-<pre><code>mvn -f java/pom.xml clean verify -Prelease -Dgpg.skip=true -DskipTests
-
-MAIN_JAR="$(find java/target -maxdepth 1 -name 'mosaic-*.jar' \
-  ! -name '*-sources.jar' ! -name '*-javadoc.jar' -print -quit)"
-SOURCES_JAR="$(find java/target -maxdepth 1 -name '*-sources.jar' -print -quit)"
-JAVADOC_JAR="$(find java/target -maxdepth 1 -name '*-javadoc.jar' -print -quit)"
-python3 tools/verify_java_jars.py \
-  --main "${MAIN_JAR}" \
-  --sources "${SOURCES_JAR}" \
-  --javadoc "${JAVADOC_JAR}" \
-  --require-all-natives</code></pre>
-            <p>Keep the personal signing key on this trusted machine. Run signing and deployment in a strict subshell so the short-lived GPG passphrase and Nexus credentials disappear on both success and failure, while any Maven failure remains visible to the caller:</p>
+EXPECTED_NATIVE_FILES="$(cat &lt;&lt;'EOF'
+linux/aarch64/libpaimon_mosaic_jni.so
+linux/x86_64/libpaimon_mosaic_jni.so
+macos/aarch64/libpaimon_mosaic_jni.dylib
+windows/x86_64/paimon_mosaic_jni.dll
+EOF
+)"
+ACTUAL_NATIVE_FILES="$(
+  find java/src/main/resources/native -type f \
+    | sed 's#^java/src/main/resources/native/##' \
+    | LC_ALL=C sort
+)"
+test "${ACTUAL_NATIVE_FILES}" = "${EXPECTED_NATIVE_FILES}"
+test -z "$(git status --porcelain --untracked-files=all)"</code></pre>
+            <p>Use a fresh isolated worktree: before the download it must contain no tracked, untracked, or ignored files beyond the checkout itself. After the download, the four listed native libraries are the only permitted non-Git inputs. Keep the personal signing key on this trusted machine. Build, verify, sign, and deploy in one Maven lifecycle so the release-profile verifier checks the exact JARs that Maven will sign and stage. The verifier runs in <code>verify</code> before GPG signing and requires all four native libraries plus artifact-exact legal metadata.</p>
+            <p>Run deployment in a strict subshell so the short-lived GPG passphrase and Nexus credentials disappear on both success and failure, while any Maven or verifier failure remains visible to the caller:</p>
 <pre><code>(
   set -euo pipefail
   export NEXUS_STAGE_DEPLOYER_USER="&lt;ASF Nexus username&gt;"
@@ -275,7 +279,7 @@ python3 tools/verify_java_jars.py \
   export NEXUS_STAGE_DEPLOYER_PW MAVEN_GPG_PASSPHRASE
 
   cd java
-  mvn deploy \
+  mvn clean deploy \
     --settings ../deploysettings.xml \
     -Prelease \
     -DskipTests \
@@ -285,10 +289,13 @@ python3 tools/verify_java_jars.py \
             <p>Record the closed <code>orgapachepaimon-XXXX</code> repository URL and verify its artifacts before including it in the vote email. If local signing, deployment, or verification fails, drop that staging repository and do not start the vote.</p>
 
             <h3>Create Source Release Artifacts</h3>
-            <p>Create source release artifacts from the same commit as the RC tag:</p>
-<pre><code>git checkout ${RC_TAG}
+            <p>Create source release artifacts from a fully clean checkout of the same commit as the RC tag. Remove the exact downloaded Java native-input directory first, or use a fresh isolated worktree; do not clean unrelated files implicitly:</p>
+<pre><code>rm -rf java/src/main/resources/native
+git checkout --detach ${RC_TAG}
+test -z "$(git status --porcelain --untracked-files=all)"
 cd tools
 RELEASE_VERSION=${RELEASE_VERSION} ./create_source_release.sh</code></pre>
+            <p>The source tool creates a deterministic archive and compares every normalized path, entry type, mode, symbolic-link target, and file content against the exact Git commit before signing it.</p>
             <p>This creates the following under <code>tools/release/</code>:</p>
             <ul>
                 <li><code>apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz</code> &mdash; source archive</li>
@@ -413,7 +420,7 @@ test "$(git rev-parse HEAD)" = "$(git rev-parse ${RC_TAG}^{commit})"
 git tag -s ${RELEASE_TAG} -m "Release Apache Paimon Mosaic ${RELEASE_VERSION}"
 git tag -v ${RELEASE_TAG}
 git push origin ${RELEASE_TAG}</code></pre>
-            <p>The final workflow completes the full preflight, Java verification, and target-runner wheel build/import checks. It verifies the promoted ASF source release and confirms that the crates.io and PyPI versions are absent, publishes the Rust crate, and finally publishes the wheels to PyPI. It does not deploy or release Java artifacts from the final tag.</p>
+            <p>The final workflow completes the full preflight, Java verification, and target-runner wheel build/import checks. It verifies that the promoted ASF source archive exactly matches the final Git commit, compares any existing crates.io artifact by SHA-256, and compares every existing PyPI wheel filename and SHA-256. Matching publication is skipped, only missing wheels are uploaded, and any mismatch or unexpected PyPI release file blocks the workflow. It does not deploy or release Java artifacts from the final tag.</p>
 
             <h3>Release the Java Artifacts</h3>
             <ol>

@@ -174,6 +174,34 @@
             <build>
                 <plugins>
                     <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.6.3</version>
+                        <executions>
+                            <execution>
+                                <id>verify-release-jars</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>python3</executable>
+                                    <workingDirectory>${project.basedir}/..</workingDirectory>
+                                    <arguments>
+                                        <argument>tools/verify_java_jars.py</argument>
+                                        <argument>--main</argument>
+                                        <argument>${project.build.directory}/${project.build.finalName}.jar</argument>
+                                        <argument>--sources</argument>
+                                        <argument>${project.build.directory}/${project.build.finalName}-sources.jar</argument>
+                                        <argument>--javadoc</argument>
+                                        <argument>${project.build.directory}/${project.build.finalName}-javadoc.jar</argument>
+                                        <argument>--require-all-natives</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-gpg-plugin</artifactId>
                         <version>3.2.8</version>
@@ -246,7 +274,7 @@
                                             <version>1.8.0</version>
                                         </requireJavaVersion>
                                         <requireMavenVersion>
-                                            <version>[3.1.1,)</version>
+                                            <version>[3.6.3,)</version>
                                         </requireMavenVersion>
                                     </rules>
                                 </configuration>

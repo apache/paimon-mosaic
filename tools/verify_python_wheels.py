@@ -49,6 +49,16 @@ NESTED_LICENSE_MARKERS = (
 )
 
 WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:/")
+MACHO_MAGICS = {
+    b"\xfe\xed\xfa\xce",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf",
+    b"\xbf\xba\xfe\xca",
+}
 
 
 def repository_root() -> Path:
@@ -173,6 +183,21 @@ def validate_archive_paths(archive: ZipFile) -> set[str]:
         names.add(raw_name)
         normalized_names.add(normalized_name)
     return names
+
+
+def native_binary_magic(source, size: int) -> str | None:
+    header = source.read(min(size, 64))
+    if header.startswith(b"\x7fELF"):
+        return "ELF"
+    if header[:4] in MACHO_MAGICS:
+        return "Mach-O"
+    if header.startswith(b"MZ") and len(header) >= 64:
+        pe_offset = int.from_bytes(header[0x3C:0x40], "little")
+        if pe_offset <= size - 4:
+            source.seek(pe_offset)
+            if source.read(4) == b"PE\0\0":
+                return "PE"
+    return None
 
 
 def require_single_header(message: email.message.Message, name: str) -> str:
@@ -360,12 +385,19 @@ def verify_wheel(wheel: Path, root: Path) -> str:
         for archive_path, expected_path in {**package_legal, **standard_legal}.items():
             require_equal(archive.read(archive_path), expected_path, archive_path)
 
-        native_entries = sorted(
-            name
-            for name in names
-            if name.startswith("mosaic/")
-            and name.endswith((".so", ".dylib", ".dll"))
-        )
+        native_entries = []
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            name = info.filename
+            with archive.open(info) as source:
+                magic = native_binary_magic(source, info.file_size)
+            if (
+                name.startswith("mosaic/")
+                and name.endswith((".so", ".dylib", ".dll"))
+            ) or magic is not None:
+                native_entries.append(name)
+        native_entries.sort()
         if native_entries != [NATIVE_LIBRARY[target]]:
             raise ValueError(f"unexpected native libraries: {native_entries}")
         verify_native_target(

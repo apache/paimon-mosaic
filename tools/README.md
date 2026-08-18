@@ -76,3 +76,27 @@ python3 tools/verify_java_jars.py \
   --require-all-natives
 python3 tools/verify_python_wheels.py --require-all-targets dist/*.whl
 ```
+
+The Maven `release` profile runs the Java verifier with
+`--require-all-natives` during `verify`, before GPG signing. Release managers
+must therefore use one `mvn clean deploy -Prelease` lifecycle rather than
+verifying one build and deploying a rebuilt set of JARs.
+
+Source archives are created and checked against an exact Git commit with the
+shared path exclusions in `verify_source_archive.py`:
+
+```bash
+python3 tools/verify_source_archive.py create \
+  --repository . --commit HEAD \
+  --prefix paimon-mosaic-0.3.0/ \
+  --output /tmp/apache-paimon-mosaic-0.3.0-src.tgz
+python3 tools/verify_source_archive.py verify \
+  --repository . --commit HEAD \
+  --prefix paimon-mosaic-0.3.0/ \
+  --archive /tmp/apache-paimon-mosaic-0.3.0-src.tgz
+```
+
+Final registry publication uses `verify_registry_artifacts.py` after fetching
+the version JSON from PyPI or crates.io. Existing files are accepted only when
+their SHA-256 digests match the local release artifacts exactly; PyPI uploads
+are staged with only the missing wheels.
