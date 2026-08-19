@@ -916,6 +916,35 @@ mod tests {
     }
 
     #[test]
+    fn test_write_batch_name_mismatch_reports_mapped_batch_index() {
+        let arrow_schema = Schema::new(vec![
+            Field::new("z", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
+        ]);
+        let out = MemOutputFile::new();
+        let mut writer = MosaicWriter::new(out, &arrow_schema, WriterOptions::default()).unwrap();
+
+        let mismatched_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("z", DataType::Int32, false),
+                Field::new("x", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![3, 4])),
+            ],
+        )
+        .unwrap();
+
+        let err = writer.write_batch(&mismatched_batch).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "field name mismatch at column 1: schema has 'a' but batch has 'x'"
+        );
+    }
+
+    #[test]
     fn test_stats_columns_not_found() {
         let arrow_schema = Schema::new(vec![
             Field::new("a", DataType::Int32, true),
