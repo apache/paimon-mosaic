@@ -21,13 +21,14 @@ set -o pipefail
 
 TEST_SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TOOLS_DIR=$(cd "$TEST_SCRIPT_DIR/.." && pwd)
-TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/paimon-mosaic-staging-test.XXXXXX")
+TEST_TMPDIR=$(cd "${TMPDIR:-/tmp}" && pwd -P)
+TEST_ROOT=$(mktemp -d "$TEST_TMPDIR/paimon-mosaic-staging-test.XXXXXX")
 REAL_PYTHON=$(command -v python3)
 TEST_COUNT=0
 
 cleanup() {
   case "$TEST_ROOT" in
-    "${TMPDIR:-/tmp}"/paimon-mosaic-staging-test.*)
+    "$TEST_TMPDIR"/paimon-mosaic-staging-test.*)
       rm -rf -- "$TEST_ROOT"
       ;;
     *)
