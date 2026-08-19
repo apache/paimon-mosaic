@@ -18,7 +18,7 @@
 use std::io;
 
 use arrow_array::*;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::Schema;
 
 use crate::bucket_writer::{BucketWriter, PagedBucketOutput};
 use crate::schema::MosaicSchema;
@@ -46,31 +46,6 @@ fn check_zstd_block_size(size: usize, field: &str) -> io::Result<()> {
         ));
     }
     Ok(())
-}
-
-fn data_types_match(expected: &DataType, actual: &DataType) -> bool {
-    match (expected, actual) {
-        (DataType::List(expected_field), DataType::List(actual_field)) => {
-            fields_match(expected_field, actual_field)
-        }
-        (
-            DataType::Map(expected_field, expected_sorted),
-            DataType::Map(actual_field, actual_sorted),
-        ) => expected_sorted == actual_sorted && fields_match(expected_field, actual_field),
-        (DataType::Struct(expected_fields), DataType::Struct(actual_fields)) => {
-            expected_fields.len() == actual_fields.len()
-                && expected_fields.iter().zip(actual_fields.iter()).all(
-                    |(expected_field, actual_field)| fields_match(expected_field, actual_field),
-                )
-        }
-        _ => expected == actual,
-    }
-}
-
-fn fields_match(expected: &Field, actual: &Field) -> bool {
-    expected.name() == actual.name()
-        && expected.is_nullable() == actual.is_nullable()
-        && data_types_match(expected.data_type(), actual.data_type())
 }
 
 pub trait OutputFile {
@@ -376,20 +351,9 @@ impl<S: OutputFile> MosaicWriter<S> {
                     io::ErrorKind::InvalidInput,
                     format!(
                         "field name mismatch at column {}: schema has '{}' but batch has '{}'",
-                        i,
+                        self.batch_col_map[i],
                         col.name,
                         batch_field.name()
-                    ),
-                ));
-            }
-            if !data_types_match(&col.data_type, batch_field.data_type()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "field type mismatch for column '{}': schema has {:?} but batch has {:?}",
-                        col.name,
-                        col.data_type,
-                        batch_field.data_type()
                     ),
                 ));
             }
