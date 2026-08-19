@@ -27,6 +27,13 @@ on:
         description: Publish only after the top-level release gates pass
         required: true
         type: boolean
+    secrets:
+      TEST_PYPI_API_TOKEN:
+        description: TestPyPI token used only by the RC publish action
+        required: false
+      PYPI_API_TOKEN:
+        description: PyPI token used only by the final publish action
+        required: false
 
 concurrency:
   group: release-python-publish-${{ github.ref }}
@@ -127,14 +134,9 @@ jobs:
         if: contains(github.ref_name, '-rc')
         env:
           TAG_NAME: ${{ github.ref_name }}
-          TEST_PYPI_API_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$TEST_PYPI_API_TOKEN" || {
-            echo "TEST_PYPI_API_TOKEN is not configured" >&2
-            exit 1
-          }
           version="${TAG_NAME#v}"
           version="${version/-rc/rc}"
           response="$RUNNER_TEMP/testpypi-version.json"

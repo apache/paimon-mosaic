@@ -55,3 +55,40 @@ def test_testpypi_publication_stages_only_missing_verified_wheels():
     assert "steps.test_registry.outputs.publish == 'true'" in python_publish
     assert "packages-dir: dist-testpypi" in python_publish
     assert "Require an unused TestPyPI RC version" not in python_publish
+
+
+def test_registry_secrets_are_scoped_to_publish_workflows():
+    release = workflow("release.yml")
+    final_preflight = job(
+        release, "final-publication-preflight", "rust-final-publish"
+    )
+    rust_verify = job(release, "rust", "java")
+    python_wheels = job(release, "python-wheels", "python-rc-publish")
+    rc_publish = job(release, "python-rc-publish", "final-publication-preflight")
+    rust_publish = job(release, "rust-final-publish", "python-final-publish")
+    python_publish = job(release, "python-final-publish", None)
+
+    assert "CARGO_REGISTRY_TOKEN" not in final_preflight
+    assert "PYPI_API_TOKEN" not in final_preflight
+    assert "TEST_PYPI_API_TOKEN" not in job(
+        release, "tag-validation", "preflight"
+    )
+    assert "secrets: inherit" not in release
+    assert "secrets:" not in rust_verify
+    assert "secrets:" not in python_wheels
+    assert "TEST_PYPI_API_TOKEN:" in rc_publish
+    assert "CARGO_REGISTRY_TOKEN:" in rust_publish
+    assert "PYPI_API_TOKEN:" in python_publish
+
+    rust_workflow = workflow("release-rust.yml")
+    assert "CARGO_REGISTRY_TOKEN:" in rust_workflow
+    assert "CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}" in rust_workflow
+
+    python_workflow = workflow("release-python-publish.yml")
+    test_registry = python_workflow[
+        python_workflow.index("      - name: Verify TestPyPI RC artifact state") :
+        python_workflow.index("      - name: Verify final PyPI artifact state")
+    ]
+    assert "TEST_PYPI_API_TOKEN" not in test_registry
+    assert "password: ${{ secrets.TEST_PYPI_API_TOKEN }}" in python_workflow
+    assert "password: ${{ secrets.PYPI_API_TOKEN }}" in python_workflow

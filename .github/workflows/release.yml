@@ -66,18 +66,6 @@ jobs:
             "$TAG_NAME" \
             --keys-file "$RUNNER_TEMP/paimon-KEYS"
 
-      - name: Require TestPyPI credentials for pushed RC tags
-        if: github.event_name == 'push' && github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
-        env:
-          TEST_PYPI_API_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "$TEST_PYPI_API_TOKEN" || {
-            echo "TEST_PYPI_API_TOKEN is not configured" >&2
-            exit 1
-          }
-
       - name: Confirm manual dispatch is build-only
         if: github.event_name == 'workflow_dispatch'
         run: echo "Manual dispatch runs all release verification without staging or publication."
@@ -91,7 +79,6 @@ jobs:
     name: Rust package verification
     needs: [preflight]
     uses: ./.github/workflows/release-rust.yml
-    secrets: inherit
 
   java:
     name: Java release verification
@@ -102,7 +89,6 @@ jobs:
     name: Python wheels
     needs: [preflight]
     uses: ./.github/workflows/release-python.yml
-    secrets: inherit
 
   python-rc-publish:
     name: Publish RC wheels to TestPyPI
@@ -111,7 +97,8 @@ jobs:
     uses: ./.github/workflows/release-python-publish.yml
     with:
       publish_authorized: true
-    secrets: inherit
+    secrets:
+      TEST_PYPI_API_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
 
   final-publication-preflight:
     name: Final publication preflight
@@ -301,35 +288,14 @@ jobs:
           echo "crates_publish=$crates_publish" >> "$GITHUB_OUTPUT"
           echo "pypi_publish=$pypi_publish" >> "$GITHUB_OUTPUT"
 
-      - name: Require credentials for missing registry artifacts
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-          CRATES_PUBLISH: ${{ steps.registry_preflight.outputs.crates_publish }}
-          PYPI_PUBLISH: ${{ steps.registry_preflight.outputs.pypi_publish }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$CRATES_PUBLISH" == "true" ]]; then
-            test -n "$CARGO_REGISTRY_TOKEN" || {
-              echo "CARGO_REGISTRY_TOKEN is not configured" >&2
-              exit 1
-            }
-          fi
-          if [[ "$PYPI_PUBLISH" == "true" ]]; then
-            test -n "$PYPI_API_TOKEN" || {
-              echo "PYPI_API_TOKEN is not configured" >&2
-              exit 1
-            }
-          fi
-
   rust-final-publish:
     name: Publish final Rust crate
     needs: [final-publication-preflight]
     uses: ./.github/workflows/release-rust.yml
     with:
       publish: true
-    secrets: inherit
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   python-final-publish:
     name: Publish final wheels to PyPI
@@ -337,4 +303,5 @@ jobs:
     uses: ./.github/workflows/release-python-publish.yml
     with:
       publish_authorized: true
-    secrets: inherit
+    secrets:
+      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}

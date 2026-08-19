@@ -32,6 +32,10 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        description: crates.io token used only by the authorized publish step
+        required: false
   workflow_dispatch:
 
 concurrency:
