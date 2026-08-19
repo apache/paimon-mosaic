@@ -30,3 +30,6 @@ zstd = "0.13"
 arrow-schema = "58"
 arrow-array = "58"
 arrow-buffer = "58"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
