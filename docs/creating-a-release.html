@@ -219,7 +219,7 @@ cd ..</code></pre>
 git tag -v ${RC_TAG}
 git push origin ${RELEASE_BRANCH}
 git push origin ${RC_TAG}</code></pre>
-            <p>The tag must use the canonical <code>vX.Y.Z-rcN</code> form and its OpenPGP signer must be present in the Apache Paimon <a href="https://downloads.apache.org/paimon/KEYS">KEYS</a> file. Every RC number maps to a distinct TestPyPI version; if that version already exists, create a new RC tag instead of overwriting or skipping files.</p>
+            <p>The tag must use the canonical <code>vX.Y.Z-rcN</code> form and its OpenPGP signer must be present in the Apache Paimon <a href="https://downloads.apache.org/paimon/KEYS">KEYS</a> file. Every RC number maps to a distinct TestPyPI version. A rerun accepts existing wheels only when their filenames and SHA-256 digests exactly match the current release artifacts, then uploads only missing wheels. Create a new RC tag if any existing file differs or an unexpected file is present.</p>
             <p>After pushing, verify in <a href="https://github.com/apache/paimon-mosaic/actions">GitHub Actions</a> that the <code>Release</code> workflow succeeds:</p>
             <ul>
                 <li><strong>Release preflight</strong> &mdash; runs license, advisory, formatting, Clippy, Rust, C++, Java, Python, and artifact checks before any staging or publication job starts</li>
@@ -229,7 +229,7 @@ git push origin ${RC_TAG}</code></pre>
                 <li><strong>Python publish</strong> &mdash; publishes to TestPyPI only after the Rust, Java, and Python wheel jobs succeed</li>
             </ul>
             <p>The PyPI flow intentionally publishes binary wheels only. The signed ASF source archive is the authoritative source release; do not upload a Python sdist that lacks a target native library.</p>
-            <p>If only the Python publish job fails due to a transient PyPI or TestPyPI issue, use <strong>Re-run failed jobs</strong> on the <code>Release</code> workflow. The successful Rust, Java, and Python wheel jobs do not need to be repeated.</p>
+            <p>If only the Python publish job fails due to a transient PyPI or TestPyPI issue, use <strong>Re-run failed jobs</strong> on the original tag-push <code>Release</code> workflow. The publish preflight verifies any existing files by filename and SHA-256 and stages only missing wheels; the successful Rust, Java, and Python wheel jobs do not need to be repeated. Manual workflow dispatch is verification-only, even when a tag ref is selected.</p>
 
             <h3>Sign and Stage Java Artifacts Locally</h3>
             <p>Use the exact successful <code>Release</code> workflow run for the RC tag. Confirm that the run's head SHA is the signed RC commit, then download its already verified four-platform native input bundle:</p>

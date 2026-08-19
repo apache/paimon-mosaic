@@ -66,10 +66,9 @@ jobs:
             "$TAG_NAME" \
             --keys-file "$RUNNER_TEMP/paimon-KEYS"
 
-      - name: Require an unused TestPyPI RC version
-        if: github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
+      - name: Require TestPyPI credentials for pushed RC tags
+        if: github.event_name == 'push' && github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
         env:
-          TAG_NAME: ${{ github.ref_name }}
           TEST_PYPI_API_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
         shell: bash
         run: |
@@ -79,37 +78,9 @@ jobs:
             exit 1
           }
 
-          version="${TAG_NAME#v}"
-          version="${version/-rc/rc}"
-          response="$RUNNER_TEMP/testpypi-version.json"
-          status="$(
-            curl \
-              --proto '=https' \
-              --tlsv1.2 \
-              --location \
-              --retry 3 \
-              --show-error \
-              --silent \
-              --output "$response" \
-              --write-out '%{http_code}' \
-              "https://test.pypi.org/pypi/paimon-mosaic/${version}/json"
-          )"
-          case "$status" in
-            404) echo "TestPyPI version ${version} is available" ;;
-            200)
-              echo "TestPyPI version ${version} already exists; use a new RC tag" >&2
-              exit 1
-              ;;
-            *)
-              cat "$response" >&2
-              echo "Unexpected TestPyPI response: HTTP ${status}" >&2
-              exit 1
-              ;;
-          esac
-
-      - name: Confirm branch dispatch is build-only
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        run: echo "No release tag is selected; all leaf workflows will run without staging or publication."
+      - name: Confirm manual dispatch is build-only
+        if: github.event_name == 'workflow_dispatch'
+        run: echo "Manual dispatch runs all release verification without staging or publication."
 
   preflight:
     name: Release preflight
@@ -136,7 +107,7 @@ jobs:
   python-rc-publish:
     name: Publish RC wheels to TestPyPI
     needs: [rust, java, python-wheels]
-    if: github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
+    if: github.event_name == 'push' && github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
     uses: ./.github/workflows/release-python-publish.yml
     with:
       publish_authorized: true
@@ -145,7 +116,7 @@ jobs:
   final-publication-preflight:
     name: Final publication preflight
     needs: [rust, java, python-wheels]
-    if: github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-')
+    if: github.event_name == 'push' && github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
