@@ -192,7 +192,14 @@ else
 fi
 EOF
 
+  cat > "$FIXTURE_DIR/fake-bin/file" <<'EOF'
+#!/bin/sh
+echo "external file command must not be used" >&2
+exit 99
+EOF
+
   chmod +x \
+    "$FIXTURE_DIR/fake-bin/file" \
     "$FIXTURE_DIR/fake-bin/gh" \
     "$FIXTURE_DIR/fake-bin/gpg" \
     "$FIXTURE_DIR/fake-bin/mvn" \
@@ -338,7 +345,7 @@ test_invalid_native_files_fail_without_external_file_command() {
   new_fixture
   (
     cd "$FIXTURE_DIR"
-    PATH="$FIXTURE_DIR/fake-bin:$(dirname "$BASH"):/bin" \
+    PATH="$FIXTURE_DIR/fake-bin:$PATH" \
       MVN="$FIXTURE_DIR/fake-bin/mvn" \
       PYTHON="$REAL_PYTHON" \
       FAKE_MVN_LOG="$MAVEN_LOG" \
