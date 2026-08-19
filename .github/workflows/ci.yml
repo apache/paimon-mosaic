@@ -132,6 +132,7 @@ jobs:
 
   cpp-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
 
@@ -150,7 +151,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y apt-transport-https lsb-release ca-certificates curl
-          curl -fsSL https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb -o /tmp/arrow-apt.deb
+          curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-connrefused \
+            --connect-timeout 10 \
+            --max-time 300 \
+            --show-error \
+            --silent \
+            --output /tmp/arrow-apt.deb \
+            "https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
           sudo apt-get install -y /tmp/arrow-apt.deb
           sudo apt-get update
           sudo apt-get install -y libarrow-dev

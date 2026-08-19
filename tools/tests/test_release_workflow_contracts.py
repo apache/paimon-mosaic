@@ -31,6 +31,29 @@ def job(workflow_text: str, name: str, next_name: str | None) -> str:
     return workflow_text[start:end]
 
 
+def step(workflow_text: str, name: str) -> str:
+    start = workflow_text.index(f"      - name: {name}")
+    end = workflow_text.find("\n      - ", start + 1)
+    return workflow_text[start:] if end == -1 else workflow_text[start:end]
+
+
+def curl_commands(workflow_text: str) -> list[str]:
+    lines = workflow_text.splitlines()
+    commands = []
+    for index, line in enumerate(lines):
+        if not line.strip().startswith("curl"):
+            continue
+        if line.strip() != "curl \\":
+            raise AssertionError(f"unsupported curl command form: {line}")
+        command = [line]
+        for continuation in lines[index + 1 :]:
+            command.append(continuation)
+            if not continuation.rstrip().endswith("\\"):
+                break
+        commands.append("\n".join(command))
+    return commands
+
+
 def test_manual_release_dispatch_is_build_only():
     release = workflow("release.yml")
 
@@ -76,13 +99,32 @@ def test_registry_secrets_are_scoped_to_publish_workflows():
     assert "secrets: inherit" not in release
     assert "secrets:" not in rust_verify
     assert "secrets:" not in python_wheels
-    assert "TEST_PYPI_API_TOKEN:" in rc_publish
-    assert "CARGO_REGISTRY_TOKEN:" in rust_publish
-    assert "PYPI_API_TOKEN:" in python_publish
+    registry_secrets = {
+        "TEST_PYPI_API_TOKEN": "secrets.TEST_PYPI_API_TOKEN",
+        "CARGO_REGISTRY_TOKEN": "secrets.CARGO_REGISTRY_TOKEN",
+        "PYPI_API_TOKEN": "secrets.PYPI_API_TOKEN",
+    }
+    publish_jobs = {
+        "TEST_PYPI_API_TOKEN": rc_publish,
+        "CARGO_REGISTRY_TOKEN": rust_publish,
+        "PYPI_API_TOKEN": python_publish,
+    }
+    for expected_name, publish_job in publish_jobs.items():
+        expected_value = registry_secrets[expected_name]
+        assert f"{expected_name}: ${{{{ {expected_value} }}}}" in publish_job
+        for other_name, other_value in registry_secrets.items():
+            if other_name != expected_name:
+                assert other_value not in publish_job
 
     rust_workflow = workflow("release-rust.yml")
-    assert "CARGO_REGISTRY_TOKEN:" in rust_workflow
-    assert "CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}" in rust_workflow
+    rust_publish_step = step(rust_workflow, "Publish paimon-mosaic-core to crates.io")
+    assert rust_workflow.count("secrets.CARGO_REGISTRY_TOKEN") == 1
+    assert "CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}" in (
+        rust_publish_step
+    )
+    assert "secrets.CARGO_REGISTRY_TOKEN" not in rust_workflow.replace(
+        rust_publish_step, ""
+    )
 
     python_workflow = workflow("release-python-publish.yml")
     test_registry = python_workflow[
@@ -90,8 +132,73 @@ def test_registry_secrets_are_scoped_to_publish_workflows():
         python_workflow.index("      - name: Verify final PyPI artifact state")
     ]
     assert "TEST_PYPI_API_TOKEN" not in test_registry
-    assert "password: ${{ secrets.TEST_PYPI_API_TOKEN }}" in python_workflow
-    assert "password: ${{ secrets.PYPI_API_TOKEN }}" in python_workflow
+    test_publish_step = step(python_workflow, "Publish to TestPyPI")
+    final_publish_step = step(python_workflow, "Publish to PyPI")
+    assert python_workflow.count("secrets.TEST_PYPI_API_TOKEN") == 1
+    assert python_workflow.count("secrets.PYPI_API_TOKEN") == 1
+    assert "password: ${{ secrets.TEST_PYPI_API_TOKEN }}" in test_publish_step
+    assert "password: ${{ secrets.PYPI_API_TOKEN }}" in final_publish_step
+    non_publish_steps = python_workflow.replace(test_publish_step, "").replace(
+        final_publish_step, ""
+    )
+    assert "secrets.TEST_PYPI_API_TOKEN" not in non_publish_steps
+    assert "secrets.PYPI_API_TOKEN" not in non_publish_steps
+
+
+def test_final_publication_preflight_binds_source_to_final_tag_commit():
+    release = workflow("release.yml")
+    final_preflight = job(
+        release, "final-publication-preflight", "rust-final-publish"
+    )
+
+    assert "python3 tools/verify_source_archive.py verify \\" in final_preflight
+    assert "--repository . \\" in final_preflight
+    assert '--commit "$GITHUB_SHA" \\' in final_preflight
+    assert '--prefix "paimon-mosaic-${version}/" \\' in final_preflight
+    assert '--archive "$release_dir/$archive"' in final_preflight
+
+
+def test_release_network_calls_have_bounded_timeouts():
+    release = workflow("release.yml")
+    assert "timeout-minutes: 30" in job(release, "tag-validation", "preflight")
+    assert "timeout-minutes: 30" in job(
+        release, "final-publication-preflight", "rust-final-publish"
+    )
+
+    rust = workflow("release-rust.yml")
+    assert "timeout-minutes: 30" in job(rust, "verify", None)
+
+    python_publish = workflow("release-python-publish.yml")
+    assert "timeout-minutes: 30" in job(python_publish, "publish", None)
+
+    python_wheels = workflow("release-python.yml")
+    assert "timeout-minutes: 60" in job(
+        python_wheels, "wheels-linux", "wheels-macos"
+    )
+
+    ci = workflow("ci.yml")
+    assert "timeout-minutes: 30" in job(ci, "cpp-test", "java-test")
+
+    workflows_with_curl = {}
+    for path in sorted((ROOT / ".github/workflows").glob("*.y*ml")):
+        contents = path.read_text(encoding="utf-8")
+        commands = curl_commands(contents)
+        if commands:
+            workflows_with_curl[path.name] = commands
+
+    assert set(workflows_with_curl) == {
+        "ci.yml",
+        "release-python-publish.yml",
+        "release-python.yml",
+        "release-rust.yml",
+        "release.yml",
+    }
+    for commands in workflows_with_curl.values():
+        for command in commands:
+            assert "--connect-timeout 10 \\" in command, command
+            assert "--max-time 300 \\" in command, command
+            assert "--retry 3 \\" in command, command
+            assert "--retry-connrefused \\" in command, command
 
 
 def test_crates_publish_does_not_rebuild_with_registry_credentials():

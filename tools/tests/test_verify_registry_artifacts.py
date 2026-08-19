@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -62,6 +63,15 @@ def crates_release(crate, *, checksum=None):
             "checksum": checksum or crate.sha256,
         }
     }
+
+
+def run_main(monkeypatch, *args):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["verify_registry_artifacts.py", *map(str, args)],
+    )
+    return verifier.main()
 
 
 def test_pypi_matching_subset_stages_only_missing_wheels(tmp_path):
@@ -262,6 +272,145 @@ def test_github_output_records_publish_decision(tmp_path):
     assert output.read_text(encoding="utf-8").splitlines() == [
         "publish=true",
         "missing_count=2",
+        "publish=false",
+        "missing_count=0",
+    ]
+
+
+def test_pypi_cli_records_partial_and_complete_publish_decisions(
+    tmp_path, monkeypatch
+):
+    first = create_artifact(
+        tmp_path,
+        "paimon_mosaic-0.3.0-py3-none-manylinux_2_28_x86_64.whl",
+        b"x86 wheel",
+    )
+    second = create_artifact(
+        tmp_path,
+        "paimon_mosaic-0.3.0-py3-none-manylinux_2_28_aarch64.whl",
+        b"arm wheel",
+    )
+    release_json = tmp_path / "release.json"
+    github_output = tmp_path / "github-output"
+    upload = tmp_path / "upload"
+
+    release_json.write_text(
+        json.dumps(pypi_release(first)),
+        encoding="utf-8",
+    )
+    assert (
+        run_main(
+            monkeypatch,
+            "pypi",
+            "--project",
+            PROJECT,
+            "--version",
+            VERSION,
+            "--wheel",
+            first.path,
+            second.path,
+            "--upload-directory",
+            upload,
+            "--release-json",
+            release_json,
+            "--github-output",
+            github_output,
+        )
+        == 0
+    )
+    assert github_output.read_text(encoding="utf-8").splitlines() == [
+        "publish=true",
+        "missing_count=1",
+    ]
+    assert [path.name for path in upload.iterdir()] == [second.filename]
+
+    github_output.unlink()
+    release_json.write_text(
+        json.dumps(pypi_release(first, second)),
+        encoding="utf-8",
+    )
+    assert (
+        run_main(
+            monkeypatch,
+            "pypi",
+            "--project",
+            PROJECT,
+            "--version",
+            VERSION,
+            "--wheel",
+            first.path,
+            second.path,
+            "--upload-directory",
+            upload,
+            "--release-json",
+            release_json,
+            "--github-output",
+            github_output,
+        )
+        == 0
+    )
+    assert github_output.read_text(encoding="utf-8").splitlines() == [
+        "publish=false",
+        "missing_count=0",
+    ]
+    assert list(upload.iterdir()) == []
+
+
+def test_crates_io_cli_records_absent_and_matching_publish_decisions(
+    tmp_path, monkeypatch
+):
+    crate = create_artifact(
+        tmp_path,
+        "paimon-mosaic-core-0.3.0.crate",
+        b"crate",
+    )
+    release_json = tmp_path / "release.json"
+    github_output = tmp_path / "github-output"
+
+    assert (
+        run_main(
+            monkeypatch,
+            "crates-io",
+            "--crate-name",
+            "paimon-mosaic-core",
+            "--version",
+            VERSION,
+            "--artifact",
+            crate.path,
+            "--version-not-found",
+            "--github-output",
+            github_output,
+        )
+        == 0
+    )
+    assert github_output.read_text(encoding="utf-8").splitlines() == [
+        "publish=true",
+        "missing_count=1",
+    ]
+
+    github_output.unlink()
+    release_json.write_text(
+        json.dumps(crates_release(crate)),
+        encoding="utf-8",
+    )
+    assert (
+        run_main(
+            monkeypatch,
+            "crates-io",
+            "--crate-name",
+            "paimon-mosaic-core",
+            "--version",
+            VERSION,
+            "--artifact",
+            crate.path,
+            "--version-json",
+            release_json,
+            "--github-output",
+            github_output,
+        )
+        == 0
+    )
+    assert github_output.read_text(encoding="utf-8").splitlines() == [
         "publish=false",
         "missing_count=0",
     ]

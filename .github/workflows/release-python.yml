@@ -37,6 +37,7 @@ permissions:
 jobs:
   wheels-linux:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -81,8 +82,20 @@ jobs:
             from mosaic import _ffi;
             options = _ffi.lib.mosaic_writer_options_default();
             print('Loaded wheel native library, compression=', options.compression)"
-          CIBW_BEFORE_ALL_LINUX: >
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none &&
+          CIBW_BEFORE_ALL_LINUX: |
+            curl \
+              --proto '=https' \
+              --tlsv1.2 \
+              --fail \
+              --location \
+              --retry 3 \
+              --retry-connrefused \
+              --connect-timeout 10 \
+              --max-time 300 \
+              --show-error \
+              --silent \
+              https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain none &&
             source $HOME/.cargo/env &&
             rustc --version &&
             cargo --version &&

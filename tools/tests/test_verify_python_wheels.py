@@ -17,6 +17,7 @@ import base64
 import csv
 import hashlib
 import io
+import shutil
 import stat
 import sys
 import warnings
@@ -147,7 +148,7 @@ def build_wheel(
 
     root = tmp_path / "root"
     legal_root = root / "python/licenses" / target
-    legal_root.mkdir(parents=True)
+    legal_root.mkdir(parents=True, exist_ok=True)
     for name, content in legal_files.items():
         (legal_root / name).write_bytes(content)
     return wheel, root
@@ -237,6 +238,50 @@ def test_verify_wheel_accepts_unrecorded_directory_entries(tmp_path, monkeypatch
     monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
 
     assert verifier.verify_wheel(wheel, root) == "aarch64-unknown-linux-gnu"
+
+
+def test_main_requires_exactly_one_wheel_per_release_target(
+    tmp_path, monkeypatch
+):
+    wheels = []
+    root = None
+    for target, platform_tag in SUPPORTED_WHEELS:
+        wheel, root = build_wheel(
+            tmp_path,
+            target=target,
+            platform_tag=platform_tag,
+        )
+        wheels.append(wheel)
+
+    monkeypatch.setattr(verifier, "repository_root", lambda: root)
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["verify_python_wheels.py", "--require-all-targets", *map(str, wheels)],
+    )
+    assert verifier.main() == 0
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["verify_python_wheels.py", "--require-all-targets", *map(str, wheels[:-1])],
+    )
+    assert verifier.main() == 1
+
+    duplicate = tmp_path / wheels[0].name.replace("-py3-", "-1-py3-")
+    shutil.copy2(wheels[0], duplicate)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "verify_python_wheels.py",
+            "--require-all-targets",
+            *map(str, [*wheels, duplicate]),
+        ],
+    )
+    assert verifier.main() == 1
 
 
 @pytest.mark.parametrize(

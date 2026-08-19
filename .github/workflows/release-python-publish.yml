@@ -48,6 +48,7 @@ jobs:
     name: Publish to PyPI
     if: inputs.publish_authorized == true && github.event_name == 'push' && github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
@@ -65,6 +66,9 @@ jobs:
             --fail \
             --location \
             --retry 3 \
+            --retry-connrefused \
+            --connect-timeout 10 \
+            --max-time 300 \
             --show-error \
             --silent \
             https://downloads.apache.org/paimon/KEYS \
@@ -146,6 +150,9 @@ jobs:
               --tlsv1.2 \
               --location \
               --retry 3 \
+              --retry-connrefused \
+              --connect-timeout 10 \
+              --max-time 300 \
               --show-error \
               --silent \
               --output "$response" \
@@ -192,6 +199,9 @@ jobs:
               --tlsv1.2 \
               --location \
               --retry 3 \
+              --retry-connrefused \
+              --connect-timeout 10 \
+              --max-time 300 \
               --show-error \
               --silent \
               --output "$response" \

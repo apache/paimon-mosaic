@@ -23,6 +23,7 @@ import tempfile
 import unittest
 import warnings
 import xml.etree.ElementTree as ET
+from collections.abc import Iterable
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -35,6 +36,20 @@ REPOSITORY_ROOT = TOOLS_DIRECTORY.parent
 sys.path.insert(0, str(TOOLS_DIRECTORY))
 
 import verify_java_jars  # noqa: E402
+
+
+EXPECTED_TARGETS = (
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+)
+EXPECTED_NATIVE_ENTRIES = {
+    "native/linux/x86_64/libpaimon_mosaic_jni.so": "x86_64-unknown-linux-gnu",
+    "native/linux/aarch64/libpaimon_mosaic_jni.so": "aarch64-unknown-linux-gnu",
+    "native/macos/aarch64/libpaimon_mosaic_jni.dylib": "aarch64-apple-darwin",
+    "native/windows/x86_64/paimon_mosaic_jni.dll": "x86_64-pc-windows-msvc",
+}
 
 
 class VerifyJavaJarsTest(unittest.TestCase):
@@ -70,6 +85,36 @@ class VerifyJavaJarsTest(unittest.TestCase):
             ("META-INF/NOTICE", (self.root / "NOTICE").read_bytes()),
             *extra_entries,
         ]
+
+    def prepare_main_jar_fixture(
+        self, native_entries: Iterable[str]
+    ) -> list[tuple[str, bytes]]:
+        binary_resources = self.root / "java/src/main/binary-resources/META-INF"
+        report_paths = [
+            f"META-INF/licenses/{target}/THIRD-PARTY-LICENSES.html"
+            for target in EXPECTED_TARGETS
+        ]
+        license_contents = "\n".join(report_paths).encode()
+        (binary_resources / "LICENSE").parent.mkdir(parents=True, exist_ok=True)
+        (binary_resources / "LICENSE").write_bytes(license_contents)
+        (binary_resources / "NOTICE").write_bytes(b"Apache Arrow\n")
+
+        entries = [
+            ("META-INF/LICENSE", license_contents),
+            ("META-INF/NOTICE", b"Apache Arrow\n"),
+        ]
+        for target, report_path in zip(EXPECTED_TARGETS, report_paths):
+            report_contents = (
+                f"{target}\nFor Zstandard software\nApache Arrow\n".encode()
+            )
+            report_source = binary_resources / report_path.removeprefix("META-INF/")
+            report_source.parent.mkdir(parents=True, exist_ok=True)
+            report_source.write_bytes(report_contents)
+            entries.append((report_path, report_contents))
+        entries.extend(
+            (native_entry, native_entry.encode()) for native_entry in native_entries
+        )
+        return entries
 
     def test_rejects_unsafe_entry_paths(self) -> None:
         symlink = ZipInfo("link")
@@ -180,31 +225,9 @@ class VerifyJavaJarsTest(unittest.TestCase):
             self.verify_classifier(malformed)
 
     def test_main_jar_keeps_target_report_and_native_validation(self) -> None:
-        binary_resources = self.root / "java/src/main/binary-resources/META-INF"
-        report_paths = [
-            f"META-INF/licenses/{target}/THIRD-PARTY-LICENSES.html"
-            for target in verify_java_jars.TARGETS
-        ]
-        license_contents = "\n".join(report_paths).encode()
-        (binary_resources / "LICENSE").parent.mkdir(parents=True)
-        (binary_resources / "LICENSE").write_bytes(license_contents)
-        (binary_resources / "NOTICE").write_bytes(b"Apache Arrow\n")
-
-        jar_entries = [
-            ("META-INF/LICENSE", license_contents),
-            ("META-INF/NOTICE", b"Apache Arrow\n"),
-        ]
-        for target, report_path in zip(verify_java_jars.TARGETS, report_paths):
-            report_contents = (
-                f"{target}\nFor Zstandard software\nApache Arrow\n".encode()
-            )
-            report_source = binary_resources / report_path.removeprefix("META-INF/")
-            report_source.parent.mkdir(parents=True, exist_ok=True)
-            report_source.write_bytes(report_contents)
-            jar_entries.append((report_path, report_contents))
-
-        for native_entry in verify_java_jars.NATIVE_ENTRIES:
-            jar_entries.append((native_entry, native_entry.encode()))
+        self.assertEqual(EXPECTED_TARGETS, verify_java_jars.TARGETS)
+        self.assertEqual(EXPECTED_NATIVE_ENTRIES, verify_java_jars.NATIVE_ENTRIES)
+        jar_entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
         path = self.write_jar("main.jar", jar_entries)
 
         with mock.patch.object(
@@ -216,13 +239,13 @@ class VerifyJavaJarsTest(unittest.TestCase):
                 [
                     mock.call(native_entry.encode(), native_target, native_entry)
                     for native_entry, native_target in (
-                        verify_java_jars.NATIVE_ENTRIES.items()
+                        EXPECTED_NATIVE_ENTRIES.items()
                     )
                 ],
                 any_order=True,
             )
             self.assertEqual(
-                len(verify_java_jars.NATIVE_ENTRIES), verify_native.call_count
+                len(EXPECTED_NATIVE_ENTRIES), verify_native.call_count
             )
 
             injected = self.write_jar(
@@ -235,6 +258,27 @@ class VerifyJavaJarsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unexpected native"):
                 with redirect_stdout(StringIO()):
                     verify_java_jars.verify_main_jar(injected, self.root, True)
+
+    def test_release_main_jar_requires_all_declared_natives(self) -> None:
+        for index, omitted_native in enumerate(EXPECTED_NATIVE_ENTRIES):
+            with self.subTest(omitted_native=omitted_native):
+                jar_entries = self.prepare_main_jar_fixture(
+                    [
+                        native_entry
+                        for native_entry in EXPECTED_NATIVE_ENTRIES
+                        if native_entry != omitted_native
+                    ]
+                )
+                path = self.write_jar(f"missing-native-{index}.jar", jar_entries)
+
+                with mock.patch.object(verify_java_jars, "verify_native_target"):
+                    with redirect_stdout(StringIO()):
+                        verify_java_jars.verify_main_jar(path, self.root, False)
+                    with self.assertRaisesRegex(
+                        ValueError, "differ from the four declared targets"
+                    ):
+                        with redirect_stdout(StringIO()):
+                            verify_java_jars.verify_main_jar(path, self.root, True)
 
     def test_release_profile_verifies_jars_before_gpg_signing(self) -> None:
         namespace = {"m": "http://maven.apache.org/POM/4.0.0"}

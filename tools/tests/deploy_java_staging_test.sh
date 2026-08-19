@@ -110,8 +110,11 @@ set -o nounset
 set -o pipefail
 
 [[ "${GH_HOST:-}" == "github.com" ]]
+expected_repository=${FAKE_EXPECTED_REPOSITORY:-apache/paimon-mosaic}
+expected_run_id=${FAKE_EXPECTED_RUN_ID:-42}
 
 if [[ "$1" == "api" && "$2" == */actions/runs/* ]]; then
+  [[ "$2" == "repos/$expected_repository/actions/runs/$expected_run_id" ]]
   printf 'status=completed\nconclusion=success\nhead_sha=%s\nhead_branch=%s\nworkflow_name=Release\nworkflow_path=%s\nevent=push\n' \
     "${FAKE_RUN_SHA:-$(git -C "$FAKE_REPO" rev-parse "${FAKE_RUN_REF}^{commit}")}" \
     "$FAKE_RUN_REF" \
@@ -121,15 +124,19 @@ fi
 
 if [[ "$1 $2" == "run download" ]]; then
   printf 'args=%s\n' "$*" >> "${ARTIFACT_DOWNLOAD_LOG:-/dev/null}"
+  [[ "$3" == "$expected_run_id" ]]
   destination=
   artifact=
+  repository=
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --repo) repository=$2; shift 2 ;;
       --name) artifact=$2; shift 2 ;;
       --dir) destination=$2; shift 2 ;;
       *) shift ;;
     esac
   done
+  [[ "$repository" == "$expected_repository" ]]
   [[ "$artifact" == "java-release-native-inputs" ]]
   mkdir -p \
     "$destination/linux/x86_64" \
@@ -247,6 +254,8 @@ run_script() {
       FAKE_REPO="$FIXTURE_DIR" \
       FAKE_RUN_REF="${FAKE_RUN_REF:-v0.3.0-rc1}" \
       FAKE_RUN_SHA="${FAKE_RUN_SHA:-}" \
+      FAKE_EXPECTED_REPOSITORY="${FAKE_EXPECTED_REPOSITORY:-apache/paimon-mosaic}" \
+      FAKE_EXPECTED_RUN_ID="${FAKE_EXPECTED_RUN_ID:-42}" \
       FAKE_WORKFLOW_PATH="${FAKE_WORKFLOW_PATH:-}" \
       FAKE_TAG_VALIDATION_RESULT="${FAKE_TAG_VALIDATION_RESULT:-}" \
       FAKE_GPG_FINGERPRINT="${FAKE_GPG_FINGERPRINT:-}" \
@@ -259,7 +268,7 @@ run_script() {
       "$BASH" ./tools/deploy_java_staging.sh \
         --release-version 0.3.0 \
         --rc 1 \
-        --run-id 42 \
+        --run-id "${RUN_ID_UNDER_TEST:-42}" \
         "$@"
   )
 }
@@ -305,6 +314,17 @@ test_workflow_run_sha_must_match_tag() {
   fi
   assert_contains "$OUTPUT_LOG" "does not match v0.3.0-rc1"
   assert_maven_not_invoked
+}
+
+test_artifact_download_uses_validated_run_and_repository() {
+  new_fixture
+  FAKE_EXPECTED_REPOSITORY=example/fork \
+    FAKE_EXPECTED_RUN_ID=314159 \
+    RUN_ID_UNDER_TEST=314159 \
+    run_script --repo example/fork --dry-run > "$OUTPUT_LOG" 2>&1
+
+  assert_contains "$ARTIFACT_DOWNLOAD_LOG" \
+    "args=run download 314159 --repo example/fork"
 }
 
 test_real_deploy_requires_official_repository_run() {
@@ -517,6 +537,7 @@ run_test test_dry_run_builds_exact_tag_in_isolated_directory
 run_test test_run_tests_omits_skip_flag
 run_test test_missing_option_value_never_deploys
 run_test test_workflow_run_sha_must_match_tag
+run_test test_artifact_download_uses_validated_run_and_repository
 run_test test_real_deploy_requires_official_repository_run
 run_test test_git_index_flags_are_rejected
 run_test test_dirty_caller_worktree_is_rejected

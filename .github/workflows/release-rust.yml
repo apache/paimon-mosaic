@@ -45,6 +45,7 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -77,6 +78,9 @@ jobs:
             --fail \
             --location \
             --retry 3 \
+            --retry-connrefused \
+            --connect-timeout 10 \
+            --max-time 300 \
             --show-error \
             --silent \
             https://downloads.apache.org/paimon/KEYS \
@@ -136,6 +140,9 @@ jobs:
               --tlsv1.2 \
               --location \
               --retry 3 \
+              --retry-connrefused \
+              --connect-timeout 10 \
+              --max-time 300 \
               --show-error \
               --silent \
               --user-agent 'Apache Paimon Mosaic release workflow' \
