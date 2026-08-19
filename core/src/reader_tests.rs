@@ -815,6 +815,67 @@ fn write_and_read(
     (reader, data)
 }
 
+#[test]
+fn test_nullable_const_timestamp_nanos_boundaries_roundtrip() {
+    use crate::reader::Encoding;
+
+    let columns = vec![
+        (
+            "ts_min".to_string(),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+        (
+            "ts_max".to_string(),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ];
+    let (min_millis, min_nanos) = crate::types::ns_to_millis_nanos(i64::MIN);
+    let (max_millis, max_nanos) = crate::types::ns_to_millis_nanos(i64::MAX);
+    let rows: Vec<Vec<Value>> = (0..200)
+        .map(|row| {
+            if row < 25 {
+                vec![
+                    Value::TimestampNanos {
+                        millis: min_millis,
+                        nanos_of_milli: min_nanos,
+                    },
+                    Value::TimestampNanos {
+                        millis: max_millis,
+                        nanos_of_milli: max_nanos,
+                    },
+                ]
+            } else {
+                vec![Value::Null, Value::Null]
+            }
+        })
+        .collect();
+
+    let (reader, _) = write_and_read_paged(columns, &rows);
+    assert!(reader
+        .page_infos(0)
+        .unwrap()
+        .iter()
+        .all(|info| info.encoding == Encoding::Const));
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+    for (column, expected) in [(0, i64::MIN), (1, i64::MAX)] {
+        let values = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        assert_eq!(values.len(), 200);
+        assert_eq!(values.null_count(), 175);
+        for row in 0..200 {
+            if !values.is_null(row) {
+                assert_eq!(values.value(row), expected, "column {column}, row {row}");
+            }
+        }
+    }
+}
+
 /// Mirrors Paimon's testSchemaEvolutionTypeWidening.
 /// Writes with narrow types (INT, FLOAT, TINYINT) and verifies the reader
 /// produces the exact values that a higher layer can widen to BIGINT/DOUBLE/INT.
@@ -1739,6 +1800,198 @@ fn test_const_encoding_with_nulls() {
             assert_eq!(vs.value(i), 77);
         }
     }
+}
+
+fn assert_const_encoding_with_nulls_all_primitive_types(batch: &RecordBatch, num_rows: usize) {
+    let bools = batch_col_bool(batch, "bool");
+    let tiny = batch_col_i8(batch, "tiny");
+    let small = batch_col_i16(batch, "small");
+    let ints = batch_col_i32(batch, "int");
+    let big = batch_col_i64(batch, "big");
+    let floats = batch_col_f32(batch, "float");
+    let doubles = batch_col_f64(batch, "double");
+    let strings = batch_col_string(batch, "string");
+    assert_eq!(
+        strings.value_data().len(),
+        18 * "constant".len(),
+        "variable-width CONST values should remain compact at null positions"
+    );
+    for i in 0..num_rows {
+        if i % 4 == 0 {
+            assert!(bools.is_null(i));
+            assert!(tiny.is_null(i));
+            assert!(small.is_null(i));
+            assert!(ints.is_null(i));
+            assert!(big.is_null(i));
+            assert!(floats.is_null(i));
+            assert!(doubles.is_null(i));
+            assert!(strings.is_null(i));
+        } else {
+            assert!(bools.value(i));
+            assert_eq!(tiny.value(i), -7);
+            assert_eq!(small.value(i), 1234);
+            assert_eq!(ints.value(i), -56789);
+            assert_eq!(big.value(i), 9_876_543_210);
+            assert_eq!(floats.value(i), 1.25);
+            assert_eq!(doubles.value(i), -12.5);
+            assert_eq!(strings.value(i), "constant");
+        }
+    }
+}
+
+#[test]
+fn test_const_encoding_with_nulls_all_primitive_types() {
+    let columns = vec![
+        ("bool".to_string(), DataType::Boolean, true),
+        ("tiny".to_string(), DataType::Int8, true),
+        ("small".to_string(), DataType::Int16, true),
+        ("int".to_string(), DataType::Int32, true),
+        ("big".to_string(), DataType::Int64, true),
+        ("float".to_string(), DataType::Float32, true),
+        ("double".to_string(), DataType::Float64, true),
+        ("string".to_string(), DataType::Utf8, true),
+    ];
+    let rows: Vec<Vec<Value>> = (0..24)
+        .map(|i| {
+            if i % 4 == 0 {
+                vec![Value::Null; columns.len()]
+            } else {
+                vec![
+                    Value::Boolean(true),
+                    Value::TinyInt(-7),
+                    Value::SmallInt(1234),
+                    Value::Integer(-56789),
+                    Value::BigInt(9_876_543_210),
+                    Value::Float(1.25),
+                    Value::Double(-12.5),
+                    Value::String(b"constant".to_vec()),
+                ]
+            }
+        })
+        .collect();
+
+    let (reader, _) = write_and_read(columns.clone(), &rows);
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+    assert_const_encoding_with_nulls_all_primitive_types(&batch, rows.len());
+
+    let (reader, _) = write_and_read_paged(columns, &rows);
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+    assert_const_encoding_with_nulls_all_primitive_types(&batch, rows.len());
+}
+
+fn assert_sparse_const_encoding_with_nulls(batch: &RecordBatch, non_null_rows: &[usize]) {
+    let bools = batch_col_bool(batch, "bool");
+    let tiny = batch_col_i8(batch, "tiny");
+    let small = batch_col_i16(batch, "small");
+    let ints = batch_col_i32(batch, "int");
+    let big = batch_col_i64(batch, "big");
+    let floats = batch_col_f32(batch, "float");
+    let doubles = batch_col_f64(batch, "double");
+    let timestamp_nanos = batch
+        .column_by_name("timestamp_nanos")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    let expected_timestamp_nanos =
+        crate::types::millis_nanos_to_ns(1_700_000_000_000, 123_456).unwrap();
+
+    for i in 0..batch.num_rows() {
+        if non_null_rows.contains(&i) {
+            assert!(!bools.is_null(i));
+            assert!(!tiny.is_null(i));
+            assert!(!small.is_null(i));
+            assert!(!ints.is_null(i));
+            assert!(!big.is_null(i));
+            assert!(!floats.is_null(i));
+            assert!(!doubles.is_null(i));
+            assert!(!timestamp_nanos.is_null(i));
+            assert!(bools.value(i));
+            assert_eq!(tiny.value(i), -7);
+            assert_eq!(small.value(i), 1234);
+            assert_eq!(ints.value(i), -56_789);
+            assert_eq!(big.value(i), 9_876_543_210);
+            assert_eq!(floats.value(i), 1.25);
+            assert_eq!(doubles.value(i), -12.5);
+            assert_eq!(timestamp_nanos.value(i), expected_timestamp_nanos);
+        } else {
+            assert!(bools.is_null(i));
+            assert!(tiny.is_null(i));
+            assert!(small.is_null(i));
+            assert!(ints.is_null(i));
+            assert!(big.is_null(i));
+            assert!(floats.is_null(i));
+            assert!(doubles.is_null(i));
+            assert!(timestamp_nanos.is_null(i));
+        }
+    }
+}
+
+#[test]
+fn test_sparse_const_encoding_with_nulls() {
+    use crate::reader::Encoding;
+
+    let columns = vec![
+        ("bool".to_string(), DataType::Boolean, true),
+        ("tiny".to_string(), DataType::Int8, true),
+        ("small".to_string(), DataType::Int16, true),
+        ("int".to_string(), DataType::Int32, true),
+        ("big".to_string(), DataType::Int64, true),
+        ("float".to_string(), DataType::Float32, true),
+        ("double".to_string(), DataType::Float64, true),
+        (
+            "timestamp_nanos".to_string(),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ];
+    let non_null_rows = [0, 127, 255];
+    let rows: Vec<Vec<Value>> = (0..256)
+        .map(|i| {
+            if non_null_rows.contains(&i) {
+                vec![
+                    Value::Boolean(true),
+                    Value::TinyInt(-7),
+                    Value::SmallInt(1234),
+                    Value::Integer(-56_789),
+                    Value::BigInt(9_876_543_210),
+                    Value::Float(1.25),
+                    Value::Double(-12.5),
+                    Value::TimestampNanos {
+                        millis: 1_700_000_000_000,
+                        nanos_of_milli: 123_456,
+                    },
+                ]
+            } else {
+                vec![Value::Null; columns.len()]
+            }
+        })
+        .collect();
+    assert!(non_null_rows.len() < rows.len().div_ceil(8));
+
+    let (reader, _) = write_and_read(columns.clone(), &rows);
+    assert!(reader
+        .page_infos(0)
+        .unwrap()
+        .iter()
+        .all(|info| info.encoding == Encoding::Const));
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+    assert_eq!(batch.num_rows(), rows.len());
+    assert_sparse_const_encoding_with_nulls(&batch, &non_null_rows);
+
+    let (reader, _) = write_and_read_paged(columns, &rows);
+    assert!(reader
+        .page_infos(0)
+        .unwrap()
+        .iter()
+        .all(|info| info.encoding == Encoding::Const));
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+    assert_eq!(batch.num_rows(), rows.len());
+    assert_sparse_const_encoding_with_nulls(&batch, &non_null_rows);
 }
 
 #[test]
