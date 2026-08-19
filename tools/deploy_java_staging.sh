@@ -42,6 +42,7 @@ KEYS_FILE=
 STAGING_DESCRIPTION=
 BUILD_ROOT=
 GITHUB_HOST=github.com
+RELEASE_WORKFLOW_PATH=.github/workflows/release.yml
 
 usage() {
   cat <<'EOF'
@@ -303,13 +304,21 @@ validate_github_run() {
   local head_sha=
   local head_branch=
   local workflow_name=
+  local workflow_path=
   local event=
 
   output=$(
-    gh_exact run view "$RUN_ID" \
-      --repo "$REPOSITORY" \
-      --json status,conclusion,headSha,headBranch,workflowName,event \
-      --template '{{printf "status=%s\nconclusion=%s\nhead_sha=%s\nhead_branch=%s\nworkflow_name=%s\nevent=%s\n" .status .conclusion .headSha (or .headBranch "") (or .workflowName "") (or .event "")}}'
+    gh_exact api \
+      "repos/$REPOSITORY/actions/runs/$RUN_ID" \
+      --jq '[
+        "status=\(.status // "")",
+        "conclusion=\(.conclusion // "")",
+        "head_sha=\(.head_sha // "")",
+        "head_branch=\(.head_branch // "")",
+        "workflow_name=\(.name // "")",
+        "workflow_path=\(.path // "")",
+        "event=\(.event // "")"
+      ] | .[]'
   )
   while IFS='=' read -r key value; do
     case "$key" in
@@ -318,6 +327,7 @@ validate_github_run() {
       head_sha) head_sha=$value ;;
       head_branch) head_branch=$value ;;
       workflow_name) workflow_name=$value ;;
+      workflow_path) workflow_path=$value ;;
       event) event=$value ;;
       *)
         echo "Unexpected GitHub Actions run field: $key" >&2
@@ -334,6 +344,12 @@ EOF
   fi
   if [[ "$workflow_name" != Release || "$event" != push ]]; then
     echo "GitHub Actions run $RUN_ID is not a Release tag-push run." >&2
+    exit 1
+  fi
+  if [[ "$workflow_path" != "$RELEASE_WORKFLOW_PATH" ]]; then
+    echo "GitHub Actions run $RUN_ID does not use the canonical Release workflow." >&2
+    echo "workflow path: $workflow_path" >&2
+    echo "expected:      $RELEASE_WORKFLOW_PATH" >&2
     exit 1
   fi
   if [[ "$head_branch" != "$TAG" || "$head_sha" != "$TAG_COMMIT" ]]; then
@@ -407,6 +423,11 @@ validate_signing_key() {
 
 if [[ "$DRY_RUN" != true ]]; then
   validate_signing_key
+  "$PYTHON" "$REPO_DIR/tools/validate_release_tag.py" \
+    "$TAG" \
+    --keys-file "$KEYS_FILE" \
+    --repository "$REPO_DIR" \
+    --expected-commit "$TAG_COMMIT"
 fi
 
 ARCHIVE_PREFIX="paimon-mosaic-${RELEASE_VERSION}"
@@ -504,6 +525,13 @@ else
     clean deploy -Prelease
     -Dexec.skip=false
     -Dgpg.skip=false
+    -DskipLocalStaging=false
+    -DskipNexusStagingDeployMojo=false
+    -DskipRemoteStaging=false
+    -DskipStaging=false
+    -DskipStagingRepositoryClose=false
+    -Dmaven.wagon.http.ssl.allowall=false
+    -Dmaven.wagon.http.ssl.insecure=false
     "-DstagingDescription=$STAGING_DESCRIPTION"
   )
 fi

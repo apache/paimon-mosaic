@@ -70,10 +70,19 @@ assert_maven_not_invoked() {
   fi
 }
 
+assert_artifact_download_not_invoked() {
+  if [[ -s "$ARTIFACT_DOWNLOAD_LOG" ]]; then
+    sed -n '1,200p' "$ARTIFACT_DOWNLOAD_LOG" >&2
+    fail "release artifacts must not be downloaded"
+  fi
+}
+
 new_fixture() {
   FIXTURE_DIR=$(mktemp -d "$TEST_ROOT/fixture.XXXXXX")
   OUTPUT_LOG="$TEST_ROOT/output.$TEST_COUNT.log"
   MAVEN_LOG="$TEST_ROOT/maven.$TEST_COUNT.log"
+  TAG_VALIDATION_LOG="$TEST_ROOT/tag-validation.$TEST_COUNT.log"
+  ARTIFACT_DOWNLOAD_LOG="$TEST_ROOT/artifact-download.$TEST_COUNT.log"
   TEMP_ROOT="$TEST_ROOT/tmp.$TEST_COUNT"
   mkdir -p \
     "$FIXTURE_DIR/fake-bin" \
@@ -83,6 +92,7 @@ new_fixture() {
 
   cp "$TOOLS_DIR/deploy_java_staging.sh" "$FIXTURE_DIR/tools/"
   cp "$TOOLS_DIR/native_binary.py" "$FIXTURE_DIR/tools/"
+  cp "$TOOLS_DIR/validate_release_tag.py" "$FIXTURE_DIR/tools/"
   cp "$TOOLS_DIR/verify_java_jars.py" "$FIXTURE_DIR/tools/"
   chmod +x "$FIXTURE_DIR/tools/deploy_java_staging.sh"
 
@@ -101,14 +111,16 @@ set -o pipefail
 
 [[ "${GH_HOST:-}" == "github.com" ]]
 
-if [[ "$1 $2" == "run view" ]]; then
-  printf 'status=completed\nconclusion=success\nhead_sha=%s\nhead_branch=%s\nworkflow_name=Release\nevent=push\n' \
+if [[ "$1" == "api" && "$2" == */actions/runs/* ]]; then
+  printf 'status=completed\nconclusion=success\nhead_sha=%s\nhead_branch=%s\nworkflow_name=Release\nworkflow_path=%s\nevent=push\n' \
     "${FAKE_RUN_SHA:-$(git -C "$FAKE_REPO" rev-parse "${FAKE_RUN_REF}^{commit}")}" \
-    "$FAKE_RUN_REF"
+    "$FAKE_RUN_REF" \
+    "${FAKE_WORKFLOW_PATH:-.github/workflows/release.yml}"
   exit 0
 fi
 
 if [[ "$1 $2" == "run download" ]]; then
+  printf 'args=%s\n' "$*" >> "${ARTIFACT_DOWNLOAD_LOG:-/dev/null}"
   destination=
   artifact=
   while [[ $# -gt 0 ]]; do
@@ -145,6 +157,7 @@ set -o pipefail
   printf 'args=%s\n' "$*"
   printf 'maven-opts=%s\n' "${MAVEN_OPTS:-}"
   printf 'maven-args=%s\n' "${MAVEN_ARGS:-}"
+  printf 'java-tool-options=%s\n' "${JAVA_TOOL_OPTIONS:-}"
   sed -n 's#.*<version>\([^<]*\)</version>.*#pom-version=\1#p' pom.xml | tail -n1
 } >> "$FAKE_MVN_LOG"
 
@@ -166,6 +179,15 @@ EOF
 set -o errexit
 set -o nounset
 set -o pipefail
+
+if [[ $# -gt 0 && "$1" == */validate_release_tag.py ]]; then
+  printf 'args=%s\n' "$*" >> "$TAG_VALIDATION_LOG"
+  if [[ "${FAKE_TAG_VALIDATION_RESULT:-success}" != success ]]; then
+    echo "fake release tag validation failed" >&2
+    exit 1
+  fi
+  exit 0
+fi
 
 script=$(cat)
 if grep -q "xml.etree.ElementTree" <<< "$script"; then
@@ -225,9 +247,13 @@ run_script() {
       FAKE_REPO="$FIXTURE_DIR" \
       FAKE_RUN_REF="${FAKE_RUN_REF:-v0.3.0-rc1}" \
       FAKE_RUN_SHA="${FAKE_RUN_SHA:-}" \
+      FAKE_WORKFLOW_PATH="${FAKE_WORKFLOW_PATH:-}" \
+      FAKE_TAG_VALIDATION_RESULT="${FAKE_TAG_VALIDATION_RESULT:-}" \
       FAKE_GPG_FINGERPRINT="${FAKE_GPG_FINGERPRINT:-}" \
       FAKE_KEYS_FINGERPRINT="${FAKE_KEYS_FINGERPRINT:-}" \
       FAKE_SIGNATURE_FINGERPRINT="${FAKE_SIGNATURE_FINGERPRINT:-}" \
+      ARTIFACT_DOWNLOAD_LOG="$ARTIFACT_DOWNLOAD_LOG" \
+      TAG_VALIDATION_LOG="$TAG_VALIDATION_LOG" \
       GH_HOST=enterprise.example.invalid \
       TMPDIR="$TEMP_ROOT" \
       "$BASH" ./tools/deploy_java_staging.sh \
@@ -247,6 +273,7 @@ test_dry_run_builds_exact_tag_in_isolated_directory() {
   assert_contains "$MAVEN_LOG" "-DskipTests"
   assert_contains "$MAVEN_LOG" "pom-version=0.3.0"
   assert_not_contains "$MAVEN_LOG" " deploy"
+  assert_not_contains "$TAG_VALIDATION_LOG" "validate_release_tag.py"
   if grep -Fq "pwd=$FIXTURE_DIR/java" "$MAVEN_LOG"; then
     fail "Maven used the caller's worktree instead of an isolated tag archive"
   fi
@@ -371,24 +398,74 @@ test_real_deploy_uses_one_verified_maven_lifecycle() {
   keys="$TEST_ROOT/keys.$TEST_COUNT"
   printf '<settings/>\n' > "$settings"
   printf 'fake KEYS\n' > "$keys"
+  hostile_maven_opts='-Xmx1g -Dexec.skip=true -Dgpg.skip=true -DskipLocalStaging=true -DskipRemoteStaging=true -DskipStagingRepositoryClose=true -Dmaven.wagon.http.ssl.allowall=true'
+  hostile_java_tool_options='-Xms256m -DskipNexusStagingDeployMojo=true -DskipStaging=true -Dmaven.wagon.http.ssl.insecure=true'
 
-  MAVEN_OPTS='-Dexec.skip=true -Dgpg.skip=true' run_script \
-    --maven-settings "$settings" \
-    --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
-    --keys-file "$keys" > "$OUTPUT_LOG" 2>&1
+  MAVEN_OPTS="$hostile_maven_opts" \
+    JAVA_TOOL_OPTIONS="$hostile_java_tool_options" \
+    run_script \
+      --maven-settings "$settings" \
+      --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+      --keys-file "$keys" > "$OUTPUT_LOG" 2>&1
 
   assert_contains "$MAVEN_LOG" \
     "args=-s $settings clean deploy -Prelease"
   assert_contains "$MAVEN_LOG" "-Dexec.skip=false"
   assert_contains "$MAVEN_LOG" "-Dgpg.skip=false"
+  for property in \
+    skipLocalStaging \
+    skipNexusStagingDeployMojo \
+    skipRemoteStaging \
+    skipStaging \
+    skipStagingRepositoryClose \
+    maven.wagon.http.ssl.allowall \
+    maven.wagon.http.ssl.insecure; do
+    assert_contains "$MAVEN_LOG" "-D${property}=false"
+  done
   assert_contains "$MAVEN_LOG" \
     "-Dgpg.keyname=0123456789ABCDEF0123456789ABCDEF01234567!"
+  assert_contains "$MAVEN_LOG" "maven-opts=$hostile_maven_opts"
   assert_contains "$MAVEN_LOG" \
-    "maven-opts=-Dexec.skip=true -Dgpg.skip=true"
+    "java-tool-options=$hostile_java_tool_options"
   assert_contains "$MAVEN_LOG" "maven-args="
+  assert_contains "$TAG_VALIDATION_LOG" \
+    "$FIXTURE_DIR/tools/validate_release_tag.py v0.3.0-rc1 --keys-file $keys --repository $FIXTURE_DIR --expected-commit $(git -C "$FIXTURE_DIR" rev-parse HEAD)"
   if [[ $(grep -c '^pwd=' "$MAVEN_LOG") -ne 1 ]]; then
     fail "real deploy should invoke Maven exactly once"
   fi
+}
+
+test_real_deploy_requires_signed_release_tag() {
+  new_fixture
+  settings="$TEST_ROOT/settings.$TEST_COUNT.xml"
+  keys="$TEST_ROOT/keys.$TEST_COUNT"
+  printf '<settings/>\n' > "$settings"
+  printf 'fake KEYS\n' > "$keys"
+
+  if FAKE_TAG_VALIDATION_RESULT=failure run_script \
+    --maven-settings "$settings" \
+    --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+    --keys-file "$keys" > "$OUTPUT_LOG" 2>&1; then
+    fail "real deployment accepted a tag that failed release validation"
+  fi
+
+  assert_contains "$OUTPUT_LOG" "fake release tag validation failed"
+  assert_contains "$TAG_VALIDATION_LOG" \
+    "validate_release_tag.py v0.3.0-rc1"
+  assert_artifact_download_not_invoked
+  assert_maven_not_invoked
+}
+
+test_run_must_use_canonical_release_workflow() {
+  new_fixture
+
+  if FAKE_WORKFLOW_PATH=.github/workflows/not-release.yml \
+    run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "non-canonical Release workflow was accepted"
+  fi
+
+  assert_contains "$OUTPUT_LOG" "canonical Release workflow"
+  assert_maven_not_invoked
 }
 
 test_real_deploy_requires_full_signing_fingerprint() {
@@ -447,6 +524,8 @@ run_test test_git_replacement_refs_are_rejected
 run_test test_repository_local_archive_attributes_are_rejected
 run_test test_invalid_native_files_fail_without_external_file_command
 run_test test_real_deploy_uses_one_verified_maven_lifecycle
+run_test test_real_deploy_requires_signed_release_tag
+run_test test_run_must_use_canonical_release_workflow
 run_test test_real_deploy_requires_full_signing_fingerprint
 run_test test_real_deploy_rejects_unexpected_signature_key
 run_test test_real_deploy_requires_signing_key_in_asf_keys

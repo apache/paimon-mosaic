@@ -897,6 +897,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-schema",
+ "libc",
  "zstd",
 ]
 
