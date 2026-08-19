@@ -94,6 +94,58 @@ def test_registry_secrets_are_scoped_to_publish_workflows():
     assert "password: ${{ secrets.PYPI_API_TOKEN }}" in python_workflow
 
 
+def test_crates_publish_does_not_rebuild_with_registry_credentials():
+    rust_workflow = workflow("release-rust.yml")
+    publish_step = rust_workflow[
+        rust_workflow.index(
+            "      - name: Publish paimon-mosaic-core to crates.io"
+        ) :
+    ]
+
+    assert "cargo publish" in publish_step
+    assert "--no-verify" in publish_step
+
+
+def test_snapshot_publication_cannot_run_branch_controlled_code_with_secrets():
+    snapshot = workflow("publish_snapshot.yml")
+    publish_job = job(snapshot, "publish-snapshot", None)
+
+    assert "workflow_dispatch:" not in snapshot
+    assert "repository_dispatch:" in snapshot
+    assert "types: [publish-snapshot]" in snapshot
+    assert "github.ref == 'refs/heads/main'" in publish_job
+    assert "permissions:\n  contents: read" in snapshot
+    assert "persist-credentials: false" in publish_job
+    assert "github.run_id" not in snapshot
+    assert "cancel-in-progress: false" in snapshot
+
+
+def test_local_java_staging_script_runs_on_linux_and_macos():
+    ci = workflow("ci.yml")
+    staging_job = job(ci, "java-staging-script", "rust-test")
+
+    assert "ubuntu-latest" in staging_job
+    assert "macos-latest" in staging_job
+    assert "/bin/bash -n tools/deploy_java_staging.sh" in staging_job
+    assert "/bin/bash tools/tests/deploy_java_staging_test.sh" in staging_job
+
+
+def test_release_guide_uses_fail_closed_java_staging_script():
+    guide = (ROOT / "docs/creating-a-release.html").read_text(encoding="utf-8")
+    section = guide[
+        guide.index("<h3>Sign and Stage Java Artifacts Locally</h3>") :
+        guide.index("<h3>Create Source Release Artifacts</h3>")
+    ]
+
+    assert "./tools/deploy_java_staging.sh" in section
+    assert "--dry-run" in section
+    assert "gh run view" not in section
+    assert "mvn clean deploy" not in section
+    tools_readme = (ROOT / "tools/README.md").read_text(encoding="utf-8")
+    assert "deploy_java_staging.sh" in tools_readme
+    assert "java-release-native-inputs" in tools_readme
+
+
 def test_release_builds_use_the_exact_pinned_rust_toolchain():
     toolchain = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
     assert 'channel = "1.97.1"' in toolchain

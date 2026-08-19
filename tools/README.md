@@ -21,6 +21,42 @@
 Release automation requires Python 3.11 or newer. The published Python
 binding has a separate runtime floor of Python 3.9.
 
+## Local Java Nexus staging
+
+Java release signing and Nexus deployment run only on the Release Manager's
+trusted machine. Start from a clean detached checkout of the RC tag and use the
+exact successful top-level `Release` workflow run:
+
+```bash
+./tools/deploy_java_staging.sh \
+  --release-version 0.3.0 \
+  --rc 1 \
+  --run-id 12345678901 \
+  --dry-run
+```
+
+After the dry run succeeds, repeat without `--dry-run`, supplying the Maven
+settings and exact signing-key fingerprint:
+
+```bash
+./tools/deploy_java_staging.sh \
+  --release-version 0.3.0 \
+  --rc 1 \
+  --run-id 12345678901 \
+  --maven-settings deploysettings.xml \
+  --gpg-keyname FULL_GPG_FINGERPRINT
+```
+
+The script binds the local tag to the workflow run SHA/ref, rejects replacement
+refs, special Git index flags, and any dirty or ignored worktree content, then
+builds from an isolated archive of the tag. It downloads only the run's
+`java-release-native-inputs`, validates the exact four native binaries with the
+repository's `tools/native_binary.py` verifier, and relies on the Maven
+`release` profile to verify the JARs before signing and deployment in the same
+lifecycle. Real deployment always reads the run from `github.com`, requires a
+full signing-key fingerprint present in the ASF Paimon `KEYS` file, and verifies
+the generated Maven signatures against that exact fingerprint.
+
 ## Dependency and artifact licensing
 
 The committed lockfile freezes the dependency closure used by source, Rust,

@@ -232,45 +232,16 @@ git push origin ${RC_TAG}</code></pre>
             <p>If only the Python publish job fails due to a transient PyPI or TestPyPI issue, use <strong>Re-run failed jobs</strong> on the original tag-push <code>Release</code> workflow. The publish preflight verifies any existing files by filename and SHA-256 and stages only missing wheels; the successful Rust, Java, and Python wheel jobs do not need to be repeated. Manual workflow dispatch is verification-only, even when a tag ref is selected.</p>
 
             <h3>Sign and Stage Java Artifacts Locally</h3>
-            <p>Use the exact successful <code>Release</code> workflow run for the RC tag. Confirm that the run's head SHA is the signed RC commit, then download its already verified four-platform native input bundle:</p>
+            <p>Use a fresh detached checkout of the RC tag and the exact successful top-level <code>Release</code> workflow run from <code>github.com/apache/paimon-mosaic</code>. The staging script requires a completed, successful <code>Release</code> tag-push run whose ref is the RC tag and whose SHA matches both the tag commit and local <code>HEAD</code>. It also rejects Git replacement refs, special index flags, and any dirty, untracked, or ignored worktree content. The script builds from an isolated archive of the tag, downloads only <code>java-release-native-inputs</code>, validates all four binaries without relying on the external <code>file</code> command, and runs the JAR verifier in the same Maven lifecycle that will sign and deploy. A real deployment requires a full signing-key fingerprint present in the ASF Paimon <code>KEYS</code> file and verifies the generated Maven signatures against that exact key.</p>
 <pre><code>RELEASE_RUN_ID="&lt;successful Release workflow run ID&gt;"
-RC_COMMIT_SHA="$(git rev-parse "${RC_TAG}^{commit}")"
-
-test "$(gh run view "${RELEASE_RUN_ID}" \
-  --repo apache/paimon-mosaic --json headSha --jq .headSha)" = "${RC_COMMIT_SHA}"
-test "$(gh run view "${RELEASE_RUN_ID}" \
-  --repo apache/paimon-mosaic --json conclusion --jq .conclusion)" = "success"
-test "$(gh run view "${RELEASE_RUN_ID}" \
-  --repo apache/paimon-mosaic --json workflowName --jq .workflowName)" = "Release"
-test "$(gh run view "${RELEASE_RUN_ID}" \
-  --repo apache/paimon-mosaic --json event --jq .event)" = "push"
-test "$(gh run view "${RELEASE_RUN_ID}" \
-  --repo apache/paimon-mosaic --json headBranch --jq .headBranch)" = "${RC_TAG}"
-
 git checkout --detach "${RC_TAG}"
-test -z "$(git status --porcelain --untracked-files=all --ignored=matching)"
-test ! -e java/src/main/resources/native
-mkdir -p java/src/main/resources/native
-gh run download "${RELEASE_RUN_ID}" \
-  --repo apache/paimon-mosaic \
-  --name java-release-native-inputs \
-  --dir java/src/main/resources/native
-EXPECTED_NATIVE_FILES="$(cat &lt;&lt;'EOF'
-linux/aarch64/libpaimon_mosaic_jni.so
-linux/x86_64/libpaimon_mosaic_jni.so
-macos/aarch64/libpaimon_mosaic_jni.dylib
-windows/x86_64/paimon_mosaic_jni.dll
-EOF
-)"
-ACTUAL_NATIVE_FILES="$(
-  find java/src/main/resources/native -type f \
-    | sed 's#^java/src/main/resources/native/##' \
-    | LC_ALL=C sort
-)"
-test "${ACTUAL_NATIVE_FILES}" = "${EXPECTED_NATIVE_FILES}"
-test -z "$(git status --porcelain --untracked-files=all)"</code></pre>
-            <p>Use a fresh isolated worktree: before the download it must contain no tracked, untracked, or ignored files beyond the checkout itself. After the download, the four listed native libraries are the only permitted non-Git inputs. Keep the personal signing key on this trusted machine. Build, verify, sign, and deploy in one Maven lifecycle so the release-profile verifier checks the exact JARs that Maven will sign and stage. The verifier runs in <code>verify</code> before GPG signing and requires all four native libraries plus artifact-exact legal metadata.</p>
-            <p>Run deployment in a strict subshell so the short-lived GPG passphrase and Nexus credentials disappear on both success and failure, while any Maven or verifier failure remains visible to the caller:</p>
+
+./tools/deploy_java_staging.sh \
+  --release-version "${RELEASE_VERSION}" \
+  --rc "${RC_NUM}" \
+  --run-id "${RELEASE_RUN_ID}" \
+  --dry-run</code></pre>
+            <p>After the dry run succeeds, keep the personal signing key on this trusted machine and run the real deployment in a strict subshell so short-lived credentials disappear on both success and failure:</p>
 <pre><code>(
   set -euo pipefail
   export NEXUS_STAGE_DEPLOYER_USER="&lt;ASF Nexus username&gt;"
@@ -278,20 +249,18 @@ test -z "$(git status --porcelain --untracked-files=all)"</code></pre>
   read -rsp "GPG passphrase: " MAVEN_GPG_PASSPHRASE; echo
   export NEXUS_STAGE_DEPLOYER_PW MAVEN_GPG_PASSPHRASE
 
-  cd java
-  mvn clean deploy \
-    --settings ../deploysettings.xml \
-    -Prelease \
-    -DskipTests \
-    -Dgpg.keyname="&lt;FULL_GPG_FINGERPRINT&gt;" \
-    -DstagingDescription="Apache Paimon Mosaic ${RELEASE_VERSION} RC${RC_NUM}"
+  ./tools/deploy_java_staging.sh \
+    --release-version "${RELEASE_VERSION}" \
+    --rc "${RC_NUM}" \
+    --run-id "${RELEASE_RUN_ID}" \
+    --maven-settings deploysettings.xml \
+    --gpg-keyname "&lt;FULL_GPG_FINGERPRINT&gt;"
 )</code></pre>
             <p>Record the closed <code>orgapachepaimon-XXXX</code> repository URL and verify its artifacts before including it in the vote email. If local signing, deployment, or verification fails, drop that staging repository and do not start the vote.</p>
 
             <h3>Create Source Release Artifacts</h3>
-            <p>Create source release artifacts from a fully clean checkout of the same commit as the RC tag. Remove the exact downloaded Java native-input directory first, or use a fresh isolated worktree; do not clean unrelated files implicitly:</p>
-<pre><code>rm -rf java/src/main/resources/native
-git checkout --detach ${RC_TAG}
+            <p>Create source release artifacts from a fresh, fully clean checkout of the same commit as the RC tag. The Java staging script downloads native inputs only into its temporary build directory and removes that directory automatically:</p>
+<pre><code>git checkout --detach ${RC_TAG}
 test -z "$(git status --porcelain --untracked-files=all)"
 cd tools
 RELEASE_VERSION=${RELEASE_VERSION} ./create_source_release.sh</code></pre>

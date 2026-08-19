@@ -164,6 +164,6 @@ jobs:
 
       - name: Publish paimon-mosaic-core to crates.io
         if: inputs.publish == true && steps.registry.outputs.publish == 'true'
-        run: cargo publish -p paimon-mosaic-core --locked --registry crates-io
+        run: cargo publish -p paimon-mosaic-core --locked --registry crates-io --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

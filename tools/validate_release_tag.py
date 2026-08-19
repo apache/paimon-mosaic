@@ -96,8 +96,32 @@ def run(
     return result
 
 
+def git_environment(
+    environment: dict[str, str] | None = None,
+) -> dict[str, str]:
+    result = os.environ.copy() if environment is None else environment.copy()
+    result["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return result
+
+
 def git(repo: Path, *arguments: str) -> str:
-    return run(["git", *arguments], cwd=repo).stdout.strip()
+    return run(
+        ["git", *arguments], cwd=repo, env=git_environment()
+    ).stdout.strip()
+
+
+def reject_git_replacement_refs(repo: Path) -> None:
+    replacements = git(
+        repo,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/replace",
+    )
+    if replacements:
+        raise TagValidationError(
+            "repository contains Git replacement refs that could change object "
+            f"identity:\n{replacements}"
+        )
 
 
 def inspect_annotated_tag(repo: Path, tag: str) -> str:
@@ -151,7 +175,7 @@ def import_keys(repo: Path, keys_file: Path, gpg_home: Path) -> dict[str, str]:
         raise TagValidationError(f"KEYS file is missing or empty: {keys_file}")
 
     gpg_home.chmod(0o700)
-    env = os.environ.copy()
+    env = git_environment()
     env["GNUPGHOME"] = str(gpg_home)
     run(
         ["gpg", "--batch", "--no-tty", "--import", str(keys_file.resolve())],
@@ -181,7 +205,7 @@ def verify_signature(repo: Path, tag: str, env: dict[str, str]) -> str:
             tag,
         ],
         cwd=repo,
-        env=env,
+        env=git_environment(env),
         check=False,
     )
     status = "\n".join(part for part in (result.stdout, result.stderr) if part)
@@ -219,6 +243,7 @@ def validate_release_tag(
     expected_commit: str = "HEAD",
 ) -> VerifiedTag:
     repo = repo.resolve()
+    reject_git_replacement_refs(repo)
     tag = parse_release_tag(tag_name)
     commit = inspect_annotated_tag(repo, tag.name)
     expected = git(repo, "rev-parse", "--verify", f"{expected_commit}^{{commit}}")

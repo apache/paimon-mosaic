@@ -118,6 +118,22 @@ def test_archive_verification_rejects_same_tree_from_different_commit(tmp_path):
         verifier.verify_archive(archive, repo, second_commit, PREFIX)
 
 
+def test_archive_creation_rejects_git_replacement_refs(tmp_path):
+    repo, first_commit = initialize_repo(tmp_path)
+    (repo / "README.md").write_text("replacement contents\n", encoding="utf-8")
+    run(["git", "add", "README.md"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "replacement"], cwd=repo)
+    second_commit = (
+        run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.decode().strip()
+    )
+    run(["git", "replace", first_commit, second_commit], cwd=repo)
+
+    with pytest.raises(ValueError, match="replacement refs"):
+        verifier.create_archive(
+            tmp_path / "source.tgz", repo, first_commit, PREFIX
+        )
+
+
 def test_archive_creation_uses_fixed_tar_umask(tmp_path):
     repo, commit = initialize_repo(tmp_path)
     archive = tmp_path / "source.tgz"

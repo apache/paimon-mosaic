@@ -81,6 +81,30 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --workspace --locked -- -D warnings
 
+  java-staging-script:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check local Java staging script syntax
+        run: |
+          /bin/bash -n tools/deploy_java_staging.sh
+          /bin/bash -n tools/tests/deploy_java_staging_test.sh
+
+      - name: Test local Java staging safety
+        run: /bin/bash tools/tests/deploy_java_staging_test.sh
+
   rust-test:
     runs-on: ubuntu-latest
     steps:

@@ -140,6 +140,45 @@ class VerifyJavaJarsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "root NOTICE"):
             self.verify_classifier(wrong_notice)
 
+    def test_classifier_does_not_treat_java_class_magic_as_macho(self) -> None:
+        java_class = (
+            b"\xca\xfe\xba\xbe"
+            b"\x00\x00"
+            b"\x00\x34"
+            b"\x00\x05"
+            b"\x01\x00\x07Example"
+            b"\x07\x00\x01"
+            b"\x01\x00\x10java/lang/Object"
+            b"\x07\x00\x03"
+            b"\x00\x21"
+            b"\x00\x02"
+            b"\x00\x04"
+            b"\x00\x00"
+            b"\x00\x00"
+            b"\x00\x00"
+            b"\x00\x00"
+        )
+        path = self.write_jar(
+            "java-class.jar",
+            self.classifier_entries(
+                ("org/apache/paimon/mosaic/Example.class", java_class)
+            ),
+        )
+
+        self.verify_classifier(path)
+
+        malformed = self.write_jar(
+            "malformed-java-class.jar",
+            self.classifier_entries(
+                (
+                    "org/apache/paimon/mosaic/Malformed.class",
+                    b"\xca\xfe\xba\xbe\x00\x00\x00\x34\x00\x01",
+                )
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "binary-only"):
+            self.verify_classifier(malformed)
+
     def test_main_jar_keeps_target_report_and_native_validation(self) -> None:
         binary_resources = self.root / "java/src/main/binary-resources/META-INF"
         report_paths = [
@@ -173,17 +212,29 @@ class VerifyJavaJarsTest(unittest.TestCase):
         ) as verify_native:
             with redirect_stdout(StringIO()):
                 verify_java_jars.verify_main_jar(path, self.root, True)
+            verify_native.assert_has_calls(
+                [
+                    mock.call(native_entry.encode(), native_target, native_entry)
+                    for native_entry, native_target in (
+                        verify_java_jars.NATIVE_ENTRIES.items()
+                    )
+                ],
+                any_order=True,
+            )
+            self.assertEqual(
+                len(verify_java_jars.NATIVE_ENTRIES), verify_native.call_count
+            )
 
-        verify_native.assert_has_calls(
-            [
-                mock.call(native_entry.encode(), native_target, native_entry)
-                for native_entry, native_target in (
-                    verify_java_jars.NATIVE_ENTRIES.items()
-                )
-            ],
-            any_order=True,
-        )
-        self.assertEqual(len(verify_java_jars.NATIVE_ENTRIES), verify_native.call_count)
+            injected = self.write_jar(
+                "main-with-undeclared-native.jar",
+                [
+                    *jar_entries,
+                    ("payload/undeclared-native.bin", b"\x7fELF" + b"\0" * 64),
+                ],
+            )
+            with self.assertRaisesRegex(ValueError, "unexpected native"):
+                with redirect_stdout(StringIO()):
+                    verify_java_jars.verify_main_jar(injected, self.root, True)
 
     def test_release_profile_verifies_jars_before_gpg_signing(self) -> None:
         namespace = {"m": "http://maven.apache.org/POM/4.0.0"}

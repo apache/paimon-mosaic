@@ -189,6 +189,20 @@ def test_final_tag_rejects_rc_on_a_different_commit(tmp_path, signing_keys):
         validator.validate_release_tag(repo, "v2.0.0", keys)
 
 
+def test_tag_validation_rejects_git_replacement_refs(tmp_path, signing_keys):
+    (home, fingerprint, keys), _ = signing_keys
+    repo = repository(tmp_path)
+    sign_tag(repo, "v2.1.0-rc1", home, fingerprint)
+    commit(repo, "replacement")
+    sign_tag(repo, "v2.1.0-rc2", home, fingerprint)
+    first_tag = run(["git", "rev-parse", "refs/tags/v2.1.0-rc1"], cwd=repo)
+    second_tag = run(["git", "rev-parse", "refs/tags/v2.1.0-rc2"], cwd=repo)
+    run(["git", "replace", first_tag, second_tag], cwd=repo)
+
+    with pytest.raises(validator.TagValidationError, match="replacement refs"):
+        validator.validate_release_tag(repo, "v2.1.0-rc1", keys)
+
+
 def test_signature_must_match_a_key_in_supplied_keys(tmp_path, signing_keys):
     (home, fingerprint, _), (_, _, unrelated_keys) = signing_keys
     repo = repository(tmp_path)

@@ -59,6 +59,7 @@ class ArchiveEntry:
 
 
 def resolve_commit(repository: Path, commit: str) -> str:
+    reject_git_replacement_refs(repository)
     result = subprocess.run(
         [
             "git",
@@ -72,6 +73,7 @@ def resolve_commit(repository: Path, commit: str) -> str:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=git_environment(),
     )
     return result.stdout.strip()
 
@@ -79,7 +81,32 @@ def resolve_commit(repository: Path, commit: str) -> str:
 def git_environment() -> dict[str, str]:
     environment = os.environ.copy()
     environment["GIT_ATTR_NOSYSTEM"] = "1"
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     return environment
+
+
+def reject_git_replacement_refs(repository: Path) -> None:
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/replace",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=git_environment(),
+    )
+    replacements = result.stdout.strip()
+    if replacements:
+        raise ValueError(
+            "repository contains Git replacement refs that could change object "
+            f"identity:\n{replacements}"
+        )
 
 
 def reject_repository_archive_attributes(repository: Path) -> None:
@@ -96,6 +123,7 @@ def reject_repository_archive_attributes(repository: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=git_environment(),
     )
     attributes = Path(result.stdout.strip())
     if not attributes.is_absolute():
