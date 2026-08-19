@@ -96,10 +96,10 @@ jobs:
           version="${version%%-rc*}"
           python3 tools/verify_release_versions.py "$version"
 
-      - name: Setup Rust toolchain
+      - name: Verify pinned Rust toolchain
         run: |
-          rustup update stable
-          rustup default stable
+          rustc --version
+          cargo --version
 
       - name: Dry run
         shell: bash

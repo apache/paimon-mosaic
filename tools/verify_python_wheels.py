@@ -43,6 +43,13 @@ NATIVE_LIBRARY = {
     "x86_64-pc-windows-msvc": "mosaic/paimon_mosaic_ffi.dll",
 }
 
+EXPECTED_WHEEL_TAG = {
+    "x86_64-unknown-linux-gnu": "py3-none-manylinux_2_28_x86_64",
+    "aarch64-unknown-linux-gnu": "py3-none-manylinux_2_28_aarch64",
+    "aarch64-apple-darwin": "py3-none-macosx_11_0_arm64",
+    "x86_64-pc-windows-msvc": "py3-none-win_amd64",
+}
+
 NESTED_LICENSE_MARKERS = (
     "For Zstandard software",
     "Apache Arrow",
@@ -125,11 +132,14 @@ def target_from_wheel_tags(tags: set[str]) -> str:
         raise ValueError("musllinux wheels do not match the supported GNU targets")
     matching_targets = [
         target
-        for target in NATIVE_LIBRARY
-        if all(wheel_tag_matches_target(tag, target) for tag in tags)
+        for target, expected_tag in EXPECTED_WHEEL_TAG.items()
+        if tags == {expected_tag}
     ]
     if len(matching_targets) != 1:
-        raise ValueError(f"unsupported wheel platform tags: {sorted(tags)}")
+        raise ValueError(
+            f"unsupported wheel tags: {sorted(tags)}; expected exactly one of "
+            f"{sorted(EXPECTED_WHEEL_TAG.values())}"
+        )
     return matching_targets[0]
 
 
@@ -294,25 +304,6 @@ def require_equal(actual: bytes, expected_path: Path, archive_path: str) -> None
         raise ValueError(
             f"{archive_path} does not match {expected_path.as_posix()}"
         )
-
-
-def wheel_tag_matches_target(tag: str, target: str) -> bool:
-    platform_tag = tag.rsplit("-", 1)[-1].lower()
-    if target == "x86_64-pc-windows-msvc":
-        return platform_tag == "win_amd64"
-    if target == "aarch64-apple-darwin":
-        return platform_tag.startswith("macosx_") and platform_tag.endswith("_arm64")
-    if target == "aarch64-unknown-linux-gnu":
-        return (
-            platform_tag.startswith(("linux_", "manylinux_"))
-            and platform_tag.endswith("_aarch64")
-        )
-    if target == "x86_64-unknown-linux-gnu":
-        return (
-            platform_tag.startswith(("linux_", "manylinux_"))
-            and platform_tag.endswith("_x86_64")
-        )
-    return False
 
 
 def verify_wheel(wheel: Path, root: Path) -> str:

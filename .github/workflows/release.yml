@@ -177,10 +177,10 @@ jobs:
             --prefix "paimon-mosaic-${version}/" \
             --archive "$release_dir/$archive"
 
-      - name: Set up Rust toolchain for registry preflight
+      - name: Verify pinned Rust toolchain for registry preflight
         run: |
-          rustup update stable
-          rustup default stable
+          rustc --version
+          cargo --version
 
       - name: Download final wheel artifacts
         uses: actions/download-artifact@v5

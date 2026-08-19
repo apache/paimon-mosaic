@@ -72,7 +72,9 @@ def record_bytes(contents, record_path, mutate_record=None):
 def build_wheel(
     tmp_path,
     target="aarch64-unknown-linux-gnu",
-    platform_tag="linux_aarch64",
+    platform_tag="manylinux_2_28_aarch64",
+    python_tag="py3",
+    abi_tag="none",
     filename_distribution="paimon_mosaic",
     filename_version="0.3.0",
     dist_info_distribution=None,
@@ -87,7 +89,7 @@ def build_wheel(
 ):
     dist_info_distribution = dist_info_distribution or filename_distribution
     dist_info_version = dist_info_version or filename_version
-    wheel_tags = wheel_tags or [f"py3-none-{platform_tag}"]
+    wheel_tags = wheel_tags or [f"{python_tag}-{abi_tag}-{platform_tag}"]
     dist_info = f"{dist_info_distribution}-{dist_info_version}.dist-info"
     record_path = f"{dist_info}/RECORD"
 
@@ -135,7 +137,7 @@ def build_wheel(
         tmp_path
         / (
             f"{filename_distribution}-{filename_version}-"
-            f"py3-none-{platform_tag}.whl"
+            f"{python_tag}-{abi_tag}-{platform_tag}.whl"
         )
     )
     entries = list(contents.items())
@@ -159,6 +161,68 @@ def test_verify_wheel_accepts_supported_targets(
     monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
 
     assert verifier.verify_wheel(wheel, root) == target
+
+
+@pytest.mark.parametrize(
+    "target,python_tag,abi_tag,platform_tag",
+    (
+        (
+            "aarch64-unknown-linux-gnu",
+            "cp39",
+            "cp39",
+            "manylinux_2_28_aarch64",
+        ),
+        (
+            "x86_64-unknown-linux-gnu",
+            "cp312",
+            "abi3",
+            "manylinux_2_28_x86_64",
+        ),
+        (
+            "aarch64-apple-darwin",
+            "py2",
+            "none",
+            "macosx_11_0_arm64",
+        ),
+        (
+            "aarch64-unknown-linux-gnu",
+            "py3",
+            "none",
+            "linux_aarch64",
+        ),
+        (
+            "x86_64-unknown-linux-gnu",
+            "py3",
+            "none",
+            "manylinux_2_17_x86_64",
+        ),
+        (
+            "aarch64-apple-darwin",
+            "py3",
+            "none",
+            "macosx_10_9_arm64",
+        ),
+    ),
+)
+def test_verify_wheel_rejects_non_release_tags(
+    tmp_path,
+    monkeypatch,
+    target,
+    python_tag,
+    abi_tag,
+    platform_tag,
+):
+    wheel, root = build_wheel(
+        tmp_path,
+        target=target,
+        python_tag=python_tag,
+        abi_tag=abi_tag,
+        platform_tag=platform_tag,
+    )
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
+
+    with pytest.raises(ValueError, match="unsupported wheel tags"):
+        verifier.verify_wheel(wheel, root)
 
 
 def test_verify_wheel_accepts_unrecorded_directory_entries(tmp_path, monkeypatch):

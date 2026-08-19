@@ -82,8 +82,10 @@ jobs:
             options = _ffi.lib.mosaic_writer_options_default();
             print('Loaded wheel native library, compression=', options.compression)"
           CIBW_BEFORE_ALL_LINUX: >
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none &&
             source $HOME/.cargo/env &&
+            rustc --version &&
+            cargo --version &&
             cargo build --release --locked -p paimon-mosaic-ffi &&
             cp target/release/libpaimon_mosaic_ffi.so {package}/mosaic/
 
@@ -112,10 +114,10 @@ jobs:
           PEP440_VERSION=$(echo "$TAG" | sed 's/-rc/rc/')
           sed -i '' "s/^version = .*/version = \"${PEP440_VERSION}\"/" python/pyproject.toml
 
-      - name: Setup Rust toolchain
+      - name: Verify pinned Rust toolchain
         run: |
-          rustup update stable
-          rustup default stable
+          rustc --version
+          cargo --version
 
       - name: Build native library
         run: cargo build --release --locked -p paimon-mosaic-ffi
@@ -191,10 +193,10 @@ jobs:
           PEP440_VERSION=$(echo "$TAG" | sed 's/-rc/rc/')
           sed -i "s/^version = .*/version = \"${PEP440_VERSION}\"/" python/pyproject.toml
 
-      - name: Setup Rust toolchain
+      - name: Verify pinned Rust toolchain
         run: |
-          rustup update stable
-          rustup default stable
+          rustc --version
+          cargo --version
 
       - name: Build native library
         run: cargo build --release --locked -p paimon-mosaic-ffi

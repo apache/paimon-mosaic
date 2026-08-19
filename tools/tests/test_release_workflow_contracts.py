@@ -92,3 +92,24 @@ def test_registry_secrets_are_scoped_to_publish_workflows():
     assert "TEST_PYPI_API_TOKEN" not in test_registry
     assert "password: ${{ secrets.TEST_PYPI_API_TOKEN }}" in python_workflow
     assert "password: ${{ secrets.PYPI_API_TOKEN }}" in python_workflow
+
+
+def test_release_builds_use_the_exact_pinned_rust_toolchain():
+    toolchain = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
+    assert 'channel = "1.97.1"' in toolchain
+    assert 'profile = "minimal"' in toolchain
+
+    for name in (
+        "ci.yml",
+        "publish_snapshot.yml",
+        "release-java.yml",
+        "release-python.yml",
+        "release-rust.yml",
+        "release.yml",
+    ):
+        contents = workflow(name)
+        assert "rustup update stable" not in contents
+        assert "rustup default stable" not in contents
+
+    python_release = workflow("release-python.yml")
+    assert "--default-toolchain none" in python_release
