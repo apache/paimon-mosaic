@@ -45,14 +45,57 @@ MACHO_CPU_ARCHITECTURE = {
 
 MOSAIC_SYMBOL_FAMILIES = {
     "JNI": {
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeReaderExportSchema",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeReaderFree",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeReaderNumRowGroups",
         "Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpen",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpenRowGroup",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupNumRows",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatMaxs",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatMins",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatNames",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGroupStatNullCounts",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeReaderSetProjection",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderFree",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderNumRows",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderReadColumns",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeWriterClose",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeWriterEstimatedSize",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeWriterFree",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeWriterNumRowGroups",
         "Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatMaxs",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatMins",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatNames",
+        "Java_org_apache_paimon_mosaic_NativeLib_nativeWriterRowGroupStatNullCounts",
         "Java_org_apache_paimon_mosaic_NativeLib_nativeWriterWriteBatch",
     },
     "FFI": {
         "mosaic_last_error",
+        "mosaic_reader_export_schema",
+        "mosaic_reader_free",
+        "mosaic_reader_num_row_groups",
         "mosaic_reader_open",
+        "mosaic_reader_open_row_group",
+        "mosaic_reader_row_group_num_rows",
+        "mosaic_reader_row_group_num_stats",
+        "mosaic_reader_row_group_stats",
+        "mosaic_reader_set_projection",
+        "mosaic_record_batch_export",
+        "mosaic_record_batch_free",
+        "mosaic_record_batch_num_columns",
+        "mosaic_record_batch_num_rows",
+        "mosaic_row_group_reader_free",
+        "mosaic_row_group_reader_num_rows",
+        "mosaic_row_group_reader_read_columns",
+        "mosaic_writer_close",
+        "mosaic_writer_estimated_file_size",
+        "mosaic_writer_free",
+        "mosaic_writer_num_row_groups",
         "mosaic_writer_open",
+        "mosaic_writer_options_default",
+        "mosaic_writer_row_group_num_stats",
+        "mosaic_writer_row_group_stats",
         "mosaic_writer_write_batch",
     },
 }
@@ -1008,6 +1051,7 @@ def parse_pe(data: bytes) -> NativeBinary | None:
                     "PE export module name",
                 )
 
+            previous_name = None
             for index in range(name_count):
                 ordinal = struct.unpack_from(
                     "<H", data, ordinals_offset + index * 2
@@ -1033,16 +1077,20 @@ def parse_pe(data: bytes) -> NativeBinary | None:
                     len(data),
                     f"PE export name {index}",
                 )
-                name = ascii_symbol(
-                    c_string_bytes(
-                        data,
-                        name_offset,
-                        name_offset + name_available,
-                        f"PE export name {index}",
-                    )
+                raw_name = c_string_bytes(
+                    data,
+                    name_offset,
+                    name_offset + name_available,
+                    f"PE export name {index}",
                 )
+                name = ascii_symbol(raw_name)
                 if name is None:
                     raise ValueError(f"PE export name {index} is not ASCII")
+                if previous_name is not None and raw_name <= previous_name:
+                    raise ValueError(
+                        "PE export names are not strictly increasing"
+                    )
+                previous_name = raw_name
                 if export_rva <= function_rva < export_rva + export_size:
                     forwarder_offset = export_offset + function_rva - export_rva
                     forwarder = ascii_symbol(
@@ -1071,6 +1119,165 @@ def parse_pe(data: bytes) -> NativeBinary | None:
     return NativeBinary(
         "PE", frozenset({architecture}), frozenset(exported_symbols)
     )
+
+
+def macho_uleb128(
+    data: bytes, offset: int, limit: int, description: str
+) -> tuple[int, int]:
+    value = 0
+    for index in range(10):
+        if offset >= limit:
+            raise ValueError(f"{description} ULEB128 is truncated")
+        byte = data[offset]
+        offset += 1
+        if index == 9 and byte > 1:
+            raise ValueError(f"{description} ULEB128 overflows 64 bits")
+        value |= (byte & 0x7F) << (index * 7)
+        if not byte & 0x80:
+            return value, offset
+    raise ValueError(f"{description} ULEB128 overflows 64 bits")
+
+
+def parse_macho_export_trie(
+    data: bytes, trie_offset: int, trie_size: int
+) -> frozenset[str]:
+    require_range(data, trie_offset, trie_size, "Mach-O export trie")
+    if trie_size == 0:
+        return frozenset()
+
+    trie_end = trie_offset + trie_size
+    exported_symbols = set()
+    active_nodes = set()
+    visited_nodes = set()
+    stack = [(False, 0, b"")]
+    while stack:
+        leaving, node_offset, prefix = stack.pop()
+        if leaving:
+            active_nodes.remove(node_offset)
+            continue
+        if node_offset in active_nodes:
+            raise ValueError("Mach-O export trie contains a cycle")
+        if node_offset in visited_nodes:
+            raise ValueError(
+                "Mach-O export trie references a node more than once"
+            )
+        if node_offset >= trie_size:
+            raise ValueError(
+                "Mach-O export trie child offset is out of bounds"
+            )
+        active_nodes.add(node_offset)
+        visited_nodes.add(node_offset)
+        stack.append((True, node_offset, b""))
+
+        cursor = trie_offset + node_offset
+        terminal_size, cursor = macho_uleb128(
+            data,
+            cursor,
+            trie_end,
+            f"Mach-O export trie node {node_offset} terminal size",
+        )
+        if terminal_size > trie_end - cursor:
+            raise ValueError("Mach-O export trie terminal is out of bounds")
+        terminal_end = cursor + terminal_size
+        if terminal_size:
+            flags, cursor = macho_uleb128(
+                data,
+                cursor,
+                terminal_end,
+                "Mach-O export trie terminal flags",
+            )
+            if flags & 0x03 == 0x03:
+                raise ValueError(
+                    "Mach-O export trie terminal has an invalid export kind"
+                )
+            if flags & 0x08 and flags & 0x10:
+                raise ValueError(
+                    "Mach-O export trie terminal combines re-export "
+                    "and stub/resolver flags"
+                )
+            if flags & 0x08:
+                _ordinal, cursor = macho_uleb128(
+                    data,
+                    cursor,
+                    terminal_end,
+                    "Mach-O export trie re-export ordinal",
+                )
+                import_name = c_string_bytes(
+                    data,
+                    cursor,
+                    terminal_end,
+                    "Mach-O export trie re-export name",
+                )
+                cursor += len(import_name) + 1
+            else:
+                _address, cursor = macho_uleb128(
+                    data,
+                    cursor,
+                    terminal_end,
+                    "Mach-O export trie terminal address",
+                )
+                if flags & 0x10:
+                    _resolver, cursor = macho_uleb128(
+                        data,
+                        cursor,
+                        terminal_end,
+                        "Mach-O export trie resolver address",
+                    )
+            if cursor != terminal_end:
+                raise ValueError(
+                    "Mach-O export trie terminal has trailing payload data"
+                )
+            name = ascii_symbol(prefix)
+            if name:
+                exported_symbols.add(name)
+
+        cursor = terminal_end
+        if cursor >= trie_end:
+            raise ValueError(
+                "Mach-O export trie child count is out of bounds"
+            )
+        child_count = data[cursor]
+        cursor += 1
+        child_edges = set()
+        children = []
+        for child_index in range(child_count):
+            edge = c_string_bytes(
+                data,
+                cursor,
+                trie_end,
+                f"Mach-O export trie child {child_index} edge",
+            )
+            cursor += len(edge) + 1
+            if not edge:
+                raise ValueError(
+                    f"Mach-O export trie child {child_index} has an empty edge"
+                )
+            if edge in child_edges:
+                raise ValueError(
+                    "Mach-O export trie node has duplicate child edges"
+                )
+            child_edges.add(edge)
+            child_offset, cursor = macho_uleb128(
+                data,
+                cursor,
+                trie_end,
+                f"Mach-O export trie child {child_index} offset",
+            )
+            if child_offset >= trie_size:
+                raise ValueError(
+                    "Mach-O export trie child offset is out of bounds"
+                )
+            child_prefix = prefix + edge
+            if len(child_prefix) > trie_size:
+                raise ValueError(
+                    "Mach-O export trie symbol path is unreasonably long"
+                )
+            children.append((child_offset, child_prefix))
+
+        for child_offset, child_prefix in reversed(children):
+            stack.append((False, child_offset, child_prefix))
+
+    return frozenset(exported_symbols)
 
 
 def parse_macho_thin(data: bytes) -> NativeBinary | None:
@@ -1118,6 +1325,8 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
     has_file_backed_segment = False
     section_count = 0
     symbol_table = None
+    id_dylib_count = 0
+    export_trie = None
     for index in range(command_count):
         require_range(
             data, command_offset, 8, f"Mach-O load command {index}"
@@ -1227,6 +1436,72 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
                 strings_offset,
                 strings_size,
             )
+        elif command == 0x0D:
+            if command_size < 24:
+                raise ValueError(
+                    f"Mach-O LC_ID_DYLIB command {index} has invalid size "
+                    f"{command_size}"
+                )
+            id_dylib_count += 1
+            if id_dylib_count > 1:
+                raise ValueError(
+                    "Mach-O image contains multiple LC_ID_DYLIB commands"
+                )
+            name_offset = struct.unpack_from(
+                "<I", data, command_offset + 8
+            )[0]
+            if name_offset < 24 or name_offset >= command_size:
+                raise ValueError(
+                    f"Mach-O LC_ID_DYLIB command {index} has invalid name offset"
+                )
+            install_name = c_string_bytes(
+                data,
+                command_offset + name_offset,
+                command_offset + command_size,
+                f"Mach-O LC_ID_DYLIB command {index} name",
+            )
+            if not install_name:
+                raise ValueError(
+                    f"Mach-O LC_ID_DYLIB command {index} has an empty name"
+                )
+        elif command in (0x22, 0x80000022):
+            if command_size != 48:
+                raise ValueError(
+                    f"invalid Mach-O LC_DYLD_INFO command {index}"
+                )
+            if export_trie is not None:
+                raise ValueError(
+                    "Mach-O image contains multiple export trie commands"
+                )
+            export_offset, export_size = struct.unpack_from(
+                "<II", data, command_offset + 40
+            )
+            require_range(
+                data,
+                export_offset,
+                export_size,
+                "Mach-O export trie",
+            )
+            export_trie = (export_offset, export_size)
+        elif command == 0x80000033:
+            if command_size != 16:
+                raise ValueError(
+                    f"invalid Mach-O LC_DYLD_EXPORTS_TRIE command {index}"
+                )
+            if export_trie is not None:
+                raise ValueError(
+                    "Mach-O image contains multiple export trie commands"
+                )
+            export_offset, export_size = struct.unpack_from(
+                "<II", data, command_offset + 8
+            )
+            require_range(
+                data,
+                export_offset,
+                export_size,
+                "Mach-O export trie",
+            )
+            export_trie = (export_offset, export_size)
 
         command_offset += command_size
 
@@ -1234,9 +1509,15 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
         raise ValueError("Mach-O load-command sizes do not match sizeofcmds")
     if not has_file_backed_segment:
         raise ValueError("Mach-O dylib has no non-empty file-backed segment")
+    if id_dylib_count == 0:
+        raise ValueError("Mach-O dylib is missing LC_ID_DYLIB")
 
     exported_symbols = set()
-    if symbol_table is not None:
+    if export_trie is not None:
+        exported_symbols.update(
+            parse_macho_export_trie(data, export_trie[0], export_trie[1])
+        )
+    elif symbol_table is not None:
         (
             symbols_offset,
             symbol_count,
