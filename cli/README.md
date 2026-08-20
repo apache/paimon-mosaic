@@ -103,9 +103,14 @@ a new Mosaic file; the schema is inferred from the input unless `--schema` is
 provided. A field with no non-null value cannot be inferred and is reported as
 an error — pass `--schema` for such data.
 An existing output is kept unless `--overwrite` is given.
-`--schema` accepts an Avro record schema file.
+`--schema` accepts the supported subset of an Avro record schema: primitive
+fields, nullable unions with one non-null branch, arrays/maps, and `date`,
+`time-millis`, `timestamp-*`, `local-timestamp-*`, `decimal`, and `uuid`
+logical types. It is not a general Avro name resolver: nested records, enums,
+named-type references, and non-decimal `fixed` fields are rejected.
 Avro arrays and maps are converted recursively. Avro `timestamp-*` logical
-types remain UTC instants, while `local-timestamp-*` remains timezone-free.
+types remain UTC instants, while `local-timestamp-*` remains timezone-free;
+unknown logical types are ignored and use their underlying Avro type.
 Use `-c`/`--column`/`--columns` to project top-level fields; each occurrence
 accepts a comma-separated list.
 `--stats id` builds min/max for those columns, which `cat --where` then uses
@@ -121,8 +126,10 @@ $ mosaic convert data.json -o data.mosaic --stats id
 ## Convert CSV
 
 Import CSV into a new Mosaic file, either with an Avro record schema file
-given via `--schema`, or with a schema inferred from the CSV data. Multiple
-input files are allowed when they share one schema; empty files are skipped.
+given via `--schema`, or with a schema inferred from the CSV data. For multiple
+inputs with headers, inferred fields are matched by name rather than position,
+and mixed `Int64`/`Float64` fields are promoted to `Float64`; other field-name
+or type conflicts require `--schema`. Empty and header-only files are skipped.
 CSV cannot say what type an all-empty column is, so columns inferred as Arrow
 `Null` fall back to nullable `Utf8` and their values remain null. Use
 `--schema` when such a column should have another type. When a CSV schema is

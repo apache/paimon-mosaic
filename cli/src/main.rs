@@ -24,7 +24,18 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use arrow::array::{new_null_array, ArrayRef, RecordBatch};
+use arrow::array::timezone::Tz;
+use arrow::array::types::{
+    ArrowPrimitiveType, Date32Type, Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
+    Time32MillisecondType, TimestampMicrosecondType, TimestampMillisecondType,
+    TimestampNanosecondType,
+};
+use arrow::array::{
+    new_null_array, ArrayRef, BooleanArray, PrimitiveArray, RecordBatch, StringArray,
+};
+use arrow::compute::kernels::cast_utils::{
+    parse_decimal, string_to_datetime, Parser as ArrowValueParser,
+};
 use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use clap::{Parser, Subcommand};
 use paimon_mosaic_core::reader::{MosaicReader, ReaderAccess};
@@ -133,7 +144,7 @@ enum Cmd {
         /// Output .mosaic path.
         #[arg(short = 'o', long = "output")]
         out: PathBuf,
-        /// Avro record schema file to use instead of inferring one.
+        /// Avro record schema file (supported subset; see the CLI README).
         #[arg(short = 's', long)]
         schema: Option<PathBuf>,
         /// Columns to keep; each occurrence accepts a comma-separated list.
@@ -154,7 +165,7 @@ enum Cmd {
         /// Output .mosaic path.
         #[arg(short = 'o', long = "output")]
         out: PathBuf,
-        /// Avro record schema file to use instead of inferring one (scalar fields only).
+        /// Avro record schema file (supported subset, scalar fields only; see the CLI README).
         #[arg(short = 's', long)]
         schema: Option<PathBuf>,
         /// Do not allow null values for inferred fields; repeat for multiple fields.
@@ -594,10 +605,7 @@ fn convert_csv(
     let bad = |e: ArrowError| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
     let format = csv_format(&options)?;
     let explicit_schema = schema.map(load_convert_schema).transpose()?;
-    // Arrow schema inference rejects ragged rows, so once inference succeeds
-    // every row is as wide as the header; only an explicit schema needs the
-    // row widths scanned to size the reader for extra CSV columns.
-    let scan_widths = explicit_schema.is_some();
+    let has_explicit_schema = explicit_schema.is_some();
     let schema = match explicit_schema {
         Some(schema) => schema,
         None => {
@@ -624,16 +632,28 @@ fn convert_csv(
         }
     };
     reject_csv_unsupported_fields(&schema)?;
+    let schema_index = csv_schema_index(&schema);
     write_mosaic(out, overwrite, &schema, stats, |writer, rows| {
         for input in inputs {
-            let layout = csv_input_layout(input, &options, scan_widths)?;
-            // An empty file read in header mode yields an empty header: nothing
-            // to read, and no header names to complain about.
-            if layout.header.as_ref().is_some_and(|h| h.is_empty()) {
+            if has_explicit_schema {
+                write_explicit_schema_csv_input(
+                    writer,
+                    rows,
+                    input,
+                    &schema,
+                    &schema_index,
+                    &options,
+                )?;
                 continue;
             }
-            let reader_schema = csv_reader_schema(&schema, &layout);
-            let source_mapping = csv_output_mapping(&schema, &layout);
+            let layout = csv_input_layout(input, &options)?;
+            // Empty and header-only shards contribute no rows, so their header
+            // cannot affect the schema inferred from non-empty inputs.
+            if !layout.has_records {
+                continue;
+            }
+            let reader_schema = csv_reader_schema(&schema, &schema_index, &layout);
+            let source_mapping = csv_output_mapping(&schema, &schema_index, &layout);
             validate_csv_mapping(&schema, &layout, &source_mapping, input)?;
             let (projection, mapping) = csv_projection(&source_mapping);
             let batch_size = csv_batch_size(reader_schema.fields().len());
@@ -856,6 +876,13 @@ fn open_csv(path: &Path, skip_lines: usize) -> std::io::Result<std::io::BufReade
 struct CsvInputLayout {
     header: Option<Vec<String>>,
     columns: usize,
+    has_records: bool,
+}
+
+struct CsvInput {
+    reader: csv::Reader<std::io::BufReader<std::fs::File>>,
+    layout: CsvInputLayout,
+    first_record: Option<csv::StringRecord>,
 }
 
 const DEFAULT_CSV_BATCH_SIZE: usize = 1024;
@@ -871,11 +898,11 @@ fn csv_batch_size(columns: usize) -> usize {
     (TARGET_CSV_DECODE_CELLS / columns).clamp(1, DEFAULT_CSV_BATCH_SIZE)
 }
 
-fn csv_input_layout(
-    path: &Path,
-    options: &CsvConvertOptions,
-    scan_widths: bool,
-) -> std::io::Result<CsvInputLayout> {
+fn csv_input_layout(path: &Path, options: &CsvConvertOptions) -> std::io::Result<CsvInputLayout> {
+    Ok(open_csv_input(path, options)?.layout)
+}
+
+fn open_csv_input(path: &Path, options: &CsvConvertOptions) -> std::io::Result<CsvInput> {
     let delimiter = parse_csv_byte(&options.delimiter, "delimiter")?;
     let escape = parse_optional_csv_byte(options.escape.as_deref(), "escape")?;
     let quote = parse_csv_byte(&options.quote, "quote")?;
@@ -887,34 +914,307 @@ fn csv_input_layout(
         .quote(quote)
         .escape(escape);
     let mut reader = builder.from_reader(open_csv(path, options.skip_lines)?);
-    let mut records = reader.records();
+    let file_header = options.header.is_none() && !options.no_header;
     let header = if let Some(header) = &options.header {
         Some(parse_csv_header(header, options)?)
     } else if options.no_header {
         None
     } else {
-        match records.next() {
-            Some(record) => {
-                let record =
-                    record.map_err(|e| invalid_schema(format!("invalid CSV header: {e}")))?;
-                let header: Vec<String> = record.iter().map(ToString::to_string).collect();
-                validate_csv_header_names(&header)?;
-                Some(header)
-            }
-            None => Some(Vec::new()),
+        let mut record = csv::StringRecord::new();
+        if reader
+            .read_record(&mut record)
+            .map_err(|e| invalid_schema(format!("invalid CSV header: {e}")))?
+        {
+            Some(record.iter().map(ToString::to_string).collect())
+        } else {
+            Some(Vec::new())
         }
     };
-    let mut columns = header.as_ref().map_or(0, Vec::len);
-    if scan_widths {
-        for record in records {
-            let record = record.map_err(|e| invalid_schema(format!("invalid CSV record: {e}")))?;
-            columns = columns.max(record.len());
-        }
+    let columns = header.as_ref().map_or(0, Vec::len);
+    let mut first_record = csv::StringRecord::new();
+    let has_records = reader
+        .read_record(&mut first_record)
+        .map_err(|e| invalid_schema(format!("invalid CSV record: {e}")))?;
+    if has_records && file_header {
+        validate_csv_header_names(header.as_ref().unwrap())?;
     }
-    Ok(CsvInputLayout { header, columns })
+    Ok(CsvInput {
+        reader,
+        layout: CsvInputLayout {
+            header,
+            columns,
+            has_records,
+        },
+        first_record: has_records.then_some(first_record),
+    })
 }
 
-fn csv_reader_schema(output_schema: &Schema, layout: &CsvInputLayout) -> Schema {
+fn write_explicit_schema_csv_input(
+    writer: &mut paimon_mosaic_core::writer::MosaicWriter<paimon_mosaic_core::writer::FileSink>,
+    rows: &mut usize,
+    input: &Path,
+    schema: &Schema,
+    schema_index: &std::collections::HashMap<&str, usize>,
+    options: &CsvConvertOptions,
+) -> std::io::Result<()> {
+    let mut input_reader = open_csv_input(input, options)?;
+    if !input_reader.layout.has_records {
+        return Ok(());
+    }
+    let source_mapping = csv_output_mapping(schema, schema_index, &input_reader.layout);
+    validate_csv_mapping(schema, &input_reader.layout, &source_mapping, input)?;
+
+    let mut records = Vec::with_capacity(csv_batch_size(
+        input_reader.layout.columns.max(schema.fields().len()),
+    ));
+    let mut cells = 0;
+    let mut next = input_reader.first_record.take();
+    while let Some(record) = next {
+        if !records.is_empty()
+            && (records.len() >= DEFAULT_CSV_BATCH_SIZE
+                || cells + record.len() > TARGET_CSV_DECODE_CELLS)
+        {
+            write_explicit_csv_records(writer, rows, schema, &source_mapping, &records)?;
+            records.clear();
+            cells = 0;
+        }
+        cells += record.len();
+        records.push(record);
+
+        let mut record = csv::StringRecord::new();
+        next = input_reader
+            .reader
+            .read_record(&mut record)
+            .map_err(|e| invalid_schema(format!("invalid CSV record in {}: {e}", input.display())))?
+            .then_some(record);
+    }
+    if !records.is_empty() {
+        write_explicit_csv_records(writer, rows, schema, &source_mapping, &records)?;
+    }
+    Ok(())
+}
+
+fn write_explicit_csv_records(
+    writer: &mut paimon_mosaic_core::writer::MosaicWriter<paimon_mosaic_core::writer::FileSink>,
+    rows: &mut usize,
+    schema: &Schema,
+    mapping: &[Option<usize>],
+    records: &[csv::StringRecord],
+) -> std::io::Result<()> {
+    let batch = csv_records_to_batch(schema, mapping, records)?;
+    *rows += batch.num_rows();
+    writer.write_batch(&batch)
+}
+
+fn csv_records_to_batch(
+    schema: &Schema,
+    mapping: &[Option<usize>],
+    records: &[csv::StringRecord],
+) -> std::io::Result<RecordBatch> {
+    let columns = schema
+        .fields()
+        .iter()
+        .zip(mapping)
+        .map(|(field, source)| match source {
+            Some(source) => csv_column_array(records, *source, field),
+            None => Ok(new_null_array(field.data_type(), records.len())),
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    RecordBatch::try_new(Arc::new(schema.clone()), columns)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+}
+
+fn csv_column_array(
+    records: &[csv::StringRecord],
+    source: usize,
+    field: &Field,
+) -> std::io::Result<ArrayRef> {
+    match field.data_type() {
+        DataType::Boolean => {
+            let values = records
+                .iter()
+                .map(|record| {
+                    let Some(value) = csv_record_value(record, source) else {
+                        return Ok(None);
+                    };
+                    if value.eq_ignore_ascii_case("true") {
+                        Ok(Some(true))
+                    } else if value.eq_ignore_ascii_case("false") {
+                        Ok(Some(false))
+                    } else {
+                        Err(csv_value_parse_error(record, field, value))
+                    }
+                })
+                .collect::<std::io::Result<Vec<_>>>()?;
+            Ok(Arc::new(BooleanArray::from(values)))
+        }
+        DataType::Int32 => csv_primitive_column::<Int32Type>(records, source, field),
+        DataType::Int64 => csv_primitive_column::<Int64Type>(records, source, field),
+        DataType::Float32 => csv_primitive_column::<Float32Type>(records, source, field),
+        DataType::Float64 => csv_primitive_column::<Float64Type>(records, source, field),
+        DataType::Date32 => csv_primitive_column::<Date32Type>(records, source, field),
+        DataType::Time32(TimeUnit::Millisecond) => {
+            csv_primitive_column::<Time32MillisecondType>(records, source, field)
+        }
+        DataType::Timestamp(unit, timezone) => {
+            csv_timestamp_column(records, source, field, unit, timezone.clone())
+        }
+        DataType::Decimal128(precision, scale) => {
+            let values = records
+                .iter()
+                .map(|record| {
+                    csv_record_value(record, source)
+                        .map(|value| {
+                            parse_decimal::<Decimal128Type>(value, *precision, *scale)
+                                .map(Some)
+                                .map_err(|_| csv_value_parse_error(record, field, value))
+                        })
+                        .unwrap_or(Ok(None))
+                })
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let array: PrimitiveArray<Decimal128Type> = values.into_iter().collect();
+            Ok(Arc::new(
+                array
+                    .with_precision_and_scale(*precision, *scale)
+                    .map_err(|e| invalid_schema(e.to_string()))?,
+            ))
+        }
+        DataType::Utf8 => Ok(Arc::new(
+            records
+                .iter()
+                .map(|record| csv_record_value(record, source))
+                .collect::<StringArray>(),
+        )),
+        data_type => Err(invalid_schema(format!(
+            "CSV conversion does not support field '{}' with type {data_type}",
+            fmt::safe(field.name())
+        ))),
+    }
+}
+
+fn csv_primitive_column<T>(
+    records: &[csv::StringRecord],
+    source: usize,
+    field: &Field,
+) -> std::io::Result<ArrayRef>
+where
+    T: ArrowPrimitiveType + ArrowValueParser,
+{
+    Ok(Arc::new(csv_primitive_array::<T>(records, source, field)?))
+}
+
+fn csv_primitive_array<T>(
+    records: &[csv::StringRecord],
+    source: usize,
+    field: &Field,
+) -> std::io::Result<PrimitiveArray<T>>
+where
+    T: ArrowPrimitiveType + ArrowValueParser,
+{
+    let values = records
+        .iter()
+        .map(|record| {
+            csv_record_value(record, source)
+                .map(|value| {
+                    T::parse(value)
+                        .map(Some)
+                        .ok_or_else(|| csv_value_parse_error(record, field, value))
+                })
+                .unwrap_or(Ok(None))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    Ok(values.into_iter().collect())
+}
+
+fn csv_timestamp_column(
+    records: &[csv::StringRecord],
+    source: usize,
+    field: &Field,
+    unit: &TimeUnit,
+    timezone: Option<Arc<str>>,
+) -> std::io::Result<ArrayRef> {
+    let parser_timezone: Tz = timezone
+        .as_deref()
+        .unwrap_or("+00:00")
+        .parse()
+        .map_err(|e| invalid_schema(format!("invalid timestamp timezone: {e}")))?;
+    let values = records
+        .iter()
+        .map(|record| {
+            let Some(value) = csv_record_value(record, source) else {
+                return Ok(None);
+            };
+            let datetime = string_to_datetime(&parser_timezone, value)
+                .map_err(|_| csv_value_parse_error(record, field, value))?;
+            let timestamp = match unit {
+                TimeUnit::Millisecond => datetime.timestamp_millis(),
+                TimeUnit::Microsecond => datetime.timestamp_micros(),
+                TimeUnit::Nanosecond => datetime
+                    .timestamp_nanos_opt()
+                    .ok_or_else(|| csv_value_parse_error(record, field, value))?,
+                unit => {
+                    return Err(invalid_schema(format!(
+                        "CSV conversion does not support timestamp unit {unit:?}"
+                    )));
+                }
+            };
+            Ok(Some(timestamp))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    Ok(match unit {
+        TimeUnit::Millisecond => Arc::new(
+            PrimitiveArray::<TimestampMillisecondType>::from(values)
+                .with_timezone_opt(timezone.clone()),
+        ),
+        TimeUnit::Microsecond => Arc::new(
+            PrimitiveArray::<TimestampMicrosecondType>::from(values)
+                .with_timezone_opt(timezone.clone()),
+        ),
+        TimeUnit::Nanosecond => Arc::new(
+            PrimitiveArray::<TimestampNanosecondType>::from(values).with_timezone_opt(timezone),
+        ),
+        unit => {
+            return Err(invalid_schema(format!(
+                "CSV conversion does not support timestamp unit {unit:?}"
+            )));
+        }
+    })
+}
+
+fn csv_record_value(record: &csv::StringRecord, source: usize) -> Option<&str> {
+    record.get(source).filter(|value| !value.is_empty())
+}
+
+fn csv_value_parse_error(record: &csv::StringRecord, field: &Field, value: &str) -> std::io::Error {
+    let line = record
+        .position()
+        .map(|position| position.line().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "cannot parse '{}' as {} for CSV field '{}' at line {line}",
+            fmt::safe(value),
+            field.data_type(),
+            fmt::safe(field.name())
+        ),
+    )
+}
+
+fn csv_schema_index(schema: &Schema) -> std::collections::HashMap<&str, usize> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| (field.name().as_str(), index))
+        .collect()
+}
+
+fn csv_reader_schema(
+    output_schema: &Schema,
+    schema_index: &std::collections::HashMap<&str, usize>,
+    layout: &CsvInputLayout,
+) -> Schema {
     let positional = layout.header.is_none();
     let columns = if positional {
         layout.columns.max(output_schema.fields().len())
@@ -926,7 +1226,7 @@ fn csv_reader_schema(output_schema: &Schema, layout: &CsvInputLayout) -> Schema 
             let source = if let Some(header) = &layout.header {
                 header
                     .get(i)
-                    .and_then(|name| output_schema.index_of(name).ok())
+                    .and_then(|name| schema_index.get(name.as_str()).copied())
             } else {
                 (i < output_schema.fields().len()).then_some(i)
             };
@@ -947,11 +1247,15 @@ fn csv_reader_schema(output_schema: &Schema, layout: &CsvInputLayout) -> Schema 
     Schema::new(fields)
 }
 
-fn csv_output_mapping(output_schema: &Schema, layout: &CsvInputLayout) -> Vec<Option<usize>> {
+fn csv_output_mapping(
+    output_schema: &Schema,
+    schema_index: &std::collections::HashMap<&str, usize>,
+    layout: &CsvInputLayout,
+) -> Vec<Option<usize>> {
     if let Some(header) = &layout.header {
         let mut mapping = vec![None; output_schema.fields().len()];
         for (csv_index, name) in header.iter().enumerate() {
-            if let Ok(field_index) = output_schema.index_of(name) {
+            if let Some(field_index) = schema_index.get(name.as_str()).copied() {
                 mapping[field_index] = Some(csv_index);
             }
         }
@@ -1094,7 +1398,8 @@ fn validate_csv_header_names(header: &[String]) -> std::io::Result<()> {
         }
         if !seen.insert(name.as_str()) {
             return Err(invalid_schema(format!(
-                "duplicate CSV header field '{name}'"
+                "duplicate CSV header field '{}'",
+                fmt::safe(name)
             )));
         }
     }
@@ -1139,11 +1444,21 @@ fn merge_csv_inferred_schema(prev: Schema, next: Schema, input: &Path) -> std::i
     if prev.fields().len() != next.fields().len() {
         return Err(csv_schema_mismatch(input));
     }
+    let next_fields: std::collections::HashMap<&str, &Field> = next
+        .fields()
+        .iter()
+        .map(|field| (field.name().as_str(), field.as_ref()))
+        .collect();
     let fields: Vec<Field> = prev
         .fields()
         .iter()
-        .zip(next.fields())
-        .map(|(left, right)| merge_csv_inferred_field(left.as_ref(), right.as_ref(), input))
+        .map(|left| {
+            let right = next_fields
+                .get(left.name().as_str())
+                .copied()
+                .ok_or_else(|| csv_schema_mismatch(input))?;
+            merge_csv_inferred_field(left.as_ref(), right, input)
+        })
         .collect::<std::io::Result<_>>()?;
     Ok(Schema::new_with_metadata(fields, prev.metadata().clone()))
 }
@@ -1157,6 +1472,10 @@ fn merge_csv_inferred_field(left: &Field, right: &Field, input: &Path) -> std::i
         (left_type, right_type) if left_type == right_type => left.clone().with_nullable(nullable),
         (DataType::Null, _) => right.clone().with_nullable(true),
         (_, DataType::Null) => left.clone().with_nullable(true),
+        (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64) => left
+            .clone()
+            .with_data_type(DataType::Float64)
+            .with_nullable(nullable),
         _ => return Err(csv_schema_mismatch(input)),
     };
     Ok(field)
@@ -1260,7 +1579,9 @@ fn parse_avro_named_type(name: &str, full_type: Option<&Value>) -> Result<DataTy
         .and_then(|value| value.get("logicalType"))
         .and_then(Value::as_str);
     if let Some(logical_type) = logical_type {
-        return parse_avro_logical_type(name, logical_type, full_type.unwrap());
+        if let Some(result) = parse_avro_logical_type(name, logical_type, full_type.unwrap()) {
+            return result;
+        }
     }
     match name {
         "boolean" => Ok(DataType::Boolean),
@@ -1311,8 +1632,8 @@ fn parse_avro_logical_type(
     physical_type: &str,
     logical_type: &str,
     full_type: &Value,
-) -> Result<DataType, String> {
-    match (physical_type, logical_type) {
+) -> Option<Result<DataType, String>> {
+    Some(match (physical_type, logical_type) {
         ("int", "date") => Ok(DataType::Date32),
         ("int", "time-millis") => Ok(DataType::Time32(TimeUnit::Millisecond)),
         ("long", "timestamp-millis") => Ok(DataType::Timestamp(
@@ -1332,10 +1653,8 @@ fn parse_avro_logical_type(
         ("long", "local-timestamp-nanos") => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
         ("bytes" | "fixed", "decimal") => parse_avro_decimal(full_type),
         ("string", "uuid") => Ok(DataType::Utf8),
-        _ => Err(format!(
-            "unsupported Avro logical type '{logical_type}' on '{physical_type}'"
-        )),
-    }
+        _ => return None,
+    })
 }
 
 fn parse_avro_decimal(full_type: &Value) -> Result<DataType, String> {
@@ -1747,6 +2066,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_avro_schema_ignores_unknown_logical_types() {
+        let schema = parse_avro_schema(
+            r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "id", "type": {"type": "long", "logicalType": "vendor-id"}},
+    {"name": "name", "type": {"type": "string", "logicalType": "vendor-name"}}
+  ]
+}"#,
+        )
+        .unwrap();
+        assert_eq!(schema.fields()[0].data_type(), &DataType::Int64);
+        assert_eq!(schema.fields()[1].data_type(), &DataType::Utf8);
+    }
+
+    #[test]
     fn parse_avro_schema_supports_recursive_array_and_map_types() {
         let schema = parse_avro_schema(
             r#"{
@@ -1806,6 +2142,73 @@ mod tests {
         let (projection, mapping) = csv_projection(&[Some(5), None, Some(1)]);
         assert_eq!(projection, [5, 1]);
         assert_eq!(mapping, [Some(0), None, Some(1)]);
+    }
+
+    #[test]
+    fn csv_schema_index_drives_wide_reordered_mappings() {
+        let schema = Schema::new(
+            (0..4096)
+                .map(|i| Field::new(format!("field_{i}"), DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        );
+        let index = csv_schema_index(&schema);
+        let layout = CsvInputLayout {
+            header: Some((0..4096).rev().map(|i| format!("field_{i}")).collect()),
+            columns: 4096,
+            has_records: true,
+        };
+        let reader_schema = csv_reader_schema(&schema, &index, &layout);
+        let mapping = csv_output_mapping(&schema, &index, &layout);
+        assert_eq!(reader_schema.fields()[0].name(), "field_0");
+        assert_eq!(reader_schema.fields()[4095].name(), "field_4095");
+        assert_eq!(mapping[0], Some(4095));
+        assert_eq!(mapping[4095], Some(0));
+    }
+
+    #[test]
+    fn explicit_csv_timestamps_floor_before_epoch() {
+        let records = [csv::StringRecord::from(vec![
+            "1969-12-31T23:59:59.999500Z",
+            "1969-12-31T23:59:59.999999500Z",
+        ])];
+        let millis_field = Field::new(
+            "millis",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("+00:00".into())),
+            false,
+        );
+        let micros_field = Field::new(
+            "micros",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        );
+        let millis = csv_column_array(&records, 0, &millis_field).unwrap();
+        let micros = csv_column_array(&records, 1, &micros_field).unwrap();
+        assert_eq!(
+            millis
+                .as_any()
+                .downcast_ref::<PrimitiveArray<TimestampMillisecondType>>()
+                .unwrap()
+                .value(0),
+            -1
+        );
+        assert_eq!(
+            micros
+                .as_any()
+                .downcast_ref::<PrimitiveArray<TimestampMicrosecondType>>()
+                .unwrap()
+                .value(0),
+            -1
+        );
+    }
+
+    #[test]
+    fn duplicate_csv_header_errors_sanitize_control_characters() {
+        let name = "bad\u{1b}]2;title\u{7}";
+        let err = validate_csv_header_names(&[name.to_string(), name.to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(!err.chars().any(char::is_control), "{err:?}");
+        assert!(err.contains("bad\u{fffd}]2;title\u{fffd}"), "{err:?}");
     }
 
     #[test]
