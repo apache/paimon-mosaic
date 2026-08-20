@@ -20,6 +20,7 @@
 package org.apache.paimon.mosaic;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -72,7 +73,7 @@ public class MosaicComprehensiveTest {
         return baos.toByteArray();
     }
 
-    private MosaicReader readerFromBytes(byte[] data) {
+    private MosaicReader readerFromBytes(byte[] data) throws IOException {
         InputFile inputFile = (position, buffer, offset, length) -> {
             System.arraycopy(data, (int) position, buffer, offset, length);
         };
@@ -81,7 +82,7 @@ public class MosaicComprehensiveTest {
 
     // Test 1: Large data roundtrip with 1M rows
     @Test
-    public void testLargeDataRoundtrip() {
+    public void testLargeDataRoundtrip() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(64, true)),
                 Field.nullable("name", ArrowType.Utf8.INSTANCE),
@@ -145,7 +146,7 @@ public class MosaicComprehensiveTest {
 
     // Test 2: All constant values - should produce small file
     @Test
-    public void testAllConstantValues() {
+    public void testAllConstantValues() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(64, true)),
                 Field.nullable("name", ArrowType.Utf8.INSTANCE),
@@ -208,7 +209,7 @@ public class MosaicComprehensiveTest {
 
     // Test 3: High null rate (95%)
     @Test
-    public void testHighNullRate() {
+    public void testHighNullRate() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(64, true)),
                 Field.nullable("name", ArrowType.Utf8.INSTANCE),
@@ -294,7 +295,7 @@ public class MosaicComprehensiveTest {
 
     // Test 4: Wide table with 100 columns
     @Test
-    public void testWideTable() {
+    public void testWideTable() throws IOException {
         int numCols = 100;
         int totalRows = 50_000;
 
@@ -367,7 +368,7 @@ public class MosaicComprehensiveTest {
 
     // Test 5: Many small writes (10000 batches of 10 rows)
     @Test
-    public void testManySmallWrites() {
+    public void testManySmallWrites() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("val", ArrowType.Utf8.INSTANCE)
@@ -408,7 +409,7 @@ public class MosaicComprehensiveTest {
 
     // Test 6: Projection with large column count
     @Test
-    public void testProjectionWithLargeColumnCount() {
+    public void testProjectionWithLargeColumnCount() throws IOException {
         int numCols = 50;
         List<Field> fields = new ArrayList<>();
         for (int c = 0; c < numCols; c++) {
@@ -460,7 +461,7 @@ public class MosaicComprehensiveTest {
 
     // Test 7: Sequential vs random data file size comparison
     @Test
-    public void testSequentialVsRandomData() {
+    public void testSequentialVsRandomData() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("val", new ArrowType.Int(64, true))
         ));
@@ -523,7 +524,7 @@ public class MosaicComprehensiveTest {
 
     // Test 8: Multiple row groups roundtrip with small max size
     @Test
-    public void testMultipleRowGroupsRoundtrip() {
+    public void testMultipleRowGroupsRoundtrip() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("data", new ArrowType.Int(64, true)),
@@ -587,7 +588,7 @@ public class MosaicComprehensiveTest {
 
     // Test 9: Empty string values mixed with non-empty
     @Test
-    public void testEmptyStringValues() {
+    public void testEmptyStringValues() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("text", ArrowType.Utf8.INSTANCE)
@@ -646,7 +647,7 @@ public class MosaicComprehensiveTest {
 
     // Test 10: Decimal precisions
     @Test
-    public void testDecimalPrecisions() {
+    public void testDecimalPrecisions() throws IOException {
         // Test Decimal128 with precision 10
         Schema schema10 = new Schema(Arrays.asList(
                 Field.nullable("dec10", new ArrowType.Decimal(10, 2, 128))

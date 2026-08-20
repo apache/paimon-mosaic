@@ -19,6 +19,7 @@
 
 package org.apache.paimon.mosaic;
 
+import java.io.IOException;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -46,7 +47,14 @@ public class MosaicReader implements AutoCloseable {
         }
     }
 
-    public static MosaicReader open(InputFile inputFile, long fileLength, BufferAllocator allocator) {
+    /**
+     * Opens a Mosaic reader.
+     *
+     * @throws IOException if {@link InputFile#readFully(long, byte[], int, int)} throws one while
+     *     reading file metadata; the original exception is propagated
+     */
+    public static MosaicReader open(InputFile inputFile, long fileLength, BufferAllocator allocator)
+            throws IOException {
         long handle = NativeLib.nativeReaderOpen(inputFile, fileLength);
         if (handle == 0) {
             throw new RuntimeException("failed to open reader");
@@ -71,7 +79,13 @@ public class MosaicReader implements AutoCloseable {
         NativeLib.nativeReaderSetProjection(handle, columns);
     }
 
-    public VectorSchemaRoot readRowGroup(int rgIndex, BufferAllocator allocator) {
+    /**
+     * Reads a row group.
+     *
+     * @throws IOException if {@link InputFile#readFully(long, byte[], int, int)} throws one while
+     *     reading row-group data; the original exception is propagated
+     */
+    public VectorSchemaRoot readRowGroup(int rgIndex, BufferAllocator allocator) throws IOException {
         long rgHandle = NativeLib.nativeReaderOpenRowGroup(handle, rgIndex);
         if (rgHandle == 0) {
             throw new RuntimeException("failed to open row group " + rgIndex);

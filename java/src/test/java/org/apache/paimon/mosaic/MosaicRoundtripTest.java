@@ -28,6 +28,9 @@ import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.arrow.c.jni.JniWrapper;
 import org.apache.arrow.memory.ArrowBuf;
@@ -171,7 +174,7 @@ public class MosaicRoundtripTest {
         return baos.toByteArray();
     }
 
-    private MosaicReader readerFromBytes(byte[] data) {
+    private MosaicReader readerFromBytes(byte[] data) throws IOException {
         InputFile inputFile = (position, buffer, offset, length) -> {
             System.arraycopy(data, (int) position, buffer, offset, length);
         };
@@ -192,7 +195,14 @@ public class MosaicRoundtripTest {
             System.runFinalization();
             Thread.sleep(50L);
         }
-        assertNull("expected input file to be released after failed open", reference.get());
+        assertNull("expected native callback object to be released", reference.get());
+    }
+
+    private static void awaitGarbageCollection(List<WeakReference<?>> references)
+            throws InterruptedException {
+        for (WeakReference<?> reference : references) {
+            awaitGarbageCollection(reference);
+        }
     }
 
     private WeakReference<InputFile> openReaderWithClosedAllocator(byte[] data) {
@@ -211,8 +221,72 @@ public class MosaicRoundtripTest {
         return reference;
     }
 
+    private List<WeakReference<?>> openReaderWithFailingInput() {
+        IOException expected = new IOException("intentional native input failure");
+        InputFile inputFile =
+                new InputFile() {
+                    @Override
+                    public void readFully(
+                            long position, byte[] buffer, int offset, int length)
+                            throws IOException {
+                        throw expected;
+                    }
+                };
+        WeakReference<InputFile> inputReference = new WeakReference<>(inputFile);
+        WeakReference<IOException> exceptionReference = new WeakReference<>(expected);
+
+        try (MosaicReader ignored = MosaicReader.open(inputFile, 64L, allocator)) {
+            fail("expected IOException");
+        } catch (IOException error) {
+            assertSame(expected, error);
+        }
+        return Arrays.asList(inputReference, exceptionReference);
+    }
+
+    private List<WeakReference<?>> readRowGroupWithFailingInput(byte[] data) throws IOException {
+        IOException expected = new IOException("intentional native background input failure");
+        long callingThreadId = Thread.currentThread().getId();
+        AtomicBoolean failReads = new AtomicBoolean();
+        AtomicInteger reads = new AtomicInteger();
+        AtomicLong failingThreadId = new AtomicLong(-1L);
+        InputFile inputFile =
+                new InputFile() {
+                    @Override
+                    public void readFully(
+                            long position, byte[] buffer, int offset, int length)
+                            throws IOException {
+                        reads.incrementAndGet();
+                        if (failReads.get()) {
+                            failingThreadId.compareAndSet(
+                                    -1L, Thread.currentThread().getId());
+                            throw expected;
+                        }
+                        System.arraycopy(data, (int) position, buffer, offset, length);
+                    }
+                };
+        WeakReference<InputFile> inputReference = new WeakReference<>(inputFile);
+        WeakReference<IOException> exceptionReference = new WeakReference<>(expected);
+
+        MosaicReader reader = MosaicReader.open(inputFile, data.length, allocator);
+        int readsAfterOpen = reads.get();
+        try {
+            failReads.set(true);
+            try (VectorSchemaRoot ignored = reader.readRowGroup(0, allocator)) {
+                fail("expected IOException");
+            } catch (IOException actual) {
+                assertSame(expected, actual);
+            }
+            assertTrue("expected a row-group read", reads.get() > readsAfterOpen);
+            assertNotEquals(callingThreadId, failingThreadId.get());
+            assertEquals(1, reader.numRowGroups());
+        } finally {
+            reader.close();
+        }
+        return Arrays.asList(inputReference, exceptionReference);
+    }
+
     @Test
-    public void testBasicRoundtrip() {
+    public void testBasicRoundtrip() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.notNullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("name", ArrowType.Utf8.INSTANCE),
@@ -280,7 +354,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testWriteFromIndependentRootAllocator() {
+    public void testWriteFromIndependentRootAllocator() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.notNullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("name", ArrowType.Utf8.INSTANCE)
@@ -316,7 +390,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testWriteFromLimitedChildAllocator() {
+    public void testWriteFromLimitedChildAllocator() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.notNullable("id", new ArrowType.Int(32, true))
         ));
@@ -389,7 +463,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testSameRootExportKeepsWriterAllocatorAccounting() {
+    public void testSameRootExportKeepsWriterAllocatorAccounting() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.notNullable("id", new ArrowType.Int(32, true))
         ));
@@ -432,7 +506,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testCrossRootWriterAllocatorOutOfMemoryCanRetryWithoutLeak() {
+    public void testCrossRootWriterAllocatorOutOfMemoryCanRetryWithoutLeak() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true))
         ));
@@ -483,7 +557,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testCrossRootFailureAfterRootRegistrationCanRetryWithoutLeak() {
+    public void testCrossRootFailureAfterRootRegistrationCanRetryWithoutLeak() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.notNullable("id", new ArrowType.Int(32, true))
         ));
@@ -554,7 +628,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testCrossRootPreflightValidationFailureCanRetryWithoutLeak() {
+    public void testCrossRootPreflightValidationFailureCanRetryWithoutLeak() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.notNullable("id", new ArrowType.Int(32, true))
         ));
@@ -723,7 +797,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testCrossRootPartialExportFailureCanRetryWithoutLeak() {
+    public void testCrossRootPartialExportFailureCanRetryWithoutLeak() throws IOException {
         byte[] data;
         try (RootAllocator writerRoot = new RootAllocator(16L * 1024 * 1024);
              RootAllocator inputRoot = new RootAllocator(16L * 1024 * 1024)) {
@@ -781,7 +855,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testWriteSequentialBundlesFromDifferentRootAllocators() {
+    public void testWriteSequentialBundlesFromDifferentRootAllocators() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.notNullable("id", new ArrowType.Int(32, true))
         ));
@@ -907,7 +981,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testNullValues() {
+    public void testNullValues() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("name", ArrowType.Utf8.INSTANCE),
@@ -967,7 +1041,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testProjection() {
+    public void testProjection() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("a", new ArrowType.Int(32, true)),
                 Field.nullable("b", ArrowType.Utf8.INSTANCE),
@@ -1013,7 +1087,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testProjectionOrder() {
+    public void testProjectionOrder() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("a", new ArrowType.Int(32, true)),
                 Field.nullable("b", ArrowType.Utf8.INSTANCE),
@@ -1061,7 +1135,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testProjectionEmpty() {
+    public void testProjectionEmpty() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("a", new ArrowType.Int(32, true)),
                 Field.nullable("b", ArrowType.Utf8.INSTANCE)
@@ -1093,7 +1167,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testStats() {
+    public void testStats() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("name", ArrowType.Utf8.INSTANCE),
@@ -1141,7 +1215,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testAllTypes() {
+    public void testAllTypes() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("f_bool", ArrowType.Bool.INSTANCE),
                 Field.nullable("f_int8", new ArrowType.Int(8, true)),
@@ -1217,7 +1291,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testTimestampNsRoundtrip() {
+    public void testTimestampNsRoundtrip() throws IOException {
         ArrowType.Timestamp tsNsType = new ArrowType.Timestamp(TimeUnit.NANOSECOND, null);
         ArrowType.Timestamp tsNsTzType = new ArrowType.Timestamp(TimeUnit.NANOSECOND, "Asia/Shanghai");
         Schema arrowSchema = new Schema(Arrays.asList(
@@ -1263,7 +1337,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testCompressionNone() {
+    public void testCompressionNone() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("x", new ArrowType.Int(32, true)),
                 Field.nullable("y", ArrowType.Utf8.INSTANCE)
@@ -1295,7 +1369,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testMultipleRowGroups() {
+    public void testMultipleRowGroups() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("data", new ArrowType.Int(64, true))
@@ -1342,7 +1416,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testMultipleWrites() {
+    public void testMultipleWrites() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("x", new ArrowType.Int(32, true))
         ));
@@ -1409,7 +1483,30 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testSingleRow() {
+    public void testReaderOpenReleasesInputGlobalRefWhenReadFails() throws Exception {
+        awaitGarbageCollection(openReaderWithFailingInput());
+    }
+
+    @Test
+    public void testReaderRestoresBackgroundInputExceptionAndReleasesGlobalRef()
+            throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.nullable("value", new ArrowType.Int(32, true))
+        ));
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector values = (IntVector) root.getVector("value");
+            values.allocateNew(1);
+            values.set(0, 7);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        awaitGarbageCollection(readRowGroupWithFailingInput(data));
+    }
+
+    @Test
+    public void testSingleRow() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("v", new ArrowType.Int(32, true))
         ));
@@ -1432,7 +1529,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testZeroRows() {
+    public void testZeroRows() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("v", new ArrowType.Int(32, true))
         ));
@@ -1450,7 +1547,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testStatsWithNulls() {
+    public void testStatsWithNulls() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("a", new ArrowType.Int(32, true)),
                 Field.nullable("b", new ArrowType.Int(64, true))
@@ -1502,7 +1599,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testStatsAllNull() {
+    public void testStatsAllNull() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("x", new ArrowType.Int(32, true))
         ));
@@ -1556,7 +1653,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testSchemaRoundtrip() {
+    public void testSchemaRoundtrip() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("name", ArrowType.Utf8.INSTANCE),
                 Field.notNullable("id", new ArrowType.Int(32, true)),
@@ -1719,7 +1816,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testWriterStatsMatchesReaderStats() {
+    public void testWriterStatsMatchesReaderStats() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("value", new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE))
@@ -1763,7 +1860,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testRowGroupNumRows() {
+    public void testRowGroupNumRows() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("data", new ArrowType.Int(64, true))
@@ -1806,7 +1903,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testStatsEmptyStringMin() {
+    public void testStatsEmptyStringMin() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("s", ArrowType.Utf8.INSTANCE)
         ));
@@ -1849,7 +1946,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testRowGroupNumRowsSingleRowGroup() {
+    public void testRowGroupNumRowsSingleRowGroup() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("x", new ArrowType.Int(32, true))
         ));
@@ -1872,7 +1969,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testArrayType() {
+    public void testArrayType() throws IOException {
         Field elementField = new Field("item", FieldType.nullable(new ArrowType.Int(32, true)), null);
         Field listField = new Field("tags", FieldType.nullable(ArrowType.List.INSTANCE), Arrays.asList(elementField));
         Schema arrowSchema = new Schema(Arrays.asList(
@@ -1960,7 +2057,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testMapType() {
+    public void testMapType() throws IOException {
         // Use MapVector's writer to avoid schema mismatch with UnionMapWriter
         Field keyField = new Field("keys", FieldType.notNullable(new ArrowType.Int(32, true)), null);
         Field valueField = new Field("values", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);

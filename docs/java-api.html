@@ -260,7 +260,13 @@ w.endMap();</code></pre>
 <pre><code><span class="ty">BufferAllocator</span> allocator = <span class="kw">new</span> <span class="ty">RootAllocator</span>();
 <span class="ty">InputFile</span> inputFile = ...;
 <span class="kw">long</span> fileLength = ...;
+<span class="cmt">// The enclosing method declares throws IOException.</span>
 <span class="ty">MosaicReader</span> reader = <span class="ty">MosaicReader</span>.open(inputFile, fileLength, allocator);</code></pre>
+            <p>
+                <code>open()</code> and <code>readRowGroup()</code> propagate the original
+                <code>IOException</code> thrown by <code>InputFile.readFully()</code>. Callers must
+                catch it or declare <code>throws IOException</code>.
+            </p>
 
             <h3>2. Inspect the Schema</h3>
             <p>
@@ -283,7 +289,7 @@ w.endMap();</code></pre>
                     <tr><td><code>numRowGroups()</code></td><td><code>int</code></td><td>Row group count</td></tr>
                     <tr><td><code>rowGroupNumRows(rg)</code></td><td><code>int</code></td><td>Number of rows in a specific row group</td></tr>
                     <tr><td><code>project(String[])</code></td><td><code>void</code></td><td>Set projection: subsequent reads return only the named columns in the specified order</td></tr>
-                    <tr><td><code>readRowGroup(rg, allocator)</code></td><td><code>VectorSchemaRoot</code></td><td>Read a row group (all columns or projected columns if project() was called)</td></tr>
+                    <tr><td><code>readRowGroup(rg, allocator) throws IOException</code></td><td><code>VectorSchemaRoot</code></td><td>Read a row group, propagating the original <code>InputFile</code> exception</td></tr>
                     <tr><td><code>getRowGroupStatistics(rg)</code></td><td><code>Map&lt;String, ColumnStatistics&gt;</code></td><td>Column statistics for a row group, keyed by column name</td></tr>
                 </tbody>
             </table>
@@ -424,12 +430,11 @@ writer.close();
 <span class="kw">byte</span>[] data = baos.toByteArray();
 
 <span class="cmt">// 2. Read</span>
-<span class="ty">MosaicReader</span> reader = <span class="ty">MosaicReader</span>.open(
-    (pos, buf, off, len) -&gt; System.arraycopy(data, (<span class="kw">int</span>) pos, buf, off, len),
-    data.length,
-    allocator);
-
-<span class="kw">try</span> (reader) {
+<span class="cmt">// The enclosing method declares throws IOException.</span>
+<span class="kw">try</span> (<span class="ty">MosaicReader</span> reader = <span class="ty">MosaicReader</span>.open(
+        (pos, buf, off, len) -&gt; System.arraycopy(data, (<span class="kw">int</span>) pos, buf, off, len),
+        data.length,
+        allocator)) {
     <span class="kw">for</span> (<span class="kw">int</span> rg = <span class="num">0</span>; rg &lt; reader.numRowGroups(); rg++) {
         <span class="kw">try</span> (<span class="ty">VectorSchemaRoot</span> batch = reader.readRowGroup(rg, allocator)) {
 
