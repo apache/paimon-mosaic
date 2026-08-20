@@ -23,10 +23,334 @@ use arrow_array::*;
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, TimeUnit};
 
+use crate::reader::Encoding;
 use crate::spec::*;
 use crate::types;
 use crate::values::Value;
 use crate::varint;
+
+/// Borrowed view of one encoded scalar column.
+///
+/// The view borrows buffers owned by a [`crate::reader::RowGroupReader`] and must be consumed
+/// synchronously during [`crate::reader::RowGroupReader::visit_encoded_columns`]. It exposes the
+/// physical encoding without first materializing an Arrow array.
+#[derive(Clone, Copy)]
+pub struct EncodedColumn<'a> {
+    data_type: &'a DataType,
+    encoding: u8,
+    has_nulls: bool,
+    null_bitmap: &'a [u8],
+    const_value: &'a Value,
+    dict_values: &'a [Value],
+    dict_bit_width: usize,
+    data: &'a [u8],
+    data_cursor: usize,
+    num_rows: usize,
+}
+
+impl<'a> EncodedColumn<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        data_type: &'a DataType,
+        encoding: u8,
+        has_nulls: bool,
+        null_bitmap: &'a [u8],
+        const_value: &'a Value,
+        dict_values: &'a [Value],
+        dict_bit_width: usize,
+        data: &'a [u8],
+        data_cursor: usize,
+        num_rows: usize,
+    ) -> Self {
+        Self {
+            data_type,
+            encoding,
+            has_nulls,
+            null_bitmap,
+            const_value,
+            dict_values,
+            dict_bit_width,
+            data,
+            data_cursor,
+            num_rows,
+        }
+    }
+
+    pub fn data_type(&self) -> &DataType {
+        self.data_type
+    }
+
+    /// Returns the physical encoding used by this column.
+    pub fn encoding(&self) -> Encoding {
+        Encoding::from_code(self.encoding)
+    }
+
+    /// Returns the logical row count.
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    /// Returns whether at least one row is null.
+    pub fn has_nulls(&self) -> bool {
+        self.has_nulls || self.encoding == ENCODING_ALL_NULL
+    }
+
+    /// Returns the physical null bitmap when one is present.
+    ///
+    /// A set bit means that the corresponding row is null.
+    pub fn null_bitmap(&self) -> Option<&'a [u8]> {
+        self.has_nulls.then_some(self.null_bitmap)
+    }
+
+    /// Returns whether `row` is null.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `row >= self.num_rows()`.
+    pub fn is_null(&self, row: usize) -> bool {
+        assert!(row < self.num_rows, "encoded column row out of bounds");
+        self.encoding == ENCODING_ALL_NULL || (self.has_nulls && is_null(self.null_bitmap, row))
+    }
+
+    /// Returns the single encoded value for a CONST column.
+    pub fn constant(&self) -> io::Result<Option<EncodedValueRef<'a>>> {
+        if self.encoding != ENCODING_CONST {
+            return Ok(None);
+        }
+        encoded_value_ref(self.data_type, self.const_value).map(Some)
+    }
+
+    /// Iterates values in logical row order without materializing an Arrow array.
+    ///
+    /// Null rows are returned as [`EncodedValueRef::Null`]. Dictionary indexes and PLAIN values
+    /// are decoded lazily as the iterator advances.
+    pub fn values(&self) -> EncodedColumnValues<'a> {
+        EncodedColumnValues {
+            column: *self,
+            row: 0,
+            data_cursor: self.data_cursor,
+            bit_offset: 0,
+            done: false,
+        }
+    }
+}
+
+/// Borrowed scalar value returned by [`EncodedColumnValues`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum EncodedValueRef<'a> {
+    Null,
+    Boolean(bool),
+    Int8(i8),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    Float32(f32),
+    Float64(f64),
+    Utf8(&'a [u8]),
+    Binary(&'a [u8]),
+    DecimalCompact(i64),
+    DecimalLarge(&'a [u8]),
+    Date32(i32),
+    Time32(i32),
+    TimestampMillis(i64),
+    TimestampMicros(i64),
+    TimestampNanos { millis: i64, nanos_of_milli: i32 },
+}
+
+/// Iterator over an [`EncodedColumn`] in logical row order.
+pub struct EncodedColumnValues<'a> {
+    column: EncodedColumn<'a>,
+    row: usize,
+    data_cursor: usize,
+    bit_offset: usize,
+    done: bool,
+}
+
+impl<'a> Iterator for EncodedColumnValues<'a> {
+    type Item = io::Result<EncodedValueRef<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.row >= self.column.num_rows {
+            return None;
+        }
+
+        let row = self.row;
+        self.row += 1;
+        if self.column.is_null(row) {
+            return Some(Ok(EncodedValueRef::Null));
+        }
+
+        let value = match self.column.encoding {
+            ENCODING_CONST => encoded_value_ref(self.column.data_type, self.column.const_value),
+            ENCODING_DICT => read_bit_packed_checked(
+                self.column.data,
+                self.column.data_cursor,
+                self.bit_offset,
+                self.column.dict_bit_width,
+            )
+            .and_then(|index| {
+                self.bit_offset += self.column.dict_bit_width;
+                self.column
+                    .dict_values
+                    .get(index)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupt dict index"))
+                    .and_then(|value| encoded_value_ref(self.column.data_type, value))
+            }),
+            ENCODING_PLAIN => {
+                let result =
+                    read_encoded_value(self.column.data_type, self.column.data, self.data_cursor);
+                if let Ok((_, size)) = result {
+                    self.data_cursor += size;
+                }
+                result.map(|(value, _)| value)
+            }
+            ENCODING_ALL_NULL => Ok(EncodedValueRef::Null),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported encoding {}", self.column.encoding),
+            )),
+        };
+        if value.is_err() {
+            self.done = true;
+        }
+        Some(value)
+    }
+}
+
+fn encoded_value_ref<'a>(
+    data_type: &DataType,
+    value: &'a Value,
+) -> io::Result<EncodedValueRef<'a>> {
+    let value = match value {
+        Value::Null => EncodedValueRef::Null,
+        Value::Boolean(value) => EncodedValueRef::Boolean(*value),
+        Value::TinyInt(value) => EncodedValueRef::Int8(*value),
+        Value::SmallInt(value) => EncodedValueRef::Int16(*value),
+        Value::Integer(value) => EncodedValueRef::Int32(*value),
+        Value::BigInt(value) => EncodedValueRef::Int64(*value),
+        Value::Float(value) => EncodedValueRef::Float32(*value),
+        Value::Double(value) => EncodedValueRef::Float64(*value),
+        Value::Date(value) => EncodedValueRef::Date32(*value),
+        Value::Time(value) => EncodedValueRef::Time32(*value),
+        Value::String(value) => EncodedValueRef::Utf8(value),
+        Value::Bytes(value) => EncodedValueRef::Binary(value),
+        Value::DecimalCompact(value) => EncodedValueRef::DecimalCompact(*value),
+        Value::DecimalLarge(value) => EncodedValueRef::DecimalLarge(value),
+        Value::TimestampMillis(value) => EncodedValueRef::TimestampMillis(*value),
+        Value::TimestampMicros(value) => EncodedValueRef::TimestampMicros(*value),
+        Value::TimestampNanos {
+            millis,
+            nanos_of_milli,
+        } => EncodedValueRef::TimestampNanos {
+            millis: *millis,
+            nanos_of_milli: *nanos_of_milli,
+        },
+    };
+    validate_encoded_value(data_type, value)
+}
+
+fn validate_encoded_value<'a>(
+    data_type: &DataType,
+    value: EncodedValueRef<'a>,
+) -> io::Result<EncodedValueRef<'a>> {
+    if let EncodedValueRef::TimestampNanos {
+        millis,
+        nanos_of_milli,
+    } = value
+    {
+        if types::is_timestamp_nanos(data_type) {
+            types::millis_nanos_to_ns(millis, nanos_of_milli)?;
+        }
+    }
+    Ok(value)
+}
+
+fn read_encoded_value<'a>(
+    data_type: &DataType,
+    data: &'a [u8],
+    position: usize,
+) -> io::Result<(EncodedValueRef<'a>, usize)> {
+    let width = types::fixed_width(data_type);
+    if width <= 0 {
+        let mut payload = position;
+        let length = varint::decode(data, &mut payload).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated varint in variable-length value",
+            )
+        })? as usize;
+        let end = payload
+            .checked_add(length)
+            .filter(|end| *end <= data.len())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "buffer truncated in variable-length value",
+                )
+            })?;
+        let value = match data_type {
+            DataType::Utf8 => EncodedValueRef::Utf8(&data[payload..end]),
+            DataType::Binary => EncodedValueRef::Binary(&data[payload..end]),
+            DataType::Decimal128(_, _) => EncodedValueRef::DecimalLarge(&data[payload..end]),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported encoded data type: {data_type:?}"),
+                ));
+            }
+        };
+        return Ok((value, end - position));
+    }
+
+    let width = width as usize;
+    let end = position
+        .checked_add(width)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "column data truncated"))?;
+    let bytes = &data[position..end];
+    let value = match data_type {
+        DataType::Boolean => EncodedValueRef::Boolean(bytes[0] != 0),
+        DataType::Int8 => EncodedValueRef::Int8(bytes[0] as i8),
+        DataType::Int16 => EncodedValueRef::Int16(i16::from_be_bytes([bytes[0], bytes[1]])),
+        DataType::Int32 => {
+            EncodedValueRef::Int32(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        DataType::Date32 => {
+            EncodedValueRef::Date32(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        DataType::Time32(_) => {
+            EncodedValueRef::Time32(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        DataType::Float32 => EncodedValueRef::Float32(f32::from_bits(u32::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))),
+        DataType::Int64 => EncodedValueRef::Int64(read_i64(data, position)),
+        DataType::Float64 => EncodedValueRef::Float64(f64::from_bits(read_u64(data, position))),
+        DataType::Decimal128(_, _) => EncodedValueRef::DecimalCompact(read_i64(data, position)),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            EncodedValueRef::TimestampMillis(read_i64(data, position))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            EncodedValueRef::TimestampMicros(read_i64(data, position))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) | DataType::Struct(_)
+            if types::is_timestamp_nanos(data_type) =>
+        {
+            EncodedValueRef::TimestampNanos {
+                millis: read_i64(data, position),
+                nanos_of_milli: i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            }
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported encoded data type: {data_type:?}"),
+            ));
+        }
+    };
+    validate_encoded_value(data_type, value).map(|value| (value, width))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataVariant {
@@ -917,6 +1241,30 @@ pub struct BucketReader {
 }
 
 impl BucketReader {
+    pub(crate) fn encoded_column(&self, column: usize) -> io::Result<EncodedColumn<'_>> {
+        if column >= self.total_columns {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "column index {} out of range (num_columns={})",
+                    column, self.total_columns
+                ),
+            ));
+        }
+        Ok(EncodedColumn::new(
+            &self.col_types[column],
+            self.encodings[column],
+            self.has_nulls[column],
+            &self.null_bitmaps[column],
+            &self.const_values[column],
+            &self.dict_values[column],
+            self.dict_bit_widths[column],
+            &self.data,
+            self.data_cursors[column],
+            self.col_num_rows(column),
+        ))
+    }
+
     fn col_num_rows(&self, col: usize) -> usize {
         if col < self.num_primary {
             self.num_rows
@@ -1201,6 +1549,21 @@ pub struct ColumnPageReader {
 }
 
 impl ColumnPageReader {
+    pub(crate) fn encoded_column(&self) -> EncodedColumn<'_> {
+        EncodedColumn::new(
+            &self.col_type,
+            self.encoding,
+            self.has_nulls,
+            &self.null_bitmap,
+            &self.const_value,
+            &self.dict_values,
+            self.dict_bit_width,
+            &self.data,
+            self.data_cursor,
+            self.num_rows,
+        )
+    }
+
     pub fn new(
         col_type: DataType,
         encoding: u8,
@@ -1229,6 +1592,15 @@ impl ColumnPageReader {
         page_data_start: usize,
         num_rows: usize,
     ) -> io::Result<Self> {
+        if !matches!(
+            encoding,
+            ENCODING_PLAIN | ENCODING_CONST | ENCODING_DICT | ENCODING_ALL_NULL
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("column page: unsupported encoding {}", encoding),
+            ));
+        }
         if page_data_start > data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1996,6 +2368,23 @@ fn read_bit_packed(buf: &[u8], byte_base: usize, bit_offset: usize, bit_width: u
     value
 }
 
+fn read_bit_packed_checked(
+    buf: &[u8],
+    byte_base: usize,
+    bit_offset: usize,
+    bit_width: usize,
+) -> io::Result<usize> {
+    let bit_end = bit_offset
+        .checked_add(bit_width)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "dict index offset overflow"))?;
+    let byte_end = byte_base
+        .checked_add(bit_end.div_ceil(8))
+        .filter(|end| *end <= buf.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated dict indexes"))?;
+    let _ = byte_end;
+    Ok(read_bit_packed(buf, byte_base, bit_offset, bit_width))
+}
+
 fn bit_width(num_entries: usize) -> usize {
     if num_entries <= 1 {
         return 0;
@@ -2414,5 +2803,173 @@ mod tests {
         assert!(negative_zero_values[non_null_rows.len()..]
             .iter()
             .all(|value| value.to_bits() == 0.0f32.to_bits()));
+    }
+}
+
+#[cfg(test)]
+mod encoded_column_tests {
+    use super::*;
+
+    #[test]
+    fn column_page_rejects_unknown_encoding_without_panicking() {
+        let result = std::panic::catch_unwind(|| -> io::Result<()> {
+            let page =
+                ColumnPageReader::new(DataType::Int32, 0xff, true, Value::Null, Vec::new(), 1)?;
+            page.read_all()?;
+            Ok(())
+        });
+
+        let err = result
+            .expect("unknown column page encoding must not panic")
+            .expect_err("unknown column page encoding must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unsupported encoding 255"));
+    }
+
+    #[test]
+    fn rejects_invalid_timestamp_nanos_for_all_encodings() {
+        let data_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let invalid = Value::TimestampNanos {
+            millis: 0,
+            nanos_of_milli: 1_000_000,
+        };
+        let placeholder = Value::Null;
+
+        let constant = EncodedColumn::new(
+            &data_type,
+            ENCODING_CONST,
+            false,
+            &[],
+            &invalid,
+            &[],
+            0,
+            &[],
+            0,
+            1,
+        );
+        assert_eq!(
+            constant.constant().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            constant.values().next().unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let dictionary = EncodedColumn::new(
+            &data_type,
+            ENCODING_DICT,
+            false,
+            &[],
+            &placeholder,
+            std::slice::from_ref(&invalid),
+            0,
+            &[],
+            0,
+            1,
+        );
+        assert_eq!(
+            dictionary.values().next().unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut plain_data = 0i64.to_be_bytes().to_vec();
+        plain_data.extend_from_slice(&1_000_000i32.to_be_bytes());
+        let plain = EncodedColumn::new(
+            &data_type,
+            ENCODING_PLAIN,
+            false,
+            &[],
+            &placeholder,
+            &[],
+            0,
+            &plain_data,
+            0,
+            1,
+        );
+        assert_eq!(
+            plain.values().next().unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn reports_corrupt_dict_indexes_without_panicking() {
+        let data_type = DataType::Int32;
+        let placeholder = Value::Null;
+        let dict_values = [Value::Integer(7)];
+
+        let truncated = EncodedColumn::new(
+            &data_type,
+            ENCODING_DICT,
+            false,
+            &[],
+            &placeholder,
+            &dict_values,
+            1,
+            &[],
+            0,
+            1,
+        );
+        assert_eq!(
+            truncated.values().next().unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let out_of_range = EncodedColumn::new(
+            &data_type,
+            ENCODING_DICT,
+            false,
+            &[],
+            &placeholder,
+            &dict_values,
+            1,
+            &[1],
+            0,
+            1,
+        );
+        assert_eq!(
+            out_of_range.values().next().unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn reports_truncated_plain_values_without_panicking() {
+        let placeholder = Value::Null;
+
+        let fixed = EncodedColumn::new(
+            &DataType::Int64,
+            ENCODING_PLAIN,
+            false,
+            &[],
+            &placeholder,
+            &[],
+            0,
+            &[0; 7],
+            0,
+            1,
+        );
+        assert_eq!(
+            fixed.values().next().unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let variable = EncodedColumn::new(
+            &DataType::Utf8,
+            ENCODING_PLAIN,
+            false,
+            &[],
+            &placeholder,
+            &[],
+            0,
+            &[3, b'a', b'b'],
+            0,
+            1,
+        );
+        assert_eq!(
+            variable.values().next().unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

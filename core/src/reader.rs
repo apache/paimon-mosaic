@@ -22,6 +22,7 @@ use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema};
 
 use crate::bucket_reader::{read_typed_value, read_variable_value, BucketReader, ColumnPageReader};
+pub use crate::bucket_reader::{EncodedColumn, EncodedColumnValues, EncodedValueRef};
 use crate::schema::MosaicSchema;
 use crate::spec::*;
 use crate::stats::{self, ColumnStats};
@@ -224,8 +225,8 @@ pub enum Encoding {
 }
 
 impl Encoding {
-    fn from_code(c: u8) -> Self {
-        match c {
+    pub(crate) fn from_code(code: u8) -> Self {
+        match code {
             ENCODING_PLAIN => Encoding::Plain,
             ENCODING_CONST => Encoding::Const,
             ENCODING_DICT => Encoding::Dict,
@@ -1501,6 +1502,80 @@ impl RowGroupReader {
 
     pub fn num_rows(&self) -> usize {
         self.num_rows
+    }
+
+    /// Visits projected scalar columns in output order without materializing Arrow arrays.
+    ///
+    /// Each [`EncodedColumn`] borrows this row group's buffers and is valid only for the duration
+    /// of the callback. ARRAY and MAP columns are rejected before the first callback because they
+    /// are represented by multiple physical columns.
+    pub fn visit_encoded_columns<F>(&self, mut visitor: F) -> io::Result<()>
+    where
+        F: FnMut(&str, &DataType, bool, EncodedColumn<'_>) -> io::Result<()>,
+    {
+        for &global_index in &self.output_order {
+            if self.projected_columns[global_index]
+                && matches!(
+                    self.schema.columns[global_index].data_type,
+                    DataType::List(_) | DataType::Map(_, _)
+                )
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "encoded access does not support nested column '{}'",
+                        self.schema.columns[global_index].name
+                    ),
+                ));
+            }
+        }
+
+        let mut visited = vec![false; self.num_columns];
+        for &global_index in &self.output_order {
+            if visited[global_index] {
+                continue;
+            }
+            visited[global_index] = true;
+            if !self.projected_columns[global_index] {
+                continue;
+            }
+
+            let column = &self.schema.columns[global_index];
+            let bucket_id = column.bucket_id;
+            let local_index = self.bucket_to_global[bucket_id]
+                .iter()
+                .position(|&index| index == global_index)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("column {} missing from bucket {}", global_index, bucket_id),
+                    )
+                })?;
+            let state = self.bucket_states[bucket_id].as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("projected bucket {} was not loaded", bucket_id),
+                )
+            })?;
+            let encoded = match state {
+                BucketState::Monolithic { reader } => reader.encoded_column(local_index)?,
+                BucketState::Paged { column_readers } => column_readers
+                    .get(local_index)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "projected column {} missing from paged bucket {}",
+                                global_index, bucket_id
+                            ),
+                        )
+                    })?
+                    .encoded_column(),
+            };
+            visitor(&column.name, &column.data_type, column.nullable, encoded)?;
+        }
+        Ok(())
     }
 
     pub fn read_columns(&mut self) -> io::Result<RecordBatch> {
