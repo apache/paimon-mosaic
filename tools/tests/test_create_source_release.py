@@ -125,6 +125,48 @@ fi
     return repo, env, commit
 
 
+def assert_hidden_index_mutation_is_rejected(
+    tmp_path: Path,
+    *,
+    index_flag: str,
+    expected_marker: str,
+) -> None:
+    repo, env, _ = initialize_release_repo(tmp_path)
+    script = repo / "tools" / SOURCE_SCRIPT.name
+    notice = repo / "NOTICE"
+
+    run(["git", "update-index", index_flag, "NOTICE"], cwd=repo)
+    notice.write_text("hidden worktree NOTICE\n", encoding="utf-8")
+
+    status = run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=repo,
+    ).stdout
+    index_entry = (
+        run(["git", "ls-files", "-v", "--", "NOTICE"], cwd=repo)
+        .stdout.decode("utf-8")
+        .strip()
+    )
+    head_notice = run(["git", "show", "HEAD:NOTICE"], cwd=repo).stdout
+    assert status == b""
+    assert index_entry.startswith(expected_marker)
+    assert notice.read_bytes() != head_notice
+
+    result = subprocess.run(
+        ["bash", script.name],
+        cwd=script.parent,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    output = (result.stdout + result.stderr).decode("utf-8")
+    assert result.returncode != 0
+    assert "Git index flags" in output
+    assert index_entry in output
+
+
 def test_requires_release_version_without_nounset_trace() -> None:
     env = os.environ.copy()
     env.pop("RELEASE_VERSION", None)
@@ -141,6 +183,98 @@ def test_requires_release_version_without_nounset_trace() -> None:
     assert result.returncode != 0
     assert "RELEASE_VERSION is unset" in output
     assert "unbound variable" not in output
+
+
+def test_assume_unchanged_hidden_mutation_is_rejected(tmp_path: Path) -> None:
+    assert_hidden_index_mutation_is_rejected(
+        tmp_path,
+        index_flag="--assume-unchanged",
+        expected_marker="h ",
+    )
+
+
+def test_skip_worktree_hidden_mutation_is_rejected(tmp_path: Path) -> None:
+    assert_hidden_index_mutation_is_rejected(
+        tmp_path,
+        index_flag="--skip-worktree",
+        expected_marker="S ",
+    )
+
+
+def test_semantic_checks_run_against_the_archived_head_tree(
+    tmp_path: Path,
+) -> None:
+    repo, env, _ = initialize_release_repo(tmp_path)
+    script = repo / "tools" / SOURCE_SCRIPT.name
+    verifier = repo / "tools" / "verify_release_versions.py"
+    notice = repo / "NOTICE"
+    attributes = tmp_path / "attributes"
+    semantic_marker = tmp_path / "semantic-check-root"
+    archive = (
+        repo
+        / "tools"
+        / "release"
+        / f"apache-paimon-mosaic-{VERSION}-src.tgz"
+    )
+
+    write(
+        verifier,
+        """#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+
+Path(os.environ["SEMANTIC_CHECK_MARKER"]).write_text(
+    str(Path.cwd().resolve()),
+    encoding="utf-8",
+)
+if Path("NOTICE").read_text(encoding="utf-8") != "NOTICE\\n":
+    print("semantic checks inspected a tree other than HEAD", file=sys.stderr)
+    raise SystemExit(1)
+""",
+    )
+    run(["git", "add", verifier.relative_to(repo)], cwd=repo)
+    run(["git", "commit", "-q", "-m", "assert exact release tree"], cwd=repo)
+
+    attributes.write_text("/NOTICE filter=canonical-notice\n", encoding="utf-8")
+    run(
+        ["git", "config", "core.attributesFile", str(attributes)],
+        cwd=repo,
+    )
+    run(
+        [
+            "git",
+            "config",
+            "filter.canonical-notice.clean",
+            "sh -c 'printf \"NOTICE\\\\n\"'",
+        ],
+        cwd=repo,
+    )
+    notice.write_text("HIDDEN WORKTREE NOTICE\n", encoding="utf-8")
+    run(["git", "add", "NOTICE"], cwd=repo)
+    env["SEMANTIC_CHECK_MARKER"] = str(semantic_marker)
+    assert (
+        run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=repo,
+        ).stdout
+        == b""
+    )
+    assert notice.read_text(encoding="utf-8") == "HIDDEN WORKTREE NOTICE\n"
+
+    run(["bash", script.name], cwd=script.parent, env=env)
+
+    checked_root = Path(semantic_marker.read_text(encoding="utf-8"))
+    assert checked_root.name == f"paimon-mosaic-{VERSION}"
+    assert checked_root.parent.name.startswith("paimon-source-check.")
+    assert checked_root != repo
+
+    with tarfile.open(archive, mode="r:gz") as source:
+        archived_notice = source.extractfile(
+            f"paimon-mosaic-{VERSION}/NOTICE"
+        )
+        assert archived_notice is not None
+        assert archived_notice.read() == b"NOTICE\n"
 
 
 def test_source_archive_is_commit_bound_and_reproducible(tmp_path: Path) -> None:

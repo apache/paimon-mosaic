@@ -56,6 +56,16 @@ fi
 
 cd ..
 
+INDEX_FLAGGED_PATHS=$(
+  git ls-files -v |
+    awk 'substr($0, 1, 1) == "S" || substr($0, 1, 1) ~ /[a-z]/'
+)
+if [[ -n "${INDEX_FLAGGED_PATHS}" ]]; then
+  echo "Git index flags such as assume-unchanged or skip-worktree are not allowed." >&2
+  printf '%s\n' "${INDEX_FLAGGED_PATHS}" >&2
+  exit 1
+fi
+
 if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
   echo "The source release must be created from a clean Git worktree" >&2
   git status --short >&2
@@ -67,22 +77,31 @@ git rev-parse --verify 'HEAD^{commit}' > /dev/null
 rm -rf tools/release
 mkdir tools/release
 
-python3 tools/verify_release_versions.py "${RELEASE_VERSION}"
-
-echo "Verifying locked dependencies and generated legal metadata"
-cargo metadata --locked --format-version 1 --no-deps > /dev/null
-python3 tools/dependencies.py check
-python3 tools/generate_license_reports.py --check
-
 echo "Creating source package"
 
 ARCHIVE="apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz"
 ARCHIVE_PATH="tools/release/${ARCHIVE}"
+ARCHIVE_ROOT="paimon-mosaic-${RELEASE_VERSION}"
 python3 tools/verify_source_archive.py create \
   --repository . \
   --commit HEAD \
-  --prefix "paimon-mosaic-${RELEASE_VERSION}/" \
+  --prefix "${ARCHIVE_ROOT}/" \
   --output "${ARCHIVE_PATH}"
+
+CHECK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/paimon-source-check.XXXXXX")
+trap 'rm -rf "${CHECK_DIR}"' EXIT
+tar xzf "${ARCHIVE_PATH}" -C "${CHECK_DIR}"
+(
+  cd "${CHECK_DIR}/${ARCHIVE_ROOT}"
+  python3 tools/verify_release_versions.py "${RELEASE_VERSION}"
+
+  echo "Verifying locked dependencies and generated legal metadata"
+  cargo metadata --locked --format-version 1 --no-deps > /dev/null
+  python3 tools/dependencies.py check
+  python3 tools/generate_license_reports.py --check
+)
+rm -rf "${CHECK_DIR}"
+trap - EXIT
 
 cd tools/release
 
@@ -95,7 +114,6 @@ gpg --verify "${ARCHIVE}.asc" "${ARCHIVE}"
 echo "Verifying tarball integrity"
 tar tzf "${ARCHIVE}" > /dev/null
 
-ARCHIVE_ROOT="paimon-mosaic-${RELEASE_VERSION}"
 for REQUIRED_FILE in \
   Cargo.lock \
   LICENSE \
