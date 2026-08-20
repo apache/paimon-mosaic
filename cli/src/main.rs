@@ -285,7 +285,7 @@ fn main() -> ExitCode {
     match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {}", fmt::safe(&e.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -580,113 +580,148 @@ fn convert(
 }
 
 fn write_validated_json_input<R: std::io::BufRead>(
-    mut reader: R,
+    reader: R,
     schema: &Schema,
     writer: &mut paimon_mosaic_core::writer::MosaicWriter<paimon_mosaic_core::writer::FileSink>,
     rows: &mut usize,
 ) -> std::io::Result<()> {
+    for_each_validated_json_batch(reader, schema, TARGET_CONVERT_BATCH_BYTES, |batch| {
+        *rows += batch.num_rows();
+        writer.write_batch(&batch)
+    })
+}
+
+const DEFAULT_JSON_BATCH_SIZE: usize = 1024;
+const TARGET_CONVERT_BATCH_BYTES: usize = 16 * 1024 * 1024;
+
+fn for_each_validated_json_batch<R, F>(
+    reader: R,
+    schema: &Schema,
+    byte_budget: usize,
+    mut write: F,
+) -> std::io::Result<()>
+where
+    R: std::io::Read,
+    F: FnMut(RecordBatch) -> std::io::Result<()>,
+{
     let bad = |e: arrow::error::ArrowError| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
     };
-    let mut decoder = arrow::json::ReaderBuilder::new(Arc::new(schema.clone()))
-        .build_decoder()
-        .map_err(bad)?;
-    let mut raw_batch = Vec::new();
+    let build_decoder = || {
+        arrow::json::ReaderBuilder::new(Arc::new(schema.clone()))
+            .with_batch_size(DEFAULT_JSON_BATCH_SIZE)
+            .build_decoder()
+            .map_err(bad)
+    };
+    let fields = json_special_fields(schema);
+    let mut decoder = build_decoder()?;
+    let mut batch_bytes = 0_usize;
+    let records = serde_json::Deserializer::from_reader(reader).into_iter::<Box<RawValue>>();
 
-    loop {
-        loop {
-            let buf = reader.fill_buf()?;
-            if buf.is_empty() {
-                break;
+    for (index, raw) in records.enumerate() {
+        let record = index + 1;
+        let raw = raw.map_err(|e| invalid_schema(format!("invalid JSON record {record}: {e}")))?;
+        let raw_bytes = raw.get().as_bytes();
+        if !decoder.is_empty()
+            && (decoder.len() >= DEFAULT_JSON_BATCH_SIZE
+                || batch_bytes.saturating_add(raw_bytes.len()) > byte_budget)
+        {
+            if let Some(batch) = decoder.flush().map_err(bad)? {
+                write(batch)?;
             }
-            let available = buf.len();
-            let decoded = decoder.decode(buf).map_err(bad)?;
-            raw_batch.extend_from_slice(&buf[..decoded]);
-            reader.consume(decoded);
-            if decoded != available {
-                break;
-            }
+            batch_bytes = 0;
         }
 
-        let batch = decoder.flush().map_err(bad)?;
-        let Some(batch) = batch else {
-            break;
-        };
-        validate_json_special_values(&raw_batch, schema, *rows + 1)?;
-        raw_batch.clear();
-        *rows += batch.num_rows();
-        writer.write_batch(&batch)?;
+        validate_json_special_values(raw_bytes, &fields, record)?;
+        let decoded = decoder.decode(raw_bytes).map_err(bad)?;
+        if decoded != raw_bytes.len() || decoder.has_partial_record() {
+            return Err(invalid_schema(format!(
+                "invalid JSON record {record}: decoder stopped before the record ended"
+            )));
+        }
+        batch_bytes = batch_bytes.saturating_add(raw_bytes.len());
+
+        if decoder.len() >= DEFAULT_JSON_BATCH_SIZE || batch_bytes >= byte_budget {
+            if let Some(batch) = decoder.flush().map_err(bad)? {
+                write(batch)?;
+            }
+            if batch_bytes > byte_budget {
+                decoder = build_decoder()?;
+            }
+            batch_bytes = 0;
+        }
+    }
+
+    if let Some(batch) = decoder.flush().map_err(bad)? {
+        write(batch)?;
     }
     Ok(())
 }
 
 fn schema_needs_json_validation(schema: &Schema) -> bool {
-    schema.fields().iter().any(|field| {
-        data_type_has_local_timestamp(field.data_type()) || data_type_has_decimal(field.data_type())
-    })
+    schema
+        .fields()
+        .iter()
+        .any(|field| field_needs_json_validation(field))
 }
 
-fn data_type_has_local_timestamp(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Timestamp(_, None) => true,
-        DataType::List(field) | DataType::Map(field, _) => {
-            data_type_has_local_timestamp(field.data_type())
-        }
-        DataType::Struct(fields) => fields
-            .iter()
-            .any(|field| data_type_has_local_timestamp(field.data_type())),
-        _ => false,
-    }
+const AVRO_LOGICAL_TYPE_METADATA: &str = "paimon.mosaic.avro.logical_type";
+const AVRO_UUID_LOGICAL_TYPE: &str = "uuid";
+
+fn field_needs_json_validation(field: &Field) -> bool {
+    field_is_avro_uuid(field) || data_type_needs_json_validation(field.data_type())
 }
 
-fn data_type_has_decimal(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Decimal128(_, _) => true,
-        DataType::List(field) | DataType::Map(field, _) => data_type_has_decimal(field.data_type()),
-        DataType::Struct(fields) => fields
-            .iter()
-            .any(|field| data_type_has_decimal(field.data_type())),
-        _ => false,
-    }
+fn field_is_avro_uuid(field: &Field) -> bool {
+    field
+        .metadata()
+        .get(AVRO_LOGICAL_TYPE_METADATA)
+        .is_some_and(|value| value == AVRO_UUID_LOGICAL_TYPE)
 }
 
 fn data_type_needs_json_validation(data_type: &DataType) -> bool {
-    data_type_has_local_timestamp(data_type) || data_type_has_decimal(data_type)
+    match data_type {
+        DataType::Int32
+        | DataType::Int64
+        | DataType::Date32
+        | DataType::Time32(_)
+        | DataType::Timestamp(_, _)
+        | DataType::Decimal128(_, _) => true,
+        DataType::List(field) | DataType::Map(field, _) => field_needs_json_validation(field),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| field_needs_json_validation(field)),
+        _ => false,
+    }
 }
 
 fn validate_json_special_values(
     raw: &[u8],
-    schema: &Schema,
+    fields: &std::collections::HashMap<String, Arc<Field>>,
     first_record: usize,
 ) -> std::io::Result<()> {
     // Borrow only the raw values of relevant fields. Unrelated values are
     // skipped without constructing a second set of Arrow arrays or a Value tree.
-    let fields: std::collections::HashMap<String, DataType> = schema
+    let mut deserializer = serde_json::Deserializer::from_slice(raw);
+    JsonSpecialRecordSeed {
+        fields,
+        record: first_record,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|e| invalid_schema(format!("invalid JSON record {first_record}: {e}")))
+}
+
+fn json_special_fields(schema: &Schema) -> std::collections::HashMap<String, Arc<Field>> {
+    schema
         .fields()
         .iter()
-        .filter(|field| data_type_needs_json_validation(field.data_type()))
-        .map(|field| (field.name().clone(), field.data_type().clone()))
-        .collect();
-    let mut deserializer = serde_json::Deserializer::from_slice(raw);
-    let mut record = first_record;
-    loop {
-        let seed = JsonSpecialRecordSeed {
-            fields: &fields,
-            record,
-        };
-        match seed.deserialize(&mut deserializer) {
-            Ok(()) => record += 1,
-            Err(e) if e.is_eof() => break,
-            Err(e) => {
-                return Err(invalid_schema(format!("invalid JSON record {record}: {e}")));
-            }
-        }
-    }
-    Ok(())
+        .filter(|field| field_needs_json_validation(field))
+        .map(|field| (field.name().clone(), Arc::clone(field)))
+        .collect()
 }
 
 struct JsonSpecialRecordSeed<'a> {
-    fields: &'a std::collections::HashMap<String, DataType>,
+    fields: &'a std::collections::HashMap<String, Arc<Field>>,
     record: usize,
 }
 
@@ -705,7 +740,7 @@ impl<'de> DeserializeSeed<'de> for JsonSpecialRecordSeed<'_> {
 }
 
 struct JsonSpecialRecordVisitor<'a> {
-    fields: &'a std::collections::HashMap<String, DataType>,
+    fields: &'a std::collections::HashMap<String, Arc<Field>>,
     record: usize,
 }
 
@@ -721,9 +756,9 @@ impl<'de> Visitor<'de> for JsonSpecialRecordVisitor<'_> {
         M: MapAccess<'de>,
     {
         while let Some(name) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-            if let Some(data_type) = self.fields.get(name.as_ref()) {
+            if let Some(field) = self.fields.get(name.as_ref()) {
                 let raw: &RawValue = map.next_value()?;
-                validate_json_special_value(raw, data_type, name.as_ref(), self.record)
+                validate_json_special_value(raw, field, name.as_ref(), self.record)
                     .map_err(M::Error::custom)?;
             } else {
                 map.next_value::<IgnoredAny>()?;
@@ -734,7 +769,7 @@ impl<'de> Visitor<'de> for JsonSpecialRecordVisitor<'_> {
 }
 
 struct JsonSpecialMapSeed<'a> {
-    value_type: &'a DataType,
+    value_field: &'a Field,
     path: &'a str,
     record: usize,
 }
@@ -747,7 +782,7 @@ impl<'de> DeserializeSeed<'de> for JsonSpecialMapSeed<'_> {
         D: serde::Deserializer<'de>,
     {
         deserializer.deserialize_map(JsonSpecialMapVisitor {
-            value_type: self.value_type,
+            value_field: self.value_field,
             path: self.path,
             record: self.record,
         })
@@ -755,7 +790,7 @@ impl<'de> DeserializeSeed<'de> for JsonSpecialMapSeed<'_> {
 }
 
 struct JsonSpecialMapVisitor<'a> {
-    value_type: &'a DataType,
+    value_field: &'a Field,
     path: &'a str,
     record: usize,
 }
@@ -782,7 +817,7 @@ impl<'de> Visitor<'de> for JsonSpecialMapVisitor<'_> {
                 )));
             }
             let raw: &RawValue = map.next_value()?;
-            validate_json_special_value(raw, self.value_type, self.path, self.record)
+            validate_json_special_value(raw, self.value_field, self.path, self.record)
                 .map_err(M::Error::custom)?;
         }
         Ok(())
@@ -791,14 +826,50 @@ impl<'de> Visitor<'de> for JsonSpecialMapVisitor<'_> {
 
 fn validate_json_special_value(
     raw: &RawValue,
-    data_type: &DataType,
+    field: &Field,
     path: &str,
     record: usize,
 ) -> std::io::Result<()> {
-    if raw.get() == "null" || !data_type_needs_json_validation(data_type) {
+    if raw.get() == "null" || !field_needs_json_validation(field) {
         return Ok(());
     }
+    if field_is_avro_uuid(field) {
+        let value: String = serde_json::from_str(raw.get()).map_err(|_| {
+            invalid_schema(format!(
+                "JSON field '{}' at record {record} must be a valid UUID string",
+                fmt::safe(path)
+            ))
+        })?;
+        validate_avro_uuid(&value).map_err(|_| {
+            invalid_schema(format!(
+                "invalid UUID '{}' for JSON field '{}' at record {record}",
+                fmt::safe(&value),
+                fmt::safe(path)
+            ))
+        })?;
+    }
+    let data_type = field.data_type();
     match data_type {
+        DataType::Int32 | DataType::Date32 | DataType::Time32(_) if !raw.get().starts_with('"') => {
+            validate_json_integer(
+                raw,
+                data_type,
+                path,
+                record,
+                i128::from(i32::MIN),
+                i128::from(i32::MAX),
+            )?;
+        }
+        DataType::Int64 | DataType::Timestamp(_, _) if !raw.get().starts_with('"') => {
+            validate_json_integer(
+                raw,
+                data_type,
+                path,
+                record,
+                i128::from(i64::MIN),
+                i128::from(i64::MAX),
+            )?;
+        }
         DataType::Decimal128(precision, scale) => {
             let raw_text = raw.get();
             let value = if raw_text.starts_with('"') {
@@ -822,7 +893,7 @@ fn validate_json_special_value(
                 .map_err(|e| invalid_schema(format!("invalid JSON array: {e}")))?;
             let child_path = format!("{path}[]");
             for value in values {
-                validate_json_special_value(value, field.data_type(), &child_path, record)?;
+                validate_json_special_value(value, field, &child_path, record)?;
             }
         }
         DataType::Map(entries, _) => {
@@ -835,7 +906,7 @@ fn validate_json_special_value(
             let child_path = format!("{path}{{}}");
             let mut deserializer = serde_json::Deserializer::from_str(raw.get());
             JsonSpecialMapSeed {
-                value_type: value_field.data_type(),
+                value_field,
                 path: &child_path,
                 record,
             }
@@ -849,7 +920,7 @@ fn validate_json_special_value(
             for field in fields {
                 if let Some(value) = values.get(field.name()) {
                     let child_path = format!("{path}.{}", field.name());
-                    validate_json_special_value(value, field.data_type(), &child_path, record)?;
+                    validate_json_special_value(value, field, &child_path, record)?;
                 }
             }
         }
@@ -865,6 +936,49 @@ fn validate_json_special_value(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_avro_uuid(value: &str) -> Result<(), ()> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return Err(());
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            if *byte != b'-' {
+                return Err(());
+            }
+        } else if !byte.is_ascii_hexdigit() {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn validate_json_integer(
+    raw: &RawValue,
+    data_type: &DataType,
+    path: &str,
+    record: usize,
+    min: i128,
+    max: i128,
+) -> std::io::Result<()> {
+    let value = raw.get();
+    let parsed = parse_decimal_exact(value, 38, 0).map_err(|_| {
+        invalid_schema(format!(
+            "JSON field '{}' at record {record} must be an integer for {data_type}; got '{}'",
+            fmt::safe(path),
+            fmt::safe(value)
+        ))
+    })?;
+    if parsed < min || parsed > max {
+        return Err(invalid_schema(format!(
+            "JSON field '{}' at record {record} is out of range for {data_type}; got '{}'",
+            fmt::safe(path),
+            fmt::safe(value)
+        )));
     }
     Ok(())
 }
@@ -904,12 +1018,12 @@ fn convert_csv(
     let format = csv_format(&options)?;
     let explicit_schema = schema.map(load_convert_schema).transpose()?;
     let has_explicit_schema = explicit_schema.is_some();
-    let mut inferred_input_schemas = vec![None; inputs.len()];
+    let mut inferred_csv_types = std::collections::HashMap::new();
     let schema = match explicit_schema {
         Some(schema) => schema,
         None => {
             let mut inferred: Option<Schema> = None;
-            for (index, input) in inputs.iter().enumerate() {
+            for input in inputs {
                 let (schema, rows) = format
                     .infer_schema(open_csv(input, options.skip_lines)?, None)
                     .map_err(bad)?;
@@ -919,7 +1033,7 @@ fn convert_csv(
                     continue;
                 }
                 let schema = csv_schema_with_csv_names(schema, &options)?;
-                inferred_input_schemas[index] = Some(schema.clone());
+                observe_csv_inferred_types(&mut inferred_csv_types, &schema);
                 inferred = Some(match inferred.take() {
                     Some(prev) => merge_csv_inferred_schema(prev, schema, input)?,
                     None => schema,
@@ -933,7 +1047,7 @@ fn convert_csv(
     };
     reject_csv_unsupported_fields(&schema)?;
     let schema_index = csv_schema_index(&schema);
-    let mixed_float_fields = mixed_csv_float_fields(&schema, &inferred_input_schemas);
+    let mixed_float_fields = mixed_csv_float_fields(&schema, &inferred_csv_types);
     write_mosaic(out, overwrite, &schema, stats, |writer, rows| {
         for input in inputs {
             if has_explicit_schema {
@@ -1286,6 +1400,7 @@ fn write_explicit_schema_csv_input(
         first.chain(rest),
         input_reader.layout.columns,
         schema,
+        TARGET_CONVERT_BATCH_BYTES,
         |records| write_explicit_csv_records(writer, rows, schema, &source_mapping, records),
     )
 }
@@ -1294,6 +1409,7 @@ fn for_each_explicit_csv_batch<I, F>(
     records: I,
     source_columns: usize,
     schema: &Schema,
+    byte_budget: usize,
     mut write: F,
 ) -> std::io::Result<()>
 where
@@ -1303,19 +1419,30 @@ where
     let output_columns = schema.fields().len();
     let mut batch = Vec::with_capacity(csv_batch_size(source_columns.max(output_columns)));
     let mut cells: usize = 0;
+    let mut bytes: usize = 0;
     for record in records {
         let record = record?;
         let row_cells = explicit_csv_row_cells(record.len(), output_columns);
+        let row_bytes = record.as_slice().len();
         if !batch.is_empty()
             && (batch.len() >= DEFAULT_CSV_BATCH_SIZE
-                || cells.saturating_add(row_cells) > TARGET_CSV_DECODE_CELLS)
+                || cells.saturating_add(row_cells) > TARGET_CSV_DECODE_CELLS
+                || bytes.saturating_add(row_bytes) > byte_budget)
         {
             write(&batch)?;
             batch.clear();
             cells = 0;
+            bytes = 0;
         }
         cells = cells.saturating_add(row_cells);
+        bytes = bytes.saturating_add(row_bytes);
         batch.push(record);
+        if row_bytes > byte_budget {
+            write(&batch)?;
+            batch.clear();
+            cells = 0;
+            bytes = 0;
+        }
     }
     if !batch.is_empty() {
         write(&batch)?;
@@ -1420,12 +1547,29 @@ fn csv_column_array(
                     .map_err(|e| invalid_schema(e.to_string()))?,
             ))
         }
-        DataType::Utf8 => Ok(Arc::new(
-            records
+        DataType::Utf8 => {
+            let values = records
                 .iter()
-                .map(|record| csv_record_value(record, source))
-                .collect::<StringArray>(),
-        )),
+                .map(|record| {
+                    let value = csv_record_value(record, source);
+                    if let Some(value) = value {
+                        if field_is_avro_uuid(field) && validate_avro_uuid(value).is_err() {
+                            return Err(invalid_schema(format!(
+                                "invalid UUID '{}' for CSV field '{}' at line {}",
+                                fmt::safe(value),
+                                fmt::safe(field.name()),
+                                record
+                                    .position()
+                                    .map(|position| position.line().to_string())
+                                    .unwrap_or_else(|| "unknown".to_string())
+                            )));
+                        }
+                    }
+                    Ok(value)
+                })
+                .collect::<std::io::Result<StringArray>>()?;
+            Ok(Arc::new(values))
+        }
         data_type => Err(invalid_schema(format!(
             "CSV conversion does not support field '{}' with type {data_type}",
             fmt::safe(field.name())
@@ -1647,7 +1791,7 @@ fn csv_schema_index(schema: &Schema) -> std::collections::HashMap<&str, usize> {
 
 fn mixed_csv_float_fields(
     output_schema: &Schema,
-    input_schemas: &[Option<Schema>],
+    inferred_types: &std::collections::HashMap<String, ObservedCsvTypes>,
 ) -> std::collections::HashSet<String> {
     // These fields are Float64 only because different shards inferred Int64
     // and Float64. Read their raw text in every shard so integer-looking values
@@ -1656,18 +1800,44 @@ fn mixed_csv_float_fields(
         .fields()
         .iter()
         .filter(|field| matches!(field.data_type(), DataType::Float64))
-        .filter_map(|field| {
-            let mut saw_int64 = false;
-            let mut saw_float64 = false;
-            for source in input_schemas.iter().flatten() {
-                if let Ok(source) = source.field_with_name(field.name()) {
-                    saw_int64 |= matches!(source.data_type(), DataType::Int64);
-                    saw_float64 |= matches!(source.data_type(), DataType::Float64);
-                }
-            }
-            (saw_int64 && saw_float64).then(|| field.name().clone())
+        .filter(|field| {
+            inferred_types
+                .get(field.name())
+                .is_some_and(ObservedCsvTypes::is_mixed_int_float)
         })
+        .map(|field| field.name().clone())
         .collect()
+}
+
+#[derive(Default)]
+struct ObservedCsvTypes {
+    saw_int64: bool,
+    saw_float64: bool,
+}
+
+impl ObservedCsvTypes {
+    fn observe(&mut self, data_type: &DataType) {
+        self.saw_int64 |= matches!(data_type, DataType::Int64);
+        self.saw_float64 |= matches!(data_type, DataType::Float64);
+    }
+
+    fn is_mixed_int_float(&self) -> bool {
+        self.saw_int64 && self.saw_float64
+    }
+}
+
+fn observe_csv_inferred_types(
+    inferred_types: &mut std::collections::HashMap<String, ObservedCsvTypes>,
+    schema: &Schema,
+) {
+    for field in schema.fields() {
+        if matches!(field.data_type(), DataType::Int64 | DataType::Float64) {
+            inferred_types
+                .entry(field.name().clone())
+                .or_default()
+                .observe(field.data_type());
+        }
+    }
 }
 
 fn csv_reader_schema(
@@ -2042,7 +2212,7 @@ fn parse_avro_schema(spec: &str) -> std::io::Result<Schema> {
         let namespace = namespace
             .as_str()
             .ok_or_else(|| invalid_schema("Avro record namespace must be a string"))?;
-        if !is_valid_avro_fullname(namespace) {
+        if !namespace.is_empty() && !is_valid_avro_fullname(namespace) {
             return Err(invalid_schema(format!(
                 "invalid Avro record namespace '{}'",
                 fmt::safe(namespace)
@@ -2078,9 +2248,9 @@ fn parse_avro_schema(spec: &str) -> std::io::Result<Schema> {
         let avro_type = field_obj
             .get("type")
             .ok_or_else(|| invalid_schema(format!("Avro field '{name}' is missing type")))?;
-        let (data_type, nullable) = parse_avro_type(avro_type)
+        let parsed = parse_avro_type(avro_type)
             .map_err(|e| invalid_schema(format!("Avro field '{name}': {e}")))?;
-        fields.push(Field::new(name, data_type, nullable));
+        fields.push(parsed.into_field(name));
     }
     if fields.is_empty() {
         return Err(invalid_schema(
@@ -2102,22 +2272,57 @@ fn is_valid_avro_fullname(name: &str) -> bool {
     !name.is_empty() && name.split('.').all(is_valid_avro_name)
 }
 
-fn parse_avro_type(value: &Value) -> Result<(DataType, bool), String> {
+struct ParsedAvroType {
+    data_type: DataType,
+    nullable: bool,
+    logical_type: Option<&'static str>,
+}
+
+impl ParsedAvroType {
+    fn physical(data_type: DataType) -> Self {
+        Self {
+            data_type,
+            nullable: false,
+            logical_type: None,
+        }
+    }
+
+    fn uuid() -> Self {
+        Self {
+            data_type: DataType::Utf8,
+            nullable: false,
+            logical_type: Some(AVRO_UUID_LOGICAL_TYPE),
+        }
+    }
+
+    fn into_field(self, name: impl Into<String>) -> Field {
+        let field = Field::new(name, self.data_type, self.nullable);
+        match self.logical_type {
+            Some(logical_type) => field.with_metadata(std::collections::HashMap::from([(
+                AVRO_LOGICAL_TYPE_METADATA.to_string(),
+                logical_type.to_string(),
+            )])),
+            None => field,
+        }
+    }
+}
+
+fn parse_avro_type(value: &Value) -> Result<ParsedAvroType, String> {
     match value {
-        Value::String(name) => parse_avro_named_type(name, None).map(|dt| (dt, false)),
+        Value::String(name) => parse_avro_named_type(name, None),
         Value::Object(obj) => {
             let name = obj
                 .get("type")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "Avro type object must contain a string type".to_string())?;
-            parse_avro_named_type(name, Some(value)).map(|dt| (dt, false))
+            parse_avro_named_type(name, Some(value))
         }
         Value::Array(types) => parse_avro_union(types),
         _ => Err("Avro type must be a string, object, or union array".to_string()),
     }
 }
 
-fn parse_avro_union(types: &[Value]) -> Result<(DataType, bool), String> {
+fn parse_avro_union(types: &[Value]) -> Result<ParsedAvroType, String> {
     let mut has_null = false;
     let mut non_null = None;
     for ty in types {
@@ -2125,19 +2330,21 @@ fn parse_avro_union(types: &[Value]) -> Result<(DataType, bool), String> {
             has_null = true;
             continue;
         }
-        let (dt, nullable) = parse_avro_type(ty)?;
-        if nullable {
+        let parsed = parse_avro_type(ty)?;
+        if parsed.nullable {
             return Err("nested nullable unions are not supported".to_string());
         }
-        if non_null.replace(dt).is_some() {
+        if non_null.replace(parsed).is_some() {
             return Err("Avro unions with multiple non-null types are not supported".to_string());
         }
     }
-    let dt = non_null.ok_or_else(|| "pure null Avro fields are not supported".to_string())?;
-    Ok((dt, has_null))
+    let mut parsed =
+        non_null.ok_or_else(|| "pure null Avro fields are not supported".to_string())?;
+    parsed.nullable = has_null;
+    Ok(parsed)
 }
 
-fn parse_avro_named_type(name: &str, full_type: Option<&Value>) -> Result<DataType, String> {
+fn parse_avro_named_type(name: &str, full_type: Option<&Value>) -> Result<ParsedAvroType, String> {
     let logical_type = full_type
         .and_then(|value| value.get("logicalType"))
         .and_then(Value::as_str);
@@ -2147,13 +2354,13 @@ fn parse_avro_named_type(name: &str, full_type: Option<&Value>) -> Result<DataTy
         }
     }
     match name {
-        "boolean" => Ok(DataType::Boolean),
-        "int" => Ok(DataType::Int32),
-        "long" => Ok(DataType::Int64),
-        "float" => Ok(DataType::Float32),
-        "double" => Ok(DataType::Float64),
-        "string" => Ok(DataType::Utf8),
-        "bytes" => Ok(DataType::Binary),
+        "boolean" => Ok(ParsedAvroType::physical(DataType::Boolean)),
+        "int" => Ok(ParsedAvroType::physical(DataType::Int32)),
+        "long" => Ok(ParsedAvroType::physical(DataType::Int64)),
+        "float" => Ok(ParsedAvroType::physical(DataType::Float32)),
+        "double" => Ok(ParsedAvroType::physical(DataType::Float64)),
+        "string" => Ok(ParsedAvroType::physical(DataType::Utf8)),
+        "bytes" => Ok(ParsedAvroType::physical(DataType::Binary)),
         "array" => parse_avro_array(
             full_type.ok_or_else(|| "Avro array type must contain items".to_string())?,
         ),
@@ -2165,59 +2372,103 @@ fn parse_avro_named_type(name: &str, full_type: Option<&Value>) -> Result<DataTy
     }
 }
 
-fn parse_avro_array(full_type: &Value) -> Result<DataType, String> {
+fn parse_avro_array(full_type: &Value) -> Result<ParsedAvroType, String> {
     let items = full_type
         .get("items")
         .ok_or_else(|| "Avro array type must contain items".to_string())?;
-    let (data_type, nullable) = parse_avro_type(items)?;
-    Ok(DataType::List(Arc::new(Field::new(
-        "item", data_type, nullable,
+    let items = parse_avro_type(items)?;
+    Ok(ParsedAvroType::physical(DataType::List(Arc::new(
+        items.into_field("item"),
     ))))
 }
 
-fn parse_avro_map(full_type: &Value) -> Result<DataType, String> {
+fn parse_avro_map(full_type: &Value) -> Result<ParsedAvroType, String> {
     let values = full_type
         .get("values")
         .ok_or_else(|| "Avro map type must contain values".to_string())?;
-    let (value_type, value_nullable) = parse_avro_type(values)?;
+    let values = parse_avro_type(values)?;
     let entries = Field::new(
         "entries",
         DataType::Struct(Fields::from(vec![
             Field::new("keys", DataType::Utf8, false),
-            Field::new("values", value_type, value_nullable),
+            values.into_field("values"),
         ])),
         false,
     );
-    Ok(DataType::Map(Arc::new(entries), false))
+    Ok(ParsedAvroType::physical(DataType::Map(
+        Arc::new(entries),
+        false,
+    )))
 }
 
 fn parse_avro_logical_type(
     physical_type: &str,
     logical_type: &str,
     full_type: &Value,
-) -> Option<Result<DataType, String>> {
+) -> Option<Result<ParsedAvroType, String>> {
     Some(match (physical_type, logical_type) {
-        ("int", "date") => Ok(DataType::Date32),
-        ("int", "time-millis") => Ok(DataType::Time32(TimeUnit::Millisecond)),
-        ("long", "timestamp-millis") => Ok(DataType::Timestamp(
+        ("int", "date") => Ok(ParsedAvroType::physical(DataType::Date32)),
+        ("int", "time-millis") => Ok(ParsedAvroType::physical(DataType::Time32(
+            TimeUnit::Millisecond,
+        ))),
+        ("long", "timestamp-millis") => Ok(ParsedAvroType::physical(DataType::Timestamp(
             TimeUnit::Millisecond,
             Some("+00:00".into()),
-        )),
-        ("long", "timestamp-micros") => Ok(DataType::Timestamp(
+        ))),
+        ("long", "timestamp-micros") => Ok(ParsedAvroType::physical(DataType::Timestamp(
             TimeUnit::Microsecond,
             Some("+00:00".into()),
-        )),
-        ("long", "timestamp-nanos") => Ok(DataType::Timestamp(
+        ))),
+        ("long", "timestamp-nanos") => Ok(ParsedAvroType::physical(DataType::Timestamp(
             TimeUnit::Nanosecond,
             Some("+00:00".into()),
-        )),
-        ("long", "local-timestamp-millis") => Ok(DataType::Timestamp(TimeUnit::Millisecond, None)),
-        ("long", "local-timestamp-micros") => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
-        ("long", "local-timestamp-nanos") => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
-        ("bytes" | "fixed", "decimal") => parse_avro_decimal(full_type),
-        ("string", "uuid") => Ok(DataType::Utf8),
+        ))),
+        ("long", "local-timestamp-millis") => Ok(ParsedAvroType::physical(DataType::Timestamp(
+            TimeUnit::Millisecond,
+            None,
+        ))),
+        ("long", "local-timestamp-micros") => Ok(ParsedAvroType::physical(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            None,
+        ))),
+        ("long", "local-timestamp-nanos") => Ok(ParsedAvroType::physical(DataType::Timestamp(
+            TimeUnit::Nanosecond,
+            None,
+        ))),
+        ("bytes", "decimal") => parse_avro_decimal(full_type).map(ParsedAvroType::physical),
+        ("fixed", "decimal") => parse_avro_fixed_decimal(full_type).map(ParsedAvroType::physical),
+        ("string", "uuid") => Ok(ParsedAvroType::uuid()),
         _ => return None,
     })
+}
+
+fn parse_avro_fixed_decimal(full_type: &Value) -> Result<DataType, String> {
+    let name = full_type
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| is_valid_avro_fullname(name))
+        .ok_or_else(|| "fixed decimal must contain a valid name".to_string())?;
+    let size = full_type
+        .get("size")
+        .and_then(Value::as_u64)
+        .filter(|size| *size > 0)
+        .ok_or_else(|| "fixed decimal must contain a positive integer size".to_string())?;
+    let data_type = parse_avro_decimal(full_type)?;
+    let DataType::Decimal128(precision, _) = data_type else {
+        unreachable!()
+    };
+    let max_precision = if size >= 16 {
+        38
+    } else {
+        let max_value = (1_u128 << (size * 8 - 1)) - 1;
+        max_value.ilog10() as u8
+    };
+    if precision > max_precision {
+        return Err(format!(
+            "fixed decimal precision must be at most {max_precision} for size {size}, got {precision} in '{name}'"
+        ));
+    }
+    Ok(data_type)
 }
 
 fn parse_avro_decimal(full_type: &Value) -> Result<DataType, String> {
@@ -2643,6 +2894,7 @@ mod tests {
         .unwrap();
         assert_eq!(schema.fields()[0].data_type(), &DataType::Int64);
         assert_eq!(schema.fields()[1].data_type(), &DataType::Utf8);
+        assert!(!field_is_avro_uuid(&schema.fields()[1]));
     }
 
     #[test]
@@ -2680,6 +2932,55 @@ mod tests {
     }
 
     #[test]
+    fn parse_avro_schema_preserves_recursive_uuid_validation() {
+        let schema = parse_avro_schema(
+            r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "id", "type": ["null", {"type": "string", "logicalType": "uuid"}]},
+    {"name": "ids", "type": {"type": "array", "items": {"type": "string", "logicalType": "uuid"}}},
+    {"name": "by_name", "type": {"type": "map", "values": {"type": "string", "logicalType": "uuid"}}}
+  ]
+}"#,
+        )
+        .unwrap();
+        assert!(schema.fields()[0].is_nullable());
+        assert!(field_is_avro_uuid(&schema.fields()[0]));
+
+        let DataType::List(items) = schema.fields()[1].data_type() else {
+            panic!("expected List");
+        };
+        assert!(field_is_avro_uuid(items));
+
+        let DataType::Map(entries, false) = schema.fields()[2].data_type() else {
+            panic!("expected Map");
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("expected Map entries struct");
+        };
+        assert!(field_is_avro_uuid(&fields[1]));
+    }
+
+    #[test]
+    fn avro_uuid_requires_canonical_groups() {
+        for value in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "550E8400-E29B-41D4-A716-446655440000",
+        ] {
+            assert!(validate_avro_uuid(value).is_ok(), "{value}");
+        }
+        for value in [
+            "not-a-uuid",
+            "550e8400e29b41d4a716446655440000",
+            "550e8400-e29b-41d4-a716-44665544000g",
+            "550e8400-e29b41d4-a716-446655440000",
+        ] {
+            assert!(validate_avro_uuid(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
     fn convert_columns_split_each_comma_separated_occurrence() {
         assert_eq!(
             parse_convert_columns(&["id, kind".into(), "name".into()]).unwrap(),
@@ -2713,12 +3014,61 @@ mod tests {
                 .map(|i| Field::new(format!("c{i}"), DataType::Int64, true))
                 .collect::<Vec<_>>(),
         );
-        for_each_explicit_csv_batch(records, 1, &schema, |batch| {
+        for_each_explicit_csv_batch(records, 1, &schema, TARGET_CONVERT_BATCH_BYTES, |batch| {
             batch_sizes.push(batch.len());
             Ok(())
         })
         .unwrap();
         assert_eq!(batch_sizes, [16, 16, 1]);
+    }
+
+    #[test]
+    fn explicit_csv_batch_flushes_on_payload_bytes_and_isolates_oversized_row() {
+        let records = ["aaaa", "bbbbbbbbb", "c"]
+            .into_iter()
+            .map(|value| Ok(csv::StringRecord::from(vec![value])));
+        let schema = Schema::new(vec![Field::new("value", DataType::Utf8, false)]);
+        let mut batches = Vec::new();
+        for_each_explicit_csv_batch(records, 1, &schema, 8, |batch| {
+            batches.push(
+                batch
+                    .iter()
+                    .map(|record| record.as_slice().len())
+                    .collect::<Vec<_>>(),
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(batches, [vec![4], vec![9], vec![1]]);
+    }
+
+    #[test]
+    fn validated_json_batches_use_soft_byte_budget_across_multiline_records() {
+        let schema = parse_avro_schema(
+            r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "payload", "type": "string"},
+    {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}}
+  ]
+}"#,
+        )
+        .unwrap();
+        let input = format!(
+            "{{\n  \"payload\": \"{}\",\n  \"amount\": \"12.34\"\n}}\n\
+             {{\"payload\":\"b\",\"amount\":1.20}} \
+             {{\"payload\":\"c\",\"amount\":3.40}}",
+            "x".repeat(80)
+        );
+        let reader = std::io::BufReader::with_capacity(7, std::io::Cursor::new(input.into_bytes()));
+        let mut batch_rows = Vec::new();
+        for_each_validated_json_batch(reader, &schema, 64, |batch| {
+            batch_rows.push(batch.num_rows());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(batch_rows, [1, 2]);
     }
 
     #[test]
@@ -2797,23 +3147,30 @@ mod tests {
     }
 
     #[test]
-    fn mixed_csv_float_fields_require_both_source_types() {
+    fn mixed_csv_float_fields_accumulate_types_by_name() {
         let output = Schema::new(vec![
             Field::new("mixed", DataType::Float64, true),
             Field::new("float_only", DataType::Float64, true),
+            Field::new("null_then_float", DataType::Float64, true),
         ]);
-        let inputs = vec![
-            Some(Schema::new(vec![
+        let mut inferred_types = std::collections::HashMap::new();
+        for input in [
+            Schema::new(vec![
                 Field::new("mixed", DataType::Int64, true),
                 Field::new("float_only", DataType::Float64, true),
-            ])),
-            Some(Schema::new(vec![
-                Field::new("mixed", DataType::Float64, true),
+                Field::new("null_then_float", DataType::Null, true),
+            ]),
+            Schema::new(vec![
                 Field::new("float_only", DataType::Float64, true),
-            ])),
-        ];
+                Field::new("mixed", DataType::Float64, true),
+                Field::new("null_then_float", DataType::Float64, true),
+            ]),
+        ] {
+            observe_csv_inferred_types(&mut inferred_types, &input);
+        }
+        assert_eq!(inferred_types.len(), 3);
         assert_eq!(
-            mixed_csv_float_fields(&output, &inputs),
+            mixed_csv_float_fields(&output, &inferred_types),
             std::collections::HashSet::from(["mixed".to_string()])
         );
     }
@@ -2941,6 +3298,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_avro_schema_rejects_invalid_fixed_decimal() {
+        for (fixed, expected) in [
+            (
+                r#"{"type":"fixed","logicalType":"decimal","size":1,"precision":2}"#,
+                "fixed decimal must contain a valid name",
+            ),
+            (
+                r#"{"type":"fixed","logicalType":"decimal","name":"Tiny","precision":2}"#,
+                "fixed decimal must contain a positive integer size",
+            ),
+            (
+                r#"{"type":"fixed","logicalType":"decimal","name":"Tiny","size":1,"precision":3}"#,
+                "fixed decimal precision must be at most 2 for size 1",
+            ),
+        ] {
+            let err = parse_avro_schema(&format!(
+                r#"{{
+  "type": "record",
+  "name": "T",
+  "fields": [{{"name": "amount", "type": {fixed}}}]
+}}"#,
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
     fn parse_avro_schema_rejects_pure_null_type() {
         let err = parse_avro_schema(
             r#"{
@@ -2976,5 +3362,14 @@ mod tests {
             r#"{"type":"record","name":"com.example.T","fields":[{"name":"_id9","type":"long"}]}"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn parse_avro_schema_accepts_empty_namespace() {
+        let schema = parse_avro_schema(
+            r#"{"type":"record","name":"T","namespace":"","fields":[{"name":"id","type":"long"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(schema.fields()[0].data_type(), &DataType::Int64);
     }
 }

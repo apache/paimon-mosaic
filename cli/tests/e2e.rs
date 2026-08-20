@@ -467,7 +467,8 @@ fn convert_csv_explicit_schema_preserves_supported_scalar_types() {
         concat!(
             "flag,i32,i64,f32,f64,date,time,instant,local,amount,id\n",
             "true,7,8,1.5,2.5,2026-08-20,12:34:56.789,",
-            "2026-08-20T12:34:56Z,2026-08-20T12:34:56,12.34,abc\n"
+            "2026-08-20T12:34:56+08:00,2026-08-20T12:34:56,12.34,",
+            "550e8400-e29b-41d4-a716-446655440000\n"
         ),
     )
     .unwrap();
@@ -528,10 +529,120 @@ fn convert_csv_explicit_schema_preserves_supported_scalar_types() {
         concat!(
             r#"{"flag":true,"i32":7,"i64":8,"f32":1.5,"f64":2.5,"#,
             r#""date":"2026-08-20","time":"12:34:56.789","#,
-            r#""instant":"2026-08-20T12:34:56Z","#,
-            r#""local":"2026-08-20T12:34:56","amount":12.34,"id":"abc"}"#
+            r#""instant":"2026-08-20T04:34:56Z","#,
+            r#""local":"2026-08-20T12:34:56","amount":12.34,"#,
+            r#""id":"550e8400-e29b-41d4-a716-446655440000"}"#
         )
     );
+}
+
+#[test]
+fn convert_rejects_invalid_avro_uuid_values() {
+    let dir = std::env::temp_dir();
+    let schema = format!("{}/mosaic_e2e_invalid_uuid.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [{"name": "id", "type": {"type": "string", "logicalType": "uuid"}}]
+}"#,
+    )
+    .unwrap();
+    let csv = format!("{}/mosaic_e2e_invalid_uuid.csv", dir.display());
+    let json = format!("{}/mosaic_e2e_invalid_uuid.json", dir.display());
+    std::fs::write(&csv, "id\nnot-a-uuid\n").unwrap();
+    std::fs::write(&json, "{\"id\":\"not-a-uuid\"}\n").unwrap();
+
+    for (kind, command, input) in [
+        ("csv", "convert-csv", csv.as_str()),
+        ("json", "convert", json.as_str()),
+    ] {
+        let out = format!("{}/mosaic_e2e_invalid_uuid_{kind}.mosaic", dir.display());
+        let _ = std::fs::remove_file(&out);
+        let (_, err, ok) = run(&[
+            command,
+            input,
+            "-o",
+            &out,
+            "--schema",
+            &schema,
+            "--overwrite",
+        ]);
+        assert!(!ok, "{kind} unexpectedly accepted an invalid UUID");
+        assert!(err.contains("UUID") && err.contains("id"), "{kind}: {err}");
+        assert!(!std::path::Path::new(&out).exists(), "{kind}");
+    }
+}
+
+#[test]
+fn convert_json_validates_nested_uuid_values_and_projection() {
+    let dir = std::env::temp_dir();
+    let schema = format!("{}/mosaic_e2e_nested_uuid.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "id", "type": "long"},
+    {"name": "ids", "type": {"type": "array", "items": {"type": "string", "logicalType": "uuid"}}},
+    {"name": "by_name", "type": {"type": "map", "values": {"type": "string", "logicalType": "uuid"}}}
+  ]
+}"#,
+    )
+    .unwrap();
+    for (case, body, expected_path) in [
+        (
+            "array",
+            r#"{"id":1,"ids":["not-a-uuid"],"by_name":{}}"#,
+            "ids[]",
+        ),
+        (
+            "map",
+            r#"{"id":1,"ids":[],"by_name":{"a":"not-a-uuid"}}"#,
+            "by_name{}",
+        ),
+    ] {
+        let json = format!("{}/mosaic_e2e_nested_uuid_{case}.json", dir.display());
+        let out = format!("{}/mosaic_e2e_nested_uuid_{case}.mosaic", dir.display());
+        std::fs::write(&json, format!("{body}\n")).unwrap();
+        let (_, err, ok) = run(&[
+            "convert",
+            &json,
+            "-o",
+            &out,
+            "--schema",
+            &schema,
+            "--overwrite",
+        ]);
+        assert!(!ok, "{case} unexpectedly succeeded");
+        assert!(err.contains("UUID") && err.contains(expected_path), "{err}");
+        assert!(!std::path::Path::new(&out).exists());
+    }
+
+    let json = format!("{}/mosaic_e2e_nested_uuid_projection.json", dir.display());
+    let out = format!("{}/mosaic_e2e_nested_uuid_projection.mosaic", dir.display());
+    std::fs::write(
+        &json,
+        "{\"id\":1,\"ids\":[\"not-a-uuid\"],\"by_name\":{}}\n",
+    )
+    .unwrap();
+    let (msg, err, ok) = run(&[
+        "convert",
+        &json,
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "-c",
+        "id",
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(rows.trim(), r#"{"id":1}"#);
 }
 
 #[test]
@@ -1272,6 +1383,66 @@ fn convert_refuses_existing_output_before_opening_input() {
 }
 
 #[test]
+fn convert_overwrite_failure_preserves_existing_output() {
+    let dir = std::env::temp_dir();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let prefix = format!(
+        "mosaic_e2e_overwrite_failure_{}_{}",
+        std::process::id(),
+        unique
+    );
+    let csv = dir.join(format!("{prefix}.csv"));
+    let schema = dir.join(format!("{prefix}.avsc"));
+    let out = dir.join(format!("{prefix}.mosaic"));
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}}
+  ]
+}"#,
+    )
+    .unwrap();
+    let mut input = String::from("amount\n");
+    for _ in 0..1024 {
+        input.push_str("12.34\n");
+    }
+    input.push_str("12.349\n");
+    std::fs::write(&csv, input).unwrap();
+    let old = b"KEEP-OLD-OUTPUT\0\xff".to_vec();
+    std::fs::write(&out, &old).unwrap();
+
+    let (_, err, ok) = run(&[
+        "convert-csv",
+        csv.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--schema",
+        schema.to_str().unwrap(),
+        "--overwrite",
+    ]);
+    assert!(!ok);
+    assert!(
+        err.contains("cannot be represented exactly with scale 2"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&out).unwrap(), old);
+    let temp_prefix = format!("{prefix}.mosaic.");
+    let leftovers = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with(&temp_prefix) && name.ends_with(".tmp"))
+        .collect::<Vec<_>>();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
 fn convert_rejects_csv_input() {
     let csv = format!(
         "{}/mosaic_e2e_convert_rejects_csv.csv",
@@ -1427,7 +1598,8 @@ fn convert_json_preserves_avro_timestamp_semantics() {
         &js,
         concat!(
             r#"{"instant":"2026-08-04T12:34:56+08:00","#,
-            r#""local":"2026-08-04T12:34:56"}"#,
+            r#""local":"2026-08-04T12:34:56","#,
+            r#""date":"2026-08-04","time":"12:34:56.789"}"#,
             "\n"
         ),
     )
@@ -1440,7 +1612,9 @@ fn convert_json_preserves_avro_timestamp_semantics() {
   "name": "T",
   "fields": [
     {"name": "instant", "type": {"type": "long", "logicalType": "timestamp-millis"}},
-    {"name": "local", "type": {"type": "long", "logicalType": "local-timestamp-millis"}}
+    {"name": "local", "type": {"type": "long", "logicalType": "local-timestamp-millis"}},
+    {"name": "date", "type": {"type": "int", "logicalType": "date"}},
+    {"name": "time", "type": {"type": "int", "logicalType": "time-millis"}}
   ]
 }"#,
     )
@@ -1467,6 +1641,191 @@ fn convert_json_preserves_avro_timestamp_semantics() {
     assert!(ok, "stdout: {rows}\nstderr: {err}");
     assert!(rows.contains(r#""instant":"2026-08-04T04:34:56"#), "{rows}");
     assert!(rows.contains(r#""local":"2026-08-04T12:34:56""#), "{rows}");
+    assert!(rows.contains(r#""date":"2026-08-04""#), "{rows}");
+    assert!(rows.contains(r#""time":"12:34:56.789""#), "{rows}");
+}
+
+#[test]
+fn convert_json_rejects_fractional_avro_integers() {
+    let dir = std::env::temp_dir();
+    let js = format!("{}/mosaic_e2e_fractional_avro_integers.json", dir.display());
+    std::fs::write(&js, "{\"i32\":1.9,\"i64\":-2.9}\n").unwrap();
+    let schema = format!("{}/mosaic_e2e_fractional_avro_integers.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "i32", "type": "int"},
+    {"name": "i64", "type": "long"}
+  ]
+}"#,
+    )
+    .unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_fractional_avro_integers.mosaic",
+        dir.display()
+    );
+    let _ = std::fs::remove_file(&out);
+    let (_, err, ok) = run(&[
+        "convert",
+        &js,
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(!ok, "fractional Avro integers unexpectedly succeeded");
+    assert!(err.contains("i32") && err.contains("integer"), "{err}");
+    assert!(!std::path::Path::new(&out).exists());
+}
+
+#[test]
+fn convert_json_preserves_exact_avro_integer_number_forms() {
+    let dir = std::env::temp_dir();
+    let json = format!("{}/mosaic_e2e_exact_avro_integers.json", dir.display());
+    std::fs::write(&json, "{\"i32\":1.0,\"i64\":-2e0}\n").unwrap();
+    let schema = format!("{}/mosaic_e2e_exact_avro_integers.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "i32", "type": "int"},
+    {"name": "i64", "type": "long"}
+  ]
+}"#,
+    )
+    .unwrap();
+    let out = format!("{}/mosaic_e2e_exact_avro_integers.mosaic", dir.display());
+    let (msg, err, ok) = run(&[
+        "convert",
+        &json,
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(rows.trim(), r#"{"i32":1,"i64":-2}"#);
+}
+
+#[test]
+fn convert_json_rejects_out_of_range_avro_integers() {
+    let dir = std::env::temp_dir();
+    for (case, avro_type, value) in [
+        ("int", "int", "2147483648"),
+        ("long", "long", "9223372036854775808"),
+    ] {
+        let json = format!("{}/mosaic_e2e_out_of_range_{case}.json", dir.display());
+        let schema = format!("{}/mosaic_e2e_out_of_range_{case}.avsc", dir.display());
+        let out = format!("{}/mosaic_e2e_out_of_range_{case}.mosaic", dir.display());
+        std::fs::write(&json, format!("{{\"value\":{value}}}\n")).unwrap();
+        std::fs::write(
+            &schema,
+            format!(
+                r#"{{"type":"record","name":"T","fields":[{{"name":"value","type":"{avro_type}"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let (_, err, ok) = run(&[
+            "convert",
+            &json,
+            "-o",
+            &out,
+            "--schema",
+            &schema,
+            "--overwrite",
+        ]);
+        assert!(!ok, "{case} unexpectedly succeeded");
+        assert!(err.contains("out of range") && err.contains(value), "{err}");
+        assert!(!std::path::Path::new(&out).exists());
+    }
+}
+
+#[test]
+fn convert_json_rejects_nested_fractional_avro_integers() {
+    let dir = std::env::temp_dir();
+    let schema = format!(
+        "{}/mosaic_e2e_nested_fractional_integers.avsc",
+        dir.display()
+    );
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "values", "type": {"type": "array", "items": "int"}},
+    {"name": "props", "type": {"type": "map", "values": "long"}}
+  ]
+}"#,
+    )
+    .unwrap();
+    for (case, body, expected_path) in [
+        ("array", r#"{"values":[1,2.5],"props":{}}"#, "values[]"),
+        ("map", r#"{"values":[],"props":{"a":3.5}}"#, "props{}"),
+    ] {
+        let json = format!(
+            "{}/mosaic_e2e_nested_fractional_integers_{case}.json",
+            dir.display()
+        );
+        let out = format!(
+            "{}/mosaic_e2e_nested_fractional_integers_{case}.mosaic",
+            dir.display()
+        );
+        std::fs::write(&json, format!("{body}\n")).unwrap();
+        let (_, err, ok) = run(&[
+            "convert",
+            &json,
+            "-o",
+            &out,
+            "--schema",
+            &schema,
+            "--overwrite",
+        ]);
+        assert!(!ok, "{case} unexpectedly succeeded");
+        assert!(
+            err.contains(expected_path) && err.contains("integer"),
+            "{err}"
+        );
+        assert!(!std::path::Path::new(&out).exists());
+    }
+}
+
+#[test]
+fn convert_errors_sanitize_control_characters() {
+    let dir = std::env::temp_dir();
+    let js = format!("{}/mosaic_e2e_error_control_chars.json", dir.display());
+    std::fs::write(&js, "{\"id\":\"bad\\u001b]2;OWNED\\u0007\"}\n").unwrap();
+    let schema = format!("{}/mosaic_e2e_error_control_chars.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{"type":"record","name":"T","fields":[{"name":"id","type":"long"}]}"#,
+    )
+    .unwrap();
+    let out = format!("{}/mosaic_e2e_error_control_chars.mosaic", dir.display());
+    let (_, err, ok) = run(&[
+        "convert",
+        &js,
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(!ok);
+    assert!(
+        !err.chars().any(|ch| ch.is_control() && ch != '\n'),
+        "{err:?}"
+    );
+    assert!(err.contains("bad\u{fffd}]2;OWNED\u{fffd}"), "{err:?}");
 }
 
 #[test]
@@ -1540,11 +1899,14 @@ fn convert_rejects_decimal_values_that_exceed_avro_scale() {
     .unwrap();
     let csv = format!("{}/mosaic_e2e_decimal_scale.csv", dir.display());
     let json = format!("{}/mosaic_e2e_decimal_scale.json", dir.display());
+    let json_string = format!("{}/mosaic_e2e_decimal_scale_string.json", dir.display());
     std::fs::write(&csv, "amount\n12.34\n12.349\n").unwrap();
     std::fs::write(&json, "{\"amount\":12.34}\n{\"amount\":-12.349}\n").unwrap();
+    std::fs::write(&json_string, "{\"amount\":\"12.349\"}\n").unwrap();
     for (kind, command, input) in [
         ("csv", "convert-csv", csv.as_str()),
         ("json", "convert", json.as_str()),
+        ("json-string", "convert", json_string.as_str()),
     ] {
         let out = format!("{}/mosaic_e2e_decimal_scale_{kind}.mosaic", dir.display());
         let _ = std::fs::remove_file(&out);
