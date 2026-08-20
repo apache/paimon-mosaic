@@ -1326,7 +1326,8 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
     section_count = 0
     symbol_table = None
     id_dylib_count = 0
-    export_trie = None
+    dyld_info_export_trie = None
+    dedicated_export_trie = None
     for index in range(command_count):
         require_range(
             data, command_offset, 8, f"Mach-O load command {index}"
@@ -1469,9 +1470,9 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
                 raise ValueError(
                     f"invalid Mach-O LC_DYLD_INFO command {index}"
                 )
-            if export_trie is not None:
+            if dyld_info_export_trie is not None:
                 raise ValueError(
-                    "Mach-O image contains multiple export trie commands"
+                    "Mach-O image contains multiple LC_DYLD_INFO commands"
                 )
             export_offset, export_size = struct.unpack_from(
                 "<II", data, command_offset + 40
@@ -1482,15 +1483,16 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
                 export_size,
                 "Mach-O export trie",
             )
-            export_trie = (export_offset, export_size)
+            dyld_info_export_trie = (export_offset, export_size)
         elif command == 0x80000033:
             if command_size != 16:
                 raise ValueError(
                     f"invalid Mach-O LC_DYLD_EXPORTS_TRIE command {index}"
                 )
-            if export_trie is not None:
+            if dedicated_export_trie is not None:
                 raise ValueError(
-                    "Mach-O image contains multiple export trie commands"
+                    "Mach-O image contains multiple "
+                    "LC_DYLD_EXPORTS_TRIE commands"
                 )
             export_offset, export_size = struct.unpack_from(
                 "<II", data, command_offset + 8
@@ -1501,7 +1503,7 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
                 export_size,
                 "Mach-O export trie",
             )
-            export_trie = (export_offset, export_size)
+            dedicated_export_trie = (export_offset, export_size)
 
         command_offset += command_size
 
@@ -1513,6 +1515,11 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
         raise ValueError("Mach-O dylib is missing LC_ID_DYLIB")
 
     exported_symbols = set()
+    export_trie = (
+        dedicated_export_trie
+        if dedicated_export_trie is not None
+        else dyld_info_export_trie
+    )
     if export_trie is not None:
         exported_symbols.update(
             parse_macho_export_trie(data, export_trie[0], export_trie[1])

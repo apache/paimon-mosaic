@@ -290,6 +290,8 @@ def build_macho(
     export_trie_command="exports_trie",
     export_trie_offset_override=None,
     export_trie_size_override=None,
+    dyld_info_export_trie_symbols=None,
+    dyld_info_export_trie_data=None,
     symbol_type=0x0F,
 ):
     symbol_list = sorted(symbols)
@@ -314,6 +316,22 @@ def build_macho(
         export_trie = build_macho_export_trie(export_trie_symbols)
     else:
         export_trie = None
+    if (
+        dyld_info_export_trie_symbols is not None
+        and dyld_info_export_trie_data is not None
+    ):
+        raise ValueError(
+            "provide dyld_info_export_trie_symbols or "
+            "dyld_info_export_trie_data, not both"
+        )
+    if dyld_info_export_trie_data is not None:
+        dyld_info_export_trie = bytes(dyld_info_export_trie_data)
+    elif dyld_info_export_trie_symbols is not None:
+        dyld_info_export_trie = build_macho_export_trie(
+            dyld_info_export_trie_symbols
+        )
+    else:
+        dyld_info_export_trie = None
     if export_trie is None:
         export_command_size = 0
     elif export_trie_command == "exports_trie":
@@ -330,6 +348,7 @@ def build_macho(
         + sum(len(command) for command in id_dylib_commands)
         + 24
         + export_command_size
+        + (48 if dyld_info_export_trie is not None else 0)
     )
     code_offset = 32 + commands_size
     symbols_offset = align(code_offset + 1, 8)
@@ -341,11 +360,16 @@ def build_macho(
         strings.extend(b"_" + symbol.encode() + b"\0")
     strings_offset = symbols_offset + len(symbol_list) * 16
     export_trie_offset = align(strings_offset + len(strings), 8)
-    file_size = (
-        strings_offset + len(strings)
-        if not export_trie
-        else export_trie_offset + len(export_trie)
+    dyld_info_export_trie_offset = align(
+        export_trie_offset + len(export_trie or b""), 8
     )
+    file_size = strings_offset + len(strings)
+    if export_trie:
+        file_size = export_trie_offset + len(export_trie)
+    if dyld_info_export_trie:
+        file_size = (
+            dyld_info_export_trie_offset + len(dyld_info_export_trie)
+        )
     command_export_offset = (
         export_trie_offset
         if export_trie
@@ -362,6 +386,8 @@ def build_macho(
 
     command_count = 2 + len(id_dylib_commands)
     if export_trie is not None:
+        command_count += 1
+    if dyld_info_export_trie is not None:
         command_count += 1
     struct.pack_into(
         "<IiiIIIII",
@@ -459,6 +485,30 @@ def build_macho(
                 command_export_offset,
                 command_export_size,
             )
+        command_offset += export_command_size
+    if dyld_info_export_trie is not None:
+        dyld_info_export_offset = (
+            dyld_info_export_trie_offset
+            if dyld_info_export_trie
+            else 0
+        )
+        struct.pack_into(
+            "<12I",
+            data,
+            command_offset,
+            0x80000022,
+            48,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            dyld_info_export_offset,
+            len(dyld_info_export_trie),
+        )
     data[code_offset] = 0xC3
     for index, symbol in enumerate(symbol_list):
         struct.pack_into(
@@ -476,6 +526,11 @@ def build_macho(
         data[
             export_trie_offset : export_trie_offset + len(export_trie)
         ] = export_trie
+    if dyld_info_export_trie:
+        data[
+            dyld_info_export_trie_offset :
+            dyld_info_export_trie_offset + len(dyld_info_export_trie)
+        ] = dyld_info_export_trie
     return bytes(data)
 
 
@@ -866,6 +921,38 @@ def test_macho_zero_sized_dyld_info_only_export_trie_is_authoritative():
     data = build_macho(
         export_trie_data=b"",
         export_trie_command="dyld_info_only",
+    )
+
+    with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
+        verifier.verify_native_target(
+            data,
+            "aarch64-apple-darwin",
+            "libpaimon_mosaic_jni.dylib",
+        )
+
+
+def test_macho_exports_trie_command_precedes_zero_sized_dyld_info():
+    data = build_macho(
+        symbols={"unrelated_export"},
+        export_trie_symbols=JNI_SYMBOLS,
+        export_trie_command="exports_trie",
+        dyld_info_export_trie_data=b"",
+    )
+
+    verifier.verify_native_target(
+        data,
+        "aarch64-apple-darwin",
+        "libpaimon_mosaic_jni.dylib",
+    )
+
+
+def test_macho_exports_trie_command_precedes_conflicting_dyld_info():
+    missing_symbol = min(JNI_SYMBOLS)
+    data = build_macho(
+        symbols={"unrelated_export"},
+        export_trie_symbols=JNI_SYMBOLS - {missing_symbol},
+        export_trie_command="exports_trie",
+        dyld_info_export_trie_symbols=JNI_SYMBOLS,
     )
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
