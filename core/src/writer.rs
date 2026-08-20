@@ -18,7 +18,7 @@
 use std::io;
 
 use arrow_array::*;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::Schema;
 
 use crate::bucket_writer::{BucketWriter, PagedBucketOutput};
 use crate::schema::MosaicSchema;
@@ -46,31 +46,6 @@ fn check_zstd_block_size(size: usize, field: &str) -> io::Result<()> {
         ));
     }
     Ok(())
-}
-
-fn data_types_match(expected: &DataType, actual: &DataType) -> bool {
-    match (expected, actual) {
-        (DataType::List(expected_field), DataType::List(actual_field)) => {
-            fields_match(expected_field, actual_field)
-        }
-        (
-            DataType::Map(expected_field, expected_sorted),
-            DataType::Map(actual_field, actual_sorted),
-        ) => expected_sorted == actual_sorted && fields_match(expected_field, actual_field),
-        (DataType::Struct(expected_fields), DataType::Struct(actual_fields)) => {
-            expected_fields.len() == actual_fields.len()
-                && expected_fields.iter().zip(actual_fields.iter()).all(
-                    |(expected_field, actual_field)| fields_match(expected_field, actual_field),
-                )
-        }
-        _ => expected == actual,
-    }
-}
-
-fn fields_match(expected: &Field, actual: &Field) -> bool {
-    expected.name() == actual.name()
-        && expected.is_nullable() == actual.is_nullable()
-        && data_types_match(expected.data_type(), actual.data_type())
 }
 
 pub trait OutputFile {
@@ -376,20 +351,9 @@ impl<S: OutputFile> MosaicWriter<S> {
                     io::ErrorKind::InvalidInput,
                     format!(
                         "field name mismatch at column {}: schema has '{}' but batch has '{}'",
-                        i,
+                        self.batch_col_map[i],
                         col.name,
                         batch_field.name()
-                    ),
-                ));
-            }
-            if !data_types_match(&col.data_type, batch_field.data_type()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "field type mismatch for column '{}': schema has {:?} but batch has {:?}",
-                        col.name,
-                        col.data_type,
-                        batch_field.data_type()
                     ),
                 ));
             }
@@ -949,6 +913,35 @@ mod tests {
         let err = writer.write_batch(&reordered_batch).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("field name mismatch"));
+    }
+
+    #[test]
+    fn test_write_batch_name_mismatch_reports_mapped_batch_index() {
+        let arrow_schema = Schema::new(vec![
+            Field::new("z", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
+        ]);
+        let out = MemOutputFile::new();
+        let mut writer = MosaicWriter::new(out, &arrow_schema, WriterOptions::default()).unwrap();
+
+        let mismatched_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("z", DataType::Int32, false),
+                Field::new("x", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![3, 4])),
+            ],
+        )
+        .unwrap();
+
+        let err = writer.write_batch(&mismatched_batch).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "field name mismatch at column 1: schema has 'a' but batch has 'x'"
+        );
     }
 
     #[test]
