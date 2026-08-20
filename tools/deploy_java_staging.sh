@@ -464,10 +464,148 @@ fi
 
 NATIVE_DIR="$BUILD_REPO_DIR/java/src/main/resources/native"
 mkdir -p "$NATIVE_DIR"
-gh_exact run download "$RUN_ID" \
-  --repo "$REPOSITORY" \
-  --name java-release-native-inputs \
-  --dir "$NATIVE_DIR"
+ARTIFACTS_JSON="$BUILD_ROOT/java-release-native-inputs.json"
+gh_exact api \
+  "repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?name=java-release-native-inputs&per_page=100" \
+  --paginate \
+  --slurp \
+  > "$ARTIFACTS_JSON"
+ARTIFACT_SELECTION=$(
+  "$PYTHON" - "$ARTIFACTS_JSON" "$RUN_ID" "$TAG_COMMIT" <<'PY'
+# ARTIFACT_SELECTION
+import json
+import re
+import sys
+
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+pages = json.loads(open(sys.argv[1], encoding="utf-8").read())
+if isinstance(pages, dict):
+    pages = [pages]
+artifacts = [
+    artifact
+    for page in pages
+    for artifact in page.get("artifacts", [])
+    if artifact.get("name") == "java-release-native-inputs"
+    and not artifact.get("expired", False)
+]
+if not artifacts:
+    fail("no unexpired java-release-native-inputs artifact was found")
+if len(artifacts) > 1:
+    candidates = "\n".join(
+        "  id={id} created_at={created_at} digest={digest}".format(
+            id=artifact.get("id", ""),
+            created_at=artifact.get("created_at", ""),
+            digest=artifact.get("digest", ""),
+        )
+        for artifact in sorted(
+            artifacts,
+            key=lambda candidate: (
+                candidate.get("created_at", ""),
+                candidate.get("id", 0),
+            ),
+        )
+    )
+    fail(
+        "multiple unexpired java-release-native-inputs artifacts were found:\n"
+        f"{candidates}\n"
+        "inspect the candidates and delete the unintended artifacts before staging"
+    )
+
+artifact = artifacts[0]
+workflow_run = artifact.get("workflow_run") or {}
+if str(workflow_run.get("id", "")) != sys.argv[2]:
+    fail("selected artifact does not belong to the requested workflow run")
+if workflow_run.get("head_sha") != sys.argv[3]:
+    fail("selected artifact does not match the signed release tag commit")
+
+artifact_id = str(artifact.get("id", ""))
+digest = artifact.get("digest", "")
+if not artifact_id.isdigit():
+    fail("selected artifact does not have a valid immutable artifact id")
+if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+    fail("selected artifact does not have a valid SHA-256 digest")
+print(f"artifact_id={artifact_id}")
+print(f"artifact_digest={digest.lower()}")
+PY
+)
+RELEASE_ARTIFACT_ID=
+RELEASE_ARTIFACT_DIGEST=
+while IFS='=' read -r key value; do
+  case "$key" in
+    artifact_id) RELEASE_ARTIFACT_ID=$value ;;
+    artifact_digest) RELEASE_ARTIFACT_DIGEST=$value ;;
+    *)
+      echo "Unexpected release artifact field: $key" >&2
+      exit 1
+      ;;
+  esac
+done <<EOF
+$ARTIFACT_SELECTION
+EOF
+if [[ -z "$RELEASE_ARTIFACT_ID" || -z "$RELEASE_ARTIFACT_DIGEST" ]]; then
+  echo "Release artifact selection did not return an id and digest." >&2
+  exit 1
+fi
+
+ARTIFACT_ZIP="$BUILD_ROOT/java-release-native-inputs.zip"
+gh_exact api \
+  "repos/$REPOSITORY/actions/artifacts/$RELEASE_ARTIFACT_ID/zip" \
+  > "$ARTIFACT_ZIP"
+"$PYTHON" - "$ARTIFACT_ZIP" "$RELEASE_ARTIFACT_DIGEST" "$NATIVE_DIR" <<'PY'
+# ARTIFACT_EXTRACTION
+import hashlib
+import stat
+import sys
+import zipfile
+from pathlib import Path
+
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+archive_path = Path(sys.argv[1])
+expected_digest = sys.argv[2].removeprefix("sha256:")
+destination = Path(sys.argv[3])
+actual_digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+if actual_digest != expected_digest:
+    fail(
+        "downloaded release artifact digest mismatch: "
+        f"found sha256:{actual_digest}, expected sha256:{expected_digest}"
+    )
+
+seen = set()
+with zipfile.ZipFile(archive_path) as archive:
+    for info in archive.infolist():
+        name = info.filename
+        if not name or "\x00" in name or "\\" in name or name.startswith("/"):
+            fail(f"unsafe release artifact path: {name!r}")
+        parts = name.rstrip("/").split("/")
+        if not parts or any(part in {"", ".", ".."} for part in parts):
+            fail(f"unsafe release artifact path: {name!r}")
+        normalized = "/".join(parts)
+        if normalized in seen:
+            fail(f"duplicate release artifact path: {normalized!r}")
+        seen.add(normalized)
+
+        target = destination.joinpath(*parts)
+        mode = (info.external_attr >> 16) & 0xFFFF
+        entry_type = stat.S_IFMT(mode)
+        if info.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if entry_type not in (0, stat.S_IFREG):
+            fail(f"unsupported release artifact entry type: {name!r}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("xb") as output:
+            output.write(archive.read(info))
+PY
 
 EXPECTED_NATIVE_FILES=$(cat <<'EOF'
 linux/aarch64/libpaimon_mosaic_jni.so
@@ -544,7 +682,19 @@ fi
 
 (
   cd "$BUILD_REPO_DIR/java"
-  MAVEN_ARGS= "${MAVEN_CMD[@]}"
+  unset \
+    MAVEN_ARGS \
+    MAVEN_BASEDIR \
+    MAVEN_CONFIG \
+    MAVEN_DEBUG_OPTS \
+    MAVEN_OPTS \
+    MAVEN_PROJECTBASEDIR \
+    JAVA_TOOL_OPTIONS \
+    JDK_JAVA_OPTIONS \
+    _JAVA_OPTIONS
+  export MAVEN_SKIP_RC=1
+  export MAVEN_BASEDIR="$PWD"
+  "${MAVEN_CMD[@]}"
 )
 
 if [[ "$DRY_RUN" == true ]]; then

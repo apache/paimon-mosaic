@@ -50,12 +50,17 @@ settings and exact signing-key fingerprint:
 The script binds the local tag to the workflow run SHA/ref, rejects replacement
 refs, special Git index flags, and any dirty or ignored worktree content, then
 builds from an isolated archive of the tag. It downloads only the run's
-`java-release-native-inputs`, validates the exact four native binaries with the
+`java-release-native-inputs` by immutable artifact ID, verifies the GitHub
+artifact SHA-256 digest, validates the exact four native binaries with the
 repository's `tools/native_binary.py` verifier, and relies on the Maven
 `release` profile to verify the JARs before signing and deployment in the same
-lifecycle. Real deployment always reads the run from `github.com`, requires a
-full signing-key fingerprint present in the ASF Paimon `KEYS` file, and verifies
-the generated Maven signatures against that exact fingerprint.
+lifecycle. If a workflow rerun leaves multiple unexpired artifacts with that
+name, the script lists their immutable IDs, timestamps, and digests and refuses
+to guess; inspect the candidates and delete the unintended artifacts before
+staging. Real deployment always reads the run from `github.com`, clears ambient
+Maven/JVM option variables before invoking Maven, requires a full signing-key
+fingerprint present in the ASF Paimon `KEYS` file, and verifies the generated
+Maven signatures against that exact fingerprint.
 
 ## Dependency and artifact licensing
 

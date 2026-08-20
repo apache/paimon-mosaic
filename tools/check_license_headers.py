@@ -21,12 +21,26 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 
-ASF_HEADER_TOKEN = "Licensed to the Apache Software Foundation"
+ASF_HEADER = """
+Licensed to the Apache Software Foundation (ASF) under one or more
+contributor license agreements. See the NOTICE file distributed with
+this work for additional information regarding copyright ownership.
+The ASF licenses this file to You under the Apache License, Version 2.0
+(the "License"); you may not use this file except in compliance with
+the License. You may obtain a copy of the License at
+http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
 EXCLUDED_DIRECTORIES = {
     ".git",
     ".idea",
@@ -117,9 +131,14 @@ def is_text_file(path: Path) -> bool:
     return b"\0" not in path.read_bytes()
 
 
+def normalized_license_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
+
+
 def has_asf_header(path: Path) -> bool:
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    return ASF_HEADER_TOKEN in "\n".join(lines[:80])
+    header = normalized_license_text("\n".join(lines[:80]))
+    return normalized_license_text(ASF_HEADER) in header
 
 
 def missing_headers(root: Path) -> list[str]:

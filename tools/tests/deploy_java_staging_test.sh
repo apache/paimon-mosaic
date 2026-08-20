@@ -77,18 +77,48 @@ assert_artifact_download_not_invoked() {
   fi
 }
 
+update_artifact_digest() {
+  ARTIFACT_DIGEST=$(
+    "$REAL_PYTHON" - "$ARTIFACT_ZIP" <<'PY'
+import hashlib
+import sys
+
+print("sha256:" + hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
+PY
+  )
+}
+
 new_fixture() {
   FIXTURE_DIR=$(mktemp -d "$TEST_ROOT/fixture.XXXXXX")
   OUTPUT_LOG="$TEST_ROOT/output.$TEST_COUNT.log"
   MAVEN_LOG="$TEST_ROOT/maven.$TEST_COUNT.log"
   TAG_VALIDATION_LOG="$TEST_ROOT/tag-validation.$TEST_COUNT.log"
   ARTIFACT_DOWNLOAD_LOG="$TEST_ROOT/artifact-download.$TEST_COUNT.log"
+  ARTIFACT_ZIP="$TEST_ROOT/artifact.$TEST_COUNT.zip"
   TEMP_ROOT="$TEST_ROOT/tmp.$TEST_COUNT"
   mkdir -p \
     "$FIXTURE_DIR/fake-bin" \
     "$FIXTURE_DIR/java" \
     "$FIXTURE_DIR/tools" \
     "$TEMP_ROOT"
+
+  "$REAL_PYTHON" - "$ARTIFACT_ZIP" <<'PY'
+import sys
+import zipfile
+
+files = (
+    "linux/aarch64/libpaimon_mosaic_jni.so",
+    "linux/x86_64/libpaimon_mosaic_jni.so",
+    "macos/aarch64/libpaimon_mosaic_jni.dylib",
+    "windows/x86_64/paimon_mosaic_jni.dll",
+)
+with zipfile.ZipFile(sys.argv[1], "w", compression=zipfile.ZIP_STORED) as archive:
+    for name in files:
+        info = zipfile.ZipInfo(name, date_time=(2026, 8, 20, 0, 0, 0))
+        info.external_attr = 0o100644 << 16
+        archive.writestr(info, b"")
+PY
+  update_artifact_digest
 
   cp "$TOOLS_DIR/deploy_java_staging.sh" "$FIXTURE_DIR/tools/"
   cp "$TOOLS_DIR/native_binary.py" "$FIXTURE_DIR/tools/"
@@ -114,6 +144,33 @@ expected_repository=${FAKE_EXPECTED_REPOSITORY:-apache/paimon-mosaic}
 expected_run_id=${FAKE_EXPECTED_RUN_ID:-42}
 
 if [[ "$1" == "api" && "$2" == */actions/runs/* ]]; then
+  if [[ "$2" == */artifacts?* ]]; then
+    "$REAL_PYTHON" - <<'PY'
+import json
+import os
+import sys
+
+count = int(os.environ.get("FAKE_ARTIFACT_COUNT", "1"))
+run_id = int(os.environ.get("FAKE_EXPECTED_RUN_ID", "42"))
+head_sha = os.environ.get("FAKE_RUN_SHA") or os.popen(
+    f"git -C {os.environ['FAKE_REPO']} rev-parse "
+    f"{os.environ['FAKE_RUN_REF']}^{{commit}}"
+).read().strip()
+artifacts = [
+    {
+        "id": 9001 + index,
+        "name": "java-release-native-inputs",
+        "expired": False,
+        "digest": os.environ["FAKE_ARTIFACT_DIGEST"],
+        "created_at": f"2026-08-20T00:00:0{index}Z",
+        "workflow_run": {"id": run_id, "head_sha": head_sha},
+    }
+    for index in range(count)
+]
+json.dump([{"total_count": count, "artifacts": artifacts}], sys.stdout)
+PY
+    exit 0
+  fi
   [[ "$2" == "repos/$expected_repository/actions/runs/$expected_run_id" ]]
   printf 'status=completed\nconclusion=success\nhead_sha=%s\nhead_branch=%s\nworkflow_name=Release\nworkflow_path=%s\nevent=push\n' \
     "${FAKE_RUN_SHA:-$(git -C "$FAKE_REPO" rev-parse "${FAKE_RUN_REF}^{commit}")}" \
@@ -122,31 +179,10 @@ if [[ "$1" == "api" && "$2" == */actions/runs/* ]]; then
   exit 0
 fi
 
-if [[ "$1 $2" == "run download" ]]; then
+if [[ "$1" == "api" && "$2" == */actions/artifacts/*/zip ]]; then
   printf 'args=%s\n' "$*" >> "${ARTIFACT_DOWNLOAD_LOG:-/dev/null}"
-  [[ "$3" == "$expected_run_id" ]]
-  destination=
-  artifact=
-  repository=
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --repo) repository=$2; shift 2 ;;
-      --name) artifact=$2; shift 2 ;;
-      --dir) destination=$2; shift 2 ;;
-      *) shift ;;
-    esac
-  done
-  [[ "$repository" == "$expected_repository" ]]
-  [[ "$artifact" == "java-release-native-inputs" ]]
-  mkdir -p \
-    "$destination/linux/x86_64" \
-    "$destination/linux/aarch64" \
-    "$destination/macos/aarch64" \
-    "$destination/windows/x86_64"
-  : > "$destination/linux/x86_64/libpaimon_mosaic_jni.so"
-  : > "$destination/linux/aarch64/libpaimon_mosaic_jni.so"
-  : > "$destination/macos/aarch64/libpaimon_mosaic_jni.dylib"
-  : > "$destination/windows/x86_64/paimon_mosaic_jni.dll"
+  [[ "$2" == "repos/$expected_repository/actions/artifacts/9001/zip" ]]
+  cat "$FAKE_ARTIFACT_ZIP"
   exit 0
 fi
 
@@ -159,12 +195,27 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+if [[ "${MAVEN_SKIP_RC:-}" != 1 && -n "${FAKE_MAVEN_RC:-}" ]]; then
+  # Model the standard Maven launcher, which sources mavenrc files unless
+  # MAVEN_SKIP_RC is set before the launcher starts.
+  source "$FAKE_MAVEN_RC"
+fi
+if [[ "${MAVEN_BASEDIR:-}" != "$PWD" && -n "${FAKE_MAVEN_CONFIG:-}" ]]; then
+  MAVEN_ARGS=$(cat "$FAKE_MAVEN_CONFIG")
+fi
+
 {
   printf 'pwd=%s\n' "$PWD"
   printf 'args=%s\n' "$*"
   printf 'maven-opts=%s\n' "${MAVEN_OPTS:-}"
   printf 'maven-args=%s\n' "${MAVEN_ARGS:-}"
   printf 'java-tool-options=%s\n' "${JAVA_TOOL_OPTIONS:-}"
+  printf 'jdk-java-options=%s\n' "${JDK_JAVA_OPTIONS:-}"
+  printf 'underscore-java-options=%s\n' "${_JAVA_OPTIONS:-}"
+  printf 'maven-skip-rc=%s\n' "${MAVEN_SKIP_RC:-}"
+  printf 'maven-basedir=%s\n' "${MAVEN_BASEDIR:-}"
+  printf 'maven-debug-opts=%s\n' "${MAVEN_DEBUG_OPTS:-}"
+  printf 'maven-config=%s\n' "${MAVEN_CONFIG:-}"
   sed -n 's#.*<version>\([^<]*\)</version>.*#pom-version=\1#p' pom.xml | tail -n1
 } >> "$FAKE_MVN_LOG"
 
@@ -197,6 +248,10 @@ if [[ $# -gt 0 && "$1" == */validate_release_tag.py ]]; then
 fi
 
 script=$(cat)
+if grep -q "ARTIFACT_SELECTION\|ARTIFACT_EXTRACTION" <<< "$script"; then
+  printf '%s\n' "$script" | "$REAL_PYTHON" "$@"
+  exit 0
+fi
 if grep -q "xml.etree.ElementTree" <<< "$script"; then
   printf '0.3.0\n'
 fi
@@ -256,11 +311,17 @@ run_script() {
       FAKE_RUN_SHA="${FAKE_RUN_SHA:-}" \
       FAKE_EXPECTED_REPOSITORY="${FAKE_EXPECTED_REPOSITORY:-apache/paimon-mosaic}" \
       FAKE_EXPECTED_RUN_ID="${FAKE_EXPECTED_RUN_ID:-42}" \
+      FAKE_ARTIFACT_COUNT="${FAKE_ARTIFACT_COUNT:-1}" \
+      FAKE_ARTIFACT_DIGEST="${FAKE_ARTIFACT_DIGEST:-$ARTIFACT_DIGEST}" \
+      FAKE_ARTIFACT_ZIP="$ARTIFACT_ZIP" \
+      FAKE_MAVEN_RC="${FAKE_MAVEN_RC:-}" \
+      FAKE_MAVEN_CONFIG="${FAKE_MAVEN_CONFIG:-}" \
       FAKE_WORKFLOW_PATH="${FAKE_WORKFLOW_PATH:-}" \
       FAKE_TAG_VALIDATION_RESULT="${FAKE_TAG_VALIDATION_RESULT:-}" \
       FAKE_GPG_FINGERPRINT="${FAKE_GPG_FINGERPRINT:-}" \
       FAKE_KEYS_FINGERPRINT="${FAKE_KEYS_FINGERPRINT:-}" \
       FAKE_SIGNATURE_FINGERPRINT="${FAKE_SIGNATURE_FINGERPRINT:-}" \
+      REAL_PYTHON="$REAL_PYTHON" \
       ARTIFACT_DOWNLOAD_LOG="$ARTIFACT_DOWNLOAD_LOG" \
       TAG_VALIDATION_LOG="$TAG_VALIDATION_LOG" \
       GH_HOST=enterprise.example.invalid \
@@ -324,7 +385,89 @@ test_artifact_download_uses_validated_run_and_repository() {
     run_script --repo example/fork --dry-run > "$OUTPUT_LOG" 2>&1
 
   assert_contains "$ARTIFACT_DOWNLOAD_LOG" \
-    "args=run download 314159 --repo example/fork"
+    "args=api repos/example/fork/actions/artifacts/9001/zip"
+  assert_not_contains "$ARTIFACT_DOWNLOAD_LOG" "run download"
+}
+
+test_duplicate_release_artifacts_are_rejected() {
+  new_fixture
+  if FAKE_ARTIFACT_COUNT=2 run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "multiple same-name release artifacts were accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" "multiple unexpired java-release-native-inputs artifacts"
+  assert_contains "$OUTPUT_LOG" "id=9001 created_at=2026-08-20T00:00:00Z"
+  assert_contains "$OUTPUT_LOG" "id=9002 created_at=2026-08-20T00:00:01Z"
+  assert_maven_not_invoked
+}
+
+test_release_artifact_digest_must_match_metadata() {
+  new_fixture
+  wrong_digest="sha256:$(printf '1%.0s' {1..64})"
+  if FAKE_ARTIFACT_DIGEST="$wrong_digest" \
+    run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "release artifact with the wrong digest was accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" "release artifact digest mismatch"
+  assert_not_contains "$OUTPUT_LOG" "Traceback"
+  assert_maven_not_invoked
+}
+
+test_release_artifact_rejects_unsafe_zip_path() {
+  new_fixture
+  "$REAL_PYTHON" - "$ARTIFACT_ZIP" <<'PY'
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1], "w") as archive:
+    archive.writestr("../escape", b"unsafe")
+PY
+  update_artifact_digest
+
+  if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "release artifact with a traversal path was accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" "unsafe release artifact path"
+  assert_maven_not_invoked
+}
+
+test_release_artifact_rejects_symlink_entry() {
+  new_fixture
+  "$REAL_PYTHON" - "$ARTIFACT_ZIP" <<'PY'
+import stat
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1], "w") as archive:
+    info = zipfile.ZipInfo("linux/x86_64/libpaimon_mosaic_jni.so")
+    info.external_attr = (stat.S_IFLNK | 0o777) << 16
+    archive.writestr(info, b"../../outside")
+PY
+  update_artifact_digest
+
+  if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "release artifact with a symlink entry was accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" "unsupported release artifact entry type"
+  assert_maven_not_invoked
+}
+
+test_release_artifact_rejects_duplicate_zip_path() {
+  new_fixture
+  "$REAL_PYTHON" - "$ARTIFACT_ZIP" <<'PY' 2>/dev/null
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1], "w") as archive:
+    archive.writestr("linux/x86_64/libpaimon_mosaic_jni.so", b"first")
+    archive.writestr("linux/x86_64/libpaimon_mosaic_jni.so", b"second")
+PY
+  update_artifact_digest
+
+  if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "release artifact with a duplicate path was accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" "duplicate release artifact path"
+  assert_maven_not_invoked
 }
 
 test_real_deploy_requires_official_repository_run() {
@@ -399,6 +542,9 @@ test_invalid_native_files_fail_without_external_file_command() {
       FAKE_MVN_LOG="$MAVEN_LOG" \
       FAKE_REPO="$FIXTURE_DIR" \
       FAKE_RUN_REF=v0.3.0-rc1 \
+      FAKE_ARTIFACT_DIGEST="$ARTIFACT_DIGEST" \
+      FAKE_ARTIFACT_ZIP="$ARTIFACT_ZIP" \
+      REAL_PYTHON="$REAL_PYTHON" \
       TMPDIR="$TEMP_ROOT" \
       "$BASH" ./tools/deploy_java_staging.sh \
         --release-version 0.3.0 \
@@ -416,13 +562,29 @@ test_real_deploy_uses_one_verified_maven_lifecycle() {
   new_fixture
   settings="$TEST_ROOT/settings.$TEST_COUNT.xml"
   keys="$TEST_ROOT/keys.$TEST_COUNT"
+  maven_rc="$TEST_ROOT/mavenrc.$TEST_COUNT"
+  maven_config="$TEST_ROOT/maven.config.$TEST_COUNT"
   printf '<settings/>\n' > "$settings"
   printf 'fake KEYS\n' > "$keys"
-  hostile_maven_opts='-Xmx1g -Dexec.skip=true -Dgpg.skip=true -DskipLocalStaging=true -DskipRemoteStaging=true -DskipStagingRepositoryClose=true -Dmaven.wagon.http.ssl.allowall=true'
-  hostile_java_tool_options='-Xms256m -DskipNexusStagingDeployMojo=true -DskipStaging=true -Dmaven.wagon.http.ssl.insecure=true'
+  cat > "$maven_rc" <<'EOF'
+export MAVEN_OPTS='-DstagingRepositoryId=orgapachepaimon-from-rc'
+export JAVA_TOOL_OPTIONS='-DkeepStagingRepositoryOnFailure=true'
+EOF
+  printf '%s\n' '-f=/tmp/hostile-pom.xml' > "$maven_config"
+  hostile_maven_opts='-Xmx1g -DstagingRepositoryId=orgapachepaimon-4242 -DkeepStagingRepositoryOnFailure=true -Dexec.skip=true -Dgpg.skip=true'
+  hostile_java_tool_options='-Xms256m -DkeepStagingRepositoryOnCloseRuleFailure=true -DskipNexusStagingDeployMojo=true'
+  hostile_jdk_java_options='-DstagingProfileId=deadbeef -DskipStaging=true'
+  hostile_underscore_java_options='-DskipStagingRepositoryClose=true -Dmaven.wagon.http.ssl.insecure=true'
 
   MAVEN_OPTS="$hostile_maven_opts" \
     JAVA_TOOL_OPTIONS="$hostile_java_tool_options" \
+    JDK_JAVA_OPTIONS="$hostile_jdk_java_options" \
+    _JAVA_OPTIONS="$hostile_underscore_java_options" \
+    MAVEN_BASEDIR="$TEST_ROOT/hostile-basedir" \
+    MAVEN_DEBUG_OPTS='-DstagingRepositoryId=from-debug-opts' \
+    MAVEN_CONFIG='-f=/tmp/hostile-config-pom.xml' \
+    FAKE_MAVEN_RC="$maven_rc" \
+    FAKE_MAVEN_CONFIG="$maven_config" \
     run_script \
       --maven-settings "$settings" \
       --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
@@ -444,9 +606,27 @@ test_real_deploy_uses_one_verified_maven_lifecycle() {
   done
   assert_contains "$MAVEN_LOG" \
     "-Dgpg.keyname=0123456789ABCDEF0123456789ABCDEF01234567!"
-  assert_contains "$MAVEN_LOG" "maven-opts=$hostile_maven_opts"
-  assert_contains "$MAVEN_LOG" \
+  assert_contains "$MAVEN_LOG" "maven-opts="
+  assert_not_contains "$MAVEN_LOG" "maven-opts=$hostile_maven_opts"
+  assert_contains "$MAVEN_LOG" "java-tool-options="
+  assert_not_contains "$MAVEN_LOG" \
     "java-tool-options=$hostile_java_tool_options"
+  assert_contains "$MAVEN_LOG" "jdk-java-options="
+  assert_not_contains "$MAVEN_LOG" \
+    "jdk-java-options=$hostile_jdk_java_options"
+  assert_contains "$MAVEN_LOG" "underscore-java-options="
+  assert_not_contains "$MAVEN_LOG" \
+    "underscore-java-options=$hostile_underscore_java_options"
+  assert_contains "$MAVEN_LOG" "maven-skip-rc=1"
+  maven_pwd=$(sed -n 's/^pwd=//p' "$MAVEN_LOG")
+  maven_basedir=$(sed -n 's/^maven-basedir=//p' "$MAVEN_LOG")
+  if [[ "$maven_basedir" != "$maven_pwd" ]]; then
+    fail "Maven base directory was not pinned to the isolated Java project"
+  fi
+  assert_contains "$MAVEN_LOG" "maven-debug-opts="
+  assert_not_contains "$MAVEN_LOG" "from-debug-opts"
+  assert_contains "$MAVEN_LOG" "maven-config="
+  assert_not_contains "$MAVEN_LOG" "hostile-config-pom"
   assert_contains "$MAVEN_LOG" "maven-args="
   assert_contains "$TAG_VALIDATION_LOG" \
     "$FIXTURE_DIR/tools/validate_release_tag.py v0.3.0-rc1 --keys-file $keys --repository $FIXTURE_DIR --expected-commit $(git -C "$FIXTURE_DIR" rev-parse HEAD)"
@@ -538,6 +718,11 @@ run_test test_run_tests_omits_skip_flag
 run_test test_missing_option_value_never_deploys
 run_test test_workflow_run_sha_must_match_tag
 run_test test_artifact_download_uses_validated_run_and_repository
+run_test test_duplicate_release_artifacts_are_rejected
+run_test test_release_artifact_digest_must_match_metadata
+run_test test_release_artifact_rejects_unsafe_zip_path
+run_test test_release_artifact_rejects_symlink_entry
+run_test test_release_artifact_rejects_duplicate_zip_path
 run_test test_real_deploy_requires_official_repository_run
 run_test test_git_index_flags_are_rejected
 run_test test_dirty_caller_worktree_is_rejected

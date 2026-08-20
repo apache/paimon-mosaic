@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import gzip
 import io
 import os
 import subprocess
@@ -116,6 +117,38 @@ def test_archive_verification_rejects_same_tree_from_different_commit(tmp_path):
 
     with pytest.raises(ValueError, match="embedded Git commit differs"):
         verifier.verify_archive(archive, repo, second_commit, PREFIX)
+
+
+def test_archive_verification_rejects_trailing_gzip_data(tmp_path):
+    repo, commit = initialize_repo(tmp_path)
+    archive = tmp_path / "source.tgz"
+    verifier.create_archive(archive, repo, commit, PREFIX)
+    with archive.open("ab") as output:
+        output.write(b"trailing data")
+
+    with pytest.raises(ValueError, match="trailing data"):
+        verifier.verify_archive(archive, repo, commit, PREFIX)
+
+
+def test_archive_verification_rejects_second_tar_segment(tmp_path):
+    repo, commit = initialize_repo(tmp_path)
+    archive = tmp_path / "source.tgz"
+    verifier.create_archive(archive, repo, commit, PREFIX)
+
+    extra_tar = tmp_path / "extra.tar"
+    write_tar(
+        extra_tar,
+        [regular_file(f"{PREFIX}UNVERIFIED.txt", b"unverified")],
+    )
+    combined = gzip.decompress(archive.read_bytes()) + extra_tar.read_bytes()
+    with archive.open("wb") as destination:
+        with gzip.GzipFile(
+            filename="", mode="wb", fileobj=destination, mtime=0
+        ) as output:
+            output.write(combined)
+
+    with pytest.raises(ValueError, match="trailing tar data"):
+        verifier.verify_archive(archive, repo, commit, PREFIX)
 
 
 def test_archive_creation_rejects_git_replacement_refs(tmp_path):

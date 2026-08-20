@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import io
 import os
 import posixpath
 import re
@@ -29,6 +30,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -266,10 +268,24 @@ def read_source_archive(
     path: Path, prefix: str
 ) -> tuple[dict[str, ArchiveEntry], str | None]:
     try:
-        with tarfile.open(path, mode="r:gz") as archive:
+        compressed = path.read_bytes()
+        decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        raw_tar = decompressor.decompress(compressed) + decompressor.flush()
+        if not decompressor.eof:
+            raise ValueError("gzip stream ended before its trailer")
+        if decompressor.unused_data or decompressor.unconsumed_tail:
+            raise ValueError("gzip source archive contains trailing data")
+
+        with tarfile.open(fileobj=io.BytesIO(raw_tar), mode="r:") as archive:
             embedded_commit = archive.pax_headers.get("comment")
-            return archive_entries(archive, prefix), embedded_commit
-    except (tarfile.TarError, EOFError) as error:
+            entries = archive_entries(archive, prefix)
+            tar_trailer = raw_tar[archive.offset :]
+        if len(tar_trailer) < 1024 or len(tar_trailer) % 512 != 0:
+            raise ValueError("gzip source archive has an invalid tar ending")
+        if any(tar_trailer):
+            raise ValueError("gzip source archive contains trailing tar data")
+        return entries, embedded_commit
+    except (tarfile.TarError, EOFError, zlib.error) as error:
         raise ValueError(
             f"cannot read gzip source archive {path}: {error}"
         ) from error
