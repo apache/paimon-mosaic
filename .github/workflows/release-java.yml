@@ -123,17 +123,35 @@ jobs:
           EXPECTED_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          python -c '
+          python - <<'PY'
           import ctypes
           import os
           import platform
+          import re
+          from pathlib import Path
+
           machine = platform.machine().lower()
           machine = {"amd64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
           assert machine == os.environ["EXPECTED_ARCH"], (machine, os.environ["EXPECTED_ARCH"])
+
+          jni_source = Path("jni/src/lib.rs").read_text(encoding="utf-8")
+          # Capture the identifier before any optional Rust lifetime generics.
+          jni_exports = re.findall(
+              r'(?m)^pub\s+extern\s+"system"\s+fn\s+'
+              r'(Java_org_apache_paimon_mosaic_NativeLib_[A-Za-z0-9_]+)',
+              jni_source,
+          )
+          if len(jni_exports) != 24 or len(jni_exports) != len(set(jni_exports)):
+              raise RuntimeError(
+                  f"Expected 24 unique JNI exports from jni/src/lib.rs, found {len(jni_exports)}"
+              )
+
           library = os.path.abspath(os.environ["NATIVE_LIBRARY"])
-          ctypes.CDLL(library)
-          print(f"Loaded {library}")
-          '
+          native_library = ctypes.CDLL(library)
+          for symbol in jni_exports:
+              getattr(native_library, symbol)
+          print(f"Loaded {library} and resolved {len(jni_exports)} JNI exports")
+          PY
 
       - name: Upload native library
         uses: actions/upload-artifact@v5
