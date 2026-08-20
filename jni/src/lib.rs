@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::error::Error;
+use std::fmt;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
@@ -198,6 +200,77 @@ impl OutputFile for JniOutputFile {
 
 // ======================== JniInputFile ========================
 
+struct JavaInputException {
+    operation: &'static str,
+    throwable: GlobalRef,
+}
+
+impl fmt::Debug for JavaInputException {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JavaInputException")
+            .field("operation", &self.operation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for JavaInputException {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} threw a Java exception", self.operation)
+    }
+}
+
+impl Error for JavaInputException {}
+
+fn input_jni_result<T>(
+    env: &mut JNIEnv<'_>,
+    result: jni::errors::Result<T>,
+    operation: &'static str,
+) -> io::Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(JniError::JavaException) => {
+            let captured = (|| -> jni::errors::Result<GlobalRef> {
+                let exception = env.exception_occurred()?;
+                env.exception_clear()?;
+                if exception.is_null() {
+                    return Err(JniError::NullPtr("pending Java input exception"));
+                }
+                let global = env.new_global_ref(exception)?;
+                let exception_pending = env.exception_check()?;
+                if exception_pending {
+                    env.exception_clear()?;
+                }
+                if global.as_obj().is_null() || exception_pending {
+                    return Err(JniError::NullPtr(
+                        "NewGlobalRef for pending Java input exception",
+                    ));
+                }
+                Ok(global)
+            })();
+
+            match captured {
+                Ok(throwable) => Err(io::Error::other(JavaInputException {
+                    operation,
+                    throwable,
+                })),
+                Err(capture_error) => {
+                    // Native reads may run on worker threads. Do not detach a worker while a Java
+                    // exception is pending, even if preserving the original throwable failed.
+                    let _ = env.exception_clear();
+                    Err(io::Error::other(format!(
+                        "{} (failed to preserve Java exception from {}: {})",
+                        JniError::JavaException,
+                        operation,
+                        capture_error
+                    )))
+                }
+            }
+        }
+        Err(error) => Err(io::Error::other(error.to_string())),
+    }
+}
+
 struct JniInputFile {
     jvm: Arc<JavaVM>,
     input_file_ref: GlobalRef,
@@ -216,11 +289,10 @@ impl InputFile for JniInputFile {
             .attach_current_thread()
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let java_buf = env
-            .new_byte_array(buf.len() as i32)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let result = env.new_byte_array(buf.len() as i32);
+        let java_buf = input_jni_result(&mut env, result, "NewByteArray")?;
 
-        env.call_method(
+        let result = env.call_method(
             &self.input_file_ref,
             "readFully",
             "(J[BII)V",
@@ -230,13 +302,13 @@ impl InputFile for JniInputFile {
                 JValue::Int(0),
                 JValue::Int(buf.len() as jint),
             ],
-        )
-        .map_err(|e| io::Error::other(e.to_string()))?;
+        );
+        input_jni_result(&mut env, result, "InputFile.readFully")?;
 
         let i8_buf: &mut [i8] =
             unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut i8, buf.len()) };
-        env.get_byte_array_region(&java_buf, 0, i8_buf)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let result = env.get_byte_array_region(&java_buf, 0, i8_buf);
+        input_jni_result(&mut env, result, "GetByteArrayRegion")?;
 
         Ok(())
     }
@@ -252,7 +324,9 @@ fn bytemuck_cast(data: &[u8]) -> &[i8] {
 }
 
 fn throw(env: &mut JNIEnv, msg: &str) {
-    let _ = env.throw_new("java/lang/RuntimeException", msg);
+    if matches!(env.exception_check(), Ok(false)) {
+        let _ = env.throw_new("java/lang/RuntimeException", msg);
+    }
 }
 
 fn rethrow(env: &mut JNIEnv, exception: &GlobalRef) {
@@ -281,6 +355,29 @@ fn rethrow(env: &mut JNIEnv, exception: &GlobalRef) {
                 &format!("failed to rethrow preserved Java exception: {}", error),
             );
         }
+    }
+}
+
+fn find_java_input_exception<'a>(
+    error: &'a (dyn Error + 'static),
+) -> Option<&'a JavaInputException> {
+    if let Some(input_exception) = error.downcast_ref::<JavaInputException>() {
+        return Some(input_exception);
+    }
+    if let Some(io_error) = error.downcast_ref::<io::Error>() {
+        if let Some(inner) = io_error.get_ref() {
+            if let Some(input_exception) = find_java_input_exception(inner) {
+                return Some(input_exception);
+            }
+        }
+    }
+    error.source().and_then(find_java_input_exception)
+}
+
+fn throw_io_error(env: &mut JNIEnv<'_>, error: &io::Error, message: &str) {
+    match find_java_input_exception(error) {
+        Some(input_exception) => rethrow(env, &input_exception.throwable),
+        None => throw(env, message),
     }
 }
 
@@ -723,7 +820,8 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpen(
                 Box::into_raw(Box::new(rh)) as jlong
             }
             Err(e) => {
-                throw(&mut env, &format!("open failed: {}", e));
+                drop(global);
+                throw_io_error(&mut env, &e, &format!("open failed: {}", e));
                 0
             }
         }
@@ -819,7 +917,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpenR
                 Box::into_raw(rg_handle) as jlong
             }
             Err(e) => {
-                throw(&mut env, &format!("open row group failed: {}", e));
+                throw_io_error(&mut env, &e, &format!("open row group failed: {}", e));
                 0
             }
         }
@@ -1078,7 +1176,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
         let batch = match rg.inner.read_columns() {
             Ok(b) => b,
             Err(e) => {
-                throw(&mut env, &format!("read_columns failed: {}", e));
+                throw_io_error(&mut env, &e, &format!("read_columns failed: {}", e));
                 return -1;
             }
         };

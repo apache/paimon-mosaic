@@ -28,6 +28,9 @@ import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.arrow.c.jni.JniWrapper;
 import org.apache.arrow.memory.ArrowBuf;
@@ -192,7 +195,14 @@ public class MosaicRoundtripTest {
             System.runFinalization();
             Thread.sleep(50L);
         }
-        assertNull("expected input file to be released after failed open", reference.get());
+        assertNull("expected native callback object to be released", reference.get());
+    }
+
+    private static void awaitGarbageCollection(List<WeakReference<?>> references)
+            throws InterruptedException {
+        for (WeakReference<?> reference : references) {
+            awaitGarbageCollection(reference);
+        }
     }
 
     private WeakReference<InputFile> openReaderWithClosedAllocator(byte[] data) {
@@ -209,6 +219,71 @@ public class MosaicRoundtripTest {
 
         assertThrows(RuntimeException.class, () -> MosaicReader.open(inputFile, data.length, failingAllocator));
         return reference;
+    }
+
+    private List<WeakReference<?>> openReaderWithFailingInput() {
+        IOException expected = new IOException("intentional native input failure");
+        InputFile inputFile =
+                new InputFile() {
+                    @Override
+                    public void readFully(
+                            long position, byte[] buffer, int offset, int length)
+                            throws IOException {
+                        throw expected;
+                    }
+                };
+        WeakReference<InputFile> inputReference = new WeakReference<>(inputFile);
+        WeakReference<IOException> exceptionReference = new WeakReference<>(expected);
+
+        IOException error =
+                assertThrows(
+                        IOException.class,
+                        () -> MosaicReader.open(inputFile, 64L, allocator));
+        assertSame(expected, error);
+        return Arrays.asList(inputReference, exceptionReference);
+    }
+
+    private List<WeakReference<?>> readRowGroupWithFailingInput(byte[] data) {
+        IOException expected = new IOException("intentional native background input failure");
+        long callingThreadId = Thread.currentThread().getId();
+        AtomicBoolean failReads = new AtomicBoolean();
+        AtomicInteger reads = new AtomicInteger();
+        AtomicLong failingThreadId = new AtomicLong(-1L);
+        InputFile inputFile =
+                new InputFile() {
+                    @Override
+                    public void readFully(
+                            long position, byte[] buffer, int offset, int length)
+                            throws IOException {
+                        reads.incrementAndGet();
+                        if (failReads.get()) {
+                            failingThreadId.compareAndSet(
+                                    -1L, Thread.currentThread().getId());
+                            throw expected;
+                        }
+                        System.arraycopy(data, (int) position, buffer, offset, length);
+                    }
+                };
+        WeakReference<InputFile> inputReference = new WeakReference<>(inputFile);
+        WeakReference<IOException> exceptionReference = new WeakReference<>(expected);
+
+        long handle = NativeLib.nativeReaderOpen(inputFile, data.length);
+        assertNotEquals(0L, handle);
+        int readsAfterOpen = reads.get();
+        try {
+            failReads.set(true);
+            IOException actual =
+                    assertThrows(
+                            IOException.class,
+                            () -> NativeLib.nativeReaderOpenRowGroup(handle, 0));
+            assertSame(expected, actual);
+            assertTrue("expected a row-group read", reads.get() > readsAfterOpen);
+            assertNotEquals(callingThreadId, failingThreadId.get());
+            assertEquals(1, NativeLib.nativeReaderNumRowGroups(handle));
+        } finally {
+            NativeLib.nativeReaderFree(handle);
+        }
+        return Arrays.asList(inputReference, exceptionReference);
     }
 
     @Test
@@ -1406,6 +1481,29 @@ public class MosaicRoundtripTest {
 
         WeakReference<InputFile> reference = openReaderWithClosedAllocator(data);
         awaitGarbageCollection(reference);
+    }
+
+    @Test
+    public void testReaderOpenReleasesInputGlobalRefWhenReadFails() throws Exception {
+        awaitGarbageCollection(openReaderWithFailingInput());
+    }
+
+    @Test
+    public void testReaderRestoresBackgroundInputExceptionAndReleasesGlobalRef()
+            throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.nullable("value", new ArrowType.Int(32, true))
+        ));
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector values = (IntVector) root.getVector("value");
+            values.allocateNew(1);
+            values.set(0, 7);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        awaitGarbageCollection(readRowGroupWithFailingInput(data));
     }
 
     @Test
