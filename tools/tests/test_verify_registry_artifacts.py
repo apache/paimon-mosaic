@@ -100,6 +100,36 @@ def test_pypi_matching_subset_stages_only_missing_wheels(tmp_path):
     assert (upload / second.filename).read_bytes() == b"arm wheel"
 
 
+def test_stage_missing_wheels_rejects_symlink_ancestor_before_external_delete(
+    tmp_path,
+):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    wheel = create_artifact(
+        artifacts,
+        "paimon_mosaic-0.3.0-py3-none-manylinux_2_28_x86_64.whl",
+        b"x86 wheel",
+    )
+    external_upload = tmp_path / "external" / "upload"
+    external_upload.mkdir(parents=True)
+    sentinel = external_upload / "keep.txt"
+    sentinel.write_bytes(b"keep")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "redirect").symlink_to(
+        external_upload.parent,
+        target_is_directory=True,
+    )
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        verifier.stage_missing_wheels(
+            [wheel],
+            staging / "redirect" / external_upload.name,
+        )
+
+    assert sentinel.read_bytes() == b"keep"
+
+
 def test_pypi_absent_release_stages_every_wheel(tmp_path):
     wheel = create_artifact(
         tmp_path,

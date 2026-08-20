@@ -190,6 +190,18 @@ def stage_missing_wheels(
     *,
     source_wheels: list[LocalArtifact] | None = None,
 ) -> None:
+    upload_path = (
+        upload_directory
+        if upload_directory.is_absolute()
+        else Path.cwd() / upload_directory
+    )
+    for component in (upload_path, *upload_path.parents):
+        if component.is_symlink():
+            raise ValueError(
+                "upload directory path must not contain a symbolic link: "
+                f"{component}"
+            )
+
     output = upload_directory.resolve()
     for wheel in source_wheels if source_wheels is not None else wheels:
         artifact = wheel.path.resolve()
@@ -199,10 +211,6 @@ def stage_missing_wheels(
                 f"{wheel.path}"
             )
 
-    if upload_directory.is_symlink():
-        raise ValueError(
-            f"upload directory must not be a symbolic link: {upload_directory}"
-        )
     if upload_directory.exists():
         if not upload_directory.is_dir():
             raise ValueError(
