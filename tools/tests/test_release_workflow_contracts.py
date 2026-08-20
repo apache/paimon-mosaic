@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -49,6 +51,21 @@ def step(workflow_text: str, name: str) -> str:
     start = workflow_text.index(f"      - name: {name}")
     end = workflow_text.find("\n      - ", start + 1)
     return workflow_text[start:] if end == -1 else workflow_text[start:end]
+
+
+def step_run_block(step_text: str) -> str:
+    lines = step_text.splitlines()
+    run_lines = [
+        index for index, line in enumerate(lines) if line == "        run: |"
+    ]
+    assert len(run_lines) == 1, "step must contain exactly one literal run block"
+    content_indent = 10
+    block_lines = []
+    for line in lines[run_lines[0] + 1 :]:
+        assert not line or line.startswith(" " * content_indent)
+        block_lines.append(line[content_indent:] if line else "")
+    assert block_lines
+    return "\n".join(block_lines) + "\n"
 
 
 def field(block: str, name: str, indent: int) -> str | None:
@@ -112,6 +129,13 @@ def dependency_ancestors(workflow_jobs: dict[str, str], name: str) -> set[str]:
     return ancestors
 
 
+def assert_publication_jobs_require_release_verification(release: str) -> None:
+    release_jobs = jobs(release)
+    expected_needs = ("rust", "java", "python-wheels")
+    for job_name in ("python-rc-publish", "final-publication-preflight"):
+        assert sequence_field(release_jobs[job_name], "needs", 4) == expected_needs
+
+
 def assert_final_publish_jobs_require_preflight(release: str) -> None:
     release_jobs = jobs(release)
     final_preflight = release_jobs["final-publication-preflight"]
@@ -142,7 +166,96 @@ def assert_rust_leaf_publish_gate(rust: str) -> None:
     assert condition_terms(field(publish_step, "if", 8)) == allowed_terms
 
 
-def assert_promoted_source_archive_gate(release: str) -> None:
+def write_executable(path: Path, contents: str) -> None:
+    path.write_text(contents, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def assert_source_archive_verifier_failure_fails_step(
+    source_archive_step: str, tmp_path: Path
+) -> None:
+    fake_bin = tmp_path / "bin"
+    runner_temp = tmp_path / "runner"
+    repository = tmp_path / "repository"
+    release_dir = runner_temp / "source-release"
+    archive_name = "apache-paimon-mosaic-1.2.3-src.tgz"
+    archive = release_dir / archive_name
+    fake_bin.mkdir(parents=True)
+    runner_temp.mkdir()
+    repository.mkdir()
+    release_dir.mkdir()
+
+    archive.write_text("fixture\n", encoding="utf-8")
+    (release_dir / f"{archive_name}.asc").write_text(
+        "fixture\n", encoding="utf-8"
+    )
+    (release_dir / f"{archive_name}.sha512").write_text(
+        f"{'0' * 128}  {archive_name}\n", encoding="utf-8"
+    )
+    (release_dir / "KEYS").write_text("fixture\n", encoding="utf-8")
+    for command in ("curl", "gpg", "sha512sum"):
+        write_executable(
+            fake_bin / command,
+            """#!/bin/sh
+exit 0
+""",
+        )
+
+    verifier_args = tmp_path / "verifier-args"
+    write_executable(
+        fake_bin / "python3",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$@" > "$FAKE_VERIFIER_ARGS"
+test "${1-}" = "tools/verify_source_archive.py"
+exit "$FAKE_VERIFIER_EXIT"
+""",
+    )
+
+    github_sha = "0123456789abcdef0123456789abcdef01234567"
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_VERIFIER_ARGS": str(verifier_args),
+            "FAKE_VERIFIER_EXIT": "73",
+            "GITHUB_SHA": github_sha,
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "RUNNER_TEMP": str(runner_temp),
+            "TAG_NAME": "v1.2.3",
+        }
+    )
+    result = subprocess.run(
+        ["/bin/bash", "-c", step_run_block(source_archive_step)],
+        cwd=repository,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    diagnostics = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert verifier_args.exists(), (
+        "source verifier was not executed\n" + diagnostics
+    )
+    assert verifier_args.read_text(encoding="utf-8").splitlines() == [
+        "tools/verify_source_archive.py",
+        "verify",
+        "--repository",
+        ".",
+        "--commit",
+        github_sha,
+        "--prefix",
+        "paimon-mosaic-1.2.3/",
+        "--archive",
+        str(archive),
+    ]
+    assert result.returncode != 0, (
+        "source verifier failure was ignored\n" + diagnostics
+    )
+
+
+def assert_promoted_source_archive_gate(
+    release: str, tmp_path: Path
+) -> None:
     final_preflight = jobs(release)["final-publication-preflight"]
     source_archive_step = step(
         final_preflight, "Require promoted and valid ASF source release"
@@ -150,6 +263,9 @@ def assert_promoted_source_archive_gate(release: str) -> None:
     assert field(source_archive_step, "if", 8) is None
     continue_on_error = field(source_archive_step, "continue-on-error", 8)
     assert continue_on_error is None or continue_on_error.lower() == "false"
+    assert_source_archive_verifier_failure_fails_step(
+        source_archive_step, tmp_path
+    )
     assert_final_publish_jobs_require_preflight(release)
 
 
@@ -264,6 +380,43 @@ def test_manual_release_contract_rejects_publication_bypass_mutations():
         )
 
 
+def test_publication_jobs_require_exact_release_verification_dependencies():
+    assert_publication_jobs_require_release_verification(
+        workflow("release.yml")
+    )
+
+
+@pytest.mark.parametrize(
+    ("job_name", "removed_dependency"),
+    [
+        (job_name, dependency)
+        for job_name in ("python-rc-publish", "final-publication-preflight")
+        for dependency in ("rust", "java", "python-wheels")
+    ],
+)
+def test_publication_verification_dependencies_reject_each_deleted_dependency(
+    job_name: str, removed_dependency: str
+):
+    release = workflow("release.yml")
+    publish_job = jobs(release)[job_name]
+    expected_needs = ("rust", "java", "python-wheels")
+    mutated_needs = tuple(
+        dependency
+        for dependency in expected_needs
+        if dependency != removed_dependency
+    )
+    mutated_job = replace_block(
+        publish_job,
+        f"    needs: [{', '.join(expected_needs)}]",
+        f"    needs: [{', '.join(mutated_needs)}]",
+    )
+
+    with pytest.raises(AssertionError):
+        assert_publication_jobs_require_release_verification(
+            replace_block(release, publish_job, mutated_job)
+        )
+
+
 def test_testpypi_publication_stages_only_missing_verified_wheels():
     python_publish = workflow("release-python-publish.yml")
 
@@ -339,7 +492,9 @@ def test_registry_secrets_are_scoped_to_publish_workflows():
     assert "secrets.PYPI_API_TOKEN" not in non_publish_steps
 
 
-def test_final_publication_preflight_binds_source_to_final_tag_commit():
+def test_final_publication_preflight_binds_source_to_final_tag_commit(
+    tmp_path: Path,
+):
     release = workflow("release.yml")
     final_preflight = jobs(release)["final-publication-preflight"]
     source_archive_step = step(
@@ -351,10 +506,12 @@ def test_final_publication_preflight_binds_source_to_final_tag_commit():
     assert '--commit "$GITHUB_SHA" \\' in source_archive_step
     assert '--prefix "paimon-mosaic-${version}/" \\' in source_archive_step
     assert '--archive "$release_dir/$archive"' in source_archive_step
-    assert_promoted_source_archive_gate(release)
+    assert_promoted_source_archive_gate(release, tmp_path)
 
 
-def test_promoted_source_archive_gate_rejects_skippable_mutations():
+def test_promoted_source_archive_gate_rejects_skippable_mutations(
+    tmp_path: Path,
+):
     release = workflow("release.yml")
     final_preflight = jobs(release)["final-publication-preflight"]
     source_archive_step = step(
@@ -367,8 +524,23 @@ def test_promoted_source_archive_gate_rejects_skippable_mutations():
         )
         with pytest.raises(AssertionError):
             assert_promoted_source_archive_gate(
-                replace_block(release, source_archive_step, mutated_step)
+                replace_block(release, source_archive_step, mutated_step),
+                tmp_path,
             )
+
+    verifier_failure_ignored = source_archive_step.replace(
+        '            --archive "$release_dir/$archive"',
+        '            --archive "$release_dir/$archive" || true',
+        1,
+    )
+    assert verifier_failure_ignored != source_archive_step
+    with pytest.raises(AssertionError):
+        assert_promoted_source_archive_gate(
+            replace_block(
+                release, source_archive_step, verifier_failure_ignored
+            ),
+            tmp_path,
+        )
 
 
 def test_release_network_calls_have_bounded_timeouts():
