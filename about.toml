@@ -15,41 +15,23 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Rust
-/target/
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
 
-# Java
-java/target/
-java/src/main/resources/native/
-*.class
+# Release reports describe linked runtime components. Build-only and test-only
+# crates are not bundled in the native libraries.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
 
-# C++
-cpp/build/
-
-# Python
-__pycache__/
-*.pyc
-*.egg-info/
-python/dist/
-python/build/
-.pytest_cache/
-python/mosaic/libpaimon_mosaic_ffi.*
-python/mosaic/paimon_mosaic_ffi.dll
-python/mosaic/LICENSE
-python/mosaic/NOTICE
-python/mosaic/THIRD-PARTY-LICENSES.html
-
-# Release artifacts
-tools/release/
-
-# IDE
-.idea/
-*.iml
-.vscode/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Generated headers (cbindgen)
-include/mosaic.h
+# tools/generate_license_reports.py always supplies the exact release target(s)
+# on the command line. Keeping targets out of this shared config prevents a
+# platform-union report from accidentally being copied into every wheel.
