@@ -65,6 +65,17 @@ class NativeBinary:
     exported_symbols: frozenset[str]
 
 
+@dataclass(frozen=True)
+class ElfSection:
+    section_type: int
+    flags: int
+    address: int
+    offset: int
+    size: int
+    link: int
+    entry_size: int
+
+
 def require_range(data: bytes, offset: int, size: int, description: str) -> None:
     if (
         offset < 0
@@ -95,6 +106,228 @@ def ascii_symbol(raw_name: bytes) -> str | None:
         return raw_name.decode("ascii")
     except UnicodeDecodeError:
         return None
+
+
+def elf_virtual_range(
+    data: bytes,
+    address: int,
+    size: int,
+    load_segments: list[tuple[int, int, int, int]],
+    description: str,
+) -> int:
+    mapped_offsets = set()
+    memory_mapped = False
+    for file_offset, virtual_address, file_size, memory_size in load_segments:
+        if address < virtual_address:
+            continue
+        delta = address - virtual_address
+        if delta > memory_size or size > memory_size - delta:
+            continue
+        memory_mapped = True
+        if delta <= file_size and size <= file_size - delta:
+            mapped_offsets.add(file_offset + delta)
+
+    if not mapped_offsets:
+        if memory_mapped:
+            raise ValueError(f"{description} is not file-backed")
+        raise ValueError(f"{description} is not mapped by an ELF PT_LOAD segment")
+    if len(mapped_offsets) != 1:
+        raise ValueError(f"{description} has ambiguous ELF PT_LOAD mappings")
+
+    offset = mapped_offsets.pop()
+    require_range(data, offset, size, description)
+    return offset
+
+
+def elf_loader_section(
+    data: bytes,
+    sections: list[ElfSection],
+    load_segments: list[tuple[int, int, int, int]],
+    address: int,
+    section_type: int,
+    minimum_size: int,
+    linked_section: int | None,
+    description: str,
+    section_name: str,
+) -> tuple[int, ElfSection]:
+    offset = elf_virtual_range(
+        data, address, minimum_size, load_segments, description
+    )
+    matches = [
+        (index, section)
+        for index, section in enumerate(sections)
+        if section.section_type == section_type
+        and section.address == address
+        and section.offset == offset
+    ]
+    if not matches:
+        raise ValueError(
+            f"{description} does not reference an {section_name} section"
+        )
+    if len(matches) != 1:
+        raise ValueError(f"{description} references multiple {section_name} sections")
+
+    index, section = matches[0]
+    if not section.flags & 0x2:
+        raise ValueError(f"{description} section is not allocated")
+    if section.size < minimum_size:
+        raise ValueError(f"{description} is truncated")
+    if linked_section is not None and section.link != linked_section:
+        raise ValueError(f"{description} section does not link to DT_SYMTAB")
+    if (
+        elf_virtual_range(
+            data, address, section.size, load_segments, description
+        )
+        != section.offset
+    ):
+        raise ValueError(f"{description} has inconsistent file mapping")
+    return index, section
+
+
+def elf_sysv_hash(name: bytes) -> int:
+    value = 0
+    for byte in name:
+        value = (value << 4) + byte
+        high = value & 0xF0000000
+        if high:
+            value ^= high >> 24
+            value &= ~high
+    return value & 0xFFFFFFFF
+
+
+def elf_gnu_hash(name: bytes) -> int:
+    value = 5381
+    for byte in name:
+        value = (value * 33 + byte) & 0xFFFFFFFF
+    return value
+
+
+@dataclass(frozen=True)
+class ElfSysvHash:
+    buckets: tuple[int, ...]
+    chains: tuple[int, ...]
+
+    @property
+    def symbol_count(self) -> int:
+        return len(self.chains)
+
+    def contains(self, symbol_index: int, name: bytes) -> bool:
+        index = self.buckets[elf_sysv_hash(name) % len(self.buckets)]
+        while index:
+            if index == symbol_index:
+                return True
+            index = self.chains[index]
+        return False
+
+
+@dataclass(frozen=True)
+class ElfGnuHash:
+    symbol_offset: int
+    bloom_shift: int
+    bloom: tuple[int, ...]
+    buckets: tuple[int, ...]
+    chains: tuple[int, ...]
+    symbol_count: int
+
+    def contains(self, symbol_index: int, name: bytes) -> bool:
+        name_hash = elf_gnu_hash(name)
+        bloom_word = self.bloom[(name_hash // 64) % len(self.bloom)]
+        bloom_mask = (1 << (name_hash % 64)) | (
+            1 << ((name_hash >> self.bloom_shift) % 64)
+        )
+        if bloom_word & bloom_mask != bloom_mask:
+            return False
+
+        index = self.buckets[name_hash % len(self.buckets)]
+        if (
+            index == 0
+            or symbol_index < index
+            or symbol_index < self.symbol_offset
+        ):
+            return False
+        while True:
+            chain_index = index - self.symbol_offset
+            if chain_index >= len(self.chains):
+                return False
+            chain_hash = self.chains[chain_index]
+            if index == symbol_index:
+                return (chain_hash | 1) == (name_hash | 1)
+            if chain_hash & 1:
+                return False
+            index += 1
+
+
+def parse_elf_sysv_hash(data: bytes, section: ElfSection) -> ElfSysvHash:
+    bucket_count, symbol_count = struct.unpack_from("<II", data, section.offset)
+    if bucket_count == 0 or symbol_count == 0:
+        raise ValueError("ELF DT_HASH has invalid bucket or symbol count")
+    if section.size != 8 + (bucket_count + symbol_count) * 4:
+        raise ValueError("ELF DT_HASH has an inconsistent table size")
+
+    buckets_offset = section.offset + 8
+    chains_offset = buckets_offset + bucket_count * 4
+    buckets = struct.unpack_from(f"<{bucket_count}I", data, buckets_offset)
+    chains = struct.unpack_from(f"<{symbol_count}I", data, chains_offset)
+    if chains[0] != 0:
+        raise ValueError("ELF DT_HASH chain zero is not a terminator")
+    if any(index >= symbol_count for index in buckets):
+        raise ValueError("ELF DT_HASH bucket index is out of bounds")
+    if any(index >= symbol_count for index in chains):
+        raise ValueError("ELF DT_HASH chain index is out of bounds")
+    for bucket in buckets:
+        seen = set()
+        index = bucket
+        while index:
+            if index in seen:
+                raise ValueError("ELF DT_HASH contains a chain cycle")
+            seen.add(index)
+            index = chains[index]
+    return ElfSysvHash(buckets, chains)
+
+
+def parse_elf_gnu_hash(data: bytes, section: ElfSection) -> ElfGnuHash:
+    (
+        bucket_count,
+        symbol_offset,
+        bloom_count,
+        bloom_shift,
+    ) = struct.unpack_from("<IIII", data, section.offset)
+    if bucket_count == 0 or bloom_count == 0:
+        raise ValueError("ELF DT_GNU_HASH has an invalid header")
+
+    bloom_offset = section.offset + 16
+    buckets_offset = bloom_offset + bloom_count * 8
+    chains_offset = buckets_offset + bucket_count * 4
+    section_end = section.offset + section.size
+    if chains_offset > section_end or (section_end - chains_offset) % 4:
+        raise ValueError("ELF DT_GNU_HASH has an inconsistent table size")
+
+    bloom = struct.unpack_from(f"<{bloom_count}Q", data, bloom_offset)
+    buckets = struct.unpack_from(f"<{bucket_count}I", data, buckets_offset)
+    chain_count = (section_end - chains_offset) // 4
+    chains = struct.unpack_from(f"<{chain_count}I", data, chains_offset)
+    symbol_count = symbol_offset
+    for bucket in buckets:
+        if bucket == 0:
+            continue
+        if bucket < symbol_offset:
+            raise ValueError("ELF DT_GNU_HASH bucket precedes the symbol offset")
+        chain_index = bucket - symbol_offset
+        while True:
+            if chain_index >= chain_count:
+                raise ValueError("ELF DT_GNU_HASH chain is not terminated")
+            symbol_count = max(symbol_count, symbol_offset + chain_index + 1)
+            if chains[chain_index] & 1:
+                break
+            chain_index += 1
+    return ElfGnuHash(
+        symbol_offset,
+        bloom_shift,
+        bloom,
+        buckets,
+        chains,
+        symbol_count,
+    )
 
 
 def parse_elf(data: bytes) -> NativeBinary | None:
@@ -150,12 +383,14 @@ def parse_elf(data: bytes) -> NativeBinary | None:
     )
 
     has_load_segment = False
-    has_dynamic_segment = False
+    load_segments = []
+    executable_load_segments = []
+    dynamic_segments = []
     for index in range(program_count):
         offset = program_offset + index * program_entry_size
         (
             segment_type,
-            _segment_flags,
+            segment_flags,
             file_offset,
             virtual_address,
             _physical_address,
@@ -187,17 +422,110 @@ def parse_elf(data: bytes) -> NativeBinary | None:
                     f"ELF load segment {index} has inconsistent alignment"
                 )
             has_load_segment = has_load_segment or file_size > 0
+            load_segments.append(
+                (file_offset, virtual_address, file_size, memory_size)
+            )
+            if segment_flags & 0x1:
+                executable_load_segments.append(
+                    (file_offset, virtual_address, file_size, memory_size)
+                )
         elif segment_type == 2:
             if file_size == 0 or file_size % 16:
                 raise ValueError(f"ELF dynamic segment {index} has invalid size")
-            has_dynamic_segment = True
+            if file_size > memory_size:
+                raise ValueError(
+                    f"ELF dynamic segment {index} is larger on disk than in memory"
+                )
+            dynamic_segments.append(
+                (index, file_offset, virtual_address, file_size)
+            )
         elif segment_type == 3:
             raise ValueError("ELF ET_DYN file contains PT_INTERP and is executable")
 
     if not has_load_segment:
         raise ValueError("ELF shared object has no non-empty PT_LOAD segment")
-    if not has_dynamic_segment:
+    if not dynamic_segments:
         raise ValueError("ELF shared object has no PT_DYNAMIC segment")
+    if len(dynamic_segments) != 1:
+        raise ValueError("ELF shared object has multiple PT_DYNAMIC segments")
+
+    (
+        dynamic_index,
+        dynamic_offset,
+        dynamic_address,
+        dynamic_size,
+    ) = dynamic_segments[0]
+    mapped_dynamic_offset = elf_virtual_range(
+        data,
+        dynamic_address,
+        dynamic_size,
+        load_segments,
+        f"ELF dynamic segment {dynamic_index}",
+    )
+    if mapped_dynamic_offset != dynamic_offset:
+        raise ValueError(
+            f"ELF dynamic segment {dynamic_index} has inconsistent file mapping"
+        )
+
+    required_dynamic_tag_names = {
+        6: "DT_SYMTAB",
+        5: "DT_STRTAB",
+        10: "DT_STRSZ",
+        11: "DT_SYMENT",
+    }
+    hash_dynamic_tag_names = {
+        4: "DT_HASH",
+        0x6FFFFEF5: "DT_GNU_HASH",
+    }
+    dynamic_tag_names = {
+        **required_dynamic_tag_names,
+        **hash_dynamic_tag_names,
+    }
+    dynamic_values = {}
+    dynamic_terminated = False
+    for entry_index in range(dynamic_size // 16):
+        tag, value = struct.unpack_from(
+            "<qQ", data, dynamic_offset + entry_index * 16
+        )
+        if tag == 0:
+            dynamic_terminated = True
+            break
+        if tag in dynamic_tag_names:
+            if tag in dynamic_values:
+                raise ValueError(
+                    f"ELF PT_DYNAMIC contains duplicate {dynamic_tag_names[tag]}"
+                )
+            dynamic_values[tag] = value
+    if not dynamic_terminated:
+        raise ValueError("ELF PT_DYNAMIC is not terminated by DT_NULL")
+    for tag, name in required_dynamic_tag_names.items():
+        if tag not in dynamic_values:
+            raise ValueError(f"ELF PT_DYNAMIC is missing {name}")
+    if not any(tag in dynamic_values for tag in hash_dynamic_tag_names):
+        raise ValueError("ELF PT_DYNAMIC is missing DT_HASH or DT_GNU_HASH")
+
+    string_address = dynamic_values[5]
+    symbol_address = dynamic_values[6]
+    string_size = dynamic_values[10]
+    symbol_entry_size = dynamic_values[11]
+    if string_size == 0:
+        raise ValueError("ELF DT_STRSZ is zero")
+    if symbol_entry_size != 24:
+        raise ValueError(f"ELF DT_SYMENT has invalid size {symbol_entry_size}")
+    string_offset = elf_virtual_range(
+        data,
+        string_address,
+        string_size,
+        load_segments,
+        "ELF DT_STRTAB",
+    )
+    symbol_offset = elf_virtual_range(
+        data,
+        symbol_address,
+        symbol_entry_size,
+        load_segments,
+        "ELF DT_SYMTAB",
+    )
 
     if section_offset == 0:
         if section_count != 0 or section_names_index != 0:
@@ -230,8 +558,8 @@ def parse_elf(data: bytes) -> NativeBinary | None:
         (
             _name,
             section_type,
-            _section_flags,
-            _address,
+            section_flags,
+            address,
             file_offset,
             size,
             link,
@@ -250,63 +578,172 @@ def parse_elf(data: bytes) -> NativeBinary | None:
                 size,
                 f"ELF section header {index} contents",
             )
-        sections.append((section_type, file_offset, size, link, entry_size))
+        sections.append(
+            ElfSection(
+                section_type,
+                section_flags,
+                address,
+                file_offset,
+                size,
+                link,
+                entry_size,
+            )
+        )
+
+    matching_symbol_sections = [
+        (index, section)
+        for index, section in enumerate(sections)
+        if section.section_type == 11
+        and section.address == symbol_address
+        and section.offset == symbol_offset
+    ]
+    if not matching_symbol_sections:
+        raise ValueError("ELF DT_SYMTAB does not reference an SHT_DYNSYM section")
+    if len(matching_symbol_sections) != 1:
+        raise ValueError("ELF DT_SYMTAB references multiple SHT_DYNSYM sections")
+
+    symbol_section_index, symbol_section = matching_symbol_sections[0]
+    if not symbol_section.flags & 0x2:
+        raise ValueError(
+            f"ELF dynamic symbol section {symbol_section_index} is not allocated"
+        )
+    if (
+        symbol_section.entry_size != symbol_entry_size
+        or symbol_section.size < symbol_entry_size
+        or symbol_section.size % symbol_entry_size
+    ):
+        raise ValueError(
+            f"ELF dynamic symbol section {symbol_section_index} is malformed"
+        )
+    if (
+        elf_virtual_range(
+            data,
+            symbol_address,
+            symbol_section.size,
+            load_segments,
+            f"ELF dynamic symbol section {symbol_section_index}",
+        )
+        != symbol_section.offset
+    ):
+        raise ValueError(
+            f"ELF dynamic symbol section {symbol_section_index} "
+            "has inconsistent file mapping"
+        )
+    loader_hashes = []
+    if 4 in dynamic_values:
+        hash_address = dynamic_values[4]
+        _hash_section_index, hash_section = elf_loader_section(
+            data,
+            sections,
+            load_segments,
+            hash_address,
+            5,
+            8,
+            symbol_section_index,
+            "ELF DT_HASH",
+            "SHT_HASH",
+        )
+        sysv_hash = parse_elf_sysv_hash(data, hash_section)
+        if symbol_section.size != sysv_hash.symbol_count * symbol_entry_size:
+            raise ValueError(
+                "ELF DT_HASH symbol count does not match the SHT_DYNSYM size"
+            )
+        loader_hashes.append(sysv_hash)
+    if 0x6FFFFEF5 in dynamic_values:
+        hash_address = dynamic_values[0x6FFFFEF5]
+        _hash_section_index, hash_section = elf_loader_section(
+            data,
+            sections,
+            load_segments,
+            hash_address,
+            0x6FFFFFF6,
+            16,
+            symbol_section_index,
+            "ELF DT_GNU_HASH",
+            "SHT_GNU_HASH",
+        )
+        gnu_hash = parse_elf_gnu_hash(data, hash_section)
+        if symbol_section.size != gnu_hash.symbol_count * symbol_entry_size:
+            raise ValueError(
+                "ELF DT_GNU_HASH symbol count does not match "
+                "the SHT_DYNSYM size"
+            )
+        loader_hashes.append(gnu_hash)
+    if symbol_section.link >= section_count:
+        raise ValueError(
+            f"ELF dynamic symbol section {symbol_section_index} "
+            "has invalid string-table link"
+        )
+
+    string_section = sections[symbol_section.link]
+    if string_section.section_type != 3:
+        raise ValueError(
+            f"ELF dynamic symbol section {symbol_section_index} "
+            "does not link to a string table"
+        )
+    if not string_section.flags & 0x2:
+        raise ValueError(
+            f"ELF dynamic string section {symbol_section.link} is not allocated"
+        )
+    if (
+        string_section.address != string_address
+        or string_section.offset != string_offset
+        or string_section.size != string_size
+    ):
+        raise ValueError(
+            f"ELF dynamic symbol section {symbol_section_index} "
+            "does not link to DT_STRTAB"
+        )
+    if data[string_offset] != 0:
+        raise ValueError("ELF DT_STRTAB does not start with a null byte")
+    string_limit = string_offset + string_size
 
     exported_symbols = set()
-    for index, (section_type, file_offset, size, link, entry_size) in enumerate(
-        sections
-    ):
-        if section_type != 11:
+    for symbol_index in range(symbol_section.size // symbol_entry_size):
+        entry_offset = symbol_section.offset + symbol_index * symbol_entry_size
+        (
+            name_offset,
+            info,
+            other,
+            symbol_section_index_value,
+            value,
+            symbol_size,
+        ) = struct.unpack_from("<IBBHQQ", data, entry_offset)
+        if name_offset >= string_size:
+            raise ValueError(
+                f"ELF dynamic symbol {symbol_index} has an invalid name offset"
+            )
+        if name_offset == 0:
             continue
-        if entry_size != 24 or size % entry_size:
-            raise ValueError(f"ELF dynamic symbol section {index} is malformed")
-        if link >= section_count:
-            raise ValueError(
-                f"ELF dynamic symbol section {index} has invalid string-table link"
-            )
-        string_type, string_offset, string_size, _link, _entry_size = sections[
-            link
-        ]
-        if string_type != 3:
-            raise ValueError(
-                f"ELF dynamic symbol section {index} does not link to a string table"
-            )
-        string_limit = string_offset + string_size
-
-        for symbol_index in range(size // entry_size):
-            symbol_offset = file_offset + symbol_index * entry_size
-            (
-                name_offset,
-                info,
-                other,
-                symbol_section,
-                _value,
-                _symbol_size,
-            ) = struct.unpack_from("<IBBHQQ", data, symbol_offset)
-            if name_offset >= string_size:
-                raise ValueError(
-                    f"ELF dynamic symbol {symbol_index} has an invalid name offset"
-                )
-            if name_offset == 0:
-                continue
-            binding = info >> 4
-            visibility = other & 0x03
-            if (
-                binding not in (1, 2)
-                or symbol_section == 0
-                or visibility not in (0, 3)
-            ):
-                continue
-            name = ascii_symbol(
-                c_string_bytes(
-                    data,
-                    string_offset + name_offset,
-                    string_limit,
-                    f"ELF dynamic symbol {symbol_index} name",
-                )
-            )
-            if name:
-                exported_symbols.add(name)
+        binding = info >> 4
+        symbol_type = info & 0x0F
+        visibility = other & 0x03
+        if (
+            binding not in (1, 2)
+            or symbol_type not in (2, 10)
+            or symbol_section_index_value == 0
+            or visibility not in (0, 3)
+        ):
+            continue
+        elf_virtual_range(
+            data,
+            value,
+            max(symbol_size, 1),
+            executable_load_segments,
+            f"ELF dynamic symbol {symbol_index} function",
+        )
+        raw_name = c_string_bytes(
+            data,
+            string_offset + name_offset,
+            string_limit,
+            f"ELF dynamic symbol {symbol_index} name",
+        )
+        name = ascii_symbol(raw_name)
+        if name and all(
+            loader_hash.contains(symbol_index, raw_name)
+            for loader_hash in loader_hashes
+        ):
+            exported_symbols.add(name)
 
     return NativeBinary(
         "ELF", frozenset({architecture}), frozenset(exported_symbols)
@@ -315,7 +752,7 @@ def parse_elf(data: bytes) -> NativeBinary | None:
 
 def pe_rva_span(
     rva: int,
-    sections: list[tuple[int, int, int, int]],
+    sections: list[tuple[int, int, int, int, int]],
     headers_size: int,
     data_size: int,
     description: str,
@@ -325,7 +762,13 @@ def pe_rva_span(
             raise ValueError(f"{description} RVA is out of bounds")
         return rva, min(headers_size, data_size) - rva
 
-    for virtual_address, virtual_size, file_offset, file_size in sections:
+    for (
+        virtual_address,
+        virtual_size,
+        file_offset,
+        file_size,
+        _characteristics,
+    ) in sections:
         mapped_size = max(virtual_size, file_size)
         if virtual_address <= rva < virtual_address + mapped_size:
             delta = rva - virtual_address
@@ -339,7 +782,7 @@ def pe_rva_range(
     data: bytes,
     rva: int,
     size: int,
-    sections: list[tuple[int, int, int, int]],
+    sections: list[tuple[int, int, int, int, int]],
     headers_size: int,
     description: str,
 ) -> int:
@@ -350,6 +793,31 @@ def pe_rva_range(
         raise ValueError(f"{description} is out of bounds")
     require_range(data, offset, size, description)
     return offset
+
+
+def pe_section_rva_range(
+    data: bytes,
+    rva: int,
+    size: int,
+    sections: list[tuple[int, int, int, int, int]],
+    description: str,
+) -> tuple[int, bool]:
+    for (
+        virtual_address,
+        virtual_size,
+        file_offset,
+        file_size,
+        characteristics,
+    ) in sections:
+        mapped_size = max(virtual_size, file_size)
+        if virtual_address <= rva < virtual_address + mapped_size:
+            delta = rva - virtual_address
+            if delta >= file_size or size > file_size - delta:
+                raise ValueError(f"{description} is not file-backed")
+            offset = file_offset + delta
+            require_range(data, offset, size, description)
+            return offset, bool(characteristics & 0x20000000)
+    raise ValueError(f"{description} is not mapped by a PE section")
 
 
 def parse_pe(data: bytes) -> NativeBinary | None:
@@ -433,7 +901,7 @@ def parse_pe(data: bytes) -> NativeBinary | None:
             _line_numbers,
             _relocation_count,
             _line_number_count,
-            _section_characteristics,
+            section_characteristics,
         ) = struct.unpack_from("<8sIIIIIIHHI", data, offset)
         if virtual_address % section_alignment:
             raise ValueError(f"PE section {index} has an unaligned virtual address")
@@ -447,7 +915,13 @@ def parse_pe(data: bytes) -> NativeBinary | None:
             )
             has_file_backed_section = True
         sections.append(
-            (virtual_address, virtual_size, file_offset, file_size)
+            (
+                virtual_address,
+                virtual_size,
+                file_offset,
+                file_size,
+                section_characteristics,
+            )
         )
     if not has_file_backed_section:
         raise ValueError("PE DLL has no file-backed sections")
@@ -569,7 +1043,30 @@ def parse_pe(data: bytes) -> NativeBinary | None:
                 )
                 if name is None:
                     raise ValueError(f"PE export name {index} is not ASCII")
-                exported_symbols.add(name)
+                if export_rva <= function_rva < export_rva + export_size:
+                    forwarder_offset = export_offset + function_rva - export_rva
+                    forwarder = ascii_symbol(
+                        c_string_bytes(
+                            data,
+                            forwarder_offset,
+                            export_offset + export_size,
+                            f"PE export name {index} forwarder",
+                        )
+                    )
+                    if forwarder is None:
+                        raise ValueError(
+                            f"PE export name {index} forwarder is not ASCII"
+                        )
+                    continue
+                _function_offset, executable = pe_section_rva_range(
+                    data,
+                    function_rva,
+                    1,
+                    sections,
+                    f"PE export name {index} function RVA",
+                )
+                if executable:
+                    exported_symbols.add(name)
 
     return NativeBinary(
         "PE", frozenset({architecture}), frozenset(exported_symbols)

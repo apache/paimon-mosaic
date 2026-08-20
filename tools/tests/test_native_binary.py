@@ -34,35 +34,149 @@ def align(value, alignment):
     return (value + alignment - 1) & -alignment
 
 
-def build_elf(machine=62, symbols=JNI_SYMBOLS, file_type=3, interpreter=False):
-    dynamic = b"\0" * 16
+def gnu_hash(name):
+    value = 5381
+    for byte in name:
+        value = (value * 33 + byte) & 0xFFFFFFFF
+    return value
+
+
+def build_elf(
+    machine=62,
+    symbols=JNI_SYMBOLS,
+    file_type=3,
+    interpreter=False,
+    loader_symbols=True,
+    hash_symbol_count=None,
+    hash_reachable=True,
+    hash_style="sysv",
+    gnu_hash_reachable=None,
+    symbol_info=0x12,
+    symbol_value=0x100,
+    load_flags=5,
+):
+    symbol_list = sorted(symbols)
     strings = bytearray(b"\0")
     name_offsets = {}
-    for symbol in sorted(symbols):
+    for symbol in symbol_list:
         name_offsets[symbol] = len(strings)
         strings.extend(symbol.encode() + b"\0")
 
-    program_count = 3 if interpreter else 2
-    dynamic_offset = 64 + program_count * 56
-    interpreter_bytes = b"/lib64/ld-linux-x86-64.so.2\0" if interpreter else b""
-    interpreter_offset = dynamic_offset + len(dynamic)
-    strings_offset = interpreter_offset + len(interpreter_bytes)
-    symbols_offset = align(strings_offset + len(strings), 8)
     symbol_table = bytearray(b"\0" * 24)
-    for symbol in sorted(symbols):
+    for symbol in symbol_list:
         symbol_table.extend(
             struct.pack(
                 "<IBBHQQ",
                 name_offsets[symbol],
-                0x12,
+                symbol_info,
                 0,
                 1,
-                0x1000,
+                symbol_value,
                 1,
             )
         )
+
+    hash_tables = []
+    if hash_style in ("sysv", "both"):
+        if hash_symbol_count is None:
+            hash_symbol_count = len(symbol_list) + 1
+        hash_buckets = [1 if hash_reachable and hash_symbol_count > 1 else 0]
+        hash_chains = [0] * hash_symbol_count
+        for symbol_index in range(1, hash_symbol_count - 1):
+            hash_chains[symbol_index] = symbol_index + 1
+        hash_tables.append(
+            (
+                4,
+                5,
+                4,
+                b"".join(
+                    (
+                        struct.pack(
+                            "<II", len(hash_buckets), hash_symbol_count
+                        ),
+                        struct.pack(
+                            f"<{len(hash_buckets)}I", *hash_buckets
+                        ),
+                        struct.pack(
+                            f"<{len(hash_chains)}I", *hash_chains
+                        ),
+                    )
+                ),
+            )
+        )
+    if hash_style in ("gnu", "both"):
+        if hash_symbol_count is not None and hash_style == "gnu":
+            raise ValueError("hash_symbol_count only applies to SysV hashes")
+        if gnu_hash_reachable is None:
+            gnu_hash_reachable = hash_reachable
+        symbol_hashes = [gnu_hash(symbol.encode()) for symbol in symbol_list]
+        bloom_word = 0
+        for symbol_hash in symbol_hashes:
+            bloom_word |= 1 << (symbol_hash % 64)
+            bloom_word |= 1 << ((symbol_hash >> 5) % 64)
+        stored_hashes = (
+            symbol_hashes
+            if gnu_hash_reachable
+            else [0] * len(symbol_list)
+        )
+        hash_chains = [
+            (symbol_hash & 0xFFFFFFFE)
+            | (1 if index == len(stored_hashes) - 1 else 0)
+            for index, symbol_hash in enumerate(stored_hashes)
+        ]
+        hash_tables.append(
+            (
+                0x6FFFFEF5,
+                0x6FFFFFF6,
+                0,
+                b"".join(
+                    (
+                        struct.pack("<IIII", 1, 1, 1, 5),
+                        struct.pack("<Q", bloom_word),
+                        struct.pack("<I", 1 if symbol_list else 0),
+                        struct.pack(
+                            f"<{len(hash_chains)}I", *hash_chains
+                        ),
+                    )
+                ),
+            )
+        )
+    if not hash_tables:
+        raise ValueError(f"unsupported hash style {hash_style}")
+
+    program_count = 3 if interpreter else 2
+    dynamic_offset = 64 + program_count * 56
+    dynamic_size = (5 + len(hash_tables)) * 16 if loader_symbols else 16
+    interpreter_bytes = b"/lib64/ld-linux-x86-64.so.2\0" if interpreter else b""
+    interpreter_offset = dynamic_offset + dynamic_size
+    next_offset = align(interpreter_offset + len(interpreter_bytes), 8)
+    hash_offsets = []
+    for _tag, _section_type, _entry_size, hash_table in hash_tables:
+        hash_offsets.append(next_offset)
+        next_offset = align(next_offset + len(hash_table), 8)
+    strings_offset = next_offset
+    symbols_offset = align(strings_offset + len(strings), 8)
+    if loader_symbols:
+        dynamic = b"".join(
+            (
+                *(
+                    struct.pack("<QQ", hash_table[0], hash_offset)
+                    for hash_table, hash_offset in zip(
+                        hash_tables, hash_offsets
+                    )
+                ),
+                struct.pack("<QQ", 5, strings_offset),
+                struct.pack("<QQ", 6, symbols_offset),
+                struct.pack("<QQ", 10, len(strings)),
+                struct.pack("<QQ", 11, 24),
+                b"\0" * 16,
+            )
+        )
+    else:
+        dynamic = b"\0" * 16
     section_offset = align(symbols_offset + len(symbol_table), 8)
-    file_size = section_offset + 3 * 64
+    section_count = 3 + len(hash_tables)
+    file_size = section_offset + section_count * 64
 
     data = bytearray(file_size)
     data[:16] = b"\x7fELF\x02\x01\x01" + b"\0" * 9
@@ -81,7 +195,7 @@ def build_elf(machine=62, symbols=JNI_SYMBOLS, file_type=3, interpreter=False):
         56,
         program_count,
         64,
-        3,
+        section_count,
         0,
     )
     struct.pack_into(
@@ -89,7 +203,7 @@ def build_elf(machine=62, symbols=JNI_SYMBOLS, file_type=3, interpreter=False):
         data,
         64,
         1,
-        5,
+        load_flags,
         0,
         0,
         0,
@@ -128,6 +242,9 @@ def build_elf(machine=62, symbols=JNI_SYMBOLS, file_type=3, interpreter=False):
     data[
         interpreter_offset : interpreter_offset + len(interpreter_bytes)
     ] = interpreter_bytes
+    for hash_table, hash_offset in zip(hash_tables, hash_offsets):
+        table_data = hash_table[3]
+        data[hash_offset : hash_offset + len(table_data)] = table_data
     data[strings_offset : strings_offset + len(strings)] = strings
     data[symbols_offset : symbols_offset + len(symbol_table)] = symbol_table
 
@@ -137,8 +254,8 @@ def build_elf(machine=62, symbols=JNI_SYMBOLS, file_type=3, interpreter=False):
         section_offset + 64,
         0,
         3,
-        0,
-        0,
+        2,
+        strings_offset,
         strings_offset,
         len(strings),
         0,
@@ -153,7 +270,7 @@ def build_elf(machine=62, symbols=JNI_SYMBOLS, file_type=3, interpreter=False):
         0,
         11,
         2,
-        0,
+        symbols_offset,
         symbols_offset,
         len(symbol_table),
         1,
@@ -161,10 +278,38 @@ def build_elf(machine=62, symbols=JNI_SYMBOLS, file_type=3, interpreter=False):
         8,
         24,
     )
+    for index, (hash_table, hash_offset) in enumerate(
+        zip(hash_tables, hash_offsets)
+    ):
+        _tag, hash_section_type, hash_entry_size, table_data = hash_table
+        struct.pack_into(
+            "<IIQQQQIIQQ",
+            data,
+            section_offset + (3 + index) * 64,
+            0,
+            hash_section_type,
+            2,
+            hash_offset,
+            hash_offset,
+            len(table_data),
+            2,
+            0,
+            8,
+            hash_entry_size,
+        )
     return bytes(data)
 
 
-def build_pe(symbols=JNI_SYMBOLS, dll=True, optional_magic=0x20B):
+def build_pe(
+    symbols=JNI_SYMBOLS,
+    dll=True,
+    optional_magic=0x20B,
+    function_rva=None,
+    section_characteristics=0x60000020,
+    forwarder=None,
+    symbol_rvas=None,
+    symbol_forwarders=None,
+):
     pe_offset = 0x80
     optional_size = 240
     section_table_offset = pe_offset + 24 + optional_size
@@ -172,7 +317,10 @@ def build_pe(symbols=JNI_SYMBOLS, dll=True, optional_magic=0x20B):
     section_rva = 0x1000
     section_offset = headers_size
     section_size = 0x400
-    data = bytearray(section_offset + section_size)
+    text_rva = 0x2000
+    text_offset = section_offset + section_size
+    text_size = 0x200
+    data = bytearray(text_offset + text_size)
 
     data[:2] = b"MZ"
     struct.pack_into("<I", data, 0x3C, pe_offset)
@@ -183,7 +331,7 @@ def build_pe(symbols=JNI_SYMBOLS, dll=True, optional_magic=0x20B):
         data,
         pe_offset + 4,
         0x8664,
-        1,
+        2,
         0,
         0,
         0,
@@ -195,7 +343,7 @@ def build_pe(symbols=JNI_SYMBOLS, dll=True, optional_magic=0x20B):
     struct.pack_into("<H", data, optional_offset, optional_magic)
     struct.pack_into("<I", data, optional_offset + 32, 0x1000)
     struct.pack_into("<I", data, optional_offset + 36, 0x200)
-    struct.pack_into("<I", data, optional_offset + 56, 0x2000)
+    struct.pack_into("<I", data, optional_offset + 56, 0x3000)
     struct.pack_into("<I", data, optional_offset + 60, headers_size)
     struct.pack_into("<I", data, optional_offset + 108, 16)
     struct.pack_into("<II", data, optional_offset + 112, section_rva, 0x300)
@@ -214,6 +362,21 @@ def build_pe(symbols=JNI_SYMBOLS, dll=True, optional_magic=0x20B):
         0,
         0x40000040,
     )
+    struct.pack_into(
+        "<8sIIIIIIHHI",
+        data,
+        section_table_offset + 40,
+        b".text\0\0\0",
+        text_size,
+        text_rva,
+        text_size,
+        text_offset,
+        0,
+        0,
+        0,
+        0,
+        section_characteristics,
+    )
 
     symbol_list = sorted(symbols)
     export_offset = section_offset
@@ -225,6 +388,12 @@ def build_pe(symbols=JNI_SYMBOLS, dll=True, optional_magic=0x20B):
 
     def rva(offset):
         return section_rva + offset - section_offset
+
+    forwarder_offset = section_offset + 0x2C0
+    if forwarder is not None:
+        function_rva = rva(forwarder_offset)
+    if function_rva is None:
+        function_rva = text_rva
 
     struct.pack_into(
         "<IIHHIIIIIII",
@@ -246,8 +415,24 @@ def build_pe(symbols=JNI_SYMBOLS, dll=True, optional_magic=0x20B):
     data[module_offset : module_offset + len(module_name)] = module_name
     for index, symbol in enumerate(symbol_list):
         encoded = symbol.encode() + b"\0"
+        symbol_forwarder = (
+            (symbol_forwarders or {}).get(symbol)
+            if forwarder is None
+            else forwarder
+        )
+        if symbol_forwarder is not None:
+            encoded_forwarder = symbol_forwarder.encode() + b"\0"
+            current_function_rva = rva(forwarder_offset)
+            data[
+                forwarder_offset : forwarder_offset + len(encoded_forwarder)
+            ] = encoded_forwarder
+            forwarder_offset += len(encoded_forwarder)
+        else:
+            current_function_rva = (symbol_rvas or {}).get(
+                symbol, function_rva
+            )
         struct.pack_into(
-            "<I", data, functions_offset + index * 4, section_rva + 0x380
+            "<I", data, functions_offset + index * 4, current_function_rva
         )
         struct.pack_into(
             "<I", data, names_offset + index * 4, rva(string_offset)
@@ -450,6 +635,106 @@ def test_elf_rejects_header_only_image():
         )
 
 
+def test_elf_rejects_dynsym_not_referenced_by_pt_dynamic():
+    data = build_elf(loader_symbols=False)
+
+    with pytest.raises(ValueError, match="DT_SYMTAB"):
+        verifier.verify_native_target(
+            data,
+            "x86_64-unknown-linux-gnu",
+            "libpaimon_mosaic_jni.so",
+        )
+
+
+def test_elf_rejects_dynsym_entries_beyond_dt_hash_symbol_count():
+    data = build_elf(hash_symbol_count=1)
+
+    with pytest.raises(ValueError, match="DT_HASH.*symbol count"):
+        verifier.verify_native_target(
+            data,
+            "x86_64-unknown-linux-gnu",
+            "libpaimon_mosaic_jni.so",
+        )
+
+
+def test_elf_does_not_accept_exports_unreachable_from_dt_hash():
+    data = build_elf(hash_reachable=False)
+
+    with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
+        verifier.verify_native_target(
+            data,
+            "x86_64-unknown-linux-gnu",
+            "libpaimon_mosaic_jni.so",
+        )
+
+
+def test_elf_accepts_exports_reachable_from_dt_gnu_hash():
+    verifier.verify_native_target(
+        build_elf(hash_style="gnu"),
+        "x86_64-unknown-linux-gnu",
+        "libpaimon_mosaic_jni.so",
+    )
+
+
+def test_elf_does_not_accept_exports_unreachable_from_dt_gnu_hash():
+    data = build_elf(hash_style="gnu", hash_reachable=False)
+
+    with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
+        verifier.verify_native_target(
+            data,
+            "x86_64-unknown-linux-gnu",
+            "libpaimon_mosaic_jni.so",
+        )
+
+
+def test_elf_requires_exports_reachable_from_each_loader_hash():
+    data = build_elf(
+        hash_style="both",
+        hash_reachable=True,
+        gnu_hash_reachable=False,
+    )
+
+    with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
+        verifier.verify_native_target(
+            data,
+            "x86_64-unknown-linux-gnu",
+            "libpaimon_mosaic_jni.so",
+        )
+
+
+def test_elf_does_not_accept_object_symbols_as_function_exports():
+    data = build_elf(symbol_info=0x11)
+
+    with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
+        verifier.verify_native_target(
+            data,
+            "x86_64-unknown-linux-gnu",
+            "libpaimon_mosaic_jni.so",
+        )
+
+
+def test_elf_rejects_function_export_outside_load_segments():
+    data = build_elf(symbol_value=0xFFFFFFFF)
+
+    with pytest.raises(ValueError, match="function.*not mapped"):
+        verifier.verify_native_target(
+            data,
+            "x86_64-unknown-linux-gnu",
+            "libpaimon_mosaic_jni.so",
+        )
+
+
+def test_elf_rejects_function_export_in_non_executable_segment():
+    data = build_elf(load_flags=4)
+
+    with pytest.raises(ValueError, match="function.*not mapped"):
+        verifier.verify_native_target(
+            data,
+            "x86_64-unknown-linux-gnu",
+            "libpaimon_mosaic_jni.so",
+        )
+
+
 @pytest.mark.parametrize(
     "data,error",
     (
@@ -465,6 +750,67 @@ def test_pe_rejects_truncated_executable_and_pe32_images(data, error):
             "x86_64-pc-windows-msvc",
             "paimon_mosaic_jni.dll",
         )
+
+
+def test_pe_rejects_named_export_with_unmapped_function_rva():
+    data = build_pe(function_rva=0xFFFFFFFF)
+
+    with pytest.raises(ValueError, match="function RVA.*not mapped"):
+        verifier.verify_native_target(
+            data,
+            "x86_64-pc-windows-msvc",
+            "paimon_mosaic_jni.dll",
+        )
+
+
+def test_pe_rejects_named_export_in_non_executable_section():
+    data = build_pe(section_characteristics=0x40000040)
+
+    with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
+        verifier.verify_native_target(
+            data,
+            "x86_64-pc-windows-msvc",
+            "paimon_mosaic_jni.dll",
+        )
+
+
+def test_pe_rejects_named_forwarded_export():
+    data = build_pe(forwarder="other_module.mosaic_writer_open")
+
+    with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
+        verifier.verify_native_target(
+            data,
+            "x86_64-pc-windows-msvc",
+            "paimon_mosaic_jni.dll",
+        )
+
+
+def test_pe_accepts_required_functions_with_unrelated_data_export():
+    unrelated = "unrelated_data"
+    data = build_pe(
+        symbols=JNI_SYMBOLS | {unrelated},
+        symbol_rvas={unrelated: 0x1350},
+    )
+
+    verifier.verify_native_target(
+        data,
+        "x86_64-pc-windows-msvc",
+        "paimon_mosaic_jni.dll",
+    )
+
+
+def test_pe_accepts_required_functions_with_unrelated_forwarder():
+    unrelated = "unrelated_forwarder"
+    data = build_pe(
+        symbols=JNI_SYMBOLS | {unrelated},
+        symbol_forwarders={unrelated: "KERNEL32.Sleep"},
+    )
+
+    verifier.verify_native_target(
+        data,
+        "x86_64-pc-windows-msvc",
+        "paimon_mosaic_jni.dll",
+    )
 
 
 @pytest.mark.parametrize(
