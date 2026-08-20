@@ -338,6 +338,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validate_rejects_empty_column_names() {
+        let columns = vec![("".to_string(), DataType::Int32, true)];
+        assert_eq!(
+            MosaicSchema::validate(&columns),
+            Err("empty column name".to_string())
+        );
+    }
+
+    #[test]
     fn test_bucket_assignment() {
         let columns: Vec<(String, DataType, bool)> = (0..1000)
             .map(|i| (format!("col_{:04}", i), DataType::Int32, true))

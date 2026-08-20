@@ -523,8 +523,15 @@ fn convert_csv_explicit_schema_preserves_supported_scalar_types() {
     }
     let (rows, err, ok) = run(&["cat", &out, "--json"]);
     assert!(ok, "stdout: {rows}\nstderr: {err}");
-    assert!(rows.contains(r#""flag":true"#), "{rows}");
-    assert!(rows.contains(r#""amount":12.34"#), "{rows}");
+    assert_eq!(
+        rows.trim(),
+        concat!(
+            r#"{"flag":true,"i32":7,"i64":8,"f32":1.5,"f64":2.5,"#,
+            r#""date":"2026-08-20","time":"12:34:56.789","#,
+            r#""instant":"2026-08-20T12:34:56Z","#,
+            r#""local":"2026-08-20T12:34:56","amount":12.34,"id":"abc"}"#
+        )
+    );
 }
 
 #[test]
@@ -801,7 +808,7 @@ fn convert_csv_multiple_inputs_promotes_ints_and_floats() {
     let dir = std::env::temp_dir();
     let ints = format!("{}/mosaic_e2e_multi_numeric_ints.csv", dir.display());
     let floats = format!("{}/mosaic_e2e_multi_numeric_floats.csv", dir.display());
-    std::fs::write(&ints, "value\n1\n2\n").unwrap();
+    std::fs::write(&ints, "value\n1\n9007199254740992\n").unwrap();
     std::fs::write(&floats, "value\n3.5\n4.5\n").unwrap();
     let out = format!("{}/mosaic_e2e_multi_numeric.mosaic", dir.display());
     let (msg, err, ok) = run(&["convert-csv", &ints, &floats, "-o", &out, "--overwrite"]);
@@ -811,8 +818,60 @@ fn convert_csv_multiple_inputs_promotes_ints_and_floats() {
     assert!(schema.contains("value: Float64"), "{schema}");
     let (rows, _, ok) = run(&["cat", &out, "--json"]);
     assert!(ok, "{rows}");
-    assert!(rows.contains(r#"{"value":1.0}"#), "{rows}");
-    assert!(rows.contains(r#"{"value":4.5}"#), "{rows}");
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        [
+            r#"{"value":1.0}"#,
+            r#"{"value":9.007199254740992e15}"#,
+            r#"{"value":3.5}"#,
+            r#"{"value":4.5}"#
+        ]
+    );
+}
+
+#[test]
+fn convert_csv_multiple_inputs_rejects_lossy_int_float_promotion() {
+    let dir = std::env::temp_dir();
+    for (case, integer_rows, float_rows) in [
+        (
+            "integer_shard",
+            "value\n1\n9007199254740993\n",
+            "value\n1.5\n",
+        ),
+        (
+            "float_shard",
+            "value\n1\n",
+            "value\n1.5\n9007199254740993\n",
+        ),
+    ] {
+        let ints = format!(
+            "{}/mosaic_e2e_multi_numeric_lossy_{case}_ints.csv",
+            dir.display()
+        );
+        let floats = format!(
+            "{}/mosaic_e2e_multi_numeric_lossy_{case}_floats.csv",
+            dir.display()
+        );
+        std::fs::write(&ints, integer_rows).unwrap();
+        std::fs::write(&floats, float_rows).unwrap();
+        for (order, first, second) in [
+            ("int_first", ints.as_str(), floats.as_str()),
+            ("float_first", floats.as_str(), ints.as_str()),
+        ] {
+            let out = format!(
+                "{}/mosaic_e2e_multi_numeric_lossy_{case}_{order}.mosaic",
+                dir.display()
+            );
+            let _ = std::fs::remove_file(&out);
+            let (_, err, ok) = run(&["convert-csv", first, second, "-o", &out, "--overwrite"]);
+            assert!(!ok, "{case}/{order} unexpectedly succeeded");
+            assert!(
+                err.contains("cannot be represented exactly as Float64"),
+                "{case}/{order}: {err}"
+            );
+            assert!(!std::path::Path::new(&out).exists(), "{case}/{order}");
+        }
+    }
 }
 
 #[test]
@@ -829,6 +888,26 @@ fn convert_csv_multiple_inputs_merge_fields_by_name() {
     assert!(ok, "{rows}");
     assert!(rows.contains(r#"{"id":1,"kind":"a"}"#), "{rows}");
     assert!(rows.contains(r#"{"id":2,"kind":"b"}"#), "{rows}");
+}
+
+#[test]
+fn convert_csv_multiple_inputs_reject_partially_overlapping_fields() {
+    let dir = std::env::temp_dir();
+    let first = format!("{}/mosaic_e2e_multi_partial_first.csv", dir.display());
+    let second = format!("{}/mosaic_e2e_multi_partial_second.csv", dir.display());
+    std::fs::write(&first, "id,left\n1,10\n").unwrap();
+    std::fs::write(&second, "id,right\n2,20\n").unwrap();
+    for (order, a, b) in [
+        ("first_second", first.as_str(), second.as_str()),
+        ("second_first", second.as_str(), first.as_str()),
+    ] {
+        let out = format!("{}/mosaic_e2e_multi_partial_{order}.mosaic", dir.display());
+        let _ = std::fs::remove_file(&out);
+        let (_, err, ok) = run(&["convert-csv", a, b, "-o", &out, "--overwrite"]);
+        assert!(!ok, "{order} unexpectedly succeeded");
+        assert!(err.contains("different schema"), "{order}: {err}");
+        assert!(!std::path::Path::new(&out).exists(), "{order}");
+    }
 }
 
 #[test]
@@ -1013,6 +1092,35 @@ fn convert_csv_no_header_maps_fields_by_position() {
     let (s, _, _) = run(&["schema", &out]);
     assert!(s.contains("field_0: Int64"), "{s}");
     assert!(s.contains("field_1: Utf8"), "{s}");
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        [
+            r#"{"field_0":1,"field_1":"a"}"#,
+            r#"{"field_0":2,"field_1":"b"}"#
+        ]
+    );
+}
+
+#[test]
+fn convert_csv_rejects_header_with_no_header() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_header_conflict.csv", dir.display());
+    std::fs::write(&csv, "1,a\n").unwrap();
+    let out = format!("{}/mosaic_e2e_header_conflict.mosaic", dir.display());
+    let (_, err, ok) = run(&[
+        "convert-csv",
+        &csv,
+        "-o",
+        &out,
+        "--header",
+        "id,kind",
+        "--no-header",
+        "--overwrite",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("cannot be used with"), "{err}");
 }
 
 #[test]
@@ -1359,6 +1467,201 @@ fn convert_json_preserves_avro_timestamp_semantics() {
     assert!(ok, "stdout: {rows}\nstderr: {err}");
     assert!(rows.contains(r#""instant":"2026-08-04T04:34:56"#), "{rows}");
     assert!(rows.contains(r#""local":"2026-08-04T12:34:56""#), "{rows}");
+}
+
+#[test]
+fn convert_rejects_offsets_for_avro_local_timestamps() {
+    let dir = std::env::temp_dir();
+    let schema = format!("{}/mosaic_e2e_local_timestamp_offset.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "local", "type": {"type": "long", "logicalType": "local-timestamp-millis"}}
+  ]
+}"#,
+    )
+    .unwrap();
+    let csv = format!("{}/mosaic_e2e_local_timestamp_offset.csv", dir.display());
+    let json = format!("{}/mosaic_e2e_local_timestamp_offset.json", dir.display());
+    std::fs::write(
+        &csv,
+        "local\n2026-08-20T12:34:56\n2026-08-20T12:34:56+08:00\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &json,
+        concat!(
+            "{\"local\":\"2026-08-20T12:34:56\"}\n",
+            "{\"local\":\"2026-08-20T12:34:56+08:00\"}\n"
+        ),
+    )
+    .unwrap();
+    for (kind, command, input) in [
+        ("csv", "convert-csv", csv.as_str()),
+        ("json", "convert", json.as_str()),
+    ] {
+        let out = format!(
+            "{}/mosaic_e2e_local_timestamp_offset_{kind}.mosaic",
+            dir.display()
+        );
+        let _ = std::fs::remove_file(&out);
+        let (_, err, ok) = run(&[
+            command,
+            input,
+            "-o",
+            &out,
+            "--schema",
+            &schema,
+            "--overwrite",
+        ]);
+        assert!(!ok, "{kind} unexpectedly succeeded");
+        assert!(err.contains("must not include a timezone"), "{kind}: {err}");
+        assert!(!std::path::Path::new(&out).exists(), "{kind}");
+    }
+}
+
+#[test]
+fn convert_rejects_decimal_values_that_exceed_avro_scale() {
+    let dir = std::env::temp_dir();
+    let schema = format!("{}/mosaic_e2e_decimal_scale.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}}
+  ]
+}"#,
+    )
+    .unwrap();
+    let csv = format!("{}/mosaic_e2e_decimal_scale.csv", dir.display());
+    let json = format!("{}/mosaic_e2e_decimal_scale.json", dir.display());
+    std::fs::write(&csv, "amount\n12.34\n12.349\n").unwrap();
+    std::fs::write(&json, "{\"amount\":12.34}\n{\"amount\":-12.349}\n").unwrap();
+    for (kind, command, input) in [
+        ("csv", "convert-csv", csv.as_str()),
+        ("json", "convert", json.as_str()),
+    ] {
+        let out = format!("{}/mosaic_e2e_decimal_scale_{kind}.mosaic", dir.display());
+        let _ = std::fs::remove_file(&out);
+        let (_, err, ok) = run(&[
+            command,
+            input,
+            "-o",
+            &out,
+            "--schema",
+            &schema,
+            "--overwrite",
+        ]);
+        assert!(!ok, "{kind} unexpectedly succeeded");
+        assert!(
+            err.contains("cannot be represented exactly with scale 2"),
+            "{kind}: {err}"
+        );
+        assert!(!std::path::Path::new(&out).exists(), "{kind}");
+    }
+}
+
+#[test]
+fn convert_validates_nested_avro_special_values() {
+    let dir = std::env::temp_dir();
+    let schema = format!("{}/mosaic_e2e_nested_special.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "amounts", "type": {"type": "array", "items": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}}},
+    {"name": "prices", "type": {"type": "map", "values": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}}},
+    {"name": "times", "type": {"type": "map", "values": {"type": "long", "logicalType": "local-timestamp-millis"}}}
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let good = format!("{}/mosaic_e2e_nested_special_good.json", dir.display());
+    std::fs::write(
+        &good,
+        concat!(
+            "{\"amounts\":[12.340,\"1.234e1\"],",
+            "\"prices\":{\"a\":-12.340},",
+            "\"times\":{\"a\":\"2026-08-20T12:34:56\"}}\n"
+        ),
+    )
+    .unwrap();
+    let good_out = format!("{}/mosaic_e2e_nested_special_good.mosaic", dir.display());
+    let (msg, err, ok) = run(&[
+        "convert",
+        &good,
+        "-o",
+        &good_out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &good_out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert!(rows.contains(r#""amounts":[12.34,12.34]"#), "{rows}");
+    assert!(rows.contains(r#""prices":{"a":-12.34}"#), "{rows}");
+    assert!(
+        rows.contains(r#""times":{"a":"2026-08-20T12:34:56"}"#),
+        "{rows}"
+    );
+
+    let cases = [
+        (
+            "decimal",
+            concat!(
+                "{\"amounts\":[12.34],\"prices\":{},\"times\":{}}\n",
+                "{\"amounts\":[12.349],\"prices\":{},\"times\":{}}\n"
+            ),
+            "amounts[]",
+            "12.349",
+        ),
+        (
+            "local_timestamp",
+            concat!(
+                "{\"amounts\":[],\"prices\":{},\"times\":{\"a\":\"2026-08-20T12:34:56\"}}\n",
+                "{\"amounts\":[],\"prices\":{},\"times\":{\"a\":\"2026-08-20T12:34:56+08:00\"}}\n"
+            ),
+            "times{}",
+            "2026-08-20T12:34:56+08:00",
+        ),
+        (
+            "duplicate_map_key",
+            "{\"amounts\":[],\"prices\":{\"x\":12.340,\"x\":12.340},\"times\":{}}\n",
+            "duplicate JSON map key",
+            "'x'",
+        ),
+    ];
+    for (case, input, expected_path, expected_value) in cases {
+        let json = format!("{}/mosaic_e2e_nested_special_{case}.json", dir.display());
+        std::fs::write(&json, input).unwrap();
+        let out = format!("{}/mosaic_e2e_nested_special_{case}.mosaic", dir.display());
+        let _ = std::fs::remove_file(&out);
+        let (_, err, ok) = run(&[
+            "convert",
+            &json,
+            "-o",
+            &out,
+            "--schema",
+            &schema,
+            "--overwrite",
+        ]);
+        assert!(!ok, "{case} unexpectedly succeeded");
+        assert!(err.contains(expected_path), "{case}: {err}");
+        assert!(err.contains(expected_value), "{case}: {err}");
+        if case != "duplicate_map_key" {
+            assert!(err.contains("record 2"), "{case}: {err}");
+        }
+        assert!(!std::path::Path::new(&out).exists(), "{case}");
+    }
 }
 
 #[test]

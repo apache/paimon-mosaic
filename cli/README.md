@@ -110,7 +110,10 @@ logical types. It is not a general Avro name resolver: nested records, enums,
 named-type references, and non-decimal `fixed` fields are rejected.
 Avro arrays and maps are converted recursively. Avro `timestamp-*` logical
 types remain UTC instants, while `local-timestamp-*` remains timezone-free;
-unknown logical types are ignored and use their underlying Avro type.
+inputs with an explicit offset are rejected for local timestamps. Decimal
+inputs must be exactly representable at the schema scale (extra trailing zero
+digits are accepted). Unknown logical types are ignored and use their
+underlying Avro type.
 Use `-c`/`--column`/`--columns` to project top-level fields; each occurrence
 accepts a comma-separated list.
 `--stats id` builds min/max for those columns, which `cat --where` then uses
@@ -128,8 +131,9 @@ $ mosaic convert data.json -o data.mosaic --stats id
 Import CSV into a new Mosaic file, either with an Avro record schema file
 given via `--schema`, or with a schema inferred from the CSV data. For multiple
 inputs with headers, inferred fields are matched by name rather than position,
-and mixed `Int64`/`Float64` fields are promoted to `Float64`; other field-name
-or type conflicts require `--schema`. Empty and header-only files are skipped.
+and mixed `Int64`/`Float64` fields are promoted to `Float64` only when every
+integer value is exactly representable; other field-name or type conflicts
+require `--schema`. Empty and header-only files are skipped.
 CSV cannot say what type an all-empty column is, so columns inferred as Arrow
 `Null` fall back to nullable `Utf8` and their values remain null. Use
 `--schema` when such a column should have another type. When a CSV schema is
@@ -143,7 +147,9 @@ matches the header at all.
 Backslash escaping is disabled by default so literal values such as
 `C:\temp\file` are preserved; pass `--escape '\'` only for CSV dialects that
 use a separate escape character. Avro `bytes`, `array`, and `map` fields are
-rejected because the CSV decoder supports scalar text fields only.
+rejected because the CSV decoder supports scalar text fields only. `--header`
+and `--no-header` are mutually exclusive. Explicit-schema local timestamps and
+decimals use the same offset and exact-scale rules as JSON conversion.
 `--stats id` builds min/max for those columns, which `cat --where` then uses
 to skip row groups that cannot match.
 
