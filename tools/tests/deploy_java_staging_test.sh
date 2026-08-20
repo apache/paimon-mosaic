@@ -70,6 +70,17 @@ assert_maven_not_invoked() {
   fi
 }
 
+assert_maven_arg() {
+  local expected=$1
+  local args
+  args=$(sed -n 's/^args=//p' "$MAVEN_LOG")
+  if ! tr ' ' '\n' <<< "$args" | grep -Fxq -- "$expected"; then
+    echo "Expected exact Maven argument '$expected' in $MAVEN_LOG" >&2
+    sed -n '1,200p' "$MAVEN_LOG" >&2
+    fail "missing exact Maven argument"
+  fi
+}
+
 assert_artifact_download_not_invoked() {
   if [[ -s "$ARTIFACT_DOWNLOAD_LOG" ]]; then
     sed -n '1,200p' "$ARTIFACT_DOWNLOAD_LOG" >&2
@@ -94,6 +105,8 @@ new_fixture() {
   MAVEN_LOG="$TEST_ROOT/maven.$TEST_COUNT.log"
   TAG_VALIDATION_LOG="$TEST_ROOT/tag-validation.$TEST_COUNT.log"
   ARTIFACT_DOWNLOAD_LOG="$TEST_ROOT/artifact-download.$TEST_COUNT.log"
+  CURL_LOG="$TEST_ROOT/curl.$TEST_COUNT.log"
+  CURL_ATTEMPT_LOG="$TEST_ROOT/curl-attempt.$TEST_COUNT.log"
   ARTIFACT_ZIP="$TEST_ROOT/artifact.$TEST_COUNT.zip"
   TEMP_ROOT="$TEST_ROOT/tmp.$TEST_COUNT"
   mkdir -p \
@@ -145,6 +158,7 @@ expected_run_id=${FAKE_EXPECTED_RUN_ID:-42}
 
 if [[ "$1" == "api" && "$2" == */actions/runs/* ]]; then
   if [[ "$2" == */artifacts?* ]]; then
+    printf 'args=%s\n' "$*" >> "${ARTIFACT_DOWNLOAD_LOG:-/dev/null}"
     "$REAL_PYTHON" - <<'PY'
 import json
 import os
@@ -229,7 +243,119 @@ if [[ " $* " == *" deploy "* ]]; then
     : > "target/$artifact"
     : > "target/$artifact.asc"
   done
+  printf 'created-signed-artifact-pairs=4\n' >> "$FAKE_MVN_LOG"
 fi
+
+if [[ "${FAKE_MAVEN_EXIT_CODE:-0}" -ne 0 ]]; then
+  exit "$FAKE_MAVEN_EXIT_CODE"
+fi
+EOF
+
+  cat > "$FIXTURE_DIR/fake-bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -o errexit
+set -o nounset
+set -o pipefail
+
+printf 'args=%s\n' "$*" >> "$FAKE_CURL_LOG"
+
+retry=
+retry_connrefused=false
+connect_timeout=
+max_time=
+output=
+proto=
+url=
+tlsv12=false
+location=false
+fail_on_http=false
+silent=false
+show_error=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --retry)
+      retry=$2
+      shift 2
+      ;;
+    --retry-connrefused)
+      retry_connrefused=true
+      shift
+      ;;
+    --connect-timeout)
+      connect_timeout=$2
+      shift 2
+      ;;
+    --max-time)
+      max_time=$2
+      shift 2
+      ;;
+    --output)
+      output=$2
+      shift 2
+      ;;
+    --proto)
+      proto=$2
+      shift 2
+      ;;
+    --tlsv1.2)
+      tlsv12=true
+      shift
+      ;;
+    --location)
+      location=true
+      shift
+      ;;
+    --fail)
+      fail_on_http=true
+      shift
+      ;;
+    --silent)
+      silent=true
+      shift
+      ;;
+    --show-error)
+      show_error=true
+      shift
+      ;;
+    https://*)
+      url=$1
+      shift
+      ;;
+    *)
+      echo "unexpected curl argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "$retry" != 3 ||
+      "$retry_connrefused" != true ||
+      "$connect_timeout" != 10 ||
+      "$max_time" != 300 ||
+      -z "$output" ||
+      "$proto" != "=https" ||
+      "$tlsv12" != true ||
+      "$location" != true ||
+      "$fail_on_http" != true ||
+      "$silent" != true ||
+      "$show_error" != true ||
+      "$url" != "https://downloads.apache.org/paimon/KEYS" ]]; then
+  echo "curl invocation does not match the bounded ASF KEYS contract" >&2
+  exit 2
+fi
+
+max_attempts=$((retry + 1))
+failures_before_success=${FAKE_CURL_FAILURES_BEFORE_SUCCESS:-0}
+for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+  printf 'attempt=%s\n' "$attempt" >> "$FAKE_CURL_ATTEMPT_LOG"
+  if ((attempt > failures_before_success)); then
+    printf 'fake KEYS\n' > "$output"
+    exit 0
+  fi
+done
+
+exit 22
 EOF
 
   cat > "$FIXTURE_DIR/fake-bin/python3" <<'EOF'
@@ -284,6 +410,7 @@ exit 99
 EOF
 
   chmod +x \
+    "$FIXTURE_DIR/fake-bin/curl" \
     "$FIXTURE_DIR/fake-bin/file" \
     "$FIXTURE_DIR/fake-bin/gh" \
     "$FIXTURE_DIR/fake-bin/gpg" \
@@ -305,7 +432,9 @@ run_script() {
       MVN="$FIXTURE_DIR/fake-bin/mvn" \
       PYTHON="$FIXTURE_DIR/fake-bin/python3" \
       GPG="$FIXTURE_DIR/fake-bin/gpg" \
+      CURL="$FIXTURE_DIR/fake-bin/curl" \
       FAKE_MVN_LOG="$MAVEN_LOG" \
+      FAKE_MAVEN_EXIT_CODE="${FAKE_MAVEN_EXIT_CODE:-0}" \
       FAKE_REPO="$FIXTURE_DIR" \
       FAKE_RUN_REF="${FAKE_RUN_REF:-v0.3.0-rc1}" \
       FAKE_RUN_SHA="${FAKE_RUN_SHA:-}" \
@@ -321,6 +450,9 @@ run_script() {
       FAKE_GPG_FINGERPRINT="${FAKE_GPG_FINGERPRINT:-}" \
       FAKE_KEYS_FINGERPRINT="${FAKE_KEYS_FINGERPRINT:-}" \
       FAKE_SIGNATURE_FINGERPRINT="${FAKE_SIGNATURE_FINGERPRINT:-}" \
+      FAKE_CURL_FAILURES_BEFORE_SUCCESS="${FAKE_CURL_FAILURES_BEFORE_SUCCESS:-0}" \
+      FAKE_CURL_LOG="$CURL_LOG" \
+      FAKE_CURL_ATTEMPT_LOG="$CURL_ATTEMPT_LOG" \
       REAL_PYTHON="$REAL_PYTHON" \
       ARTIFACT_DOWNLOAD_LOG="$ARTIFACT_DOWNLOAD_LOG" \
       TAG_VALIDATION_LOG="$TAG_VALIDATION_LOG" \
@@ -470,6 +602,36 @@ PY
   assert_maven_not_invoked
 }
 
+test_release_artifact_rejects_extra_regular_payload() {
+  new_fixture
+  "$REAL_PYTHON" - "$ARTIFACT_ZIP" <<'PY'
+import sys
+import zipfile
+
+files = (
+    "linux/aarch64/libpaimon_mosaic_jni.so",
+    "linux/x86_64/libpaimon_mosaic_jni.so",
+    "macos/aarch64/libpaimon_mosaic_jni.dylib",
+    "windows/x86_64/paimon_mosaic_jni.dll",
+    "README.txt",
+)
+with zipfile.ZipFile(sys.argv[1], "w", compression=zipfile.ZIP_STORED) as archive:
+    for name in files:
+        info = zipfile.ZipInfo(name, date_time=(2026, 8, 20, 0, 0, 0))
+        info.external_attr = 0o100644 << 16
+        archive.writestr(info, b"regular payload")
+PY
+  update_artifact_digest
+
+  if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "release artifact with an extra regular payload was accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" \
+    "Downloaded Java native inputs differ from the four expected files."
+  assert_contains "$OUTPUT_LOG" "README.txt"
+  assert_maven_not_invoked
+}
+
 test_real_deploy_requires_official_repository_run() {
   new_fixture
   if run_script --repo example/fork > "$OUTPUT_LOG" 2>&1; then
@@ -564,7 +726,24 @@ test_real_deploy_uses_one_verified_maven_lifecycle() {
   keys="$TEST_ROOT/keys.$TEST_COUNT"
   maven_rc="$TEST_ROOT/mavenrc.$TEST_COUNT"
   maven_config="$TEST_ROOT/maven.config.$TEST_COUNT"
-  printf '<settings/>\n' > "$settings"
+  cat > "$settings" <<'EOF'
+<settings>
+  <profiles>
+    <profile>
+      <id>hostile-staging-defaults</id>
+      <properties>
+        <stagingRepositoryId>orgapachepaimon-from-settings</stagingRepositoryId>
+        <stagingProfileId>deadbeef-from-settings</stagingProfileId>
+        <keepStagingRepositoryOnFailure>true</keepStagingRepositoryOnFailure>
+        <keepStagingRepositoryOnCloseRuleFailure>true</keepStagingRepositoryOnCloseRuleFailure>
+      </properties>
+    </profile>
+  </profiles>
+  <activeProfiles>
+    <activeProfile>hostile-staging-defaults</activeProfile>
+  </activeProfiles>
+</settings>
+EOF
   printf 'fake KEYS\n' > "$keys"
   cat > "$maven_rc" <<'EOF'
 export MAVEN_OPTS='-DstagingRepositoryId=orgapachepaimon-from-rc'
@@ -604,6 +783,14 @@ EOF
     maven.wagon.http.ssl.insecure; do
     assert_contains "$MAVEN_LOG" "-D${property}=false"
   done
+  # Maven command-line -D user properties take precedence over properties from
+  # active profiles in settings.xml, so these argv assertions prove the
+  # hostile settings defaults cannot select or retain a staging repository.
+  assert_maven_arg "-DstagingRepositoryId="
+  assert_maven_arg "-DstagingProfileId="
+  assert_maven_arg "-DkeepStagingRepositoryOnFailure=false"
+  assert_maven_arg \
+    "-DkeepStagingRepositoryOnCloseRuleFailure=false"
   assert_contains "$MAVEN_LOG" \
     "-Dgpg.keyname=0123456789ABCDEF0123456789ABCDEF01234567!"
   assert_contains "$MAVEN_LOG" "maven-opts="
@@ -633,6 +820,82 @@ EOF
   if [[ $(grep -c '^pwd=' "$MAVEN_LOG") -ne 1 ]]; then
     fail "real deploy should invoke Maven exactly once"
   fi
+}
+
+test_real_deploy_preserves_maven_partial_failure() {
+  new_fixture
+  settings="$TEST_ROOT/settings.$TEST_COUNT.xml"
+  keys="$TEST_ROOT/keys.$TEST_COUNT"
+  printf '<settings/>\n' > "$settings"
+  printf 'fake KEYS\n' > "$keys"
+
+  set +o errexit
+  (
+    export FAKE_MAVEN_EXIT_CODE=42
+    run_script \
+      --maven-settings "$settings" \
+      --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+      --keys-file "$keys"
+  ) > "$OUTPUT_LOG" 2>&1
+  status=$?
+  set -o errexit
+
+  if [[ "$status" -ne 42 ]]; then
+    fail "Maven exit 42 was not preserved; got $status"
+  fi
+  assert_contains "$MAVEN_LOG" "args=-s $settings clean deploy -Prelease"
+  assert_contains "$MAVEN_LOG" "created-signed-artifact-pairs=4"
+  assert_not_contains "$OUTPUT_LOG" "Java staging deploy finished."
+}
+
+test_default_asf_keys_download_retries_then_succeeds() {
+  new_fixture
+  settings="$TEST_ROOT/settings.$TEST_COUNT.xml"
+  printf '<settings/>\n' > "$settings"
+
+  (
+    export FAKE_CURL_FAILURES_BEFORE_SUCCESS=2
+    run_script \
+      --maven-settings "$settings" \
+      --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567
+  ) > "$OUTPUT_LOG" 2>&1
+
+  assert_contains "$CURL_LOG" \
+    "args=--proto =https --tlsv1.2 --location --fail --silent --show-error --retry 3 --retry-connrefused --connect-timeout 10 --max-time 300"
+  if [[ $(grep -c '^attempt=' "$CURL_ATTEMPT_LOG") -ne 3 ]]; then
+    fail "default ASF KEYS download did not succeed on the third attempt"
+  fi
+  assert_contains "$CURL_ATTEMPT_LOG" "attempt=1"
+  assert_contains "$CURL_ATTEMPT_LOG" "attempt=2"
+  assert_contains "$CURL_ATTEMPT_LOG" "attempt=3"
+  assert_contains "$OUTPUT_LOG" "Java staging deploy finished."
+}
+
+test_default_asf_keys_download_permanent_failure_stops_release() {
+  new_fixture
+  settings="$TEST_ROOT/settings.$TEST_COUNT.xml"
+  printf '<settings/>\n' > "$settings"
+
+  set +o errexit
+  (
+    export FAKE_CURL_FAILURES_BEFORE_SUCCESS=100
+    run_script \
+      --maven-settings "$settings" \
+      --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567
+  ) > "$OUTPUT_LOG" 2>&1
+  status=$?
+  set -o errexit
+
+  if [[ "$status" -ne 22 ]]; then
+    fail "curl exit 22 was not preserved; got $status"
+  fi
+
+  if [[ $(grep -c '^attempt=' "$CURL_ATTEMPT_LOG") -ne 4 ]]; then
+    fail "curl retry bound did not stop after one attempt plus three retries"
+  fi
+  assert_artifact_download_not_invoked
+  assert_maven_not_invoked
+  assert_not_contains "$OUTPUT_LOG" "Java staging deploy finished."
 }
 
 test_real_deploy_requires_signed_release_tag() {
@@ -723,6 +986,7 @@ run_test test_release_artifact_digest_must_match_metadata
 run_test test_release_artifact_rejects_unsafe_zip_path
 run_test test_release_artifact_rejects_symlink_entry
 run_test test_release_artifact_rejects_duplicate_zip_path
+run_test test_release_artifact_rejects_extra_regular_payload
 run_test test_real_deploy_requires_official_repository_run
 run_test test_git_index_flags_are_rejected
 run_test test_dirty_caller_worktree_is_rejected
@@ -730,6 +994,9 @@ run_test test_git_replacement_refs_are_rejected
 run_test test_repository_local_archive_attributes_are_rejected
 run_test test_invalid_native_files_fail_without_external_file_command
 run_test test_real_deploy_uses_one_verified_maven_lifecycle
+run_test test_real_deploy_preserves_maven_partial_failure
+run_test test_default_asf_keys_download_retries_then_succeeds
+run_test test_default_asf_keys_download_permanent_failure_stops_release
 run_test test_real_deploy_requires_signed_release_tag
 run_test test_run_must_use_canonical_release_workflow
 run_test test_real_deploy_requires_full_signing_fingerprint

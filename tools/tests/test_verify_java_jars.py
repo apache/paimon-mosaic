@@ -299,11 +299,39 @@ class VerifyJavaJarsTest(unittest.TestCase):
             artifact_ids.index("maven-gpg-plugin"),
         )
         exec_plugin = plugins[artifact_ids.index("exec-maven-plugin")]
-        execution = exec_plugin.find("m:executions/m:execution", namespace)
-        self.assertIsNotNone(execution)
+        verifier_executions = [
+            execution
+            for execution in exec_plugin.findall(
+                "m:executions/m:execution", namespace
+            )
+            if execution.findtext("m:id", namespaces=namespace)
+            == "verify-release-jars"
+        ]
+        self.assertEqual(len(verifier_executions), 1)
+        execution = verifier_executions[0]
         self.assertEqual(
             execution.findtext("m:phase", namespaces=namespace),
             "verify",
+        )
+        self.assertEqual(
+            [
+                goal.text
+                for goal in execution.findall("m:goals/m:goal", namespace)
+            ],
+            ["exec"],
+        )
+        self.assertEqual(
+            execution.findtext(
+                "m:configuration/m:executable", namespaces=namespace
+            ),
+            "python3",
+        )
+        skip = execution.findtext(
+            "m:configuration/m:skip", namespaces=namespace
+        )
+        self.assertIn(
+            skip.strip().lower() if skip is not None else None,
+            (None, "false"),
         )
         arguments = [
             argument.text

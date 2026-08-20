@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -23,18 +26,136 @@ def workflow(name: str) -> str:
     return (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
 
 
+def jobs(workflow_text: str) -> dict[str, str]:
+    jobs_start = workflow_text.index("\njobs:\n") + len("\njobs:\n")
+    jobs_text = workflow_text[jobs_start:]
+    matches = list(re.finditer(r"^  ([A-Za-z0-9_-]+):\s*$", jobs_text, re.MULTILINE))
+    return {
+        match.group(1): jobs_text[
+            match.start() : matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(jobs_text)
+        ]
+        for index, match in enumerate(matches)
+    }
+
+
 def job(workflow_text: str, name: str, next_name: str | None) -> str:
-    start = workflow_text.index(f"  {name}:")
-    if next_name is None:
-        return workflow_text[start:]
-    end = workflow_text.index(f"  {next_name}:", start)
-    return workflow_text[start:end]
+    del next_name
+    return jobs(workflow_text)[name]
 
 
 def step(workflow_text: str, name: str) -> str:
     start = workflow_text.index(f"      - name: {name}")
     end = workflow_text.find("\n      - ", start + 1)
     return workflow_text[start:] if end == -1 else workflow_text[start:end]
+
+
+def field(block: str, name: str, indent: int) -> str | None:
+    matches = re.findall(
+        rf"^{' ' * indent}{re.escape(name)}:\s*(.*?)\s*$",
+        block,
+        re.MULTILINE,
+    )
+    assert len(matches) <= 1, f"duplicate {name!r} fields"
+    return matches[0] if matches else None
+
+
+def sequence_field(block: str, name: str, indent: int) -> tuple[str, ...]:
+    lines = block.splitlines()
+    prefix = f"{' ' * indent}{name}:"
+    for index, line in enumerate(lines):
+        if not line.startswith(prefix):
+            continue
+        value = line[len(prefix) :].strip()
+        if value:
+            if value.startswith("["):
+                assert value.endswith("]"), f"invalid inline sequence for {name}"
+                value = value[1:-1]
+                return tuple(
+                    item.strip().strip("'\"")
+                    for item in value.split(",")
+                    if item.strip()
+                )
+            return (value.strip("'\""),)
+
+        item_prefix = f"{' ' * (indent + 2)}- "
+        items = []
+        for continuation in lines[index + 1 :]:
+            if not continuation.startswith(item_prefix):
+                break
+            items.append(continuation[len(item_prefix) :].strip().strip("'\""))
+        return tuple(items)
+    return ()
+
+
+def condition_terms(condition: str | None) -> set[str]:
+    assert condition is not None
+    condition = condition.strip()
+    if condition.startswith("${{") and condition.endswith("}}"):
+        condition = condition[3:-2].strip()
+    return {term.strip() for term in condition.split("&&")}
+
+
+def dependency_ancestors(workflow_jobs: dict[str, str], name: str) -> set[str]:
+    pending = list(sequence_field(workflow_jobs[name], "needs", 4))
+    ancestors = set()
+    while pending:
+        dependency = pending.pop()
+        if dependency in ancestors:
+            continue
+        ancestors.add(dependency)
+        if dependency in workflow_jobs:
+            pending.extend(
+                sequence_field(workflow_jobs[dependency], "needs", 4)
+            )
+    return ancestors
+
+
+def assert_final_publish_jobs_require_preflight(release: str) -> None:
+    release_jobs = jobs(release)
+    final_preflight = release_jobs["final-publication-preflight"]
+    continue_on_error = field(final_preflight, "continue-on-error", 4)
+    assert continue_on_error is None or continue_on_error.lower() == "false"
+    assert sequence_field(
+        release_jobs["rust-final-publish"], "needs", 4
+    ) == ("final-publication-preflight",)
+    for final_job in ("rust-final-publish", "python-final-publish"):
+        assert field(release_jobs[final_job], "if", 4) is None
+        assert "final-publication-preflight" in dependency_ancestors(
+            release_jobs, final_job
+        )
+
+
+def assert_rust_leaf_publish_gate(rust: str) -> None:
+    publish_step = step(
+        jobs(rust)["verify"], "Publish paimon-mosaic-core to crates.io"
+    )
+    allowed_terms = {
+        "inputs.publish == true",
+        "github.event_name == 'push'",
+        "github.repository == 'apache/paimon-mosaic'",
+        "startsWith(github.ref, 'refs/tags/')",
+        "!contains(github.ref_name, '-')",
+        "steps.registry.outputs.publish == 'true'",
+    }
+    assert condition_terms(field(publish_step, "if", 8)) == allowed_terms
+
+
+def assert_promoted_source_archive_gate(release: str) -> None:
+    final_preflight = jobs(release)["final-publication-preflight"]
+    source_archive_step = step(
+        final_preflight, "Require promoted and valid ASF source release"
+    )
+    assert field(source_archive_step, "if", 8) is None
+    continue_on_error = field(source_archive_step, "continue-on-error", 8)
+    assert continue_on_error is None or continue_on_error.lower() == "false"
+    assert_final_publish_jobs_require_preflight(release)
+
+
+def replace_block(contents: str, original: str, replacement: str) -> str:
+    assert contents.count(original) == 1
+    return contents.replace(original, replacement, 1)
 
 
 def curl_commands(workflow_text: str) -> list[str]:
@@ -56,18 +177,91 @@ def curl_commands(workflow_text: str) -> list[str]:
 
 def test_manual_release_dispatch_is_build_only():
     release = workflow("release.yml")
+    release_jobs = jobs(release)
 
-    rc_publish = job(release, "python-rc-publish", "final-publication-preflight")
-    final_preflight = job(
-        release, "final-publication-preflight", "rust-final-publish"
+    assert "github.event_name == 'push'" in condition_terms(
+        field(release_jobs["python-rc-publish"], "if", 4)
     )
-    assert "github.event_name == 'push'" in rc_publish
-    assert "github.event_name == 'push'" in final_preflight
-    assert "if: github.event_name == 'workflow_dispatch'" in release
+    assert "github.event_name == 'push'" in condition_terms(
+        field(release_jobs["final-publication-preflight"], "if", 4)
+    )
+    manual_dispatch_step = step(
+        release_jobs["tag-validation"], "Confirm manual dispatch is build-only"
+    )
+    assert condition_terms(field(manual_dispatch_step, "if", 8)) == {
+        "github.event_name == 'workflow_dispatch'"
+    }
+    assert_final_publish_jobs_require_preflight(release)
 
     python_publish = workflow("release-python-publish.yml")
-    publish_job = job(python_publish, "publish", None)
-    assert "github.event_name == 'push'" in publish_job
+    assert "github.event_name == 'push'" in condition_terms(
+        field(jobs(python_publish)["publish"], "if", 4)
+    )
+
+    rust = workflow("release-rust.yml")
+    assert_rust_leaf_publish_gate(rust)
+
+
+def test_manual_release_contract_rejects_publication_bypass_mutations():
+    release = workflow("release.yml")
+    rust_publish = jobs(release)["rust-final-publish"]
+    mutated_rust_publish = re.sub(
+        r"^    needs:.*$",
+        "    needs: [rust]",
+        rust_publish,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    assert mutated_rust_publish != rust_publish
+    with pytest.raises(AssertionError):
+        assert_final_publish_jobs_require_preflight(
+            replace_block(release, rust_publish, mutated_rust_publish)
+        )
+
+    final_preflight = jobs(release)["final-publication-preflight"]
+    mutated_final_preflight = final_preflight.replace(
+        "\n", "\n    continue-on-error: true\n", 1
+    )
+    assert mutated_final_preflight != final_preflight
+    with pytest.raises(AssertionError):
+        assert_final_publish_jobs_require_preflight(
+            replace_block(release, final_preflight, mutated_final_preflight)
+        )
+
+    python_publish = jobs(release)["python-final-publish"]
+    mutated_python_publish = python_publish.replace(
+        "\n", "\n    if: always()\n", 1
+    )
+    assert mutated_python_publish != python_publish
+    with pytest.raises(AssertionError):
+        assert_final_publish_jobs_require_preflight(
+            replace_block(release, python_publish, mutated_python_publish)
+        )
+
+    rust = workflow("release-rust.yml")
+    publish_step = step(
+        jobs(rust)["verify"], "Publish paimon-mosaic-core to crates.io"
+    )
+    mutated_publish_step = publish_step.replace(
+        "github.event_name == 'push' && ", "", 1
+    )
+    assert mutated_publish_step != publish_step
+    with pytest.raises(AssertionError):
+        assert_rust_leaf_publish_gate(
+            replace_block(rust, publish_step, mutated_publish_step)
+        )
+
+    contradictory_publish_step = publish_step.replace(
+        "steps.registry.outputs.publish == 'true'",
+        "steps.registry.outputs.publish == 'true' "
+        "&& github.event_name == 'workflow_dispatch'",
+        1,
+    )
+    assert contradictory_publish_step != publish_step
+    with pytest.raises(AssertionError):
+        assert_rust_leaf_publish_gate(
+            replace_block(rust, publish_step, contradictory_publish_step)
+        )
 
 
 def test_testpypi_publication_stages_only_missing_verified_wheels():
@@ -147,15 +341,34 @@ def test_registry_secrets_are_scoped_to_publish_workflows():
 
 def test_final_publication_preflight_binds_source_to_final_tag_commit():
     release = workflow("release.yml")
-    final_preflight = job(
-        release, "final-publication-preflight", "rust-final-publish"
+    final_preflight = jobs(release)["final-publication-preflight"]
+    source_archive_step = step(
+        final_preflight, "Require promoted and valid ASF source release"
     )
 
-    assert "python3 tools/verify_source_archive.py verify \\" in final_preflight
-    assert "--repository . \\" in final_preflight
-    assert '--commit "$GITHUB_SHA" \\' in final_preflight
-    assert '--prefix "paimon-mosaic-${version}/" \\' in final_preflight
-    assert '--archive "$release_dir/$archive"' in final_preflight
+    assert "python3 tools/verify_source_archive.py verify \\" in source_archive_step
+    assert "--repository . \\" in source_archive_step
+    assert '--commit "$GITHUB_SHA" \\' in source_archive_step
+    assert '--prefix "paimon-mosaic-${version}/" \\' in source_archive_step
+    assert '--archive "$release_dir/$archive"' in source_archive_step
+    assert_promoted_source_archive_gate(release)
+
+
+def test_promoted_source_archive_gate_rejects_skippable_mutations():
+    release = workflow("release.yml")
+    final_preflight = jobs(release)["final-publication-preflight"]
+    source_archive_step = step(
+        final_preflight, "Require promoted and valid ASF source release"
+    )
+
+    for bypass in ("        continue-on-error: true\n", "        if: false\n"):
+        mutated_step = source_archive_step.replace(
+            "\n", f"\n{bypass}", 1
+        )
+        with pytest.raises(AssertionError):
+            assert_promoted_source_archive_gate(
+                replace_block(release, source_archive_step, mutated_step)
+            )
 
 
 def test_release_network_calls_have_bounded_timeouts():

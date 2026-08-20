@@ -27,10 +27,13 @@ from zipfile import ZipFile, ZipInfo
 import pytest
 
 
-TOOLS = Path(__file__).resolve().parents[1]
+TESTS = Path(__file__).resolve().parent
+TOOLS = TESTS.parent
 sys.path.insert(0, str(TOOLS))
+sys.path.insert(0, str(TESTS))
 
 import verify_python_wheels as verifier  # noqa: E402
+from native_binary_fixtures import FFI_SYMBOLS, build_elf  # noqa: E402
 
 
 PE_SIDECAR = bytearray(132)
@@ -40,11 +43,30 @@ PE_SIDECAR[0x80:0x84] = b"PE\0\0"
 
 
 SUPPORTED_WHEELS = (
-    ("x86_64-unknown-linux-gnu", "manylinux_2_28_x86_64"),
-    ("aarch64-unknown-linux-gnu", "manylinux_2_28_aarch64"),
-    ("aarch64-apple-darwin", "macosx_11_0_arm64"),
-    ("x86_64-pc-windows-msvc", "win_amd64"),
+    (
+        "x86_64-unknown-linux-gnu",
+        "manylinux_2_28_x86_64",
+        "mosaic/libpaimon_mosaic_ffi.so",
+    ),
+    (
+        "aarch64-unknown-linux-gnu",
+        "manylinux_2_28_aarch64",
+        "mosaic/libpaimon_mosaic_ffi.so",
+    ),
+    (
+        "aarch64-apple-darwin",
+        "macosx_11_0_arm64",
+        "mosaic/libpaimon_mosaic_ffi.dylib",
+    ),
+    (
+        "x86_64-pc-windows-msvc",
+        "win_amd64",
+        "mosaic/paimon_mosaic_ffi.dll",
+    ),
 )
+EXPECTED_NATIVE_LIBRARY = {
+    target: native_path for target, _platform_tag, native_path in SUPPORTED_WHEELS
+}
 
 
 def write_zip(path, entries):
@@ -87,6 +109,8 @@ def build_wheel(
     extra_entries=None,
     unrecorded_entries=None,
     directory_entries=None,
+    native_bytes=b"native-library",
+    native_path=None,
 ):
     dist_info_distribution = dist_info_distribution or filename_distribution
     dist_info_version = dist_info_version or filename_version
@@ -121,11 +145,12 @@ def build_wheel(
         + "\n"
     ).encode()
 
+    native_path = native_path or EXPECTED_NATIVE_LIBRARY[target]
     contents = {
         "mosaic/LICENSE": license_text,
         "mosaic/NOTICE": notice_text,
         "mosaic/THIRD-PARTY-LICENSES.html": report_text,
-        verifier.NATIVE_LIBRARY[target]: b"native-library",
+        native_path: native_bytes,
         f"{dist_info}/METADATA": metadata,
         f"{dist_info}/WHEEL": wheel_metadata,
     }
@@ -154,14 +179,56 @@ def build_wheel(
     return wheel, root
 
 
-@pytest.mark.parametrize("target,platform_tag", SUPPORTED_WHEELS)
+@pytest.mark.parametrize("target,platform_tag,native_path", SUPPORTED_WHEELS)
 def test_verify_wheel_accepts_supported_targets(
-    tmp_path, monkeypatch, target, platform_tag
+    tmp_path, monkeypatch, target, platform_tag, native_path
 ):
-    wheel, root = build_wheel(tmp_path, target=target, platform_tag=platform_tag)
-    monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
+    native_bytes = f"native fixture for {target}".encode()
+    wheel, root = build_wheel(
+        tmp_path,
+        target=target,
+        platform_tag=platform_tag,
+        native_bytes=native_bytes,
+        native_path=native_path,
+    )
+    native_calls = []
+    monkeypatch.setattr(
+        verifier,
+        "verify_native_target",
+        lambda *args: native_calls.append(args),
+    )
 
     assert verifier.verify_wheel(wheel, root) == target
+    assert native_calls == [(native_bytes, target, native_path)]
+
+
+@pytest.mark.parametrize(
+    "native_bytes,error",
+    (
+        (
+            build_elf(machine=62, symbols=FFI_SYMBOLS),
+            "architectures.*expected only aarch64",
+        ),
+        (
+            build_elf(machine=183, symbols={"unrelated_export"}),
+            "missing expected Mosaic FFI exports",
+        ),
+    ),
+)
+def test_verify_wheel_rejects_invalid_native_at_canonical_path(
+    tmp_path, native_bytes, error
+):
+    target = "aarch64-unknown-linux-gnu"
+    wheel, root = build_wheel(
+        tmp_path,
+        target=target,
+        platform_tag="manylinux_2_28_aarch64",
+        native_bytes=native_bytes,
+        native_path="mosaic/libpaimon_mosaic_ffi.so",
+    )
+
+    with pytest.raises(ValueError, match=error):
+        verifier.verify_wheel(wheel, root)
 
 
 @pytest.mark.parametrize(
@@ -245,7 +312,7 @@ def test_main_requires_exactly_one_wheel_per_release_target(
 ):
     wheels = []
     root = None
-    for target, platform_tag in SUPPORTED_WHEELS:
+    for target, platform_tag, _native_path in SUPPORTED_WHEELS:
         wheel, root = build_wheel(
             tmp_path,
             target=target,

@@ -377,6 +377,7 @@ cleanup() {
 trap cleanup EXIT
 
 validate_signing_key() {
+  local curl_status
   local keys_fingerprints
   local local_fingerprints
 
@@ -394,15 +395,24 @@ validate_signing_key() {
 
   if [[ -z "$KEYS_FILE" ]]; then
     KEYS_FILE="$BUILD_ROOT/PAIMON_KEYS"
-    "$CURL" \
+    if "$CURL" \
       --proto '=https' \
       --tlsv1.2 \
       --location \
       --fail \
       --silent \
       --show-error \
+      --retry 3 \
+      --retry-connrefused \
+      --connect-timeout 10 \
+      --max-time 300 \
       --output "$KEYS_FILE" \
-      https://downloads.apache.org/paimon/KEYS
+      https://downloads.apache.org/paimon/KEYS; then
+      :
+    else
+      curl_status=$?
+      exit "$curl_status"
+    fi
   fi
   if ! keys_fingerprints=$(
     "$GPG" \
@@ -668,6 +678,10 @@ else
     -DskipRemoteStaging=false
     -DskipStaging=false
     -DskipStagingRepositoryClose=false
+    -DstagingRepositoryId=
+    -DstagingProfileId=
+    -DkeepStagingRepositoryOnFailure=false
+    -DkeepStagingRepositoryOnCloseRuleFailure=false
     -Dmaven.wagon.http.ssl.allowall=false
     -Dmaven.wagon.http.ssl.insecure=false
     "-DstagingDescription=$STAGING_DESCRIPTION"
@@ -680,7 +694,7 @@ if [[ "$DRY_RUN" != true ]]; then
   MAVEN_CMD+=("-Dgpg.keyname=${GPG_KEYNAME}!")
 fi
 
-(
+if (
   cd "$BUILD_REPO_DIR/java"
   unset \
     MAVEN_ARGS \
@@ -695,7 +709,12 @@ fi
   export MAVEN_SKIP_RC=1
   export MAVEN_BASEDIR="$PWD"
   "${MAVEN_CMD[@]}"
-)
+); then
+  :
+else
+  maven_status=$?
+  exit "$maven_status"
+fi
 
 if [[ "$DRY_RUN" == true ]]; then
   echo "Java staging dry run finished successfully."
