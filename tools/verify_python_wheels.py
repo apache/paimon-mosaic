@@ -395,6 +395,7 @@ def verify_wheel(wheel: Path, root: Path) -> str:
             archive.read(native_entries[0]),
             target,
             native_entries[0],
+            symbol_family="FFI",
         )
 
         legal_target_prefix = f"{dist_info}/licenses/licenses/"

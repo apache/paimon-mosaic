@@ -34,6 +34,15 @@ from native_binary_fixtures import (  # noqa: E402
 )
 
 
+def verify_jni_target(data, target, path):
+    verifier.verify_native_target(
+        data,
+        target,
+        path,
+        symbol_family="JNI",
+    )
+
+
 def build_pe(
     symbols=JNI_SYMBOLS,
     dll=True,
@@ -562,32 +571,66 @@ def build_fat_macho(slices):
 
 
 @pytest.mark.parametrize(
-    "target,path,data",
+    "target,path,data,symbol_family",
     (
         (
             "x86_64-unknown-linux-gnu",
             "native/linux/x86_64/libpaimon_mosaic_jni.so",
             build_elf(machine=62, symbols=JNI_SYMBOLS),
+            "JNI",
         ),
         (
             "aarch64-unknown-linux-gnu",
             "mosaic/libpaimon_mosaic_ffi.so",
             build_elf(machine=183, symbols=FFI_SYMBOLS),
+            "FFI",
         ),
         (
             "aarch64-apple-darwin",
             "native/macos/aarch64/libpaimon_mosaic_jni.dylib",
             build_macho(symbols=JNI_SYMBOLS),
+            "JNI",
         ),
         (
             "x86_64-pc-windows-msvc",
             "mosaic/paimon_mosaic_ffi.dll",
             build_pe(symbols=FFI_SYMBOLS),
+            "FFI",
         ),
     ),
 )
-def test_verify_native_target_accepts_four_release_targets(target, path, data):
-    verifier.verify_native_target(data, target, path)
+def test_verify_native_target_accepts_four_release_targets(
+    target, path, data, symbol_family
+):
+    verifier.verify_native_target(
+        data,
+        target,
+        path,
+        symbol_family=symbol_family,
+    )
+
+
+def test_verify_native_target_uses_explicit_symbol_family_for_renamed_library():
+    with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
+        verifier.verify_native_target(
+            build_elf(machine=62, symbols={"unrelated_export"}),
+            "x86_64-unknown-linux-gnu",
+            "renamed-native-library.so",
+            symbol_family="JNI",
+        )
+
+
+def test_verify_native_target_requires_keyword_only_symbol_family():
+    arguments = (
+        build_elf(machine=62, symbols=JNI_SYMBOLS),
+        "x86_64-unknown-linux-gnu",
+        "libpaimon_mosaic_jni.so",
+    )
+
+    with pytest.raises(TypeError):
+        verifier.verify_native_target(*arguments)
+    with pytest.raises(TypeError):
+        verifier.verify_native_target(*arguments, "JNI")
 
 
 @pytest.mark.parametrize(
@@ -600,7 +643,7 @@ def test_verify_native_target_accepts_four_release_targets(target, path, data):
 )
 def test_elf_rejects_truncated_and_executable_images(data, error):
     with pytest.raises(ValueError, match=error):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",
@@ -630,7 +673,7 @@ def test_elf_rejects_header_only_image():
     )
 
     with pytest.raises(ValueError, match="program header count"):
-        verifier.verify_native_target(
+        verify_jni_target(
             bytes(data),
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",
@@ -641,7 +684,7 @@ def test_elf_rejects_dynsym_not_referenced_by_pt_dynamic():
     data = build_elf(loader_symbols=False)
 
     with pytest.raises(ValueError, match="DT_SYMTAB"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",
@@ -652,7 +695,7 @@ def test_elf_rejects_dynsym_entries_beyond_dt_hash_symbol_count():
     data = build_elf(hash_symbol_count=1)
 
     with pytest.raises(ValueError, match="DT_HASH.*symbol count"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",
@@ -663,7 +706,7 @@ def test_elf_does_not_accept_exports_unreachable_from_dt_hash():
     data = build_elf(hash_reachable=False)
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",
@@ -671,7 +714,7 @@ def test_elf_does_not_accept_exports_unreachable_from_dt_hash():
 
 
 def test_elf_accepts_exports_reachable_from_dt_gnu_hash():
-    verifier.verify_native_target(
+    verify_jni_target(
         build_elf(hash_style="gnu"),
         "x86_64-unknown-linux-gnu",
         "libpaimon_mosaic_jni.so",
@@ -687,18 +730,60 @@ def test_elf_accepts_gnu_hash_with_only_unhashed_dynamic_symbols():
     assert parsed.exported_symbols == frozenset()
 
 
-def test_elf_sysv_hash_validates_shared_chain_once(monkeypatch):
+@pytest.mark.parametrize(
+    ("name", "sysv_hash", "gnu_hash"),
+    (
+        (b"printf", 0x077905A6, 0x156B2BB8),
+        (b"mosaic_writer_open", 0x0C6E4E1E, 0xFD2D0CCE),
+        (
+            b"Java_org_apache_paimon_mosaic_NativeLib_nativeOpen",
+            0x064C35DE,
+            0x440D1BC2,
+        ),
+    ),
+)
+def test_elf_hash_functions_match_known_vectors(name, sysv_hash, gnu_hash):
+    assert verifier.elf_sysv_hash(name) == sysv_hash
+    assert verifier.elf_gnu_hash(name) == gnu_hash
+
+
+@pytest.mark.parametrize(
+    ("parser", "section_type", "header_format", "header", "table_size"),
+    (
+        (
+            verifier.parse_elf_sysv_hash,
+            5,
+            "<II",
+            (32, 64),
+            8 + (32 + 64) * 4,
+        ),
+        (
+            verifier.parse_elf_gnu_hash,
+            0x6FFFFFF6,
+            "<IIII",
+            (32, 1, 1, 5),
+            16 + 8 + 32 * 4 + 64 * 4,
+        ),
+    ),
+    ids=("sysv", "gnu"),
+)
+def test_elf_hash_validates_shared_chain_once(
+    monkeypatch, parser, section_type, header_format, header, table_size
+):
     bucket_count = 32
     symbol_count = 64
     buckets = (1,) * bucket_count
 
     class CountingChains:
         def __init__(self):
-            self.values = (
-                0,
-                *range(2, symbol_count),
-                0,
-            )
+            if parser is verifier.parse_elf_gnu_hash:
+                self.values = (0,) * (symbol_count - 1) + (1,)
+            else:
+                self.values = (
+                    0,
+                    *range(2, symbol_count),
+                    0,
+                )
             self.reads = 0
 
         def __iter__(self):
@@ -711,8 +796,10 @@ def test_elf_sysv_hash_validates_shared_chain_once(monkeypatch):
     chains = CountingChains()
 
     def unpack_from(format_string, _data, _offset):
-        if format_string == "<II":
-            return bucket_count, symbol_count
+        if format_string == header_format:
+            return header
+        if format_string == "<1Q":
+            return (0xFFFFFFFFFFFFFFFF,)
         if format_string == f"<{bucket_count}I":
             return buckets
         if format_string == f"<{symbol_count}I":
@@ -721,16 +808,16 @@ def test_elf_sysv_hash_validates_shared_chain_once(monkeypatch):
 
     monkeypatch.setattr(verifier.struct, "unpack_from", unpack_from)
     section = verifier.ElfSection(
-        section_type=5,
+        section_type=section_type,
         flags=0,
         address=0,
         offset=0,
-        size=8 + (bucket_count + symbol_count) * 4,
+        size=table_size,
         link=0,
         entry_size=4,
     )
 
-    verifier.parse_elf_sysv_hash(b"", section)
+    parser(b"", section)
 
     assert chains.reads <= symbol_count * 2
 
@@ -739,7 +826,7 @@ def test_elf_does_not_accept_exports_unreachable_from_dt_gnu_hash():
     data = build_elf(hash_style="gnu", hash_reachable=False)
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",
@@ -754,7 +841,7 @@ def test_elf_requires_exports_reachable_from_each_loader_hash():
     )
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",
@@ -765,7 +852,7 @@ def test_elf_does_not_accept_object_symbols_as_function_exports():
     data = build_elf(symbol_info=0x11)
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",
@@ -776,7 +863,7 @@ def test_elf_rejects_function_export_outside_load_segments():
     data = build_elf(symbol_value=0xFFFFFFFF)
 
     with pytest.raises(ValueError, match="function.*not mapped"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",
@@ -787,7 +874,7 @@ def test_elf_rejects_function_export_in_non_executable_segment():
     data = build_elf(load_flags=4)
 
     with pytest.raises(ValueError, match="function.*not mapped"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",
@@ -804,7 +891,7 @@ def test_elf_rejects_function_export_in_non_executable_segment():
 )
 def test_pe_rejects_truncated_executable_and_pe32_images(data, error):
     with pytest.raises(ValueError, match=error):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "x86_64-pc-windows-msvc",
             "paimon_mosaic_jni.dll",
@@ -815,7 +902,7 @@ def test_pe_rejects_named_export_with_unmapped_function_rva():
     data = build_pe(function_rva=0xFFFFFFFF)
 
     with pytest.raises(ValueError, match="function RVA.*not mapped"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "x86_64-pc-windows-msvc",
             "paimon_mosaic_jni.dll",
@@ -826,7 +913,7 @@ def test_pe_rejects_named_export_in_non_executable_section():
     data = build_pe(section_characteristics=0x40000040)
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "x86_64-pc-windows-msvc",
             "paimon_mosaic_jni.dll",
@@ -837,7 +924,7 @@ def test_pe_rejects_named_forwarded_export():
     data = build_pe(forwarder="other_module.mosaic_writer_open")
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "x86_64-pc-windows-msvc",
             "paimon_mosaic_jni.dll",
@@ -851,7 +938,7 @@ def test_pe_accepts_required_functions_with_unrelated_data_export():
         symbol_rvas={unrelated: 0x1350},
     )
 
-    verifier.verify_native_target(
+    verify_jni_target(
         data,
         "x86_64-pc-windows-msvc",
         "paimon_mosaic_jni.dll",
@@ -865,7 +952,7 @@ def test_pe_accepts_required_functions_with_unrelated_forwarder():
         symbol_forwarders={unrelated: "KERNEL32.Sleep"},
     )
 
-    verifier.verify_native_target(
+    verify_jni_target(
         data,
         "x86_64-pc-windows-msvc",
         "paimon_mosaic_jni.dll",
@@ -899,7 +986,7 @@ def test_pe_rejects_duplicate_export_name_pointer():
 )
 def test_macho_rejects_truncated_and_executable_images(data, error):
     with pytest.raises(ValueError, match=error):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "aarch64-apple-darwin",
             "libpaimon_mosaic_jni.dylib",
@@ -911,7 +998,7 @@ def test_macho_rejects_truncated_load_commands():
     struct.pack_into("<I", data, 32 + 4, len(data))
 
     with pytest.raises(ValueError, match="load command"):
-        verifier.verify_native_target(
+        verify_jni_target(
             bytes(data),
             "aarch64-apple-darwin",
             "libpaimon_mosaic_jni.dylib",
@@ -956,10 +1043,22 @@ def test_macho_reads_exports_from_loader_export_trie(
         export_trie_command=export_trie_command,
     )
 
-    verifier.verify_native_target(
+    verify_jni_target(
         data,
         "aarch64-apple-darwin",
         "libpaimon_mosaic_jni.dylib",
+    )
+
+
+def test_macho_export_trie_accumulates_multilevel_prefixes():
+    # root -> "_mosaic_" -> {"open", "free"}
+    root = b"\x00\x01_mosaic_\x00\x0c"
+    shared_prefix = b"\x00\x02open\x00\x1afree\x00\x1e"
+    export_leaf = b"\x02\x00\x01\x00"
+    trie = root + shared_prefix + export_leaf + export_leaf
+
+    assert verifier.parse_macho_export_trie(trie, 0, len(trie)) == frozenset(
+        {"_mosaic_open", "_mosaic_free"}
     )
 
 
@@ -967,7 +1066,7 @@ def test_macho_empty_export_trie_is_authoritative():
     data = build_macho(export_trie_symbols=set())
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "aarch64-apple-darwin",
             "libpaimon_mosaic_jni.dylib",
@@ -981,7 +1080,7 @@ def test_macho_zero_sized_dyld_info_only_export_trie_is_authoritative():
     )
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "aarch64-apple-darwin",
             "libpaimon_mosaic_jni.dylib",
@@ -996,7 +1095,7 @@ def test_macho_exports_trie_command_precedes_zero_sized_dyld_info():
         dyld_info_export_trie_data=b"",
     )
 
-    verifier.verify_native_target(
+    verify_jni_target(
         data,
         "aarch64-apple-darwin",
         "libpaimon_mosaic_jni.dylib",
@@ -1013,7 +1112,7 @@ def test_macho_exports_trie_command_precedes_conflicting_dyld_info():
     )
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "aarch64-apple-darwin",
             "libpaimon_mosaic_jni.dylib",
@@ -1027,7 +1126,7 @@ def test_macho_does_not_fill_export_trie_gaps_from_symtab():
     )
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "aarch64-apple-darwin",
             "libpaimon_mosaic_jni.dylib",
@@ -1085,7 +1184,7 @@ def test_macho_symtab_does_not_treat_local_or_private_extern_as_exports(
     data = build_macho(symbol_type=symbol_type)
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "aarch64-apple-darwin",
             "libpaimon_mosaic_jni.dylib",
@@ -1101,7 +1200,7 @@ def test_rejects_unexpected_extra_macho_architecture():
     )
 
     with pytest.raises(ValueError, match="expected only aarch64"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "aarch64-apple-darwin",
             "libpaimon_mosaic_jni.dylib",
@@ -1114,7 +1213,7 @@ def test_rejects_macho_fat_slice_with_mismatched_cpu_type():
     )
 
     with pytest.raises(ValueError, match="CPU type does not match"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "aarch64-apple-darwin",
             "libpaimon_mosaic_jni.dylib",
@@ -1136,7 +1235,7 @@ def test_rejects_truncated_macho_fat_slice():
     )
 
     with pytest.raises(ValueError, match="fat slice 0.*out of bounds"):
-        verifier.verify_native_target(
+        verify_jni_target(
             bytes(data),
             "aarch64-apple-darwin",
             "libpaimon_mosaic_jni.dylib",
@@ -1144,28 +1243,38 @@ def test_rejects_truncated_macho_fat_slice():
 
 
 @pytest.mark.parametrize(
-    "target,path,data",
+    "target,path,data,symbol_family",
     (
         (
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",
             build_elf(symbols={"unrelated_export"}),
+            "JNI",
         ),
         (
             "x86_64-pc-windows-msvc",
             "paimon_mosaic_ffi.dll",
             build_pe(symbols={"unrelated_export"}),
+            "FFI",
         ),
         (
             "aarch64-apple-darwin",
             "libpaimon_mosaic_jni.dylib",
             build_macho(symbols={"unrelated_export"}),
+            "JNI",
         ),
     ),
 )
-def test_rejects_binary_without_expected_mosaic_exports(target, path, data):
+def test_rejects_binary_without_expected_mosaic_exports(
+    target, path, data, symbol_family
+):
     with pytest.raises(ValueError, match="missing expected Mosaic"):
-        verifier.verify_native_target(data, target, path)
+        verifier.verify_native_target(
+            data,
+            target,
+            path,
+            symbol_family=symbol_family,
+        )
 
 
 def test_raw_symbol_strings_do_not_count_as_elf_exports():
@@ -1173,7 +1282,7 @@ def test_raw_symbol_strings_do_not_count_as_elf_exports():
     data = build_elf(symbols={"unrelated_export"}) + raw_names
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
-        verifier.verify_native_target(
+        verify_jni_target(
             data,
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",

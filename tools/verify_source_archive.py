@@ -49,6 +49,7 @@ SOURCE_PATHSPECS = (
 )
 
 WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:")
+MAX_SOURCE_TAR_SIZE = 512 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -270,7 +271,24 @@ def read_source_archive(
     try:
         compressed = path.read_bytes()
         decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        raw_tar = decompressor.decompress(compressed) + decompressor.flush()
+        raw_tar = decompressor.decompress(
+            compressed,
+            MAX_SOURCE_TAR_SIZE + 1,
+        )
+        if (
+            len(raw_tar) > MAX_SOURCE_TAR_SIZE
+            or decompressor.unconsumed_tail
+        ):
+            raise ValueError(
+                "gzip source archive exceeds the uncompressed size limit "
+                f"of {MAX_SOURCE_TAR_SIZE} bytes"
+            )
+        raw_tar += decompressor.flush()
+        if len(raw_tar) > MAX_SOURCE_TAR_SIZE:
+            raise ValueError(
+                "gzip source archive exceeds the uncompressed size limit "
+                f"of {MAX_SOURCE_TAR_SIZE} bytes"
+            )
         if not decompressor.eof:
             raise ValueError("gzip stream ended before its trailer")
         if decompressor.unused_data or decompressor.unconsumed_tail:

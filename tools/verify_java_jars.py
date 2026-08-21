@@ -289,6 +289,7 @@ def verify_main_jar(path: Path, root: Path, require_all_natives: bool) -> None:
                 archive.read(entries[native_entry]),
                 NATIVE_ENTRIES[native_entry],
                 native_entry,
+                symbol_family="JNI",
             )
 
     print(f"verified main JAR: {path}")

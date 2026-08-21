@@ -352,15 +352,17 @@ def parse_elf_gnu_hash(data: bytes, section: ElfSection) -> ElfGnuHash:
     chain_count = (section_end - chains_offset) // 4
     chains = struct.unpack_from(f"<{chain_count}I", data, chains_offset)
     symbol_count = symbol_offset
+    verified = set()
     for bucket in buckets:
         if bucket == 0:
             continue
         if bucket < symbol_offset:
             raise ValueError("ELF DT_GNU_HASH bucket precedes the symbol offset")
         chain_index = bucket - symbol_offset
-        while True:
+        while chain_index not in verified:
             if chain_index >= chain_count:
                 raise ValueError("ELF DT_GNU_HASH chain is not terminated")
+            verified.add(chain_index)
             symbol_count = max(symbol_count, symbol_offset + chain_index + 1)
             if chains[chain_index] & 1:
                 break
@@ -1689,16 +1691,13 @@ def native_format_and_architectures(data: bytes) -> tuple[str, set[str]]:
     return parsed.binary_format, set(parsed.architectures)
 
 
-def expected_symbol_family(path: str) -> str | None:
-    filename = path.replace("\\", "/").rsplit("/", 1)[-1].lower()
-    if "paimon_mosaic_jni" in filename:
-        return "JNI"
-    if "paimon_mosaic_ffi" in filename:
-        return "FFI"
-    return None
-
-
-def verify_native_target(data: bytes, target: str, path: str) -> None:
+def verify_native_target(
+    data: bytes,
+    target: str,
+    path: str,
+    *,
+    symbol_family: str,
+) -> None:
     expected_format, expected_architecture = TARGET_ARCHITECTURE[target]
     parsed = native_binary(data)
     if parsed.binary_format != expected_format:
@@ -1713,15 +1712,14 @@ def verify_native_target(data: bytes, target: str, path: str) -> None:
             f"expected only {expected_architecture} for {target}"
         )
 
-    family = expected_symbol_family(path)
-    if family is None:
-        return
     normalized_symbols = {
         symbol[1:] if symbol.startswith("_") else symbol
         for symbol in parsed.exported_symbols
     }
-    missing = sorted(MOSAIC_SYMBOL_FAMILIES[family] - normalized_symbols)
+    missing = sorted(
+        MOSAIC_SYMBOL_FAMILIES[symbol_family] - normalized_symbols
+    )
     if missing:
         raise ValueError(
-            f"{path} is missing expected Mosaic {family} exports: {missing}"
+            f"{path} is missing expected Mosaic {symbol_family} exports: {missing}"
         )

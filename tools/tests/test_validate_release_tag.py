@@ -205,6 +205,34 @@ def test_invalid_extra_rc_does_not_hide_a_valid_matching_rc(tmp_path, signing_ke
     assert final.matching_rc == "v1.3.0-rc1"
 
 
+def test_final_tag_requires_matching_rc_signed_by_supplied_keys(
+    tmp_path, signing_keys
+):
+    (trusted_home, trusted_fingerprint, trusted_keys), (
+        untrusted_home,
+        untrusted_fingerprint,
+        _,
+    ) = signing_keys
+    repo = repository(tmp_path)
+    sign_tag(
+        repo,
+        "v1.4.0-rc1",
+        untrusted_home,
+        untrusted_fingerprint,
+    )
+    sign_tag(repo, "v1.4.0", trusted_home, trusted_fingerprint)
+
+    with pytest.raises(
+        validator.TagValidationError,
+        match="no matching RC tag.*valid ASF Paimon signature",
+    ):
+        validator.validate_release_tag(
+            repo,
+            "v1.4.0",
+            trusted_keys,
+        )
+
+
 def test_final_tag_rejects_rc_on_a_different_commit(tmp_path, signing_keys):
     (home, fingerprint, keys), _ = signing_keys
     repo = repository(tmp_path)

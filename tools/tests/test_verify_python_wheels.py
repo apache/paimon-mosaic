@@ -192,14 +192,23 @@ def test_verify_wheel_accepts_supported_targets(
         native_path=native_path,
     )
     native_calls = []
+
+    def capture_native_call(*args, **kwargs):
+        native_calls.append((args, kwargs))
+
     monkeypatch.setattr(
         verifier,
         "verify_native_target",
-        lambda *args: native_calls.append(args),
+        capture_native_call,
     )
 
     assert verifier.verify_wheel(wheel, root) == target
-    assert native_calls == [(native_bytes, target, native_path)]
+    assert native_calls == [
+        (
+            (native_bytes, target, native_path),
+            {"symbol_family": "FFI"},
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -287,7 +296,7 @@ def test_verify_wheel_rejects_non_release_tags(
         abi_tag=abi_tag,
         platform_tag=platform_tag,
     )
-    monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
 
     with pytest.raises(ValueError, match="unsupported wheel tags"):
         verifier.verify_wheel(wheel, root)
@@ -302,7 +311,7 @@ def test_verify_wheel_accepts_unrecorded_directory_entries(tmp_path, monkeypatch
             "paimon_mosaic-0.3.0.dist-info/licenses/",
         ),
     )
-    monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
 
     assert verifier.verify_wheel(wheel, root) == "aarch64-unknown-linux-gnu"
 
@@ -321,7 +330,7 @@ def test_main_requires_exactly_one_wheel_per_release_target(
         wheels.append(wheel)
 
     monkeypatch.setattr(verifier, "repository_root", lambda: root)
-    monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
 
     monkeypatch.setattr(
         sys,
@@ -429,7 +438,7 @@ def test_verify_wheel_rejects_identity_mismatches(
     tmp_path, monkeypatch, options, error
 ):
     wheel, root = build_wheel(tmp_path, **options)
-    monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
 
     with pytest.raises(ValueError, match=error):
         verifier.verify_wheel(wheel, root)
@@ -479,15 +488,52 @@ def find_record_row(rows, suffix):
             ),
             "blank hash and size",
         ),
+        (
+            lambda rows: find_record_row(rows, "/METADATA").__setitem__(
+                1, "sha256"
+            ),
+            "invalid hash",
+        ),
+        (
+            lambda rows: find_record_row(rows, "/METADATA").__setitem__(
+                1, "unsupported=ignored"
+            ),
+            "unknown hash algorithm",
+        ),
+        (
+            lambda rows: find_record_row(rows, "/METADATA").__setitem__(
+                1, "sha1=ignored"
+            ),
+            "weak hash algorithm",
+        ),
     ),
 )
 def test_verify_wheel_rejects_invalid_record(
     tmp_path, monkeypatch, mutate_record, error
 ):
     wheel, root = build_wheel(tmp_path, mutate_record=mutate_record)
-    monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
 
     with pytest.raises(ValueError, match=error):
+        verifier.verify_wheel(wheel, root)
+
+
+def test_verify_wheel_requires_artifact_exact_legal_files(
+    tmp_path, monkeypatch
+):
+    wheel, root = build_wheel(tmp_path)
+    expected_notice = (
+        root
+        / "python/licenses/aarch64-unknown-linux-gnu/NOTICE"
+    )
+    expected_notice.write_bytes(b"different expected notice\n")
+    monkeypatch.setattr(
+        verifier,
+        "verify_native_target",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
         verifier.verify_wheel(wheel, root)
 
 
@@ -496,7 +542,7 @@ def test_verify_wheel_rejects_unrecorded_archive_entry(tmp_path, monkeypatch):
         tmp_path,
         unrecorded_entries={"mosaic/unlisted.py": b"unlisted"},
     )
-    monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
 
     with pytest.raises(ValueError, match="omits wheel entries"):
         verifier.verify_wheel(wheel, root)
@@ -517,7 +563,7 @@ def test_verify_wheel_rejects_sidecar_native_by_magic(
         tmp_path,
         extra_entries={entry: magic + b"sidecar native"},
     )
-    monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
 
     with pytest.raises(ValueError, match="unexpected native libraries"):
         verifier.verify_wheel(wheel, root)
@@ -533,6 +579,6 @@ def test_verify_wheel_does_not_treat_plain_mz_resource_as_pe(
         tmp_path,
         extra_entries={"mosaic/data/resource.bin": bytes(not_pe)},
     )
-    monkeypatch.setattr(verifier, "verify_native_target", lambda *args: None)
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
 
     assert verifier.verify_wheel(wheel, root) == "aarch64-unknown-linux-gnu"

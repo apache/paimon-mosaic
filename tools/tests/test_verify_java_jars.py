@@ -265,7 +265,12 @@ class VerifyJavaJarsTest(unittest.TestCase):
                 verify_java_jars.verify_main_jar(path, self.root, True)
             verify_native.assert_has_calls(
                 [
-                    mock.call(native_entry.encode(), native_target, native_entry)
+                    mock.call(
+                        native_entry.encode(),
+                        native_target,
+                        native_entry,
+                        symbol_family="JNI",
+                    )
                     for native_entry, native_target in (
                         EXPECTED_NATIVE_ENTRIES.items()
                     )
@@ -286,6 +291,16 @@ class VerifyJavaJarsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unexpected native"):
                 with redirect_stdout(StringIO()):
                     verify_java_jars.verify_main_jar(injected, self.root, True)
+
+    def test_main_jar_propagates_native_verification_failure(self) -> None:
+        path = self.write_jar(
+            "invalid-native.jar",
+            self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES),
+        )
+
+        with self.assertRaisesRegex(ValueError, "unrecognized native binary"):
+            with redirect_stdout(StringIO()):
+                verify_java_jars.verify_main_jar(path, self.root, True)
 
     def test_main_jar_rejects_invalid_legal_content(self) -> None:
         first_target = EXPECTED_TARGETS[0]

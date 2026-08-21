@@ -162,6 +162,38 @@ def test_archive_verification_rejects_trailing_gzip_data(tmp_path):
         verifier.verify_archive(archive, repo, commit, PREFIX)
 
 
+def test_archive_verification_rejects_oversized_gzip_stream(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "oversized.tgz"
+    archive.write_bytes(gzip.compress(b"x" * 2048))
+    max_lengths = []
+    decompressobj = verifier.zlib.decompressobj
+
+    class RecordingDecompressor:
+        def __init__(self, *args, **kwargs):
+            self.delegate = decompressobj(*args, **kwargs)
+
+        def decompress(self, data, max_length=0):
+            max_lengths.append(max_length)
+            return self.delegate.decompress(data, max_length)
+
+        def __getattr__(self, name):
+            return getattr(self.delegate, name)
+
+    monkeypatch.setattr(verifier.zlib, "decompressobj", RecordingDecompressor)
+    monkeypatch.setattr(
+        verifier,
+        "MAX_SOURCE_TAR_SIZE",
+        1024,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="uncompressed size limit"):
+        verifier.read_source_archive(archive, PREFIX)
+    assert max_lengths == [1025]
+
+
 def test_archive_verification_rejects_second_tar_segment(tmp_path):
     repo, commit = initialize_repo(tmp_path)
     archive = tmp_path / "source.tgz"
