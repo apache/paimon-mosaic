@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import copy
 import gzip
 import io
 import os
@@ -87,6 +88,37 @@ def regular_file(name, content=b"content", mode=0o664):
     return info, content
 
 
+def repack_source_archive(path, *, drop=None, extra=None):
+    with tarfile.open(path, "r:gz") as source:
+        pax_headers = dict(source.pax_headers)
+        members = []
+        for member in source.getmembers():
+            if member.name == drop:
+                continue
+            content = source.extractfile(member).read() if member.isfile() else None
+            members.append((copy.copy(member), content))
+    if extra is not None:
+        members.append(regular_file(extra))
+
+    raw_tar = io.BytesIO()
+    with tarfile.open(
+        fileobj=raw_tar,
+        mode="w",
+        format=tarfile.PAX_FORMAT,
+        pax_headers=pax_headers,
+    ) as destination:
+        for member, content in members:
+            destination.addfile(
+                member,
+                io.BytesIO(content) if content is not None else None,
+            )
+    with path.open("wb") as destination:
+        with gzip.GzipFile(
+            filename="", mode="wb", fileobj=destination, mtime=0
+        ) as compressed:
+            compressed.write(raw_tar.getvalue())
+
+
 def test_create_and_verify_exact_git_tree(tmp_path):
     repo, commit = initialize_repo(tmp_path)
     archive = tmp_path / "source.tgz"
@@ -151,6 +183,26 @@ def test_archive_verification_rejects_second_tar_segment(tmp_path):
         verifier.verify_archive(archive, repo, commit, PREFIX)
 
 
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    (("missing", "missing entries"), ("unexpected", "unexpected entries")),
+)
+def test_archive_verification_rejects_tree_entry_set_changes(
+    tmp_path, mutation, error
+):
+    repo, commit = initialize_repo(tmp_path)
+    archive = tmp_path / "source.tgz"
+    verifier.create_archive(archive, repo, commit, PREFIX)
+
+    if mutation == "missing":
+        repack_source_archive(archive, drop=f"{PREFIX}README.md")
+    else:
+        repack_source_archive(archive, extra=f"{PREFIX}UNEXPECTED.txt")
+
+    with pytest.raises(ValueError, match=error):
+        verifier.verify_archive(archive, repo, commit, PREFIX)
+
+
 def test_archive_creation_rejects_git_replacement_refs(tmp_path):
     repo, first_commit = initialize_repo(tmp_path)
     (repo / "README.md").write_text("replacement contents\n", encoding="utf-8")
@@ -179,6 +231,17 @@ def test_archive_creation_uses_fixed_tar_umask(tmp_path):
     with tarfile.open(archive, "r:gz") as source:
         assert source.getmember(f"{PREFIX}README.md").mode == 0o664
         assert source.getmember(f"{PREFIX}script.sh").mode == 0o775
+
+
+def test_archive_creation_ignores_autocrlf(tmp_path):
+    repo, commit = initialize_repo(tmp_path)
+    archive = tmp_path / "source.tgz"
+    run(["git", "config", "core.autocrlf", "true"], cwd=repo)
+
+    verifier.create_archive(archive, repo, commit, PREFIX)
+
+    with tarfile.open(archive, "r:gz") as source:
+        assert source.extractfile(f"{PREFIX}README.md").read() == b"source contents\n"
 
 
 def test_archive_creation_rejects_repository_local_attributes(tmp_path):

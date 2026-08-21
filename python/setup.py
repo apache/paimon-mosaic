@@ -38,11 +38,6 @@ def _rust_target():
         "aarch64-apple-darwin",
         "x86_64-pc-windows-msvc",
     }
-    if configured:
-        if configured not in supported:
-            raise RuntimeError("Unsupported PAIMON_MOSAIC_RUST_TARGET: " + configured)
-        return configured
-
     system = platform.system()
     machine = platform.machine().lower()
     detected = {
@@ -59,6 +54,15 @@ def _rust_target():
         raise RuntimeError(
             f"Unsupported wheel build platform: system={system}, machine={machine}"
         )
+    if configured:
+        if configured not in supported:
+            raise RuntimeError("Unsupported PAIMON_MOSAIC_RUST_TARGET: " + configured)
+        if configured != detected:
+            raise RuntimeError(
+                f"PAIMON_MOSAIC_RUST_TARGET {configured} does not match "
+                f"build platform {detected}"
+            )
+        return configured
     return detected
 
 
@@ -90,14 +94,14 @@ def _find_native_lib():
         if os.path.isfile(candidate):
             return candidate
 
-    packaged = os.path.join(_package_dir(), lib)
-    if os.path.isfile(packaged):
-        return packaged
-
     for profile in ["release", "debug"]:
         candidate = os.path.join(here, "..", "target", profile, lib)
         if os.path.isfile(candidate):
             return candidate
+
+    packaged = os.path.join(_package_dir(), lib)
+    if os.path.isfile(packaged):
+        return packaged
 
     return None
 

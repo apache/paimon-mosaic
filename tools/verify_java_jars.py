@@ -67,7 +67,9 @@ def validated_entries(archive: ZipFile) -> dict[str, ZipInfo]:
     entries: dict[str, ZipInfo] = {}
     normalized_names: dict[str, str] = {}
     for info in archive.infolist():
-        name = info.filename
+        name = info.orig_filename
+        if not name or "\x00" in name or name != info.filename:
+            raise ValueError(f"invalid archive entry path: {name!r}")
         if "\\" in name:
             raise ValueError(f"archive entry uses a backslash: {name!r}")
         if PurePosixPath(name).is_absolute() or PureWindowsPath(name).is_absolute():

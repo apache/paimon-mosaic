@@ -22,7 +22,10 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 
 TOOLS_DIRECTORY = Path(__file__).resolve().parent.parent
@@ -97,11 +100,14 @@ class VerifyReleaseVersionsTest(unittest.TestCase):
                 )
             (package / "Cargo.toml").write_text(manifest, encoding="utf-8")
 
-    def write_release_components(self, version: str) -> None:
+    def write_release_components(
+        self, version: str, java_snapshot: bool = True
+    ) -> None:
         (self.root / "java").mkdir()
+        java_version = f"{version}-SNAPSHOT" if java_snapshot else version
         (self.root / "java/pom.xml").write_text(
             '<project xmlns="http://maven.apache.org/POM/4.0.0">\n'
-            f"  <version>{version}-SNAPSHOT</version>\n"
+            f"  <version>{java_version}</version>\n"
             "</project>\n",
             encoding="utf-8",
         )
@@ -232,6 +238,147 @@ class VerifyReleaseVersionsTest(unittest.TestCase):
         self.assertIn("cli/Cargo.toml", failures[0])
         self.assertIn("requires 0.3.0", failures[0])
         self.assertIn("does not accept 0.4.0", failures[0])
+
+    def test_verifier_reports_each_stale_release_component(self) -> None:
+        version = "0.4.0"
+        stale = "0.3.0"
+        self.write_workspace(version, version, version, version)
+        self.write_release_components(version)
+
+        cases = (
+            (
+                "java",
+                self.root / "java/pom.xml",
+                f"<version>{version}-SNAPSHOT</version>",
+                f"<version>{stale}-SNAPSHOT</version>",
+                f"java/pom.xml: expected {version}-SNAPSHOT, "
+                f"found {stale}-SNAPSHOT",
+            ),
+            (
+                "rust",
+                self.root / "core/Cargo.toml",
+                f'version = "{version}"',
+                f'version = "{stale}"',
+                f"core/Cargo.toml: expected {version}, found {stale}",
+            ),
+            (
+                "python",
+                self.root / "python/pyproject.toml",
+                f'version = "{version}"',
+                f'version = "{stale}"',
+                f"python/pyproject.toml: expected {version}, found {stale}",
+            ),
+            (
+                "lock",
+                self.root / "Cargo.lock",
+                f'name = "paimon-mosaic-core"\nversion = "{version}"',
+                f'name = "paimon-mosaic-core"\nversion = "{stale}"',
+                f"Cargo.lock paimon-mosaic-core: expected {version}, found {stale}",
+            ),
+        )
+
+        with mock.patch.object(
+            verify_release_versions,
+            "path_dependency_failures",
+            return_value=[],
+        ):
+            self.assertEqual(
+                verify_release_versions.verify(
+                    version, java_snapshot=True, root=self.root
+                ),
+                [],
+            )
+            for name, path, current, replacement, expected in cases:
+                with self.subTest(component=name):
+                    original = path.read_text(encoding="utf-8")
+                    self.assertIn(current, original)
+                    path.write_text(
+                        original.replace(current, replacement, 1),
+                        encoding="utf-8",
+                    )
+                    try:
+                        self.assertEqual(
+                            verify_release_versions.verify(
+                                version, java_snapshot=True, root=self.root
+                            ),
+                            [expected],
+                        )
+                    finally:
+                        path.write_text(original, encoding="utf-8")
+
+            pom = self.root / "java/pom.xml"
+            pom.write_text(
+                pom.read_text(encoding="utf-8").replace(
+                    f"{version}-SNAPSHOT", version
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                verify_release_versions.verify(
+                    version, java_snapshot=False, root=self.root
+                ),
+                [],
+            )
+
+    def test_main_returns_success_and_failure_status(self) -> None:
+        version = "0.4.0"
+        with mock.patch.object(
+            verify_release_versions, "verify", return_value=[]
+        ) as verify:
+            with mock.patch.object(
+                sys,
+                "argv",
+                ["verify_release_versions.py", version, "--java-snapshot"],
+            ):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    self.assertEqual(verify_release_versions.main(), 0)
+            verify.assert_called_once_with(version, True)
+
+        with mock.patch.object(
+            verify_release_versions,
+            "verify",
+            return_value=["python/pyproject.toml is stale"],
+        ) as verify:
+            with mock.patch.object(
+                sys,
+                "argv",
+                ["verify_release_versions.py", version, "--java-snapshot"],
+            ):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    self.assertEqual(verify_release_versions.main(), 1)
+            verify.assert_called_once_with(version, True)
+
+    def test_main_routes_cargo_updates_and_returns_failure_status(self) -> None:
+        arguments = [
+            "verify_release_versions.py",
+            "--update-cargo",
+            "0.3.0",
+            "0.4.0",
+        ]
+        updated_manifest = verify_release_versions.ROOT / "core/Cargo.toml"
+        with mock.patch.object(
+            verify_release_versions,
+            "update_cargo_versions",
+            return_value=[updated_manifest],
+        ) as update:
+            with mock.patch.object(sys, "argv", arguments):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    self.assertEqual(verify_release_versions.main(), 0)
+            update.assert_called_once_with(
+                verify_release_versions.ROOT, "0.3.0", "0.4.0"
+            )
+
+        with mock.patch.object(
+            verify_release_versions,
+            "update_cargo_versions",
+            side_effect=ValueError("stale manifest"),
+        ) as update:
+            with mock.patch.object(sys, "argv", arguments):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    self.assertEqual(verify_release_versions.main(), 1)
+            update.assert_called_once_with(
+                verify_release_versions.ROOT, "0.3.0", "0.4.0"
+            )
 
     def test_uses_cargo_version_requirement_semantics(self) -> None:
         self.assertTrue(

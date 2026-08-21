@@ -24,7 +24,7 @@ import unittest
 import warnings
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -72,6 +72,16 @@ class VerifyJavaJarsTest(unittest.TestCase):
                 for entry, contents in entries:
                     archive.writestr(entry, contents)
         return path
+
+    def replace_jar_entry_name(
+        self, path: Path, original: str, replacement: str
+    ) -> None:
+        original_bytes = original.encode()
+        replacement_bytes = replacement.encode()
+        self.assertEqual(len(original_bytes), len(replacement_bytes))
+        contents = path.read_bytes()
+        self.assertGreaterEqual(contents.count(original_bytes), 2)
+        path.write_bytes(contents.replace(original_bytes, replacement_bytes))
 
     def verify_classifier(self, path: Path) -> None:
         with redirect_stdout(StringIO()):
@@ -160,6 +170,24 @@ class VerifyJavaJarsTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "duplicate normalized entry names"):
             self.verify_classifier(path)
+
+    def test_rejects_nul_truncated_entry_name(self) -> None:
+        native_entry = next(iter(EXPECTED_NATIVE_ENTRIES))
+        placeholder = native_entry + "Xhidden.txt"
+        malicious = native_entry + "\0hidden.txt"
+        jar_entries = self.prepare_main_jar_fixture(
+            entry for entry in EXPECTED_NATIVE_ENTRIES if entry != native_entry
+        )
+        path = self.write_jar(
+            "nul-truncated.jar",
+            [*jar_entries, (placeholder, native_entry.encode())],
+        )
+        self.replace_jar_entry_name(path, placeholder, malicious)
+
+        with mock.patch.object(verify_java_jars, "verify_native_target"):
+            with self.assertRaisesRegex(ValueError, "invalid archive entry path"):
+                with redirect_stdout(StringIO()):
+                    verify_java_jars.verify_main_jar(path, self.root, True)
 
     def test_classifier_legal_files_must_byte_match_repository_root(self) -> None:
         valid = self.write_jar("valid.jar", self.classifier_entries())
@@ -259,6 +287,119 @@ class VerifyJavaJarsTest(unittest.TestCase):
                 with redirect_stdout(StringIO()):
                     verify_java_jars.verify_main_jar(injected, self.root, True)
 
+    def test_main_jar_rejects_invalid_legal_content(self) -> None:
+        first_target = EXPECTED_TARGETS[0]
+        first_report = (
+            f"META-INF/licenses/{first_target}/THIRD-PARTY-LICENSES.html"
+        )
+
+        def replace(entries, name, contents):
+            return [
+                (entry, contents if entry == name else data)
+                for entry, data in entries
+            ]
+
+        def remove(entries, name):
+            return [(entry, data) for entry, data in entries if entry != name]
+
+        def missing_license(entries, _resources):
+            return remove(entries, "META-INF/LICENSE")
+
+        def cross_target_inventory(entries, _resources):
+            return [*entries, ("META-INF/DEPENDENCIES.rust.tsv", b"inventory")]
+
+        def wrong_license(entries, _resources):
+            return replace(entries, "META-INF/LICENSE", b"wrong license\n")
+
+        def wrong_notice(entries, _resources):
+            return replace(entries, "META-INF/NOTICE", b"wrong notice\n")
+
+        def notice_without_arrow(entries, resources):
+            contents = b"project notice\n"
+            (resources / "NOTICE").write_bytes(contents)
+            return replace(entries, "META-INF/NOTICE", contents)
+
+        def license_without_report_link(entries, resources):
+            license_path = resources / "LICENSE"
+            contents = license_path.read_bytes().replace(first_report.encode(), b"")
+            license_path.write_bytes(contents)
+            return replace(entries, "META-INF/LICENSE", contents)
+
+        def wrong_report(entries, _resources):
+            return replace(entries, first_report, b"wrong report\n")
+
+        def report_without_target(entries, resources):
+            contents = b"For Zstandard software\nApache Arrow\n"
+            report_source = resources / first_report.removeprefix("META-INF/")
+            report_source.write_bytes(contents)
+            return replace(entries, first_report, contents)
+
+        def report_without_zstandard(entries, resources):
+            contents = f"{first_target}\nApache Arrow\n".encode()
+            report_source = resources / first_report.removeprefix("META-INF/")
+            report_source.write_bytes(contents)
+            return replace(entries, first_report, contents)
+
+        def report_without_arrow(entries, resources):
+            contents = f"{first_target}\nFor Zstandard software\n".encode()
+            report_source = resources / first_report.removeprefix("META-INF/")
+            report_source.write_bytes(contents)
+            return replace(entries, first_report, contents)
+
+        cases = (
+            ("missing_license", "missing legal files", missing_license),
+            (
+                "cross_target_inventory",
+                "cross-target repository dependency inventory",
+                cross_target_inventory,
+            ),
+            ("wrong_license", "binary-specific LICENSE", wrong_license),
+            ("wrong_notice", "binary-specific NOTICE", wrong_notice),
+            (
+                "notice_without_arrow",
+                "omits the bundled Apache Arrow",
+                notice_without_arrow,
+            ),
+            (
+                "license_without_report_link",
+                "LICENSE does not point",
+                license_without_report_link,
+            ),
+            ("wrong_report", "differs from its generated source", wrong_report),
+            (
+                "report_without_target",
+                "does not identify its target",
+                report_without_target,
+            ),
+            (
+                "report_without_zstandard",
+                "missing 'For Zstandard software'",
+                report_without_zstandard,
+            ),
+            (
+                "report_without_arrow",
+                "missing 'Apache Arrow'",
+                report_without_arrow,
+            ),
+        )
+
+        for case, error, mutate in cases:
+            with self.subTest(case=case):
+                entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+                resources = self.root / "java/src/main/binary-resources/META-INF"
+                path = self.write_jar(
+                    f"{case}.jar",
+                    mutate(entries, resources),
+                )
+                with mock.patch.object(
+                    verify_java_jars, "verify_native_target"
+                ):
+                    with self.assertRaisesRegex(ValueError, error):
+                        with redirect_stdout(StringIO()):
+                            verify_java_jars.verify_main_jar(
+                                path, self.root, True
+                            )
+
     def test_release_main_jar_requires_all_declared_natives(self) -> None:
         for index, omitted_native in enumerate(EXPECTED_NATIVE_ENTRIES):
             with self.subTest(omitted_native=omitted_native):
@@ -279,6 +420,48 @@ class VerifyJavaJarsTest(unittest.TestCase):
                     ):
                         with redirect_stdout(StringIO()):
                             verify_java_jars.verify_main_jar(path, self.root, True)
+
+    def test_main_returns_success_and_checks_javadoc_classifier(self) -> None:
+        main_jar = self.write_jar(
+            "main.jar",
+            self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES),
+        )
+        sources = self.write_jar("sources.jar", self.classifier_entries())
+        javadoc = self.write_jar("javadoc.jar", self.classifier_entries())
+        arguments = [
+            "verify_java_jars.py",
+            "--main",
+            str(main_jar),
+            "--sources",
+            str(sources),
+            "--javadoc",
+            str(javadoc),
+            "--require-all-natives",
+        ]
+
+        with mock.patch.object(
+            verify_java_jars, "repository_root", return_value=self.root
+        ):
+            with mock.patch.object(
+                verify_java_jars, "verify_native_target"
+            ):
+                with mock.patch.object(sys, "argv", arguments):
+                    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                        self.assertEqual(verify_java_jars.main(), 0)
+
+                broken_javadoc = self.write_jar(
+                    "broken-javadoc.jar",
+                    [("META-INF/LICENSE", (self.root / "LICENSE").read_bytes())],
+                )
+                broken_arguments = [
+                    *arguments[:-3],
+                    "--javadoc",
+                    str(broken_javadoc),
+                    "--require-all-natives",
+                ]
+                with mock.patch.object(sys, "argv", broken_arguments):
+                    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                        self.assertEqual(verify_java_jars.main(), 1)
 
     def test_release_profile_verifies_jars_before_gpg_signing(self) -> None:
         namespace = {"m": "http://maven.apache.org/POM/4.0.0"}

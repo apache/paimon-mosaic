@@ -43,6 +43,9 @@ jobs:
       - name: Validate .asf.yaml
         run: pip install pyyaml -q && python3 tools/validate_asf_yaml.py
 
+      - name: Run release tooling tests
+        run: pip install pytest -q && python3 -m pytest -q tools/tests
+
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:

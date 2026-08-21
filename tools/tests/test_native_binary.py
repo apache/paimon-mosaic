@@ -678,6 +678,63 @@ def test_elf_accepts_exports_reachable_from_dt_gnu_hash():
     )
 
 
+def test_elf_accepts_gnu_hash_with_only_unhashed_dynamic_symbols():
+    parsed = verifier.native_binary(
+        build_elf(symbols=set(), hash_style="gnu", unhashed_symbols=4)
+    )
+
+    assert parsed.binary_format == "ELF"
+    assert parsed.exported_symbols == frozenset()
+
+
+def test_elf_sysv_hash_validates_shared_chain_once(monkeypatch):
+    bucket_count = 32
+    symbol_count = 64
+    buckets = (1,) * bucket_count
+
+    class CountingChains:
+        def __init__(self):
+            self.values = (
+                0,
+                *range(2, symbol_count),
+                0,
+            )
+            self.reads = 0
+
+        def __iter__(self):
+            return iter(self.values)
+
+        def __getitem__(self, index):
+            self.reads += 1
+            return self.values[index]
+
+    chains = CountingChains()
+
+    def unpack_from(format_string, _data, _offset):
+        if format_string == "<II":
+            return bucket_count, symbol_count
+        if format_string == f"<{bucket_count}I":
+            return buckets
+        if format_string == f"<{symbol_count}I":
+            return chains
+        raise AssertionError(f"unexpected format: {format_string}")
+
+    monkeypatch.setattr(verifier.struct, "unpack_from", unpack_from)
+    section = verifier.ElfSection(
+        section_type=5,
+        flags=0,
+        address=0,
+        offset=0,
+        size=8 + (bucket_count + symbol_count) * 4,
+        link=0,
+        entry_size=4,
+    )
+
+    verifier.parse_elf_sysv_hash(b"", section)
+
+    assert chains.reads <= symbol_count * 2
+
+
 def test_elf_does_not_accept_exports_unreachable_from_dt_gnu_hash():
     data = build_elf(hash_style="gnu", hash_reachable=False)
 

@@ -166,6 +166,33 @@ def test_signed_rc_and_final_on_same_commit_are_accepted(tmp_path, signing_keys)
     assert final.matching_rc == "v1.2.3-rc1"
 
 
+def test_main_returns_success_and_failure_status(
+    tmp_path, signing_keys, monkeypatch, capsys
+):
+    (home, fingerprint, keys), _ = signing_keys
+    repo = repository(tmp_path)
+    tag = "v1.2.4-rc1"
+    sign_tag(repo, tag, home, fingerprint)
+    arguments = [
+        "validate_release_tag.py",
+        tag,
+        "--keys-file",
+        str(keys),
+        "--repository",
+        str(repo),
+    ]
+
+    monkeypatch.setattr(sys, "argv", arguments)
+    assert validator.main() == 0
+    capsys.readouterr()
+
+    commit(repo, "after tag")
+    monkeypatch.setattr(sys, "argv", arguments)
+    assert validator.main() == 1
+    captured = capsys.readouterr()
+    assert "release tag validation failed" in captured.err
+
+
 def test_invalid_extra_rc_does_not_hide_a_valid_matching_rc(tmp_path, signing_keys):
     (home, fingerprint, keys), _ = signing_keys
     repo = repository(tmp_path)

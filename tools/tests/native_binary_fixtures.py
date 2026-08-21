@@ -46,6 +46,7 @@ def build_elf(
     symbol_info=0x12,
     symbol_value=0x100,
     load_flags=5,
+    unhashed_symbols=0,
 ):
     symbol_list = sorted(symbols)
     strings = bytearray(b"\0")
@@ -66,6 +67,13 @@ def build_elf(
                 symbol_value,
                 1,
             )
+        )
+    for index in range(unhashed_symbols):
+        name = f"unhashed_{index}"
+        name_offset = len(strings)
+        strings.extend(name.encode() + b"\0")
+        symbol_table.extend(
+            struct.pack("<IBBHQQ", name_offset, 0x20, 0, 0, 0, 0)
         )
 
     hash_tables = []

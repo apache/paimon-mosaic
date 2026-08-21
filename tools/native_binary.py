@@ -317,14 +317,16 @@ def parse_elf_sysv_hash(data: bytes, section: ElfSection) -> ElfSysvHash:
         raise ValueError("ELF DT_HASH bucket index is out of bounds")
     if any(index >= symbol_count for index in chains):
         raise ValueError("ELF DT_HASH chain index is out of bounds")
+    verified = set()
     for bucket in buckets:
         seen = set()
         index = bucket
-        while index:
+        while index and index not in verified:
             if index in seen:
                 raise ValueError("ELF DT_HASH contains a chain cycle")
             seen.add(index)
             index = chains[index]
+        verified.update(seen)
     return ElfSysvHash(buckets, chains)
 
 
@@ -706,10 +708,9 @@ def parse_elf(data: bytes) -> NativeBinary | None:
             "SHT_GNU_HASH",
         )
         gnu_hash = parse_elf_gnu_hash(data, hash_section)
-        if symbol_section.size != gnu_hash.symbol_count * symbol_entry_size:
+        if gnu_hash.symbol_count * symbol_entry_size > symbol_section.size:
             raise ValueError(
-                "ELF DT_GNU_HASH symbol count does not match "
-                "the SHT_DYNSYM size"
+                "ELF DT_GNU_HASH symbol count exceeds the SHT_DYNSYM size"
             )
         loader_hashes.append(gnu_hash)
     if symbol_section.link >= section_count:
