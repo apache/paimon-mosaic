@@ -2178,25 +2178,20 @@ fn parse_decimal_unscaled_exact(
 }
 
 fn timestamp_has_explicit_timezone(value: &str) -> bool {
-    // Arrow's timestamp parser requires a fixed-width YYYY-MM-DD date prefix
-    // and accepts colon-separated or compact time fields. The offsets below
-    // intentionally mirror that grammar; expanded-year forms fail parsing.
+    // Arrow's timestamp grammar is a fixed-width YYYY-MM-DD date, a `T`/space
+    // separator, a `HH:MM[:SS[.fraction]]` time, then an optional zone. The
+    // separator and time-of-day only contain digits, `:`, and `.`, so after the
+    // 10-byte date prefix a trailing `Z`/`z` or any `+`/`-` marks an explicit
+    // zone regardless of whether seconds or fractional digits are present. The
+    // parser rejects expanded-year forms, so the fixed date width holds; byte
+    // scanning keeps malformed multi-byte input from panicking on a slice.
     let bytes = value.trim().as_bytes();
     if bytes.len() <= 10 {
         return false;
     }
-    let mut timezone_start = if bytes.get(13) == Some(&b':') && bytes.get(16) == Some(&b':') {
-        19
-    } else {
-        17
-    };
-    if bytes.get(timezone_start) == Some(&b'.') {
-        timezone_start += 1;
-        while bytes.get(timezone_start).is_some_and(u8::is_ascii_digit) {
-            timezone_start += 1;
-        }
-    }
-    timezone_start < bytes.len()
+    let after_date = &bytes[10..];
+    matches!(after_date.last(), Some(b'Z' | b'z'))
+        || after_date.iter().any(|b| matches!(b, b'+' | b'-'))
 }
 
 fn csv_record_value(record: &csv::StringRecord, source: usize) -> Option<&str> {
@@ -3771,6 +3766,8 @@ mod tests {
             "2026-08-20T12:34:56Z",
             "2026-08-20T12:34:56+08:00",
             "2026-08-20T12:34:56.123-08:00",
+            "2026-08-20T12:34Z",
+            "2026-08-20T12:34+05:00",
         ] {
             assert!(timestamp_has_explicit_timezone(value), "{value}");
         }
