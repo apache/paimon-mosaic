@@ -20,8 +20,6 @@ import sys
 import types
 from pathlib import Path
 
-import pytest
-
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SETUP_PY = REPOSITORY_ROOT / "python/setup.py"
@@ -50,7 +48,7 @@ def load_setup_module(monkeypatch):
     return runpy.run_path(str(SETUP_PY))
 
 
-def test_find_native_lib_prefers_fresh_release_output(
+def test_find_native_lib_prefers_release_over_debug_and_packaged(
     tmp_path, monkeypatch
 ):
     setup_module = load_setup_module(monkeypatch)
@@ -61,29 +59,13 @@ def test_find_native_lib_prefers_fresh_release_output(
     library_name = setup_module["_lib_name"]()
     packaged = python_directory / "mosaic" / library_name
     release = tmp_path / "target/release" / library_name
+    debug = tmp_path / "target/debug" / library_name
     packaged.parent.mkdir(parents=True)
     release.parent.mkdir(parents=True)
+    debug.parent.mkdir(parents=True)
     packaged.write_bytes(b"stale")
-    release.write_bytes(b"fresh")
+    release.write_bytes(b"release")
+    debug.write_bytes(b"debug")
     monkeypatch.delenv("MOSAIC_LIB_PATH", raising=False)
 
     assert Path(setup_module["_find_native_lib"]()).resolve() == release.resolve()
-
-
-def test_rust_target_rejects_cross_platform_override(monkeypatch):
-    setup_module = load_setup_module(monkeypatch)
-    detected = setup_module["_rust_target"]()
-    configured = next(
-        target
-        for target in (
-            "x86_64-unknown-linux-gnu",
-            "aarch64-unknown-linux-gnu",
-            "aarch64-apple-darwin",
-            "x86_64-pc-windows-msvc",
-        )
-        if target != detected
-    )
-    monkeypatch.setenv("PAIMON_MOSAIC_RUST_TARGET", configured)
-
-    with pytest.raises(RuntimeError, match="does not match build platform"):
-        setup_module["_rust_target"]()

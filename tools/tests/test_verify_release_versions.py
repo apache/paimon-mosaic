@@ -226,6 +226,29 @@ class VerifyReleaseVersionsTest(unittest.TestCase):
             "0.4.0",
         )
 
+    def test_update_cargo_versions_accepts_a_symlinked_root(self) -> None:
+        canonical_root = self.root / "canonical"
+        canonical_root.mkdir()
+        root = self.root / "workspace"
+        root.symlink_to(canonical_root, target_is_directory=True)
+        self.root = canonical_root
+        self.write_workspace("0.3.0", "0.3.0", "0.3.0", "0.3.0")
+        core = self.root / "core/Cargo.toml"
+        core.write_text(
+            core.read_text(encoding="utf-8").replace(
+                'version = "0.3.0"', 'version = "0.2.0"', 1
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"core/Cargo\.toml: expected package version 0\.3\.0 or 0\.4\.0",
+        ):
+            verify_release_versions.update_cargo_versions(
+                root, "0.3.0", "0.4.0"
+            )
+
     def test_verifier_rejects_stale_path_dependency_requirement(self) -> None:
         self.write_workspace("0.4.0", "0.3.0", "0.4.0", "^0.4.0")
         self.write_release_components("0.4.0")
@@ -238,6 +261,20 @@ class VerifyReleaseVersionsTest(unittest.TestCase):
         self.assertIn("cli/Cargo.toml", failures[0])
         self.assertIn("requires 0.3.0", failures[0])
         self.assertIn("does not accept 0.4.0", failures[0])
+
+    def test_path_dependency_failures_accepts_a_symlinked_root(self) -> None:
+        canonical_root = self.root / "canonical"
+        canonical_root.mkdir()
+        root = self.root / "workspace"
+        root.symlink_to(canonical_root, target_is_directory=True)
+        self.root = canonical_root
+        self.write_workspace("0.4.0", "0.3.0", "0.4.0", "^0.4.0")
+
+        failures = verify_release_versions.path_dependency_failures(root)
+
+        self.assertEqual(len(failures), 1)
+        self.assertIn("cli/Cargo.toml", failures[0])
+        self.assertIn("core/Cargo.toml", failures[0])
 
     def test_verifier_reports_each_stale_release_component(self) -> None:
         version = "0.4.0"
@@ -318,6 +355,40 @@ class VerifyReleaseVersionsTest(unittest.TestCase):
                     version, java_snapshot=False, root=self.root
                 ),
                 [],
+            )
+
+    def test_verifier_accumulates_multiple_stale_release_components(self) -> None:
+        version = "0.4.0"
+        stale = "0.3.0"
+        self.write_workspace(version, version, version, version)
+        self.write_release_components(version)
+        pom = self.root / "java/pom.xml"
+        pom.write_text(
+            pom.read_text(encoding="utf-8").replace(
+                f"{version}-SNAPSHOT", f"{stale}-SNAPSHOT"
+            ),
+            encoding="utf-8",
+        )
+        pyproject = self.root / "python/pyproject.toml"
+        pyproject.write_text(
+            pyproject.read_text(encoding="utf-8").replace(version, stale),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            verify_release_versions,
+            "path_dependency_failures",
+            return_value=[],
+        ):
+            self.assertEqual(
+                verify_release_versions.verify(
+                    version, java_snapshot=True, root=self.root
+                ),
+                [
+                    f"java/pom.xml: expected {version}-SNAPSHOT, "
+                    f"found {stale}-SNAPSHOT",
+                    f"python/pyproject.toml: expected {version}, found {stale}",
+                ],
             )
 
     def test_main_returns_success_and_failure_status(self) -> None:

@@ -31,13 +31,6 @@ def _package_dir():
 
 
 def _rust_target():
-    configured = os.environ.get("PAIMON_MOSAIC_RUST_TARGET")
-    supported = {
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu",
-        "aarch64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-    }
     system = platform.system()
     machine = platform.machine().lower()
     detected = {
@@ -54,15 +47,6 @@ def _rust_target():
         raise RuntimeError(
             f"Unsupported wheel build platform: system={system}, machine={machine}"
         )
-    if configured:
-        if configured not in supported:
-            raise RuntimeError("Unsupported PAIMON_MOSAIC_RUST_TARGET: " + configured)
-        if configured != detected:
-            raise RuntimeError(
-                f"PAIMON_MOSAIC_RUST_TARGET {configured} does not match "
-                f"build platform {detected}"
-            )
-        return configured
     return detected
 
 

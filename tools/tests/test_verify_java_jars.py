@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import stat
 import sys
 import tempfile
@@ -25,7 +26,7 @@ import warnings
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from contextlib import redirect_stderr, redirect_stdout
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from unittest import mock
 from zipfile import ZipFile, ZipInfo
@@ -36,6 +37,7 @@ REPOSITORY_ROOT = TOOLS_DIRECTORY.parent
 sys.path.insert(0, str(TOOLS_DIRECTORY))
 
 import verify_java_jars  # noqa: E402
+import native_binary  # noqa: E402
 
 
 EXPECTED_TARGETS = (
@@ -171,6 +173,28 @@ class VerifyJavaJarsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate normalized entry names"):
             self.verify_classifier(path)
 
+    def test_rejects_oversized_entry_before_archive_read(self) -> None:
+        path = self.write_jar(
+            "oversized-entry.jar",
+            self.classifier_entries(("payload/oversized.bin", b"x" * 4097)),
+        )
+
+        with mock.patch.object(
+            verify_java_jars,
+            "MAX_ARCHIVE_ENTRY_SIZE",
+            4096,
+            create=True,
+        ):
+            with mock.patch.object(
+                ZipFile,
+                "read",
+                side_effect=AssertionError("archive.read must not be called"),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, r"oversized\.bin.*size limit"
+                ):
+                    self.verify_classifier(path)
+
     def test_rejects_nul_truncated_entry_name(self) -> None:
         native_entry = next(iter(EXPECTED_NATIVE_ENTRIES))
         placeholder = native_entry + "Xhidden.txt"
@@ -251,6 +275,61 @@ class VerifyJavaJarsTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "binary-only"):
             self.verify_classifier(malformed)
+
+    def test_oversized_java_class_is_not_fully_read(self) -> None:
+        class RecordingSource(BytesIO):
+            def __init__(self, data: bytes):
+                super().__init__(data)
+                self.read_sizes = []
+
+            def read(self, size: int = -1) -> bytes:
+                self.read_sizes.append(size)
+                if size < 0:
+                    raise AssertionError("oversized class was read without a bound")
+                return super().read(size)
+
+        source = RecordingSource(
+            verify_java_jars.JAVA_CLASS_MAGIC + b"\x00" * 60
+        )
+        with mock.patch.object(
+            verify_java_jars,
+            "MAX_JAVA_CLASS_SIZE",
+            64,
+            create=True,
+        ):
+            self.assertEqual(
+                verify_java_jars.native_binary_magic(
+                    source,
+                    65,
+                    "org/apache/paimon/mosaic/Huge.class",
+                ),
+                "Mach-O",
+            )
+        self.assertEqual(source.read_sizes, [64])
+
+    def test_target_matrix_guard_rejects_drift(self) -> None:
+        with mock.patch.dict(
+            verify_java_jars.NATIVE_ENTRIES,
+            {"native/unsupported/libmosaic.so": "unsupported-target"},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "target matrices"):
+                verify_java_jars._validate_target_matrix()
+
+    def test_target_matrix_is_validated_during_import(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "verify_java_jars_matrix_probe",
+            TOOLS_DIRECTORY / "verify_java_jars.py",
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.object(
+            native_binary,
+            "TARGET_ARCHITECTURE",
+            {"unsupported-target": ("ELF", "x86_64")},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "target matrices"):
+                spec.loader.exec_module(module)
 
     def test_main_jar_keeps_target_report_and_native_validation(self) -> None:
         self.assertEqual(EXPECTED_TARGETS, verify_java_jars.TARGETS)

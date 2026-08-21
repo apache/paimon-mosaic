@@ -194,6 +194,79 @@ def test_archive_verification_rejects_oversized_gzip_stream(
     assert max_lengths == [1025]
 
 
+def test_archive_verification_rejects_oversized_compressed_input_before_read(
+    monkeypatch,
+):
+    class OversizedArchive:
+        read_called = False
+
+        class Stat:
+            st_size = 5
+
+        def stat(self):
+            return self.Stat()
+
+        def read_bytes(self):
+            self.read_called = True
+            raise AssertionError("oversized compressed input was read")
+
+    archive = OversizedArchive()
+    monkeypatch.setattr(
+        verifier,
+        "MAX_SOURCE_TAR_SIZE",
+        4,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="compressed size limit"):
+        verifier.read_source_archive(archive, PREFIX)
+    assert not archive.read_called
+
+
+def test_archive_verification_rejects_post_flush_size_overflow(monkeypatch):
+    class Archive:
+        class Stat:
+            st_size = 1
+
+        def stat(self):
+            return self.Stat()
+
+        def read_bytes(self):
+            return b"x"
+
+    class FlushOverflowDecompressor:
+        eof = True
+        unconsumed_tail = b""
+        unused_data = b""
+        flushed = False
+
+        def decompress(self, data, max_length=0):
+            assert data == b"x"
+            assert max_length == 5
+            return b"a" * 4
+
+        def flush(self):
+            self.flushed = True
+            return b"b"
+
+    decompressor = FlushOverflowDecompressor()
+    monkeypatch.setattr(
+        verifier,
+        "MAX_SOURCE_TAR_SIZE",
+        4,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        verifier.zlib,
+        "decompressobj",
+        lambda *_args, **_kwargs: decompressor,
+    )
+
+    with pytest.raises(ValueError, match="uncompressed size limit"):
+        verifier.read_source_archive(Archive(), PREFIX)
+    assert decompressor.flushed
+
+
 def test_archive_verification_rejects_second_tar_segment(tmp_path):
     repo, commit = initialize_repo(tmp_path)
     archive = tmp_path / "source.tgz"
@@ -361,6 +434,10 @@ def test_compare_entries_checks_type_mode_link_and_content():
     }
 
     for changed, error in (
+        (
+            verifier.ArchiveEntry("other", "file", 0o664, None, b"same"),
+            "normalized path differs",
+        ),
         (
             verifier.ArchiveEntry("path", "directory", 0o664, None, None),
             "entry type differs",

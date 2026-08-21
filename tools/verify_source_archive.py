@@ -269,6 +269,11 @@ def read_source_archive(
     path: Path, prefix: str
 ) -> tuple[dict[str, ArchiveEntry], str | None]:
     try:
+        if path.stat().st_size > MAX_SOURCE_TAR_SIZE:
+            raise ValueError(
+                "gzip source archive exceeds the compressed size limit "
+                f"of {MAX_SOURCE_TAR_SIZE} bytes"
+            )
         compressed = path.read_bytes()
         decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
         raw_tar = decompressor.decompress(

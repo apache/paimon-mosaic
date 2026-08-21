@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -88,12 +89,33 @@ def generate_key(tmp_path: Path, identity: str) -> tuple[Path, str, Path]:
     return home, fingerprint, keys
 
 
+def short_temporary_root(platform_name: str = os.name) -> Path:
+    if platform_name == "nt":
+        return Path(tempfile.gettempdir()).resolve()
+    return Path("/tmp").resolve()
+
+
 @pytest.fixture(scope="module")
-def signing_keys(tmp_path_factory):
-    root = tmp_path_factory.mktemp("release-signing-keys")
-    trusted = generate_key(root, "Trusted Release")
-    untrusted = generate_key(root, "Untrusted Release")
-    return trusted, untrusted
+def signing_keys():
+    temporary_root = short_temporary_root()
+    with tempfile.TemporaryDirectory(
+        prefix="pm-gpg-", dir=temporary_root
+    ) as directory:
+        root = Path(directory).resolve()
+        trusted = generate_key(root, "Trusted Release")
+        untrusted = generate_key(root, "Untrusted Release")
+        yield trusted, untrusted
+
+
+def test_signing_key_homes_use_a_short_canonical_temporary_root(signing_keys):
+    temporary_root = short_temporary_root()
+
+    for home, _, _ in signing_keys:
+        assert home == home.resolve()
+        assert home.parent.parent == temporary_root
+
+    assert short_temporary_root("posix") == Path("/tmp").resolve()
+    assert short_temporary_root("nt") == Path(tempfile.gettempdir()).resolve()
 
 
 def repository(tmp_path: Path) -> Path:
@@ -197,7 +219,14 @@ def test_invalid_extra_rc_does_not_hide_a_valid_matching_rc(tmp_path, signing_ke
     (home, fingerprint, keys), _ = signing_keys
     repo = repository(tmp_path)
     sign_tag(repo, "v1.3.0-rc1", home, fingerprint)
-    run(["git", "tag", "v1.3.0-rc2"], cwd=repo)
+    run(["git", "config", "tag.gpgSign", "true"], cwd=repo)
+    env = os.environ.copy()
+    env["GIT_EDITOR"] = "false"
+    run(
+        ["git", "-c", "tag.gpgSign=false", "tag", "v1.3.0-rc2"],
+        cwd=repo,
+        env=env,
+    )
     sign_tag(repo, "v1.3.0", home, fingerprint)
 
     final = validator.validate_release_tag(repo, "v1.3.0", keys)
@@ -270,7 +299,14 @@ def test_signature_must_match_a_key_in_supplied_keys(tmp_path, signing_keys):
 def test_lightweight_tag_is_rejected(tmp_path, signing_keys):
     (_, _, keys), _ = signing_keys
     repo = repository(tmp_path)
-    run(["git", "tag", "v4.0.0-rc1"], cwd=repo)
+    run(["git", "config", "tag.gpgSign", "true"], cwd=repo)
+    env = os.environ.copy()
+    env["GIT_EDITOR"] = "false"
+    run(
+        ["git", "-c", "tag.gpgSign=false", "tag", "v4.0.0-rc1"],
+        cwd=repo,
+        env=env,
+    )
 
     with pytest.raises(validator.TagValidationError, match="annotated signed"):
         validator.validate_release_tag(repo, "v4.0.0-rc1", keys)

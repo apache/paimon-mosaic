@@ -33,9 +33,10 @@ import sys
 from pathlib import Path
 from zipfile import ZipFile
 
-from native_binary import verify_native_target
+from native_binary import TARGET_ARCHITECTURE, verify_native_target
 
 
+MAX_ARCHIVE_ENTRY_SIZE = 256 * 1024 * 1024
 NATIVE_LIBRARY = {
     "x86_64-unknown-linux-gnu": "mosaic/libpaimon_mosaic_ffi.so",
     "aarch64-unknown-linux-gnu": "mosaic/libpaimon_mosaic_ffi.so",
@@ -66,6 +67,18 @@ MACHO_MAGICS = {
     b"\xca\xfe\xba\xbf",
     b"\xbf\xba\xfe\xca",
 }
+
+
+def _validate_target_matrix() -> None:
+    if not (
+        set(NATIVE_LIBRARY)
+        == set(EXPECTED_WHEEL_TAG)
+        == set(TARGET_ARCHITECTURE)
+    ):
+        raise RuntimeError("Python wheel native target matrices are inconsistent")
+
+
+_validate_target_matrix()
 
 
 def repository_root() -> Path:
@@ -180,6 +193,11 @@ def validate_archive_paths(archive: ZipFile) -> set[str]:
             raise ValueError(f"wheel entry uses '..': {raw_name!r}")
         if stat.S_ISLNK(info.external_attr >> 16):
             raise ValueError(f"wheel entry is a symbolic link: {raw_name!r}")
+        if info.file_size > MAX_ARCHIVE_ENTRY_SIZE:
+            raise ValueError(
+                f"wheel entry {raw_name!r} exceeds the size limit of "
+                f"{MAX_ARCHIVE_ENTRY_SIZE} bytes: {info.file_size} bytes"
+            )
 
         normalized_name = posixpath.normpath(raw_name)
         if normalized_name in ("", ".", "/"):

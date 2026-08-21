@@ -1671,26 +1671,6 @@ def native_binary(data: bytes) -> NativeBinary:
     raise ValueError("unrecognized native binary format")
 
 
-def elf_architectures(data: bytes) -> set[str] | None:
-    parsed = parse_elf(data)
-    return None if parsed is None else set(parsed.architectures)
-
-
-def pe_architectures(data: bytes) -> set[str] | None:
-    parsed = parse_pe(data)
-    return None if parsed is None else set(parsed.architectures)
-
-
-def macho_architectures(data: bytes) -> set[str] | None:
-    parsed = parse_macho(data)
-    return None if parsed is None else set(parsed.architectures)
-
-
-def native_format_and_architectures(data: bytes) -> tuple[str, set[str]]:
-    parsed = native_binary(data)
-    return parsed.binary_format, set(parsed.architectures)
-
-
 def verify_native_target(
     data: bytes,
     target: str,

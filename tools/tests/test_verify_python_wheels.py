@@ -16,6 +16,7 @@
 import base64
 import csv
 import hashlib
+import importlib.util
 import io
 import shutil
 import stat
@@ -33,6 +34,7 @@ sys.path.insert(0, str(TOOLS))
 sys.path.insert(0, str(TESTS))
 
 import verify_python_wheels as verifier  # noqa: E402
+import native_binary  # noqa: E402
 from native_binary_fixtures import FFI_SYMBOLS, build_elf  # noqa: E402
 
 
@@ -407,6 +409,57 @@ def test_validate_archive_paths_rejects_duplicate_normalized_name(tmp_path):
         ValueError, match="duplicate normalized"
     ):
         verifier.validate_archive_paths(archive)
+
+
+def test_verify_wheel_rejects_oversized_entry_before_archive_read(
+    tmp_path, monkeypatch
+):
+    wheel, root = build_wheel(
+        tmp_path,
+        extra_entries={"mosaic/oversized.bin": b"x" * 4097},
+    )
+    monkeypatch.setattr(
+        verifier,
+        "MAX_ARCHIVE_ENTRY_SIZE",
+        4096,
+        raising=False,
+    )
+
+    def fail_unbounded_read(*_args, **_kwargs):
+        raise AssertionError("archive.read must not be called")
+
+    monkeypatch.setattr(ZipFile, "read", fail_unbounded_read)
+    with pytest.raises(ValueError, match=r"oversized\.bin.*size limit"):
+        verifier.verify_wheel(wheel, root)
+
+
+def test_target_matrix_guard_rejects_drift(monkeypatch):
+    monkeypatch.setitem(
+        verifier.EXPECTED_WHEEL_TAG,
+        "unsupported-target",
+        "py3-none-unsupported",
+    )
+
+    with pytest.raises(RuntimeError, match="target matrices"):
+        verifier._validate_target_matrix()
+
+
+def test_target_matrix_is_validated_during_import(monkeypatch):
+    monkeypatch.setattr(
+        native_binary,
+        "TARGET_ARCHITECTURE",
+        {"unsupported-target": ("ELF", "x86_64")},
+    )
+    spec = importlib.util.spec_from_file_location(
+        "verify_python_wheels_matrix_probe",
+        TOOLS / "verify_python_wheels.py",
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+
+    with pytest.raises(RuntimeError, match="target matrices"):
+        spec.loader.exec_module(module)
 
 
 @pytest.mark.parametrize(

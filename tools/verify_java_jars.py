@@ -26,9 +26,11 @@ import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from zipfile import ZipFile, ZipInfo
 
-from native_binary import verify_native_target
+from native_binary import TARGET_ARCHITECTURE, verify_native_target
 
 
+MAX_ARCHIVE_ENTRY_SIZE = 256 * 1024 * 1024
+MAX_JAVA_CLASS_SIZE = 16 * 1024 * 1024
 TARGETS = (
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
@@ -59,6 +61,18 @@ NESTED_LICENSE_MARKERS = (
 )
 
 
+def _validate_target_matrix() -> None:
+    if not (
+        set(TARGETS)
+        == set(NATIVE_ENTRIES.values())
+        == set(TARGET_ARCHITECTURE)
+    ):
+        raise RuntimeError("Java native target matrices are inconsistent")
+
+
+_validate_target_matrix()
+
+
 def repository_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
@@ -78,6 +92,11 @@ def validated_entries(archive: ZipFile) -> dict[str, ZipInfo]:
             raise ValueError(f"archive entry uses a '..' path component: {name!r}")
         if stat.S_ISLNK(info.external_attr >> 16):
             raise ValueError(f"archive entry is a symbolic link: {name!r}")
+        if info.file_size > MAX_ARCHIVE_ENTRY_SIZE:
+            raise ValueError(
+                f"archive entry {name!r} exceeds the size limit of "
+                f"{MAX_ARCHIVE_ENTRY_SIZE} bytes: {info.file_size} bytes"
+            )
         if name in entries:
             raise ValueError(f"archive contains duplicate raw entry name: {name!r}")
 
@@ -199,9 +218,10 @@ def native_binary_magic(source, size: int, name: str) -> str | None:
         header.startswith(JAVA_CLASS_MAGIC)
         and name.lower().endswith(".class")
     ):
-        source.seek(0)
-        if is_java_class(source.read()):
-            return None
+        if size <= MAX_JAVA_CLASS_SIZE:
+            source.seek(0)
+            if is_java_class(source.read(MAX_JAVA_CLASS_SIZE + 1)):
+                return None
     if header[:4] in MACHO_MAGICS:
         return "Mach-O"
     if header.startswith(b"MZ") and len(header) >= 64:

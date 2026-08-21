@@ -241,6 +241,7 @@ def cargo_requirement_accepts(requirement: str, version: str) -> bool:
 
 
 def path_dependency_failures(root: Path) -> list[str]:
+    root = root.resolve()
     packages = workspace_packages(root)
     failures = []
     compatibility = {}
@@ -512,6 +513,7 @@ def replacement_spans(
 
 
 def update_cargo_versions(root: Path, old_version: str, new_version: str) -> list[Path]:
+    root = root.resolve()
     packages = workspace_packages(root)
     for package in packages.values():
         if package.version not in {old_version, new_version}:
