@@ -23,7 +23,7 @@ Requires cargo-deny: cargo install cargo-deny
 Requires Python 3.11+ (uses tomllib).
 
 Usage:
-    python3 tools/dependencies.py check      # Verify all deps have approved licenses
+    python3 tools/dependencies.py check      # Verify licenses and report freshness
     python3 tools/dependencies.py generate   # Generate DEPENDENCIES.rust.tsv
 """
 
@@ -35,6 +35,7 @@ if sys.version_info < (3, 11):
         f"Current: {sys.version}."
     )
 
+import difflib
 import subprocess
 import tomllib
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
@@ -54,46 +55,94 @@ if root_cargo.exists():
                 PACKAGES.append(m)
 
 
-def check_single_package(root):
-    pkg_dir = ROOT_DIR / root if root != "." else ROOT_DIR
-    if (pkg_dir / "Cargo.toml").exists():
-        print(f"Checking dependencies of {root}")
-        subprocess.run(
-            ["cargo", "deny", "check", "license"],
-            cwd=pkg_dir,
-            check=True,
+def package_dir(root):
+    return ROOT_DIR / root if root != "." else ROOT_DIR
+
+
+def normalized_report(root):
+    pkg_dir = package_dir(root)
+    result = subprocess.run(
+        ["cargo", "deny", "--locked", "list", "-f", "tsv", "-t", "0.6"],
+        cwd=pkg_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"cargo deny list failed in {root}: {result.stderr or result.stdout}"
         )
-    else:
-        print(f"Skipping {root} as Cargo.toml does not exist")
+    return "\n".join(line.rstrip() for line in result.stdout.splitlines()) + "\n"
 
 
 def check_deps():
-    for d in PACKAGES:
-        check_single_package(d)
+    subprocess.run(
+        ["cargo", "deny", "--locked", "check", "licenses"],
+        cwd=ROOT_DIR,
+        check=True,
+    )
+
+    stale = False
+    for legal_file in ("LICENSE", "NOTICE"):
+        source = ROOT_DIR / legal_file
+        packaged = ROOT_DIR / "core" / legal_file
+        if not packaged.is_file() or packaged.read_bytes() != source.read_bytes():
+            print(f"Stale packaged Rust legal file: {packaged}")
+            stale = True
+
+    for root in PACKAGES:
+        pkg_dir = package_dir(root)
+        if not (pkg_dir / "Cargo.toml").exists():
+            print(f"Skipping {root} as Cargo.toml does not exist")
+            continue
+
+        print(f"Checking generated dependencies of {root}")
+        out_file = pkg_dir / "DEPENDENCIES.rust.tsv"
+        expected = normalized_report(root)
+        if not out_file.is_file():
+            print(f"Missing generated dependency report: {out_file}")
+            stale = True
+            continue
+
+        actual = out_file.read_text()
+        if actual == expected:
+            continue
+
+        stale = True
+        print(f"Stale generated dependency report: {out_file}")
+        for line in difflib.unified_diff(
+            actual.splitlines(),
+            expected.splitlines(),
+            fromfile=str(out_file.relative_to(ROOT_DIR)),
+            tofile=f"generated/{out_file.relative_to(ROOT_DIR)}",
+            lineterm="",
+        ):
+            print(line)
+
+    if stale:
+        raise RuntimeError(
+            "Generated dependency reports are stale; run "
+            "'python3 tools/dependencies.py generate'."
+        )
 
 
 def generate_single_package(root):
-    pkg_dir = ROOT_DIR / root if root != "." else ROOT_DIR
+    pkg_dir = package_dir(root)
     if (pkg_dir / "Cargo.toml").exists():
         print(f"Generating dependencies for {root}")
-        result = subprocess.run(
-            ["cargo", "deny", "list", "-f", "tsv", "-t", "0.6"],
-            cwd=pkg_dir,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"cargo deny list failed in {root}: {result.stderr or result.stdout}"
-            )
         out_file = pkg_dir / "DEPENDENCIES.rust.tsv"
-        out_file.write_text(result.stdout)
+        out_file.write_text(normalized_report(root))
         print(f"  Written to {out_file}")
     else:
         print(f"Skipping {root} as Cargo.toml does not exist")
 
 
 def generate_deps():
+    for legal_file in ("LICENSE", "NOTICE"):
+        source = ROOT_DIR / legal_file
+        packaged = ROOT_DIR / "core" / legal_file
+        packaged.write_bytes(source.read_bytes())
+        print(f"Copied {source} to {packaged}")
+
     for d in PACKAGES:
         generate_single_package(d)
 

@@ -29,15 +29,30 @@ import java.util.Map;
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
+import org.apache.arrow.c.jni.JniWrapper;
+import org.apache.arrow.c.jni.PrivateData;
+import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 public class MosaicWriter implements AutoCloseable {
 
+    @FunctionalInterface
+    interface RootArrayExporter {
+
+        void export(long address, PrivateData privateData);
+    }
+
+    private static final RootArrayExporter JNI_ROOT_ARRAY_EXPORTER =
+            (address, privateData) ->
+                    JniWrapper.get().exportArray(address, privateData);
+
     private long handle;
     private boolean closed;
     private final BufferAllocator allocator;
+    private final RootArrayExporter rootArrayExporter;
     private List<Map<String, ColumnStatistics>> rowGroupStats;
 
     public MosaicWriter(OutputStream outputStream, Schema arrowSchema, BufferAllocator allocator) {
@@ -45,7 +60,17 @@ public class MosaicWriter implements AutoCloseable {
     }
 
     public MosaicWriter(OutputStream outputStream, Schema arrowSchema, WriterOptions options, BufferAllocator allocator) {
+        this(outputStream, arrowSchema, options, allocator, JNI_ROOT_ARRAY_EXPORTER);
+    }
+
+    MosaicWriter(
+            OutputStream outputStream,
+            Schema arrowSchema,
+            WriterOptions options,
+            BufferAllocator allocator,
+            RootArrayExporter rootArrayExporter) {
         this.allocator = allocator;
+        this.rootArrayExporter = rootArrayExporter;
         try (ArrowSchema cSchema = ArrowSchema.allocateNew(allocator)) {
             try {
                 Data.exportSchema(allocator, arrowSchema, null, cSchema);
@@ -69,19 +94,175 @@ public class MosaicWriter implements AutoCloseable {
         }
     }
 
+    /**
+     * Writes an Arrow batch synchronously.
+     *
+     * <p>All top-level and nested field vectors must share one allocator root. That root may be
+     * independent from the writer allocator root; temporary Arrow C Data metadata remains charged
+     * to the writer allocator supplied at construction time. The caller retains ownership of the
+     * batch and must keep it open until this method returns.
+     *
+     * @param root batch to write
+     * @throws IllegalArgumentException if field vectors use different allocator roots
+     * @throws IllegalStateException if the writer is closed
+     */
     public void write(VectorSchemaRoot root) {
         if (closed || handle == 0) {
             throw new IllegalStateException("writer is closed");
         }
+        boolean sameAllocatorRoot = sharesWriterAllocatorRoot(root);
         try (ArrowArray arrowArray = ArrowArray.allocateNew(allocator);
              ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
             try {
-                Data.exportVectorSchemaRoot(allocator, root, null, arrowArray, arrowSchema);
+                if (sameAllocatorRoot) {
+                    Data.exportVectorSchemaRoot(
+                            allocator, root, null, arrowArray, arrowSchema);
+                } else {
+                    Data.exportSchema(allocator, root.getSchema(), null, arrowSchema);
+                    exportCrossRootArray(
+                            allocator, root, arrowArray, rootArrayExporter);
+                }
                 NativeLib.nativeWriterWriteBatch(handle, arrowArray.memoryAddress(), arrowSchema.memoryAddress());
             } finally {
                 releaseExported(arrowArray);
                 releaseExported(arrowSchema);
             }
+        } catch (Throwable failure) {
+            throw propagateNativeFailure("write batch failed", failure);
+        }
+    }
+
+    private static void exportCrossRootArray(
+            BufferAllocator exportAllocator,
+            VectorSchemaRoot root,
+            ArrowArray arrowArray,
+            RootArrayExporter rootArrayExporter) {
+        // Data.exportVectorSchemaRoot reloads every field into a temporary StructVector. If that
+        // reload fails before the root ArrowArray owns a release callback, Arrow 15 can retain
+        // already-associated input buffers. Export each child directly instead: input buffers are
+        // retained without being associated with the writer allocator, while temporary C Data
+        // metadata remains charged to that allocator.
+        RootArrayPrivateData privateData = new RootArrayPrivateData();
+        try {
+            privateData.bufferPointers = exportAllocator.buffer(Long.BYTES);
+            privateData.bufferPointers.writeLong(0L);
+
+            List<FieldVector> vectors = root.getFieldVectors();
+            if (!vectors.isEmpty()) {
+                privateData.childPointers =
+                        exportAllocator.buffer((long) vectors.size() * Long.BYTES);
+                for (int i = 0; i < vectors.size(); i++) {
+                    ArrowArray child = ArrowArray.allocateNew(exportAllocator);
+                    privateData.children.add(child);
+                    privateData.childPointers.writeLong(child.memoryAddress());
+                }
+                for (int i = 0; i < vectors.size(); i++) {
+                    Data.exportVector(
+                            exportAllocator, vectors.get(i), null, privateData.children.get(i));
+                }
+            }
+
+            ArrowArray.Snapshot snapshot = new ArrowArray.Snapshot();
+            snapshot.length = root.getRowCount();
+            snapshot.null_count = 0;
+            snapshot.offset = 0;
+            snapshot.n_buffers = 1;
+            snapshot.n_children = vectors.size();
+            snapshot.buffers = privateData.bufferPointers.memoryAddress();
+            snapshot.children =
+                    privateData.childPointers == null
+                            ? 0
+                            : privateData.childPointers.memoryAddress();
+            snapshot.dictionary = 0;
+            snapshot.release = 0;
+            arrowArray.save(snapshot);
+            rootArrayExporter.export(arrowArray.memoryAddress(), privateData);
+        } catch (RuntimeException | Error failure) {
+            if (arrowArray.snapshot().release != 0) {
+                // Arrow 15 may install the root callback even when NewGlobalRef leaves a pending
+                // OutOfMemoryError. Once installed, that callback owns child traversal, so keep
+                // the child pointer table alive until the callback has run.
+                try {
+                    arrowArray.release();
+                } catch (RuntimeException | Error cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+                if (arrowArray.snapshot().release == 0) {
+                    try {
+                        privateData.close();
+                    } catch (RuntimeException | Error cleanupFailure) {
+                        failure.addSuppressed(cleanupFailure);
+                    }
+                }
+            } else {
+                privateData.abort(failure);
+            }
+            throw failure;
+        }
+    }
+
+    private static final class RootArrayPrivateData implements PrivateData {
+
+        private ArrowBuf bufferPointers;
+        private ArrowBuf childPointers;
+        private final List<ArrowArray> children = new ArrayList<>();
+
+        private void abort(Throwable failure) {
+            for (ArrowArray child : children) {
+                try {
+                    releaseExported(child);
+                } catch (RuntimeException | Error cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+            try {
+                close();
+            } catch (RuntimeException | Error cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+        }
+
+        @Override
+        public void close() {
+            if (bufferPointers != null) {
+                bufferPointers.close();
+                bufferPointers = null;
+            }
+            if (childPointers != null) {
+                childPointers.close();
+                childPointers = null;
+            }
+            for (ArrowArray child : children) {
+                child.close();
+            }
+            children.clear();
+        }
+    }
+
+    private boolean sharesWriterAllocatorRoot(VectorSchemaRoot root) {
+        List<FieldVector> vectors = root.getFieldVectors();
+        if (vectors.isEmpty()) {
+            return true;
+        }
+
+        BufferAllocator inputRoot = vectors.get(0).getAllocator().getRoot();
+        for (FieldVector vector : vectors) {
+            validateAllocatorRoot(vector, inputRoot, vector.getField().getName());
+        }
+        return inputRoot == allocator.getRoot();
+    }
+
+    private static void validateAllocatorRoot(
+            FieldVector vector, BufferAllocator expectedRoot, String fieldPath) {
+        if (vector.getAllocator().getRoot() != expectedRoot) {
+            throw new IllegalArgumentException(
+                    "All field vectors must share the same allocator root; field '"
+                            + fieldPath
+                            + "' uses a different root");
+        }
+        for (FieldVector child : vector.getChildrenFromFields()) {
+            validateAllocatorRoot(
+                    child, expectedRoot, fieldPath + "." + child.getField().getName());
         }
     }
 
@@ -95,6 +276,17 @@ public class MosaicWriter implements AutoCloseable {
         if (array.snapshot().release != 0) {
             array.release();
         }
+    }
+
+    private static RuntimeException propagateNativeFailure(
+            String message, Throwable failure) {
+        if (failure instanceof RuntimeException) {
+            return (RuntimeException) failure;
+        }
+        if (failure instanceof Error) {
+            throw (Error) failure;
+        }
+        return new RuntimeException(message, failure);
     }
 
     public long estimatedFileSize() {
@@ -125,6 +317,8 @@ public class MosaicWriter implements AutoCloseable {
             try {
                 NativeLib.nativeWriterClose(handle);
                 collectStatistics();
+            } catch (Throwable failure) {
+                throw propagateNativeFailure("close failed", failure);
             } finally {
                 NativeLib.nativeWriterFree(handle);
                 handle = 0;

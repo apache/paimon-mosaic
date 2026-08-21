@@ -16,16 +16,341 @@
 // under the License.
 
 use std::io;
+use std::mem::size_of;
 use std::sync::Arc;
 
 use arrow_array::*;
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, TimeUnit};
 
+use crate::reader::Encoding;
 use crate::spec::*;
 use crate::types;
 use crate::values::Value;
 use crate::varint;
+
+/// Borrowed view of one encoded scalar column.
+///
+/// The view borrows buffers owned by a [`crate::reader::RowGroupReader`] and must be consumed
+/// synchronously during [`crate::reader::RowGroupReader::visit_encoded_columns`]. It exposes the
+/// physical encoding without first materializing an Arrow array.
+#[derive(Clone, Copy)]
+pub struct EncodedColumn<'a> {
+    data_type: &'a DataType,
+    encoding: u8,
+    has_nulls: bool,
+    null_bitmap: &'a [u8],
+    const_value: &'a Value,
+    dict_values: &'a [Value],
+    dict_bit_width: usize,
+    data: &'a [u8],
+    data_cursor: usize,
+    num_rows: usize,
+}
+
+impl<'a> EncodedColumn<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        data_type: &'a DataType,
+        encoding: u8,
+        has_nulls: bool,
+        null_bitmap: &'a [u8],
+        const_value: &'a Value,
+        dict_values: &'a [Value],
+        dict_bit_width: usize,
+        data: &'a [u8],
+        data_cursor: usize,
+        num_rows: usize,
+    ) -> Self {
+        Self {
+            data_type,
+            encoding,
+            has_nulls,
+            null_bitmap,
+            const_value,
+            dict_values,
+            dict_bit_width,
+            data,
+            data_cursor,
+            num_rows,
+        }
+    }
+
+    pub fn data_type(&self) -> &DataType {
+        self.data_type
+    }
+
+    /// Returns the physical encoding used by this column.
+    pub fn encoding(&self) -> Encoding {
+        Encoding::from_code(self.encoding)
+    }
+
+    /// Returns the logical row count.
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    /// Returns whether at least one row is null.
+    pub fn has_nulls(&self) -> bool {
+        self.has_nulls || self.encoding == ENCODING_ALL_NULL
+    }
+
+    /// Returns the physical null bitmap when one is present.
+    ///
+    /// A set bit means that the corresponding row is null.
+    pub fn null_bitmap(&self) -> Option<&'a [u8]> {
+        self.has_nulls.then_some(self.null_bitmap)
+    }
+
+    /// Returns whether `row` is null.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `row >= self.num_rows()`.
+    pub fn is_null(&self, row: usize) -> bool {
+        assert!(row < self.num_rows, "encoded column row out of bounds");
+        self.encoding == ENCODING_ALL_NULL || (self.has_nulls && is_null(self.null_bitmap, row))
+    }
+
+    /// Returns the single encoded value for a CONST column.
+    pub fn constant(&self) -> io::Result<Option<EncodedValueRef<'a>>> {
+        if self.encoding != ENCODING_CONST {
+            return Ok(None);
+        }
+        encoded_value_ref(self.data_type, self.const_value).map(Some)
+    }
+
+    /// Iterates values in logical row order without materializing an Arrow array.
+    ///
+    /// Null rows are returned as [`EncodedValueRef::Null`]. Dictionary indexes and PLAIN values
+    /// are decoded lazily as the iterator advances.
+    pub fn values(&self) -> EncodedColumnValues<'a> {
+        EncodedColumnValues {
+            column: *self,
+            row: 0,
+            data_cursor: self.data_cursor,
+            bit_offset: 0,
+            done: false,
+        }
+    }
+}
+
+/// Borrowed scalar value returned by [`EncodedColumnValues`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum EncodedValueRef<'a> {
+    Null,
+    Boolean(bool),
+    Int8(i8),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    Float32(f32),
+    Float64(f64),
+    Utf8(&'a [u8]),
+    Binary(&'a [u8]),
+    DecimalCompact(i64),
+    DecimalLarge(&'a [u8]),
+    Date32(i32),
+    Time32(i32),
+    TimestampMillis(i64),
+    TimestampMicros(i64),
+    TimestampNanos { millis: i64, nanos_of_milli: i32 },
+}
+
+/// Iterator over an [`EncodedColumn`] in logical row order.
+pub struct EncodedColumnValues<'a> {
+    column: EncodedColumn<'a>,
+    row: usize,
+    data_cursor: usize,
+    bit_offset: usize,
+    done: bool,
+}
+
+impl<'a> Iterator for EncodedColumnValues<'a> {
+    type Item = io::Result<EncodedValueRef<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.row >= self.column.num_rows {
+            return None;
+        }
+
+        let row = self.row;
+        self.row += 1;
+        if self.column.is_null(row) {
+            return Some(Ok(EncodedValueRef::Null));
+        }
+
+        let value = match self.column.encoding {
+            ENCODING_CONST => encoded_value_ref(self.column.data_type, self.column.const_value),
+            ENCODING_DICT => read_bit_packed_checked(
+                self.column.data,
+                self.column.data_cursor,
+                self.bit_offset,
+                self.column.dict_bit_width,
+            )
+            .and_then(|index| {
+                self.bit_offset += self.column.dict_bit_width;
+                self.column
+                    .dict_values
+                    .get(index)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupt dict index"))
+                    .and_then(|value| encoded_value_ref(self.column.data_type, value))
+            }),
+            ENCODING_PLAIN => {
+                let result =
+                    read_encoded_value(self.column.data_type, self.column.data, self.data_cursor);
+                if let Ok((_, size)) = result {
+                    self.data_cursor += size;
+                }
+                result.map(|(value, _)| value)
+            }
+            ENCODING_ALL_NULL => Ok(EncodedValueRef::Null),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported encoding {}", self.column.encoding),
+            )),
+        };
+        if value.is_err() {
+            self.done = true;
+        }
+        Some(value)
+    }
+}
+
+fn encoded_value_ref<'a>(
+    data_type: &DataType,
+    value: &'a Value,
+) -> io::Result<EncodedValueRef<'a>> {
+    let value = match value {
+        Value::Null => EncodedValueRef::Null,
+        Value::Boolean(value) => EncodedValueRef::Boolean(*value),
+        Value::TinyInt(value) => EncodedValueRef::Int8(*value),
+        Value::SmallInt(value) => EncodedValueRef::Int16(*value),
+        Value::Integer(value) => EncodedValueRef::Int32(*value),
+        Value::BigInt(value) => EncodedValueRef::Int64(*value),
+        Value::Float(value) => EncodedValueRef::Float32(*value),
+        Value::Double(value) => EncodedValueRef::Float64(*value),
+        Value::Date(value) => EncodedValueRef::Date32(*value),
+        Value::Time(value) => EncodedValueRef::Time32(*value),
+        Value::String(value) => EncodedValueRef::Utf8(value),
+        Value::Bytes(value) => EncodedValueRef::Binary(value),
+        Value::DecimalCompact(value) => EncodedValueRef::DecimalCompact(*value),
+        Value::DecimalLarge(value) => EncodedValueRef::DecimalLarge(value),
+        Value::TimestampMillis(value) => EncodedValueRef::TimestampMillis(*value),
+        Value::TimestampMicros(value) => EncodedValueRef::TimestampMicros(*value),
+        Value::TimestampNanos {
+            millis,
+            nanos_of_milli,
+        } => EncodedValueRef::TimestampNanos {
+            millis: *millis,
+            nanos_of_milli: *nanos_of_milli,
+        },
+    };
+    validate_encoded_value(data_type, value)
+}
+
+fn validate_encoded_value<'a>(
+    data_type: &DataType,
+    value: EncodedValueRef<'a>,
+) -> io::Result<EncodedValueRef<'a>> {
+    if let EncodedValueRef::TimestampNanos {
+        millis,
+        nanos_of_milli,
+    } = value
+    {
+        if types::is_timestamp_nanos(data_type) {
+            types::millis_nanos_to_ns(millis, nanos_of_milli)?;
+        }
+    }
+    Ok(value)
+}
+
+fn read_encoded_value<'a>(
+    data_type: &DataType,
+    data: &'a [u8],
+    position: usize,
+) -> io::Result<(EncodedValueRef<'a>, usize)> {
+    let width = types::fixed_width(data_type);
+    if width <= 0 {
+        let mut payload = position;
+        let length = varint::decode(data, &mut payload).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated varint in variable-length value",
+            )
+        })? as usize;
+        let end = payload
+            .checked_add(length)
+            .filter(|end| *end <= data.len())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "buffer truncated in variable-length value",
+                )
+            })?;
+        let value = match data_type {
+            DataType::Utf8 => EncodedValueRef::Utf8(&data[payload..end]),
+            DataType::Binary => EncodedValueRef::Binary(&data[payload..end]),
+            DataType::Decimal128(_, _) => EncodedValueRef::DecimalLarge(&data[payload..end]),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported encoded data type: {data_type:?}"),
+                ));
+            }
+        };
+        return Ok((value, end - position));
+    }
+
+    let width = width as usize;
+    let end = position
+        .checked_add(width)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "column data truncated"))?;
+    let bytes = &data[position..end];
+    let value = match data_type {
+        DataType::Boolean => EncodedValueRef::Boolean(bytes[0] != 0),
+        DataType::Int8 => EncodedValueRef::Int8(bytes[0] as i8),
+        DataType::Int16 => EncodedValueRef::Int16(i16::from_be_bytes([bytes[0], bytes[1]])),
+        DataType::Int32 => {
+            EncodedValueRef::Int32(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        DataType::Date32 => {
+            EncodedValueRef::Date32(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        DataType::Time32(_) => {
+            EncodedValueRef::Time32(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        DataType::Float32 => EncodedValueRef::Float32(f32::from_bits(u32::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))),
+        DataType::Int64 => EncodedValueRef::Int64(read_i64(data, position)),
+        DataType::Float64 => EncodedValueRef::Float64(f64::from_bits(read_u64(data, position))),
+        DataType::Decimal128(_, _) => EncodedValueRef::DecimalCompact(read_i64(data, position)),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            EncodedValueRef::TimestampMillis(read_i64(data, position))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            EncodedValueRef::TimestampMicros(read_i64(data, position))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) | DataType::Struct(_)
+            if types::is_timestamp_nanos(data_type) =>
+        {
+            EncodedValueRef::TimestampNanos {
+                millis: read_i64(data, position),
+                nanos_of_milli: i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            }
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported encoded data type: {data_type:?}"),
+            ));
+        }
+    };
+    validate_encoded_value(data_type, value).map(|value| (value, width))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataVariant {
@@ -59,6 +384,59 @@ fn data_variant_for_type(dt: &DataType) -> DataVariant {
         dt if types::is_timestamp_nanos(dt) => DataVariant::TimestampNanos,
         DataType::Timestamp(_, _) => DataVariant::Int64,
         _ => DataVariant::Binary,
+    }
+}
+
+fn const_values_are_row_aligned(variant: DataVariant) -> bool {
+    match variant {
+        DataVariant::Boolean
+        | DataVariant::Int8
+        | DataVariant::Int16
+        | DataVariant::Int32
+        | DataVariant::Int64
+        | DataVariant::Float32
+        | DataVariant::Float64
+        | DataVariant::TimestampNanos => true,
+        DataVariant::Binary => false,
+    }
+}
+
+const CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstFillStrategy {
+    All,
+    NonNullOnly,
+    BulkFillIfAllPagesTouched,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstOutputLayout {
+    FixedWidth { bytes_per_row: usize },
+    BitPackedBoolean,
+}
+
+impl ConstOutputLayout {
+    fn row_range_for_bytes(
+        self,
+        start_byte: usize,
+        end_byte: usize,
+        num_rows: usize,
+    ) -> (usize, usize) {
+        debug_assert!(start_byte < end_byte);
+        match self {
+            Self::FixedWidth { bytes_per_row } => {
+                debug_assert!(bytes_per_row > 0);
+                (
+                    start_byte / bytes_per_row,
+                    end_byte.div_ceil(bytes_per_row).min(num_rows),
+                )
+            }
+            Self::BitPackedBoolean => (
+                start_byte.saturating_mul(8).min(num_rows),
+                end_byte.saturating_mul(8).min(num_rows),
+            ),
+        }
     }
 }
 
@@ -116,6 +494,280 @@ fn empty_raw_data_for_type(dt: &DataType) -> RawColumnData {
 
 fn invert_bitmap(bitmap: &[u8]) -> Vec<u8> {
     bitmap.iter().map(|b| !b).collect()
+}
+
+fn for_each_non_null(null_bitmap: &[u8], num_rows: usize, mut f: impl FnMut(usize)) {
+    for (byte_index, &nulls) in null_bitmap.iter().enumerate() {
+        let row_base = byte_index * 8;
+        if row_base >= num_rows {
+            break;
+        }
+
+        let rows_in_byte = (num_rows - row_base).min(8);
+        let row_mask = if rows_in_byte == 8 {
+            u8::MAX
+        } else {
+            (1u8 << rows_in_byte) - 1
+        };
+        let mut non_nulls = !nulls & row_mask;
+        while non_nulls != 0 {
+            let bit = non_nulls.trailing_zeros() as usize;
+            f(row_base + bit);
+            non_nulls &= non_nulls - 1;
+        }
+    }
+}
+
+fn row_range_has_non_null(null_bitmap: &[u8], start_row: usize, end_row: usize) -> bool {
+    if start_row >= end_row {
+        return false;
+    }
+
+    let first_byte = start_row / 8;
+    let last_byte = (end_row - 1) / 8;
+    let first_bit = start_row % 8;
+    let end_bit = end_row % 8;
+
+    if first_byte == last_byte {
+        let end_mask = if end_bit == 0 {
+            u8::MAX
+        } else {
+            (1u8 << end_bit) - 1
+        };
+        let row_mask = end_mask & (u8::MAX << first_bit);
+        return (!null_bitmap[first_byte] & row_mask) != 0;
+    }
+
+    let mut full_start = first_byte;
+    if first_bit != 0 {
+        if (!null_bitmap[first_byte] & (u8::MAX << first_bit)) != 0 {
+            return true;
+        }
+        full_start += 1;
+    }
+
+    let full_end = if end_bit == 0 {
+        last_byte + 1
+    } else {
+        last_byte
+    };
+    if null_bitmap[full_start..full_end]
+        .iter()
+        .any(|&nulls| nulls != u8::MAX)
+    {
+        return true;
+    }
+
+    end_bit != 0 && (!null_bitmap[last_byte] & ((1u8 << end_bit) - 1)) != 0
+}
+
+fn for_each_non_null_row_run(null_bitmap: &[u8], num_rows: usize, mut f: impl FnMut(usize, usize)) {
+    let mut run_start = None;
+    let mut run_end = 0;
+    for_each_non_null(null_bitmap, num_rows, |row| match run_start {
+        None => {
+            run_start = Some(row);
+            run_end = row + 1;
+        }
+        Some(_) if row == run_end => run_end += 1,
+        Some(_) => {
+            if let Some(start) = run_start.replace(row) {
+                f(start, run_end);
+            }
+            run_end = row + 1;
+        }
+    });
+    if let Some(start) = run_start {
+        f(start, run_end);
+    }
+}
+
+fn system_page_size() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        static PAGE_SIZE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        *PAGE_SIZE.get_or_init(|| {
+            // SAFETY: sysconf with _SC_PAGESIZE has no pointer arguments or caller-owned state.
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            (page_size > 0).then_some(page_size as usize)
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn all_output_pages_touched(
+    null_bitmap: &[u8],
+    num_rows: usize,
+    output_addr: usize,
+    output_len_bytes: usize,
+    page_size: usize,
+    layout: ConstOutputLayout,
+) -> bool {
+    if output_len_bytes == 0 || page_size == 0 {
+        return false;
+    }
+    let Some(output_end) = output_addr.checked_add(output_len_bytes) else {
+        return false;
+    };
+
+    let mut page_start = output_addr - output_addr % page_size;
+    loop {
+        let Some(next_page) = page_start.checked_add(page_size) else {
+            return false;
+        };
+        let start_byte = page_start.max(output_addr) - output_addr;
+        let end_byte = next_page.min(output_end) - output_addr;
+        let (start_row, end_row) = layout.row_range_for_bytes(start_byte, end_byte, num_rows);
+        if !row_range_has_non_null(null_bitmap, start_row, end_row) {
+            return false;
+        }
+
+        if next_page >= output_end {
+            return true;
+        }
+        page_start = next_page;
+    }
+}
+
+fn const_fill_strategy(
+    has_nulls: bool,
+    non_null_count: usize,
+    num_rows: usize,
+) -> ConstFillStrategy {
+    if !has_nulls || non_null_count == num_rows {
+        ConstFillStrategy::All
+    } else if non_null_count < num_rows.div_ceil(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR) {
+        ConstFillStrategy::NonNullOnly
+    } else {
+        ConstFillStrategy::BulkFillIfAllPagesTouched
+    }
+}
+
+trait ConstMaterializeValue: Default + Copy {
+    fn has_default_bit_pattern(self) -> bool;
+}
+
+macro_rules! impl_const_materialize_integer {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl ConstMaterializeValue for $ty {
+                fn has_default_bit_pattern(self) -> bool {
+                    self == 0
+                }
+            }
+        )+
+    };
+}
+
+impl_const_materialize_integer!(i8, i16, i32, i64);
+
+impl ConstMaterializeValue for f32 {
+    fn has_default_bit_pattern(self) -> bool {
+        self.to_bits() == 0
+    }
+}
+
+impl ConstMaterializeValue for f64 {
+    fn has_default_bit_pattern(self) -> bool {
+        self.to_bits() == 0
+    }
+}
+
+fn materialize_fixed_const<T: ConstMaterializeValue>(
+    value: T,
+    num_rows: usize,
+    strategy: ConstFillStrategy,
+    null_bitmap: &[u8],
+) -> Vec<T> {
+    if strategy == ConstFillStrategy::All {
+        return vec![value; num_rows];
+    }
+
+    let mut out = vec![T::default(); num_rows];
+    if value.has_default_bit_pattern() {
+        return out;
+    }
+
+    if strategy == ConstFillStrategy::BulkFillIfAllPagesTouched {
+        if let Some(page_size) = system_page_size() {
+            let output_len_bytes = out.len() * size_of::<T>();
+            if all_output_pages_touched(
+                null_bitmap,
+                num_rows,
+                out.as_ptr() as usize,
+                output_len_bytes,
+                page_size,
+                ConstOutputLayout::FixedWidth {
+                    bytes_per_row: size_of::<T>(),
+                },
+            ) {
+                out.fill(value);
+                return out;
+            }
+        }
+    }
+
+    match strategy {
+        ConstFillStrategy::All => unreachable!(),
+        ConstFillStrategy::NonNullOnly => {
+            for_each_non_null(null_bitmap, num_rows, |row| out[row] = value);
+        }
+        ConstFillStrategy::BulkFillIfAllPagesTouched => {
+            for_each_non_null_row_run(null_bitmap, num_rows, |start, end| {
+                out[start..end].fill(value);
+            });
+        }
+    }
+    out
+}
+
+fn materialize_boolean_const(
+    value: bool,
+    num_rows: usize,
+    strategy: ConstFillStrategy,
+    null_bitmap: &[u8],
+) -> Vec<u8> {
+    let mut out = vec![0u8; num_rows.div_ceil(8)];
+    if !value {
+        return out;
+    }
+
+    match strategy {
+        ConstFillStrategy::All => out.fill(u8::MAX),
+        ConstFillStrategy::NonNullOnly => {
+            for_each_non_null(null_bitmap, num_rows, |row| {
+                out[row / 8] |= 1 << (row % 8);
+            });
+        }
+        ConstFillStrategy::BulkFillIfAllPagesTouched => {
+            if system_page_size().is_some_and(|page_size| {
+                all_output_pages_touched(
+                    null_bitmap,
+                    num_rows,
+                    out.as_ptr() as usize,
+                    out.len(),
+                    page_size,
+                    ConstOutputLayout::BitPackedBoolean,
+                )
+            }) {
+                out.fill(u8::MAX);
+            } else {
+                for_each_non_null(null_bitmap, num_rows, |row| {
+                    out[row / 8] |= 1 << (row % 8);
+                });
+            }
+        }
+    }
+
+    if num_rows & 7 != 0 {
+        let last = out.len() - 1;
+        out[last] &= (1u8 << (num_rows % 8)) - 1;
+    }
+    out
 }
 
 fn make_null_buffer(bitmap: Option<Vec<u8>>, num_rows: usize) -> Option<NullBuffer> {
@@ -187,8 +839,34 @@ fn build_array(
     dt: &DataType,
     null_bitmap: Option<Vec<u8>>,
     num_rows: usize,
+    values_are_row_aligned: bool,
 ) -> io::Result<ArrayRef> {
+    debug_assert!(
+        !values_are_row_aligned
+            || match &data {
+                RawColumnData::Boolean(values) => values.len() == num_rows.div_ceil(8),
+                RawColumnData::Int8(values) => values.len() == num_rows,
+                RawColumnData::Int16(values) => values.len() == num_rows,
+                RawColumnData::Int32(values) => values.len() == num_rows,
+                RawColumnData::Int64(values) => values.len() == num_rows,
+                RawColumnData::Float32(values) => values.len() == num_rows,
+                RawColumnData::Float64(values) => values.len() == num_rows,
+                RawColumnData::Binary { .. } => false,
+                RawColumnData::TimestampNanos {
+                    millis,
+                    nanos_of_milli,
+                } => millis.len() == num_rows && nanos_of_milli.len() == num_rows,
+            },
+        "row-aligned CONST data must match the row cardinality"
+    );
+
     let null_buf = make_null_buffer(null_bitmap.clone(), num_rows);
+    let no_scatter = None;
+    let scatter_bitmap = if values_are_row_aligned {
+        &no_scatter
+    } else {
+        &null_bitmap
+    };
 
     Ok(match data {
         RawColumnData::Boolean(values) => {
@@ -196,15 +874,15 @@ fn build_array(
             Arc::new(BooleanArray::new(bool_buf, null_buf))
         }
         RawColumnData::Int8(values) => {
-            let scattered = scatter_fixed(values, &null_bitmap, num_rows);
+            let scattered = scatter_fixed(values, scatter_bitmap, num_rows);
             Arc::new(Int8Array::new(ScalarBuffer::from(scattered), null_buf))
         }
         RawColumnData::Int16(values) => {
-            let scattered = scatter_fixed(values, &null_bitmap, num_rows);
+            let scattered = scatter_fixed(values, scatter_bitmap, num_rows);
             Arc::new(Int16Array::new(ScalarBuffer::from(scattered), null_buf))
         }
         RawColumnData::Int32(values) => {
-            let scattered = scatter_fixed(values, &null_bitmap, num_rows);
+            let scattered = scatter_fixed(values, scatter_bitmap, num_rows);
             match dt {
                 DataType::Date32 => {
                     Arc::new(Date32Array::new(ScalarBuffer::from(scattered), null_buf))
@@ -217,7 +895,7 @@ fn build_array(
             }
         }
         RawColumnData::Int64(values) => {
-            let scattered = scatter_fixed(values, &null_bitmap, num_rows);
+            let scattered = scatter_fixed(values, scatter_bitmap, num_rows);
             match dt {
                 DataType::Decimal128(p, s) => {
                     let i128_values: Vec<i128> = scattered.iter().map(|&v| v as i128).collect();
@@ -249,16 +927,16 @@ fn build_array(
             }
         }
         RawColumnData::Float32(values) => {
-            let scattered = scatter_fixed(values, &null_bitmap, num_rows);
+            let scattered = scatter_fixed(values, scatter_bitmap, num_rows);
             Arc::new(Float32Array::new(ScalarBuffer::from(scattered), null_buf))
         }
         RawColumnData::Float64(values) => {
-            let scattered = scatter_fixed(values, &null_bitmap, num_rows);
+            let scattered = scatter_fixed(values, scatter_bitmap, num_rows);
             Arc::new(Float64Array::new(ScalarBuffer::from(scattered), null_buf))
         }
         RawColumnData::Binary { offsets, data } => {
             let (i32_offsets, out_data) =
-                scatter_binary_offsets(offsets, data, &null_bitmap, num_rows);
+                scatter_binary_offsets(offsets, data, scatter_bitmap, num_rows);
             let offset_buf = OffsetBuffer::new(ScalarBuffer::from(i32_offsets));
             match dt {
                 DataType::Utf8 => Arc::new(StringArray::new(
@@ -301,16 +979,30 @@ fn build_array(
             millis,
             nanos_of_milli,
         } => {
-            let millis_scattered = scatter_fixed(millis, &null_bitmap, num_rows);
-            let nanos_scattered = scatter_fixed(nanos_of_milli, &null_bitmap, num_rows);
+            let millis_scattered = scatter_fixed(millis, scatter_bitmap, num_rows);
+            let nanos_scattered = scatter_fixed(nanos_of_milli, scatter_bitmap, num_rows);
 
             match dt {
                 DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
-                    let values = millis_scattered
-                        .into_iter()
-                        .zip(nanos_scattered)
-                        .map(|(millis, nanos)| types::millis_nanos_to_ns(millis, nanos))
-                        .collect::<io::Result<Vec<_>>>()?;
+                    let values = match (values_are_row_aligned, null_buf.as_ref()) {
+                        (true, Some(nulls)) => millis_scattered
+                            .into_iter()
+                            .zip(nanos_scattered)
+                            .enumerate()
+                            .map(|(row, (millis, nanos))| {
+                                if nulls.is_null(row) {
+                                    Ok(0)
+                                } else {
+                                    types::millis_nanos_to_ns(millis, nanos)
+                                }
+                            })
+                            .collect::<io::Result<Vec<_>>>()?,
+                        _ => millis_scattered
+                            .into_iter()
+                            .zip(nanos_scattered)
+                            .map(|(millis, nanos)| types::millis_nanos_to_ns(millis, nanos))
+                            .collect::<io::Result<Vec<_>>>()?,
+                    };
                     let arr = TimestampNanosecondArray::new(ScalarBuffer::from(values), null_buf);
                     Arc::new(if let Some(tz) = tz {
                         arr.with_timezone(tz.clone())
@@ -549,6 +1241,30 @@ pub struct BucketReader {
 }
 
 impl BucketReader {
+    pub(crate) fn encoded_column(&self, column: usize) -> io::Result<EncodedColumn<'_>> {
+        if column >= self.total_columns {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "column index {} out of range (num_columns={})",
+                    column, self.total_columns
+                ),
+            ));
+        }
+        Ok(EncodedColumn::new(
+            &self.col_types[column],
+            self.encodings[column],
+            self.has_nulls[column],
+            &self.null_bitmaps[column],
+            &self.const_values[column],
+            &self.dict_values[column],
+            self.dict_bit_widths[column],
+            &self.data,
+            self.data_cursors[column],
+            self.col_num_rows(column),
+        ))
+    }
+
     fn col_num_rows(&self, col: usize) -> usize {
         if col < self.num_primary {
             self.num_rows
@@ -802,6 +1518,7 @@ impl BucketReader {
                 &self.col_types[i],
                 null_bitmap,
                 col_rows,
+                self.encodings[i] == ENCODING_CONST && const_values_are_row_aligned(variant),
             )?);
         }
 
@@ -832,6 +1549,21 @@ pub struct ColumnPageReader {
 }
 
 impl ColumnPageReader {
+    pub(crate) fn encoded_column(&self) -> EncodedColumn<'_> {
+        EncodedColumn::new(
+            &self.col_type,
+            self.encoding,
+            self.has_nulls,
+            &self.null_bitmap,
+            &self.const_value,
+            &self.dict_values,
+            self.dict_bit_width,
+            &self.data,
+            self.data_cursor,
+            self.num_rows,
+        )
+    }
+
     pub fn new(
         col_type: DataType,
         encoding: u8,
@@ -860,6 +1592,15 @@ impl ColumnPageReader {
         page_data_start: usize,
         num_rows: usize,
     ) -> io::Result<Self> {
+        if !matches!(
+            encoding,
+            ENCODING_PLAIN | ENCODING_CONST | ENCODING_DICT | ENCODING_ALL_NULL
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("column page: unsupported encoding {}", encoding),
+            ));
+        }
         if page_data_start > data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1073,7 +1814,13 @@ impl ColumnPageReader {
             _ => empty_raw_data_for_type(&self.col_type),
         };
 
-        build_array(data, &self.col_type, null_bitmap, num_rows)
+        build_array(
+            data,
+            &self.col_type,
+            null_bitmap,
+            num_rows,
+            self.encoding == ENCODING_CONST && const_values_are_row_aligned(variant),
+        )
     }
 }
 
@@ -1178,6 +1925,12 @@ fn read_all_const(
     } else {
         num_rows
     };
+    // Fixed-width CONST arrays are always materialized at row cardinality, so build_array can
+    // wrap them without another scatter buffer. Sparse columns write only valid positions. At
+    // ordinary densities, bulk-fill the whole buffer only when every physical page covered by the
+    // actual allocation already contains valid rows. Otherwise fill only contiguous non-null row
+    // runs so null-only pages remain untouched.
+    let fill_strategy = const_fill_strategy(has_nulls, non_null_count, num_rows);
 
     match variant {
         DataVariant::Boolean => {
@@ -1185,42 +1938,48 @@ fn read_all_const(
                 Value::Boolean(v) => *v,
                 _ => false,
             };
-            let mut buf = vec![0u8; num_rows.div_ceil(8)];
-            if b {
-                for row in 0..num_rows {
-                    if !has_nulls || !is_null(null_bitmap, row) {
-                        buf[row / 8] |= 1 << (row % 8);
-                    }
-                }
-            }
-            Ok(RawColumnData::Boolean(buf))
+            Ok(RawColumnData::Boolean(materialize_boolean_const(
+                b,
+                num_rows,
+                fill_strategy,
+                null_bitmap,
+            )))
         }
         DataVariant::Int8 => {
             let v = match const_value {
                 Value::TinyInt(x) => *x,
                 _ => 0,
             };
-            let mut out = vec![0i8; non_null_count];
-            out.fill(v);
-            Ok(RawColumnData::Int8(out))
+            Ok(RawColumnData::Int8(materialize_fixed_const(
+                v,
+                num_rows,
+                fill_strategy,
+                null_bitmap,
+            )))
         }
         DataVariant::Int16 => {
             let v = match const_value {
                 Value::SmallInt(x) => *x,
                 _ => 0,
             };
-            let mut out = vec![0i16; non_null_count];
-            out.fill(v);
-            Ok(RawColumnData::Int16(out))
+            Ok(RawColumnData::Int16(materialize_fixed_const(
+                v,
+                num_rows,
+                fill_strategy,
+                null_bitmap,
+            )))
         }
         DataVariant::Int32 => {
             let v = match const_value {
                 Value::Integer(x) | Value::Date(x) | Value::Time(x) => *x,
                 _ => 0,
             };
-            let mut out = vec![0i32; non_null_count];
-            out.fill(v);
-            Ok(RawColumnData::Int32(out))
+            Ok(RawColumnData::Int32(materialize_fixed_const(
+                v,
+                num_rows,
+                fill_strategy,
+                null_bitmap,
+            )))
         }
         DataVariant::Int64 => {
             let v = match const_value {
@@ -1230,27 +1989,36 @@ fn read_all_const(
                 | Value::TimestampMicros(x) => *x,
                 _ => 0,
             };
-            let mut out = vec![0i64; non_null_count];
-            out.fill(v);
-            Ok(RawColumnData::Int64(out))
+            Ok(RawColumnData::Int64(materialize_fixed_const(
+                v,
+                num_rows,
+                fill_strategy,
+                null_bitmap,
+            )))
         }
         DataVariant::Float32 => {
             let v = match const_value {
                 Value::Float(x) => *x,
                 _ => 0.0,
             };
-            let mut out = vec![0.0f32; non_null_count];
-            out.fill(v);
-            Ok(RawColumnData::Float32(out))
+            Ok(RawColumnData::Float32(materialize_fixed_const(
+                v,
+                num_rows,
+                fill_strategy,
+                null_bitmap,
+            )))
         }
         DataVariant::Float64 => {
             let v = match const_value {
                 Value::Double(x) => *x,
                 _ => 0.0,
             };
-            let mut out = vec![0.0f64; non_null_count];
-            out.fill(v);
-            Ok(RawColumnData::Float64(out))
+            Ok(RawColumnData::Float64(materialize_fixed_const(
+                v,
+                num_rows,
+                fill_strategy,
+                null_bitmap,
+            )))
         }
         DataVariant::Binary => {
             let bytes = match const_value {
@@ -1274,13 +2042,9 @@ fn read_all_const(
                 } => (*millis, *nanos_of_milli),
                 _ => (0, 0),
             };
-            let mut millis_out = vec![0i64; non_null_count];
-            let mut nanos_out = vec![0i32; non_null_count];
-            millis_out.fill(m);
-            nanos_out.fill(n);
             Ok(RawColumnData::TimestampNanos {
-                millis: millis_out,
-                nanos_of_milli: nanos_out,
+                millis: materialize_fixed_const(m, num_rows, fill_strategy, null_bitmap),
+                nanos_of_milli: materialize_fixed_const(n, num_rows, fill_strategy, null_bitmap),
             })
         }
     }
@@ -1604,6 +2368,23 @@ fn read_bit_packed(buf: &[u8], byte_base: usize, bit_offset: usize, bit_width: u
     value
 }
 
+fn read_bit_packed_checked(
+    buf: &[u8],
+    byte_base: usize,
+    bit_offset: usize,
+    bit_width: usize,
+) -> io::Result<usize> {
+    let bit_end = bit_offset
+        .checked_add(bit_width)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "dict index offset overflow"))?;
+    let byte_end = byte_base
+        .checked_add(bit_end.div_ceil(8))
+        .filter(|end| *end <= buf.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated dict indexes"))?;
+    let _ = byte_end;
+    Ok(read_bit_packed(buf, byte_base, bit_offset, bit_width))
+}
+
 fn bit_width(num_entries: usize) -> usize {
     if num_entries <= 1 {
         return 0;
@@ -1635,4 +2416,560 @@ fn read_u64(buf: &[u8], pos: usize) -> u64 {
         buf[pos + 6],
         buf[pos + 7],
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn null_bitmap(num_rows: usize, non_null_rows: &[usize]) -> Vec<u8> {
+        let mut bitmap = vec![u8::MAX; num_rows.div_ceil(8)];
+        for &row in non_null_rows {
+            bitmap[row / 8] &= !(1 << (row % 8));
+        }
+        bitmap
+    }
+
+    fn test_page_size() -> usize {
+        system_page_size().unwrap_or(4096)
+    }
+
+    #[test]
+    fn test_sparse_fixed_const_writes_only_non_null_slots() {
+        let num_rows = 32;
+        let bitmap = null_bitmap(num_rows, &[0, 31]);
+        let data = read_all_const(
+            &Value::BigInt(42),
+            num_rows,
+            true,
+            &bitmap,
+            DataVariant::Int64,
+        )
+        .unwrap();
+
+        let RawColumnData::Int64(values) = data else {
+            panic!("expected Int64 CONST data");
+        };
+        assert_eq!(values.len(), num_rows);
+        assert_eq!(values[0], 42);
+        assert_eq!(values[31], 42);
+        assert!(values[1..31].iter().all(|&value| value == 0));
+    }
+
+    #[test]
+    fn test_dense_fixed_const_values_are_row_aligned() {
+        let num_rows = 32;
+        let non_null_rows = (0..24).collect::<Vec<_>>();
+        let bitmap = null_bitmap(num_rows, &non_null_rows);
+        let data = read_all_const(
+            &Value::BigInt(42),
+            num_rows,
+            true,
+            &bitmap,
+            DataVariant::Int64,
+        )
+        .unwrap();
+
+        let RawColumnData::Int64(values) = data else {
+            panic!("expected Int64 CONST data");
+        };
+        assert_eq!(values.len(), num_rows);
+        for row in non_null_rows {
+            assert_eq!(values[row], 42);
+        }
+    }
+
+    #[test]
+    fn test_interleaved_const_chunks_write_only_non_null_runs() {
+        let rows_per_chunk = test_page_size() / size_of::<i64>();
+        let num_rows = rows_per_chunk * 4;
+        let non_null_rows = [0, 2]
+            .into_iter()
+            .flat_map(|chunk| {
+                let start = chunk * rows_per_chunk;
+                start..start + rows_per_chunk / 4
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            non_null_rows.len(),
+            num_rows.div_ceil(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR)
+        );
+        let bitmap = null_bitmap(num_rows, &non_null_rows);
+        let data = read_all_const(
+            &Value::BigInt(42),
+            num_rows,
+            true,
+            &bitmap,
+            DataVariant::Int64,
+        )
+        .unwrap();
+
+        let RawColumnData::Int64(values) = data else {
+            panic!("expected Int64 CONST data");
+        };
+        for (row, value) in values.into_iter().enumerate() {
+            let chunk = row / rows_per_chunk;
+            let row_in_chunk = row % rows_per_chunk;
+            let expected = chunk & 1 == 0 && row_in_chunk < rows_per_chunk / 4;
+            assert_eq!(value, if expected { 42 } else { 0 }, "row {row}");
+        }
+    }
+
+    #[test]
+    fn test_clustered_const_at_density_cutoff_fills_only_non_null_runs() {
+        let rows_per_chunk = test_page_size() / size_of::<i64>();
+        let num_rows = rows_per_chunk * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
+        let non_null_rows = (0..rows_per_chunk).collect::<Vec<_>>();
+        let bitmap = null_bitmap(num_rows, &non_null_rows);
+        let data = read_all_const(
+            &Value::BigInt(42),
+            num_rows,
+            true,
+            &bitmap,
+            DataVariant::Int64,
+        )
+        .unwrap();
+
+        let RawColumnData::Int64(values) = data else {
+            panic!("expected Int64 CONST data");
+        };
+        assert!(values[..rows_per_chunk].iter().all(|&value| value == 42));
+        assert!(values[rows_per_chunk..].iter().all(|&value| value == 0));
+    }
+
+    #[test]
+    fn test_distributed_const_at_density_cutoff_preserves_valid_values() {
+        let rows_per_chunk = test_page_size() / size_of::<i64>();
+        let num_rows = rows_per_chunk * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
+        let non_null_rows = (0..num_rows)
+            .step_by(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR)
+            .collect::<Vec<_>>();
+        let bitmap = null_bitmap(num_rows, &non_null_rows);
+        let data = read_all_const(
+            &Value::BigInt(42),
+            num_rows,
+            true,
+            &bitmap,
+            DataVariant::Int64,
+        )
+        .unwrap();
+
+        let RawColumnData::Int64(values) = data else {
+            panic!("expected Int64 CONST data");
+        };
+        assert_eq!(values.len(), num_rows);
+        for row in non_null_rows {
+            assert_eq!(values[row], 42);
+        }
+    }
+
+    #[test]
+    fn test_output_page_coverage_distinguishes_distributed_and_clustered_values() {
+        let page_size = 4096;
+        let rows_per_page = page_size / size_of::<i64>();
+        let num_rows = rows_per_page * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
+        let output_addr = 0;
+        let output_len_bytes = num_rows * size_of::<i64>();
+        let layout = ConstOutputLayout::FixedWidth {
+            bytes_per_row: size_of::<i64>(),
+        };
+
+        let distributed_rows = (0..num_rows)
+            .step_by(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR)
+            .collect::<Vec<_>>();
+        let distributed_bitmap = null_bitmap(num_rows, &distributed_rows);
+        assert!(all_output_pages_touched(
+            &distributed_bitmap,
+            num_rows,
+            output_addr,
+            output_len_bytes,
+            page_size,
+            layout,
+        ));
+
+        let clustered_rows = (0..rows_per_page).collect::<Vec<_>>();
+        let clustered_bitmap = null_bitmap(num_rows, &clustered_rows);
+        assert!(!all_output_pages_touched(
+            &clustered_bitmap,
+            num_rows,
+            output_addr,
+            output_len_bytes,
+            page_size,
+            layout,
+        ));
+    }
+
+    #[test]
+    fn test_page_coverage_accounts_for_allocation_offset() {
+        let page_size = 4096;
+        let rows_per_chunk = page_size / size_of::<i64>();
+        let num_rows = rows_per_chunk * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
+        let non_null_rows = (0..CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR / 2)
+            .flat_map(|pair| {
+                let even_chunk_start = pair * 2 * rows_per_chunk;
+                let odd_chunk_end = even_chunk_start + 2 * rows_per_chunk;
+                (even_chunk_start..even_chunk_start + 127).chain(std::iter::once(odd_chunk_end - 1))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            non_null_rows.len(),
+            num_rows.div_ceil(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR)
+        );
+        let bitmap = null_bitmap(num_rows, &non_null_rows);
+        for chunk_start in (0..num_rows).step_by(rows_per_chunk) {
+            assert!(row_range_has_non_null(
+                &bitmap,
+                chunk_start,
+                (chunk_start + rows_per_chunk).min(num_rows)
+            ));
+        }
+
+        let layout = ConstOutputLayout::FixedWidth {
+            bytes_per_row: size_of::<i64>(),
+        };
+        let output_len_bytes = num_rows * size_of::<i64>();
+        assert!(all_output_pages_touched(
+            &bitmap,
+            num_rows,
+            0,
+            output_len_bytes,
+            page_size,
+            layout,
+        ));
+        assert!(!all_output_pages_touched(
+            &bitmap,
+            num_rows,
+            16,
+            output_len_bytes,
+            page_size,
+            layout,
+        ));
+    }
+
+    #[test]
+    fn test_page_coverage_ignores_trailing_bitmap_bits() {
+        let page_size = 4096;
+        let rows_per_page = page_size / size_of::<i64>();
+        let num_rows = rows_per_page + 1;
+        let non_null_rows = (0..num_rows.div_ceil(8)).collect::<Vec<_>>();
+        let mut bitmap = null_bitmap(num_rows, &non_null_rows);
+        bitmap[num_rows / 8] = 0b0000_0001;
+
+        assert!(!all_output_pages_touched(
+            &bitmap,
+            num_rows,
+            0,
+            num_rows * size_of::<i64>(),
+            page_size,
+            ConstOutputLayout::FixedWidth {
+                bytes_per_row: size_of::<i64>(),
+            },
+        ));
+    }
+
+    #[test]
+    fn test_boolean_fallback_respects_non_null_and_bitmap_boundaries() {
+        let rows_per_chunk = test_page_size() * 8;
+        let num_rows = rows_per_chunk * 2 + 1;
+        let non_null_rows = (0..num_rows.div_ceil(8)).collect::<Vec<_>>();
+        let mut bitmap = null_bitmap(num_rows, &non_null_rows);
+        bitmap[num_rows / 8] = 0b0000_0001;
+        let data = read_all_const(
+            &Value::Boolean(true),
+            num_rows,
+            true,
+            &bitmap,
+            DataVariant::Boolean,
+        )
+        .unwrap();
+
+        let RawColumnData::Boolean(values) = data else {
+            panic!("expected Boolean CONST data");
+        };
+        for row in 0..num_rows {
+            let value = values[row / 8] & (1 << (row % 8)) != 0;
+            assert_eq!(value, row < non_null_rows.len(), "row {row}");
+        }
+    }
+
+    #[test]
+    fn test_timestamp_nanos_uses_each_buffer_element_width() {
+        let page_size = test_page_size();
+        let millis_rows_per_chunk = page_size / size_of::<i64>();
+        let nanos_rows_per_chunk = page_size / size_of::<i32>();
+        let num_rows = millis_rows_per_chunk * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
+        let non_null_rows = (millis_rows_per_chunk..nanos_rows_per_chunk).collect::<Vec<_>>();
+        let bitmap = null_bitmap(num_rows, &non_null_rows);
+        let data = read_all_const(
+            &Value::TimestampNanos {
+                millis: 42,
+                nanos_of_milli: 7,
+            },
+            num_rows,
+            true,
+            &bitmap,
+            DataVariant::TimestampNanos,
+        )
+        .unwrap();
+
+        let RawColumnData::TimestampNanos {
+            millis,
+            nanos_of_milli,
+        } = data
+        else {
+            panic!("expected TimestampNanos CONST data");
+        };
+        assert!(millis[..millis_rows_per_chunk]
+            .iter()
+            .all(|&value| value == 0));
+        assert!(millis[millis_rows_per_chunk..nanos_rows_per_chunk]
+            .iter()
+            .all(|&value| value == 42));
+        assert!(millis[nanos_rows_per_chunk..]
+            .iter()
+            .all(|&value| value == 0));
+        assert!(nanos_of_milli[..millis_rows_per_chunk]
+            .iter()
+            .all(|&value| value == 0));
+        assert!(nanos_of_milli[millis_rows_per_chunk..nanos_rows_per_chunk]
+            .iter()
+            .all(|&value| value == 7));
+        assert!(nanos_of_milli[nanos_rows_per_chunk..]
+            .iter()
+            .all(|&value| value == 0));
+    }
+
+    #[test]
+    fn test_timestamp_nanos_conversion_ignores_null_hidden_values() {
+        let (min_millis, min_nanos) = types::ns_to_millis_nanos(i64::MIN);
+        let (max_millis, max_nanos) = types::ns_to_millis_nanos(i64::MAX);
+        let data = RawColumnData::TimestampNanos {
+            millis: vec![min_millis, min_millis, max_millis, max_millis],
+            nanos_of_milli: vec![min_nanos, 0, max_nanos, 999_999],
+        };
+        let array = build_array(
+            data,
+            &DataType::Timestamp(TimeUnit::Nanosecond, None),
+            Some(vec![0b0000_0101]),
+            4,
+            true,
+        )
+        .unwrap();
+        let values = array
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+
+        assert_eq!(values.value(0), i64::MIN);
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), i64::MAX);
+        assert!(values.is_null(3));
+    }
+
+    #[test]
+    fn test_fixed_const_preserves_default_and_negative_zero_values() {
+        let num_rows = test_page_size();
+        let non_null_rows =
+            (0..num_rows.div_ceil(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR)).collect::<Vec<_>>();
+        let bitmap = null_bitmap(num_rows, &non_null_rows);
+
+        let zero_data = read_all_const(
+            &Value::SmallInt(0),
+            num_rows,
+            true,
+            &bitmap,
+            DataVariant::Int16,
+        )
+        .unwrap();
+        let RawColumnData::Int16(zero_values) = zero_data else {
+            panic!("expected Int16 CONST data");
+        };
+        assert!(zero_values.iter().all(|&value| value == 0));
+
+        let negative_zero_data = read_all_const(
+            &Value::Float(-0.0),
+            num_rows,
+            true,
+            &bitmap,
+            DataVariant::Float32,
+        )
+        .unwrap();
+        let RawColumnData::Float32(negative_zero_values) = negative_zero_data else {
+            panic!("expected Float32 CONST data");
+        };
+        assert!(negative_zero_values[..non_null_rows.len()]
+            .iter()
+            .all(|value| value.to_bits() == (-0.0f32).to_bits()));
+        assert!(negative_zero_values[non_null_rows.len()..]
+            .iter()
+            .all(|value| value.to_bits() == 0.0f32.to_bits()));
+    }
+}
+
+#[cfg(test)]
+mod encoded_column_tests {
+    use super::*;
+
+    #[test]
+    fn column_page_rejects_unknown_encoding_without_panicking() {
+        let result = std::panic::catch_unwind(|| -> io::Result<()> {
+            let page =
+                ColumnPageReader::new(DataType::Int32, 0xff, true, Value::Null, Vec::new(), 1)?;
+            page.read_all()?;
+            Ok(())
+        });
+
+        let err = result
+            .expect("unknown column page encoding must not panic")
+            .expect_err("unknown column page encoding must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unsupported encoding 255"));
+    }
+
+    #[test]
+    fn rejects_invalid_timestamp_nanos_for_all_encodings() {
+        let data_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let invalid = Value::TimestampNanos {
+            millis: 0,
+            nanos_of_milli: 1_000_000,
+        };
+        let placeholder = Value::Null;
+
+        let constant = EncodedColumn::new(
+            &data_type,
+            ENCODING_CONST,
+            false,
+            &[],
+            &invalid,
+            &[],
+            0,
+            &[],
+            0,
+            1,
+        );
+        assert_eq!(
+            constant.constant().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            constant.values().next().unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let dictionary = EncodedColumn::new(
+            &data_type,
+            ENCODING_DICT,
+            false,
+            &[],
+            &placeholder,
+            std::slice::from_ref(&invalid),
+            0,
+            &[],
+            0,
+            1,
+        );
+        assert_eq!(
+            dictionary.values().next().unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut plain_data = 0i64.to_be_bytes().to_vec();
+        plain_data.extend_from_slice(&1_000_000i32.to_be_bytes());
+        let plain = EncodedColumn::new(
+            &data_type,
+            ENCODING_PLAIN,
+            false,
+            &[],
+            &placeholder,
+            &[],
+            0,
+            &plain_data,
+            0,
+            1,
+        );
+        assert_eq!(
+            plain.values().next().unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn reports_corrupt_dict_indexes_without_panicking() {
+        let data_type = DataType::Int32;
+        let placeholder = Value::Null;
+        let dict_values = [Value::Integer(7)];
+
+        let truncated = EncodedColumn::new(
+            &data_type,
+            ENCODING_DICT,
+            false,
+            &[],
+            &placeholder,
+            &dict_values,
+            1,
+            &[],
+            0,
+            1,
+        );
+        assert_eq!(
+            truncated.values().next().unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let out_of_range = EncodedColumn::new(
+            &data_type,
+            ENCODING_DICT,
+            false,
+            &[],
+            &placeholder,
+            &dict_values,
+            1,
+            &[1],
+            0,
+            1,
+        );
+        assert_eq!(
+            out_of_range.values().next().unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn reports_truncated_plain_values_without_panicking() {
+        let placeholder = Value::Null;
+
+        let fixed = EncodedColumn::new(
+            &DataType::Int64,
+            ENCODING_PLAIN,
+            false,
+            &[],
+            &placeholder,
+            &[],
+            0,
+            &[0; 7],
+            0,
+            1,
+        );
+        assert_eq!(
+            fixed.values().next().unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let variable = EncodedColumn::new(
+            &DataType::Utf8,
+            ENCODING_PLAIN,
+            false,
+            &[],
+            &placeholder,
+            &[],
+            0,
+            &[3, b'a', b'b'],
+            0,
+            1,
+        );
+        assert_eq!(
+            variable.values().next().unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 }
