@@ -610,6 +610,55 @@ def test_verify_native_target_accepts_four_release_targets(
     )
 
 
+@pytest.mark.parametrize(
+    "target,path,data,symbol_family,expected_format",
+    (
+        (
+            "x86_64-unknown-linux-gnu",
+            "native/linux/x86_64/libpaimon_mosaic_jni.so",
+            build_pe(symbols=JNI_SYMBOLS),
+            "JNI",
+            "ELF",
+        ),
+        (
+            "aarch64-unknown-linux-gnu",
+            "mosaic/libpaimon_mosaic_ffi.so",
+            build_macho(symbols=FFI_SYMBOLS),
+            "FFI",
+            "ELF",
+        ),
+        (
+            "aarch64-apple-darwin",
+            "native/macos/aarch64/libpaimon_mosaic_jni.dylib",
+            build_elf(machine=183, symbols=JNI_SYMBOLS),
+            "JNI",
+            "Mach-O",
+        ),
+        (
+            "x86_64-pc-windows-msvc",
+            "mosaic/paimon_mosaic_ffi.dll",
+            build_elf(machine=62, symbols=FFI_SYMBOLS),
+            "FFI",
+            "PE",
+        ),
+    ),
+)
+def test_verify_native_target_rejects_wrong_format_with_matching_arch_and_symbols(
+    target, path, data, symbol_family, expected_format
+):
+    # The binary carries the right architecture and the right Mosaic symbols
+    # for the target; only the container format is wrong. If the format check
+    # is dropped, the architecture and symbol checks both pass and the call
+    # would wrongly succeed, so this is what pins that check in place.
+    with pytest.raises(ValueError, match=f"expected {expected_format}"):
+        verifier.verify_native_target(
+            data,
+            target,
+            path,
+            symbol_family=symbol_family,
+        )
+
+
 def test_verify_native_target_uses_explicit_symbol_family_for_renamed_library():
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
         verifier.verify_native_target(

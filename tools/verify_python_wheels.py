@@ -31,7 +31,7 @@ import re
 import stat
 import sys
 from pathlib import Path
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 
 from native_binary import TARGET_ARCHITECTURE, verify_native_target
 
@@ -508,7 +508,7 @@ def main() -> int:
     for wheel in args.wheels:
         try:
             targets.append(verify_wheel(wheel, root))
-        except (KeyError, OSError, ValueError) as error:
+        except (BadZipFile, csv.Error, KeyError, OSError, ValueError) as error:
             failed = True
             print(f"{wheel}: {error}", file=sys.stderr)
     if args.require_all_targets:

@@ -362,6 +362,19 @@ def test_main_requires_exactly_one_wheel_per_release_target(
     assert verifier.main() == 1
 
 
+def test_main_fails_closed_on_non_zip_wheel(tmp_path, monkeypatch, capsys):
+    # The filename and tag are well-formed, but the payload is not a zip, so
+    # ZipFile raises zipfile.BadZipFile. main() must report it and return 1
+    # rather than letting the exception escape as an uncaught traceback.
+    wheel, root = build_wheel(tmp_path)
+    wheel.write_bytes(b"not a zip file")
+    monkeypatch.setattr(verifier, "repository_root", lambda: root)
+    monkeypatch.setattr(sys, "argv", ["verify_python_wheels.py", str(wheel)])
+
+    assert verifier.main() == 1
+    assert "File is not a zip file" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "entry",
     (

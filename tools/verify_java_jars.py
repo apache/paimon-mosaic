@@ -24,7 +24,7 @@ import posixpath
 import stat
 import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from zipfile import ZipFile, ZipInfo
+from zipfile import BadZipFile, ZipFile, ZipInfo
 
 from native_binary import TARGET_ARCHITECTURE, verify_native_target
 
@@ -336,7 +336,7 @@ def verify_classifier(path: Path, root: Path | None = None) -> None:
             for name in entries
             if name.startswith("native/")
             or name == "META-INF/DEPENDENCIES.rust.tsv"
-            or name.endswith("/THIRD-PARTY-LICENSES.html")
+            or posixpath.basename(name) == "THIRD-PARTY-LICENSES.html"
         )
         forbidden.extend(
             sorted(native_archive_entries(archive, entries) - set(forbidden))
@@ -360,7 +360,7 @@ def main() -> int:
         verify_main_jar(args.main, root, args.require_all_natives)
         verify_classifier(args.sources, root)
         verify_classifier(args.javadoc, root)
-    except (KeyError, OSError, ValueError) as error:
+    except (BadZipFile, KeyError, OSError, ValueError) as error:
         print(f"Java artifact verification failed: {error}", file=sys.stderr)
         return 1
     return 0

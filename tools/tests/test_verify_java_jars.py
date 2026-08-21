@@ -557,6 +557,51 @@ class VerifyJavaJarsTest(unittest.TestCase):
                     with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
                         self.assertEqual(verify_java_jars.main(), 1)
 
+    def test_main_fails_closed_on_non_zip_artifact(self) -> None:
+        # A truncated / non-zip JAR raises zipfile.BadZipFile. It must be caught
+        # at the CLI boundary and reported as a failure, not escape as an
+        # uncaught traceback.
+        broken = self.root / "broken.jar"
+        broken.write_bytes(b"not a zip file")
+        classifier = self.write_jar("sources.jar", self.classifier_entries())
+        arguments = [
+            "verify_java_jars.py",
+            "--main",
+            str(broken),
+            "--sources",
+            str(classifier),
+            "--javadoc",
+            str(classifier),
+        ]
+        with mock.patch.object(
+            verify_java_jars, "repository_root", return_value=self.root
+        ):
+            with mock.patch.object(sys, "argv", arguments):
+                stderr = StringIO()
+                with redirect_stdout(StringIO()), redirect_stderr(stderr):
+                    self.assertEqual(verify_java_jars.main(), 1)
+                self.assertIn(
+                    "Java artifact verification failed", stderr.getvalue()
+                )
+
+    def test_classifier_rejects_binary_only_entries_by_name(self) -> None:
+        # These entries carry plain-text content with no native magic, so only
+        # the name-based forbidden rule can reject them — including a
+        # THIRD-PARTY-LICENSES.html report placed at the archive root.
+        for entry in (
+            "native/notes.txt",
+            "META-INF/DEPENDENCIES.rust.tsv",
+            "THIRD-PARTY-LICENSES.html",
+            "META-INF/licenses/x86_64-unknown-linux-gnu/THIRD-PARTY-LICENSES.html",
+        ):
+            with self.subTest(entry=entry):
+                path = self.write_jar(
+                    "classifier-by-name.jar",
+                    self.classifier_entries((entry, b"not a binary\n")),
+                )
+                with self.assertRaisesRegex(ValueError, "binary-only files"):
+                    self.verify_classifier(path)
+
     def test_release_profile_verifies_jars_before_gpg_signing(self) -> None:
         namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
         root = ET.parse(REPOSITORY_ROOT / "java/pom.xml").getroot()
