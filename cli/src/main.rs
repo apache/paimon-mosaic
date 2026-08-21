@@ -1780,6 +1780,9 @@ fn parse_decimal_exponent(value: &str) -> i64 {
 }
 
 fn timestamp_has_explicit_timezone(value: &str) -> bool {
+    // Arrow's timestamp parser requires a fixed-width YYYY-MM-DD date prefix
+    // and accepts colon-separated or compact time fields. The offsets below
+    // intentionally mirror that grammar; expanded-year forms fail parsing.
     let bytes = value.trim().as_bytes();
     if bytes.len() <= 10 {
         return false;
@@ -1977,7 +1980,7 @@ fn validate_csv_mapping(
         if index.is_none() && !field.is_nullable() {
             return Err(invalid_schema(format!(
                 "required field '{}' was not found in the CSV header of {}",
-                field.name(),
+                fmt::safe(field.name()),
                 input.display()
             )));
         }
@@ -2223,7 +2226,7 @@ fn reject_csv_unsupported_fields(schema: &Schema) -> std::io::Result<()> {
         if let Some(avro_type) = avro_type {
             return Err(invalid_schema(format!(
                 "CSV conversion does not support Avro '{avro_type}' field '{}'; use a scalar type or a JSON input",
-                field.name(),
+                fmt::safe(field.name()),
             )));
         }
     }
@@ -3347,6 +3350,36 @@ mod tests {
     fn duplicate_csv_header_errors_sanitize_control_characters() {
         let name = "bad\u{1b}]2;title\u{7}";
         let err = validate_csv_header_names(&[name.to_string(), name.to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(!err.chars().any(char::is_control), "{err:?}");
+        assert!(err.contains("bad\u{fffd}]2;title\u{fffd}"), "{err:?}");
+    }
+
+    #[test]
+    fn missing_required_csv_field_errors_sanitize_control_characters() {
+        let name = "bad\u{1b}]2;title\u{7}";
+        let schema = Schema::new(vec![
+            Field::new(name, DataType::Utf8, false),
+            Field::new("other", DataType::Utf8, true),
+        ]);
+        let layout = CsvInputLayout {
+            header: Some(vec!["other".to_string()]),
+            columns: 1,
+            has_records: true,
+        };
+        let err = validate_csv_mapping(&schema, &layout, &[None, Some(0)], Path::new("input.csv"))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.chars().any(char::is_control), "{err:?}");
+        assert!(err.contains("bad\u{fffd}]2;title\u{fffd}"), "{err:?}");
+    }
+
+    #[test]
+    fn unsupported_csv_field_errors_sanitize_control_characters() {
+        let name = "bad\u{1b}]2;title\u{7}";
+        let schema = Schema::new(vec![Field::new(name, DataType::Binary, false)]);
+        let err = reject_csv_unsupported_fields(&schema)
             .unwrap_err()
             .to_string();
         assert!(!err.chars().any(char::is_control), "{err:?}");
