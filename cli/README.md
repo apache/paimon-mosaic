@@ -104,7 +104,7 @@ provided. A field with no non-null value cannot be inferred and is reported as
 an error — pass `--schema` for such data.
 An existing output is kept unless `--overwrite` is given.
 `--schema` accepts the supported subset of an Avro record schema: primitive
-fields, nullable unions with one non-null branch, arrays/maps, and `date`,
+fields except raw `bytes`, nullable unions with one non-null branch, arrays/maps, and `date`,
 `time-millis`, `timestamp-*`, `local-timestamp-*`, `decimal`, and `uuid`
 logical types. It is not a general Avro name resolver: nested records, enums,
 named-type references, and non-decimal `fixed` fields are rejected.

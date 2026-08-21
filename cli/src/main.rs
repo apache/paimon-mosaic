@@ -33,9 +33,7 @@ use arrow::array::types::{
 use arrow::array::{
     new_null_array, ArrayRef, BooleanArray, PrimitiveArray, RecordBatch, StringArray,
 };
-use arrow::compute::kernels::cast_utils::{
-    parse_decimal, string_to_datetime, Parser as ArrowValueParser,
-};
+use arrow::compute::kernels::cast_utils::{string_to_datetime, Parser as ArrowValueParser};
 use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use clap::{Parser, Subcommand};
 use paimon_mosaic_core::reader::{MosaicReader, ReaderAccess};
@@ -560,6 +558,7 @@ fn convert(
     };
     let schema = project_convert_schema(schema, &columns)?;
     reject_null_inferred_fields(&schema)?;
+    reject_json_unsupported_fields(&schema)?;
     if has_explicit_schema && schema_needs_json_validation(&schema) {
         return write_mosaic(out, overwrite, &schema, stats, |writer, rows| {
             write_validated_json_input(open()?, &schema, writer, rows)
@@ -614,6 +613,7 @@ where
             .map_err(bad)
     };
     let fields = json_special_fields(schema);
+    let normalize_decimals = schema_has_decimal(schema);
     let mut decoder = build_decoder()?;
     let mut batch_bytes = 0_usize;
     let records = serde_json::Deserializer::from_reader(reader).into_iter::<Box<RawValue>>();
@@ -622,9 +622,17 @@ where
         let record = index + 1;
         let raw = raw.map_err(|e| invalid_schema(format!("invalid JSON record {record}: {e}")))?;
         let raw_bytes = raw.get().as_bytes();
+        validate_json_special_values(raw_bytes, &fields, record)?;
+        let normalized;
+        let decode_bytes = if normalize_decimals {
+            normalized = normalize_json_decimal_record(&raw, schema, record)?;
+            normalized.as_bytes()
+        } else {
+            raw_bytes
+        };
         if !decoder.is_empty()
             && (decoder.len() >= DEFAULT_JSON_BATCH_SIZE
-                || batch_bytes.saturating_add(raw_bytes.len()) > byte_budget)
+                || batch_bytes.saturating_add(decode_bytes.len()) > byte_budget)
         {
             if let Some(batch) = decoder.flush().map_err(bad)? {
                 write(batch)?;
@@ -632,14 +640,13 @@ where
             batch_bytes = 0;
         }
 
-        validate_json_special_values(raw_bytes, &fields, record)?;
-        let decoded = decoder.decode(raw_bytes).map_err(bad)?;
-        if decoded != raw_bytes.len() || decoder.has_partial_record() {
+        let decoded = decoder.decode(decode_bytes).map_err(bad)?;
+        if decoded != decode_bytes.len() || decoder.has_partial_record() {
             return Err(invalid_schema(format!(
                 "invalid JSON record {record}: decoder stopped before the record ended"
             )));
         }
-        batch_bytes = batch_bytes.saturating_add(raw_bytes.len());
+        batch_bytes = batch_bytes.saturating_add(decode_bytes.len());
 
         if decoder.len() >= DEFAULT_JSON_BATCH_SIZE || batch_bytes >= byte_budget {
             if let Some(batch) = decoder.flush().map_err(bad)? {
@@ -656,6 +663,186 @@ where
         write(batch)?;
     }
     Ok(())
+}
+
+fn schema_has_decimal(schema: &Schema) -> bool {
+    schema
+        .fields()
+        .iter()
+        .any(|field| data_type_has_decimal(field.data_type()))
+}
+
+fn data_type_has_decimal(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Decimal128(_, _) => true,
+        DataType::List(field) => data_type_has_decimal(field.data_type()),
+        DataType::Map(entries, _) => match entries.data_type() {
+            DataType::Struct(fields) => fields
+                .get(1)
+                .is_some_and(|field| data_type_has_decimal(field.data_type())),
+            _ => false,
+        },
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| data_type_has_decimal(field.data_type())),
+        _ => false,
+    }
+}
+
+fn normalize_json_decimal_record(
+    raw: &RawValue,
+    schema: &Schema,
+    record: usize,
+) -> std::io::Result<String> {
+    let values: std::collections::BTreeMap<String, Box<RawValue>> = serde_json::from_str(raw.get())
+        .map_err(|e| invalid_schema(format!("invalid JSON record {record}: {e}")))?;
+    let mut normalized = String::from("{");
+    for (index, (name, value)) in values.iter().enumerate() {
+        if index != 0 {
+            normalized.push(',');
+        }
+        normalized.push_str(
+            &serde_json::to_string(name)
+                .map_err(|e| invalid_schema(format!("invalid JSON field name: {e}")))?,
+        );
+        normalized.push(':');
+        if let Some(field) = schema.fields().iter().find(|field| field.name() == name) {
+            normalized.push_str(&normalize_json_decimal_value(value, field, name, record)?);
+        } else {
+            normalized.push_str(value.get());
+        }
+    }
+    normalized.push('}');
+    Ok(normalized)
+}
+
+fn normalize_json_decimal_value(
+    raw: &RawValue,
+    field: &Field,
+    path: &str,
+    record: usize,
+) -> std::io::Result<String> {
+    if raw.get() == "null" || !data_type_has_decimal(field.data_type()) {
+        return Ok(raw.get().to_string());
+    }
+    match field.data_type() {
+        DataType::Decimal128(precision, scale) => {
+            let raw_text = raw.get();
+            let value = if raw_text.starts_with('"') {
+                serde_json::from_str::<String>(raw_text)
+                    .map_err(|e| invalid_schema(format!("invalid JSON decimal: {e}")))?
+            } else {
+                raw_text.to_string()
+            };
+            let unscaled = parse_decimal_exact(&value, *precision, *scale).map_err(|e| {
+                invalid_schema(format!(
+                    "cannot parse '{}' as {} for JSON field '{}' at record {record}: {e}",
+                    fmt::safe(&value),
+                    field.data_type(),
+                    fmt::safe(path)
+                ))
+            })?;
+            serde_json::to_string(&format_decimal_unscaled(unscaled, *scale))
+                .map_err(|e| invalid_schema(format!("invalid JSON decimal: {e}")))
+        }
+        DataType::List(item) => {
+            let values: Vec<Box<RawValue>> = serde_json::from_str(raw.get())
+                .map_err(|e| invalid_schema(format!("invalid JSON array: {e}")))?;
+            let child_path = format!("{path}[]");
+            let mut normalized = String::from("[");
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    normalized.push(',');
+                }
+                normalized.push_str(&normalize_json_decimal_value(
+                    value,
+                    item,
+                    &child_path,
+                    record,
+                )?);
+            }
+            normalized.push(']');
+            Ok(normalized)
+        }
+        DataType::Map(entries, _) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Ok(raw.get().to_string());
+            };
+            let Some(value_field) = fields.get(1) else {
+                return Ok(raw.get().to_string());
+            };
+            let values: std::collections::BTreeMap<String, Box<RawValue>> =
+                serde_json::from_str(raw.get())
+                    .map_err(|e| invalid_schema(format!("invalid JSON map: {e}")))?;
+            let child_path = format!("{path}{{}}");
+            let mut normalized = String::from("{");
+            for (index, (name, value)) in values.iter().enumerate() {
+                if index != 0 {
+                    normalized.push(',');
+                }
+                normalized.push_str(
+                    &serde_json::to_string(name)
+                        .map_err(|e| invalid_schema(format!("invalid JSON map key: {e}")))?,
+                );
+                normalized.push(':');
+                normalized.push_str(&normalize_json_decimal_value(
+                    value,
+                    value_field,
+                    &child_path,
+                    record,
+                )?);
+            }
+            normalized.push('}');
+            Ok(normalized)
+        }
+        DataType::Struct(fields) => {
+            let values: std::collections::BTreeMap<String, Box<RawValue>> =
+                serde_json::from_str(raw.get())
+                    .map_err(|e| invalid_schema(format!("invalid JSON object: {e}")))?;
+            let mut normalized = String::from("{");
+            for (index, (name, value)) in values.iter().enumerate() {
+                if index != 0 {
+                    normalized.push(',');
+                }
+                normalized.push_str(
+                    &serde_json::to_string(name)
+                        .map_err(|e| invalid_schema(format!("invalid JSON field name: {e}")))?,
+                );
+                normalized.push(':');
+                if let Some(child) = fields.iter().find(|field| field.name() == name) {
+                    normalized.push_str(&normalize_json_decimal_value(
+                        value,
+                        child,
+                        &format!("{path}.{name}"),
+                        record,
+                    )?);
+                } else {
+                    normalized.push_str(value.get());
+                }
+            }
+            normalized.push('}');
+            Ok(normalized)
+        }
+        _ => Ok(raw.get().to_string()),
+    }
+}
+
+fn format_decimal_unscaled(unscaled: i128, scale: i8) -> String {
+    let negative = unscaled < 0;
+    let mut digits = unscaled.unsigned_abs().to_string();
+    if scale > 0 {
+        let scale = scale as usize;
+        if digits.len() <= scale {
+            digits.insert_str(0, &"0".repeat(scale + 1 - digits.len()));
+        }
+        digits.insert(digits.len() - scale, '.');
+    } else if scale < 0 {
+        digits.push_str(&"0".repeat(scale.unsigned_abs() as usize));
+    }
+    if negative {
+        digits.insert(0, '-');
+    }
+    digits
 }
 
 fn schema_needs_json_validation(schema: &Schema) -> bool {
@@ -1525,12 +1712,12 @@ fn csv_column_array(
                 .iter()
                 .map(|record| {
                     csv_record_value(record, source)
-                        .map(|value| {
-                            let parsed =
-                                parse_decimal::<Decimal128Type>(value, *precision, *scale)
-                                    .map_err(|_| csv_value_parse_error(record, field, value))?;
-                            if !decimal_is_exact_at_scale(value, *scale) {
-                                return Err(invalid_schema(format!(
+                        .map(|value| match parse_decimal_unscaled_exact(
+                            value, *precision, *scale,
+                        ) {
+                            Ok(parsed) => Ok(Some(parsed)),
+                            Err(DecimalParseFailure::Inexact) => {
+                                Err(invalid_schema(format!(
                                     "decimal value '{}' for CSV field '{}' at line {} cannot be represented exactly with scale {scale}",
                                     fmt::safe(value),
                                     fmt::safe(field.name()),
@@ -1538,9 +1725,9 @@ fn csv_column_array(
                                         .position()
                                         .map(|position| position.line().to_string())
                                         .unwrap_or_else(|| "unknown".to_string())
-                                )));
+                                )))
                             }
-                            Ok(Some(parsed))
+                            Err(_) => Err(csv_value_parse_error(record, field, value)),
                         })
                         .unwrap_or(Ok(None))
                 })
@@ -1719,63 +1906,128 @@ fn parse_decimal_exact(
     precision: u8,
     scale: i8,
 ) -> Result<i128, arrow::error::ArrowError> {
-    let parsed = parse_decimal::<Decimal128Type>(value, precision, scale)?;
-    if !decimal_is_exact_at_scale(value, scale) {
-        return Err(arrow::error::ArrowError::ParseError(format!(
-            "cannot be represented exactly with scale {scale}"
-        )));
-    }
-    Ok(parsed)
+    parse_decimal_unscaled_exact(value, precision, scale).map_err(|failure| {
+        let message = match failure {
+            DecimalParseFailure::Invalid => {
+                format!("can't parse the string value {value} to decimal")
+            }
+            DecimalParseFailure::Inexact => {
+                format!("cannot be represented exactly with scale {scale}")
+            }
+            DecimalParseFailure::Overflow => format!("parse decimal overflow ({value})"),
+        };
+        arrow::error::ArrowError::ParseError(message)
+    })
 }
 
-fn decimal_is_exact_at_scale(value: &str, scale: i8) -> bool {
-    let value = value
-        .strip_prefix('+')
-        .or_else(|| value.strip_prefix('-'))
-        .unwrap_or(value);
-    let exponent_index = value.find(['e', 'E']);
-    let (mantissa, exponent) = match exponent_index {
-        Some(index) => (&value[..index], parse_decimal_exponent(&value[index + 1..])),
-        None => (value, 0),
-    };
-    let fractional_digits = mantissa
-        .split_once('.')
-        .map_or(0_i64, |(_, fraction)| fraction.len() as i64);
-    let digits: Vec<u8> = mantissa.bytes().filter(u8::is_ascii_digit).collect();
-    if digits.is_empty() {
-        return false;
-    }
-    if digits.iter().all(|digit| *digit == b'0') {
-        return true;
-    }
-    let discarded = fractional_digits
-        .saturating_sub(exponent)
-        .saturating_sub(i64::from(scale));
-    if discarded <= 0 {
-        return true;
-    }
-    let discarded = usize::try_from(discarded).unwrap_or(usize::MAX);
-    discarded <= digits.len()
-        && digits[digits.len() - discarded..]
-            .iter()
-            .all(|digit| *digit == b'0')
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecimalParseFailure {
+    Invalid,
+    Inexact,
+    Overflow,
 }
 
-fn parse_decimal_exponent(value: &str) -> i64 {
-    let (negative, digits) = match value.as_bytes().first() {
+fn parse_decimal_unscaled_exact(
+    value: &str,
+    precision: u8,
+    scale: i8,
+) -> Result<i128, DecimalParseFailure> {
+    if precision == 0 || precision > 38 {
+        return Err(DecimalParseFailure::Overflow);
+    }
+    let (negative, unsigned) = match value.as_bytes().first() {
         Some(b'-') => (true, &value[1..]),
         Some(b'+') => (false, &value[1..]),
         _ => (false, value),
     };
-    let exponent = digits.bytes().fold(0_i64, |value, digit| {
-        value
-            .saturating_mul(10)
-            .saturating_add(i64::from(digit.saturating_sub(b'0')))
-    });
-    if negative {
-        exponent.saturating_neg()
+    let exponent_index = unsigned.find(['e', 'E']);
+    let (mantissa, exponent) = match exponent_index {
+        Some(index) => {
+            let exponent = unsigned[index + 1..]
+                .parse::<i64>()
+                .map_err(|_| DecimalParseFailure::Invalid)?;
+            (&unsigned[..index], exponent)
+        }
+        None => (unsigned, 0),
+    };
+
+    let mut seen_decimal_point = false;
+    let mut has_digit = false;
+    let mut total_digits = 0_usize;
+    let mut fractional_digits = 0_usize;
+    let mut first_nonzero = None;
+    for byte in mantissa.bytes() {
+        match byte {
+            b'0'..=b'9' => {
+                has_digit = true;
+                if seen_decimal_point {
+                    fractional_digits = fractional_digits
+                        .checked_add(1)
+                        .ok_or(DecimalParseFailure::Overflow)?;
+                }
+                if byte != b'0' && first_nonzero.is_none() {
+                    first_nonzero = Some(total_digits);
+                }
+                total_digits = total_digits
+                    .checked_add(1)
+                    .ok_or(DecimalParseFailure::Overflow)?;
+            }
+            b'.' if !seen_decimal_point => seen_decimal_point = true,
+            _ => return Err(DecimalParseFailure::Invalid),
+        }
+    }
+    if !has_digit {
+        return Err(DecimalParseFailure::Invalid);
+    }
+    let Some(first_nonzero) = first_nonzero else {
+        return Ok(0);
+    };
+
+    let shift = i128::from(exponent) - fractional_digits as i128 + i128::from(scale);
+    let (kept_digits, appended_zeros) = if shift >= 0 {
+        let appended_zeros = usize::try_from(shift).map_err(|_| DecimalParseFailure::Overflow)?;
+        (total_digits, appended_zeros)
     } else {
-        exponent
+        let discarded =
+            usize::try_from(shift.unsigned_abs()).map_err(|_| DecimalParseFailure::Inexact)?;
+        if discarded > total_digits {
+            return Err(DecimalParseFailure::Inexact);
+        }
+        let kept_digits = total_digits - discarded;
+        for (digit_index, byte) in mantissa.bytes().filter(u8::is_ascii_digit).enumerate() {
+            if digit_index >= kept_digits && byte != b'0' {
+                return Err(DecimalParseFailure::Inexact);
+            }
+        }
+        (kept_digits, 0)
+    };
+
+    let significant_digits = kept_digits
+        .saturating_sub(first_nonzero)
+        .checked_add(appended_zeros)
+        .ok_or(DecimalParseFailure::Overflow)?;
+    if significant_digits > usize::from(precision) {
+        return Err(DecimalParseFailure::Overflow);
+    }
+
+    let mut result = 0_i128;
+    for (digit_index, byte) in mantissa.bytes().filter(u8::is_ascii_digit).enumerate() {
+        if (first_nonzero..kept_digits).contains(&digit_index) {
+            result = result
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(i128::from(byte - b'0')))
+                .ok_or(DecimalParseFailure::Overflow)?;
+        }
+    }
+    for _ in 0..appended_zeros {
+        result = result
+            .checked_mul(10)
+            .ok_or(DecimalParseFailure::Overflow)?;
+    }
+    if negative {
+        result.checked_neg().ok_or(DecimalParseFailure::Overflow)
+    } else {
+        Ok(result)
     }
 }
 
@@ -2078,12 +2330,21 @@ fn parse_mixed_csv_float64(
                 .ok_or_else(|| csv_mixed_float_parse_error(value, field, input))?;
             // Fractional Float64 values retain normal floating-point semantics.
             // Integral decimal tokens must round-trip exactly.
-            if decimal_is_exact_at_scale(value, 0) {
-                let exact = parse_decimal::<Decimal128Type>(value, 38, 0)
-                    .map_err(|_| csv_mixed_float_parse_error(value, field, input))?;
-                if !promoted.is_finite() || promoted as i128 != exact {
-                    return Err(csv_mixed_float_parse_error(value, field, input));
+            if promoted.is_finite() {
+                match parse_decimal_unscaled_exact(value, 38, 0) {
+                    Ok(exact) if promoted as i128 != exact => {
+                        return Err(csv_mixed_float_parse_error(value, field, input));
+                    }
+                    Err(DecimalParseFailure::Invalid | DecimalParseFailure::Overflow) => {
+                        return Err(csv_mixed_float_parse_error(value, field, input));
+                    }
+                    Ok(_) | Err(DecimalParseFailure::Inexact) => {}
                 }
+            } else if !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "nan" | "inf" | "+inf" | "-inf" | "infinity" | "+infinity" | "-infinity"
+            ) {
+                return Err(csv_mixed_float_parse_error(value, field, input));
             }
             Ok(Some(promoted))
         })
@@ -2229,6 +2490,38 @@ fn reject_csv_unsupported_fields(schema: &Schema) -> std::io::Result<()> {
                 fmt::safe(field.name()),
             )));
         }
+    }
+    Ok(())
+}
+
+fn reject_json_unsupported_fields(schema: &Schema) -> std::io::Result<()> {
+    fn reject(field: &Field, path: &str) -> std::io::Result<()> {
+        match field.data_type() {
+            DataType::Binary => Err(invalid_schema(format!(
+                "JSON conversion does not support raw Avro 'bytes' field '{}'; use a supported logical type or encode the value as a string field",
+                fmt::safe(path)
+            ))),
+            DataType::List(item) => reject(item, &format!("{path}[]")),
+            DataType::Map(entries, _) => {
+                let DataType::Struct(fields) = entries.data_type() else {
+                    return Ok(());
+                };
+                fields
+                    .get(1)
+                    .map_or(Ok(()), |value| reject(value, &format!("{path}{{}}")))
+            }
+            DataType::Struct(fields) => {
+                for child in fields {
+                    reject(child, &format!("{path}.{}", child.name()))?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    for field in schema.fields() {
+        reject(field, field.name())?;
     }
     Ok(())
 }
@@ -3289,6 +3582,32 @@ mod tests {
         for value in ["12.349", "-12.349", "123e-3", "0.001"] {
             assert!(parse_decimal_exact(value, 10, 2).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn decimal_parsing_rejects_unbounded_literals_without_panicking() {
+        let oversized_digits = "1".repeat(255);
+        let wrapping_divisor = format!("0.{}e1", "0".repeat(129));
+        let wrapping_value = format!("0.{}1e1", "0".repeat(128));
+        for (value, expected) in [
+            ("1e40000", None),
+            (oversized_digits.as_str(), None),
+            (wrapping_divisor.as_str(), Some(0)),
+            (wrapping_value.as_str(), None),
+        ] {
+            let result = std::panic::catch_unwind(|| parse_decimal_exact(value, 38, 0));
+            assert!(result.is_ok(), "decimal parsing panicked for {value}");
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap().unwrap(), expected, "{value}"),
+                None => assert!(result.unwrap().is_err(), "{value}"),
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_parsing_accepts_extra_trailing_zero_digits() {
+        let value = format!("12.34{}", "0".repeat(40));
+        assert_eq!(parse_decimal_exact(&value, 10, 2).unwrap(), 1234);
     }
 
     #[test]
