@@ -118,6 +118,9 @@ Use `-c`/`--column`/`--columns` to project top-level fields; each occurrence
 accepts a comma-separated list.
 `--stats id` builds min/max for those columns, which `cat --where` then uses
 to skip row groups that cannot match.
+`--output` is the canonical long option; the previous `--out` spelling remains
+available as an alias. `convert` accepts JSON inputs only; use `convert-csv`
+for CSV inputs.
 
 ```text
 $ mosaic convert data.json -o data.mosaic
@@ -148,8 +151,11 @@ Backslash escaping is disabled by default so literal values such as
 `C:\temp\file` are preserved; pass `--escape '\'` only for CSV dialects that
 use a separate escape character. Avro `bytes`, `array`, and `map` fields are
 rejected because the CSV decoder supports scalar text fields only. `--header`
-and `--no-header` are mutually exclusive. Explicit-schema local timestamps and
-decimals use the same offset and exact-scale rules as JSON conversion.
+and `--no-header` are mutually exclusive. Inferred local timestamps reject
+explicit offsets and direct users to `--schema` to select timestamp semantics;
+second-precision values are stored with millisecond precision. Explicit-schema
+local timestamps and decimals use the same offset and exact-scale rules as JSON
+conversion.
 `--stats id` builds min/max for those columns, which `cat --where` then uses
 to skip row groups that cannot match.
 

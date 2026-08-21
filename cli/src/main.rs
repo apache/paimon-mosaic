@@ -144,7 +144,7 @@ enum Cmd {
         /// Input JSON data file (.json/.ndjson/.jsonl).
         input: PathBuf,
         /// Output .mosaic path.
-        #[arg(short = 'o', long = "output")]
+        #[arg(short = 'o', long = "output", visible_alias = "out")]
         out: PathBuf,
         /// Avro record schema file (supported subset; see the CLI README).
         #[arg(short = 's', long)]
@@ -165,7 +165,7 @@ enum Cmd {
         /// Input CSV path(s).
         inputs: Vec<PathBuf>,
         /// Output .mosaic path.
-        #[arg(short = 'o', long = "output")]
+        #[arg(short = 'o', long = "output", visible_alias = "out")]
         out: PathBuf,
         /// Avro record schema file (supported subset, scalar fields only; see the CLI README).
         #[arg(short = 's', long)]
@@ -687,7 +687,10 @@ fn data_type_needs_json_validation(data_type: &DataType) -> bool {
         | DataType::Time32(_)
         | DataType::Timestamp(_, _)
         | DataType::Decimal128(_, _) => true,
-        DataType::List(field) | DataType::Map(field, _) => field_needs_json_validation(field),
+        DataType::List(field) => field_needs_json_validation(field),
+        // Every map must be walked so duplicate keys are rejected even when
+        // its values do not otherwise need special Avro validation.
+        DataType::Map(_, _) => true,
         DataType::Struct(fields) => fields
             .iter()
             .any(|field| field_needs_json_validation(field)),
@@ -1032,7 +1035,9 @@ fn convert_csv(
                 if rows == 0 || schema.fields().is_empty() {
                     continue;
                 }
-                let schema = csv_schema_with_csv_names(schema, &options)?;
+                let schema = promote_second_precision_csv_timestamps(csv_schema_with_csv_names(
+                    schema, &options,
+                )?);
                 observe_csv_inferred_types(&mut inferred_csv_types, &schema);
                 inferred = Some(match inferred.take() {
                     Some(prev) => merge_csv_inferred_schema(prev, schema, input)?,
@@ -1623,39 +1628,72 @@ fn csv_timestamp_column(
         .unwrap_or("+00:00")
         .parse()
         .map_err(|e| invalid_schema(format!("invalid timestamp timezone: {e}")))?;
+    let timezone_policy = timezone.is_none().then_some("a local timestamp");
     let values = records
         .iter()
         .map(|record| {
             let Some(value) = csv_record_value(record, source) else {
                 return Ok(None);
             };
-            if timezone.is_none() && timestamp_has_explicit_timezone(value) {
-                return Err(invalid_schema(format!(
-                    "CSV field '{}' at line {} must not include a timezone for a local timestamp",
-                    fmt::safe(field.name()),
-                    record
-                        .position()
-                        .map(|position| position.line().to_string())
-                        .unwrap_or_else(|| "unknown".to_string())
-                )));
-            }
-            let datetime = string_to_datetime(&parser_timezone, value)
-                .map_err(|_| csv_value_parse_error(record, field, value))?;
-            let timestamp = match unit {
-                TimeUnit::Millisecond => datetime.timestamp_millis(),
-                TimeUnit::Microsecond => datetime.timestamp_micros(),
-                TimeUnit::Nanosecond => datetime
-                    .timestamp_nanos_opt()
-                    .ok_or_else(|| csv_value_parse_error(record, field, value))?,
-                unit => {
-                    return Err(invalid_schema(format!(
-                        "CSV conversion does not support timestamp unit {unit:?}"
-                    )));
-                }
-            };
-            Ok(Some(timestamp))
+            let line = record
+                .position()
+                .map(|position| position.line().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            parse_csv_timestamp_value(
+                value,
+                field,
+                unit,
+                &parser_timezone,
+                timezone_policy,
+                &format!("at line {line}"),
+            )
+            .map(Some)
         })
         .collect::<std::io::Result<Vec<_>>>()?;
+    csv_timestamp_array(values, unit, timezone)
+}
+
+fn parse_csv_timestamp_value(
+    value: &str,
+    field: &Field,
+    unit: &TimeUnit,
+    parser_timezone: &Tz,
+    timezone_policy: Option<&str>,
+    location: &str,
+) -> std::io::Result<i64> {
+    match timezone_policy {
+        Some(policy) if timestamp_has_explicit_timezone(value) => {
+            return Err(invalid_schema(format!(
+                "CSV field '{}' {location} must not include a timezone for {policy}",
+                fmt::safe(field.name())
+            )));
+        }
+        _ => {}
+    }
+    let parse_error = || {
+        invalid_schema(format!(
+            "cannot parse '{}' as {} for CSV field '{}' {location}",
+            fmt::safe(value),
+            field.data_type(),
+            fmt::safe(field.name())
+        ))
+    };
+    let datetime = string_to_datetime(parser_timezone, value).map_err(|_| parse_error())?;
+    match unit {
+        TimeUnit::Millisecond => Ok(datetime.timestamp_millis()),
+        TimeUnit::Microsecond => Ok(datetime.timestamp_micros()),
+        TimeUnit::Nanosecond => datetime.timestamp_nanos_opt().ok_or_else(parse_error),
+        unit => Err(invalid_schema(format!(
+            "CSV conversion does not support timestamp unit {unit:?}"
+        ))),
+    }
+}
+
+fn csv_timestamp_array(
+    values: Vec<Option<i64>>,
+    unit: &TimeUnit,
+    timezone: Option<Arc<str>>,
+) -> std::io::Result<ArrayRef> {
     Ok(match unit {
         TimeUnit::Millisecond => Arc::new(
             PrimitiveArray::<TimestampMillisecondType>::from(values)
@@ -1863,7 +1901,9 @@ fn csv_reader_schema(
             };
             if let Some(source) = source {
                 let output_field = output_schema.fields()[source].as_ref();
-                let data_type = if mixed_float_fields.contains(output_field.name()) {
+                let data_type = if mixed_float_fields.contains(output_field.name())
+                    || matches!(output_field.data_type(), DataType::Timestamp(_, _))
+                {
                     DataType::Utf8
                 } else {
                     output_field.data_type().clone()
@@ -1956,11 +1996,16 @@ fn align_csv_batch_to_schema(
         .iter()
         .zip(mapping)
         .map(|(field, index)| match index {
-            Some(index)
-                if batch.column(*index).data_type() == &DataType::Utf8
-                    && field.data_type() == &DataType::Float64 =>
-            {
-                parse_mixed_csv_float64(batch.column(*index), field, input)
+            Some(index) if batch.column(*index).data_type() == &DataType::Utf8 => {
+                match field.data_type() {
+                    DataType::Float64 => {
+                        parse_mixed_csv_float64(batch.column(*index), field, input)
+                    }
+                    DataType::Timestamp(_, _) => {
+                        parse_inferred_csv_timestamp_column(batch.column(*index), field, input)
+                    }
+                    _ => Ok(batch.column(*index).clone()),
+                }
             }
             Some(index) => Ok(batch.column(*index).clone()),
             None => Ok(new_null_array(field.data_type(), batch.num_rows())),
@@ -1968,6 +2013,47 @@ fn align_csv_batch_to_schema(
         .collect::<std::io::Result<Vec<_>>>()?;
     RecordBatch::try_new(Arc::new(schema.clone()), columns)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+}
+
+fn parse_inferred_csv_timestamp_column(
+    array: &ArrayRef,
+    field: &Field,
+    input: &Path,
+) -> std::io::Result<ArrayRef> {
+    let values = array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| invalid_schema("expected a Utf8 CSV timestamp column"))?;
+    let DataType::Timestamp(unit, timezone) = field.data_type() else {
+        return Err(invalid_schema("expected a Timestamp CSV field"));
+    };
+    let parser_timezone: Tz = timezone
+        .as_deref()
+        .unwrap_or("+00:00")
+        .parse()
+        .map_err(|e| invalid_schema(format!("invalid timestamp timezone: {e}")))?;
+    let timezone_policy = timezone
+        .is_none()
+        .then_some("an inferred local timestamp; provide --schema to select timestamp semantics");
+    let location = format!("in {}", input.display());
+    let values = values
+        .iter()
+        .map(|value| {
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            parse_csv_timestamp_value(
+                value,
+                field,
+                unit,
+                &parser_timezone,
+                timezone_policy,
+                &location,
+            )
+            .map(Some)
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    csv_timestamp_array(values, unit, timezone.clone())
 }
 
 fn parse_mixed_csv_float64(
@@ -2103,6 +2189,23 @@ fn csv_schema_with_null_fallback(schema: Schema) -> Schema {
                 field.with_data_type(DataType::Utf8)
             } else {
                 field
+            }
+        })
+        .collect();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
+fn promote_second_precision_csv_timestamps(schema: Schema) -> Schema {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let field = field.as_ref().clone();
+            match field.data_type().clone() {
+                DataType::Timestamp(TimeUnit::Second, timezone) => {
+                    field.with_data_type(DataType::Timestamp(TimeUnit::Millisecond, timezone))
+                }
+                _ => field,
             }
         })
         .collect();

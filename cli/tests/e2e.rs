@@ -367,6 +367,99 @@ fn convert_csv_then_inspect() {
 }
 
 #[test]
+fn convert_csv_infers_second_precision_timestamps() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_second_timestamp.csv", dir.display());
+    std::fs::write(&csv, "ts\n2024-01-01 00:00:00\n2024-01-01 00:00:01\n").unwrap();
+    let out = format!("{}/mosaic_e2e_second_timestamp.mosaic", dir.display());
+
+    let (msg, err, ok) = run(&["convert-csv", &csv, "-o", &out, "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+
+    let (schema, err, ok) = run(&["schema", &out]);
+    assert!(ok, "stdout: {schema}\nstderr: {err}");
+    assert!(
+        schema.contains("ts: Timestamp(Millisecond, None)"),
+        "{schema}"
+    );
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        [
+            r#"{"ts":"2024-01-01T00:00:00"}"#,
+            r#"{"ts":"2024-01-01T00:00:01"}"#
+        ]
+    );
+}
+
+#[test]
+fn convert_csv_inferred_timestamp_rejects_explicit_timezone() {
+    let dir = std::env::temp_dir();
+    let csv = format!(
+        "{}/mosaic_e2e_inferred_timestamp_timezone.csv",
+        dir.display()
+    );
+    std::fs::write(&csv, "ts\n2024-01-01T00:00:00.000+08:00\n").unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_inferred_timestamp_timezone.mosaic",
+        dir.display()
+    );
+    let _ = std::fs::remove_file(&out);
+
+    let (_, err, ok) = run(&["convert-csv", &csv, "-o", &out, "--overwrite"]);
+    assert!(!ok);
+    assert!(err.contains("must not include a timezone"), "{err}");
+    assert!(err.contains("--schema"), "{err}");
+    assert!(!std::path::Path::new(&out).exists());
+}
+
+#[test]
+fn convert_commands_accept_legacy_out_alias() {
+    let dir = std::env::temp_dir();
+
+    let csv = format!("{}/mosaic_e2e_legacy_out.csv", dir.display());
+    std::fs::write(&csv, "id\n1\n").unwrap();
+    let csv_out = format!("{}/mosaic_e2e_legacy_out_csv.mosaic", dir.display());
+    let (msg, err, ok) = run(&["convert-csv", &csv, "--out", &csv_out, "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+
+    let json = format!("{}/mosaic_e2e_legacy_out.json", dir.display());
+    std::fs::write(&json, "{\"id\":1}\n").unwrap();
+    let json_out = format!("{}/mosaic_e2e_legacy_out_json.mosaic", dir.display());
+    let (msg, err, ok) = run(&["convert", &json, "--out", &json_out, "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+}
+
+#[test]
+fn convert_csv_applies_dialect_flags() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_csv_dialect.csv", dir.display());
+    std::fs::write(&csv, "ignored preamble\nid|name\n1|'a\\'b'\n").unwrap();
+    let out = format!("{}/mosaic_e2e_csv_dialect.mosaic", dir.display());
+
+    let (msg, err, ok) = run(&[
+        "convert-csv",
+        &csv,
+        "-o",
+        &out,
+        "--delimiter",
+        "|",
+        "--quote",
+        "'",
+        "--escape",
+        "\\",
+        "--skip-lines",
+        "1",
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(rows, "{\"id\":1,\"name\":\"a'b\"}\n");
+}
+
+#[test]
 fn convert_csv_preserves_backslashes_by_default() {
     let dir = std::env::temp_dir();
     let csv = format!("{}/mosaic_e2e_backslashes.csv", dir.display());
@@ -856,7 +949,12 @@ fn convert_csv_require_marks_inferred_field_not_null() {
     assert!(ok, "stdout: {msg}\nstderr: {err}");
     let (s, _, _) = run(&["schema", &out]);
     assert!(s.contains("id: Int64 not null"), "{s}");
-    assert!(s.contains("name: Utf8"), "{s}");
+    let name = s
+        .lines()
+        .find(|line| line.trim_start().starts_with("name:"))
+        .unwrap_or_else(|| panic!("missing name field in schema:\n{s}"));
+    assert!(name.contains("name: Utf8"), "{s}");
+    assert!(!name.contains("not null"), "{s}");
 }
 
 #[test]
@@ -2067,6 +2165,41 @@ fn convert_json_supports_avro_array_and_map_schema() {
     assert!(ok, "stdout: {rows}\nstderr: {err}");
     assert!(rows.contains(r#""tags":["a",null,"b"]"#), "{rows}");
     assert!(rows.contains(r#""props":{"x":[1,2],"y":[]}"#), "{rows}");
+}
+
+#[test]
+fn convert_json_rejects_duplicate_string_map_keys() {
+    let dir = std::env::temp_dir();
+    let js = format!("{}/mosaic_e2e_duplicate_string_map.json", dir.display());
+    std::fs::write(&js, "{\"props\":{\"x\":\"first\",\"x\":\"second\"}}\n").unwrap();
+    let schema = format!("{}/mosaic_e2e_duplicate_string_map.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "props", "type": {"type": "map", "values": "string"}}
+  ]
+}"#,
+    )
+    .unwrap();
+    let out = format!("{}/mosaic_e2e_duplicate_string_map.mosaic", dir.display());
+    let _ = std::fs::remove_file(&out);
+
+    let (_, err, ok) = run(&[
+        "convert",
+        &js,
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("duplicate JSON map key 'x'"), "{err}");
+    assert!(err.contains("props{}"), "{err}");
+    assert!(!std::path::Path::new(&out).exists());
 }
 
 #[test]
