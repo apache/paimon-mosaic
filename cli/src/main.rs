@@ -142,13 +142,13 @@ enum Cmd {
         /// Input JSON data file (.json/.ndjson/.jsonl).
         input: PathBuf,
         /// Output .mosaic path.
-        #[arg(short = 'o', long = "output", visible_alias = "out")]
+        #[arg(short = 'o', long = "output")]
         out: PathBuf,
         /// Avro record schema file (supported subset; see the CLI README).
         #[arg(short = 's', long)]
         schema: Option<PathBuf>,
         /// Columns to keep; each occurrence accepts a comma-separated list.
-        #[arg(short = 'c', long = "column", visible_alias = "columns")]
+        #[arg(short = 'c', long = "column")]
         columns: Vec<String>,
         /// Columns to build min/max stats for (comma-separated); `cat --where`
         /// uses them to skip row groups.
@@ -163,7 +163,7 @@ enum Cmd {
         /// Input CSV path(s).
         inputs: Vec<PathBuf>,
         /// Output .mosaic path.
-        #[arg(short = 'o', long = "output", visible_alias = "out")]
+        #[arg(short = 'o', long = "output")]
         out: PathBuf,
         /// Avro record schema file (supported subset, scalar fields only; see the CLI README).
         #[arg(short = 's', long)]
@@ -592,6 +592,11 @@ fn write_validated_json_input<R: std::io::BufRead>(
 
 const DEFAULT_JSON_BATCH_SIZE: usize = 1024;
 const TARGET_CONVERT_BATCH_BYTES: usize = 16 * 1024 * 1024;
+// Hard ceiling on a single raw JSON record. Guards against a hostile input
+// where one record is arbitrarily large: `Deserializer::into_iter::<Box<RawValue>>`
+// buffers the whole record before yielding, and `normalize_json_decimal_record`
+// reallocates it into a fresh `String`. Enforced before normalization runs.
+const MAX_JSON_RECORD_BYTES: usize = 256 * 1024 * 1024;
 
 fn for_each_validated_json_batch<R, F>(
     reader: R,
@@ -622,6 +627,13 @@ where
         let record = index + 1;
         let raw = raw.map_err(|e| invalid_schema(format!("invalid JSON record {record}: {e}")))?;
         let raw_bytes = raw.get().as_bytes();
+        if raw_bytes.len() > MAX_JSON_RECORD_BYTES {
+            return Err(invalid_schema(format!(
+                "JSON record {record} is {} bytes, exceeds the {} byte limit",
+                raw_bytes.len(),
+                MAX_JSON_RECORD_BYTES
+            )));
+        }
         validate_json_special_values(raw_bytes, &fields, record)?;
         let normalized;
         let decode_bytes = if normalize_decimals {
@@ -1596,6 +1608,10 @@ const DEFAULT_CSV_BATCH_SIZE: usize = 1024;
 // offset per cell before projection is applied. Keep that eager allocation
 // bounded for very wide records by reducing the number of rows per batch.
 const TARGET_CSV_DECODE_CELLS: usize = 64 * 1024;
+// Hard ceiling on the inferred column count. The width comes from the CSV
+// header row, which is attacker-controllable; without this cap a pathological
+// header could force csv_reader_schema to allocate a Vec of millions of Fields.
+const MAX_CSV_COLUMNS: usize = 65_535;
 
 fn csv_batch_size(columns: usize) -> usize {
     if columns == 0 {
@@ -1645,6 +1661,14 @@ fn open_csv_input(path: &Path, options: &CsvConvertOptions) -> std::io::Result<C
         }
     };
     let columns = header.as_ref().map_or(0, Vec::len);
+    if columns > MAX_CSV_COLUMNS {
+        return Err(invalid_schema(format!(
+            "CSV input {} has {} columns, exceeds the {} column limit",
+            path.display(),
+            columns,
+            MAX_CSV_COLUMNS
+        )));
+    }
     let mut first_record = csv::StringRecord::new();
     let has_records = reader.read_record(&mut first_record).map_err(|e| {
         invalid_schema(format!(
@@ -2694,8 +2718,24 @@ fn csv_schema_mismatch(input: &Path) -> std::io::Error {
     )
 }
 
+// Hard ceiling on the `--schema` file. The path is user-supplied, so a
+// softlink to /dev/zero or an inflated file must not be able to OOM the CLI.
+// 4 MiB is generous for any realistic Avro record schema.
+const MAX_SCHEMA_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
 fn load_convert_schema(path: &Path) -> std::io::Result<Schema> {
-    let text = std::fs::read_to_string(path)?;
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)?
+        .take(MAX_SCHEMA_FILE_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_SCHEMA_FILE_BYTES {
+        return Err(invalid_schema(format!(
+            "--schema file {} exceeds the {} byte limit",
+            path.display(),
+            MAX_SCHEMA_FILE_BYTES
+        )));
+    }
     parse_avro_schema(&text)
 }
 
@@ -3979,5 +4019,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(schema.fields()[0].data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn load_convert_schema_rejects_oversized_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("mosaic_test_oversized_schema.avsc");
+        let mut spec = String::from(
+            r#"{"type":"record","name":"T","fields":[{"name":"id","type":"long","doc":""#,
+        );
+        spec.push_str(&"x".repeat(MAX_SCHEMA_FILE_BYTES as usize + 4096));
+        spec.push_str(r#""}]}"#);
+        std::fs::write(&path, spec).unwrap();
+        let err = load_convert_schema(&path).unwrap_err().to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.contains("exceeds the") && err.contains("byte limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_csv_input_rejects_too_many_columns() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("mosaic_test_wide_header.csv");
+        let header = (0..MAX_CSV_COLUMNS + 1)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+        let options = CsvConvertOptions {
+            delimiter: ",".to_string(),
+            escape: None,
+            quote: "\"".to_string(),
+            no_header: false,
+            header: None,
+            skip_lines: 0,
+        };
+        let err = match open_csv_input(&path, &options) {
+            Ok(_) => panic!("expected CSV width guard to reject this header"),
+            Err(err) => err.to_string(),
+        };
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.contains("exceeds the") && err.contains("column limit"),
+            "unexpected error: {err}"
+        );
     }
 }

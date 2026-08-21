@@ -115,13 +115,11 @@ inputs must be exactly representable at the schema scale (extra trailing zero
 digits are accepted). UUID values are validated during import but stored as
 `Utf8`; the Avro logical-type marker is not preserved in Mosaic. Unknown logical
 types are ignored and use their underlying Avro type.
-Use `-c`/`--column`/`--columns` to project top-level fields; each occurrence
+Use `-c`/`--column` to project top-level fields; each occurrence
 accepts a comma-separated list.
 `--stats id` builds min/max for those columns, which `cat --where` then uses
 to skip row groups that cannot match.
-`--output` is the canonical long option; the previous `--out` spelling remains
-available as an alias. `convert` accepts JSON inputs only; use `convert-csv`
-for CSV inputs.
+`convert` accepts JSON inputs only; use `convert-csv` for CSV inputs.
 
 ```text
 $ mosaic convert data.json -o data.mosaic

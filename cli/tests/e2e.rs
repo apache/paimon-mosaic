@@ -415,23 +415,6 @@ fn convert_csv_inferred_timestamp_rejects_explicit_timezone() {
 }
 
 #[test]
-fn convert_commands_accept_legacy_out_alias() {
-    let dir = std::env::temp_dir();
-
-    let csv = format!("{}/mosaic_e2e_legacy_out.csv", dir.display());
-    std::fs::write(&csv, "id\n1\n").unwrap();
-    let csv_out = format!("{}/mosaic_e2e_legacy_out_csv.mosaic", dir.display());
-    let (msg, err, ok) = run(&["convert-csv", &csv, "--out", &csv_out, "--overwrite"]);
-    assert!(ok, "stdout: {msg}\nstderr: {err}");
-
-    let json = format!("{}/mosaic_e2e_legacy_out.json", dir.display());
-    std::fs::write(&json, "{\"id\":1}\n").unwrap();
-    let json_out = format!("{}/mosaic_e2e_legacy_out_json.mosaic", dir.display());
-    let (msg, err, ok) = run(&["convert", &json, "--out", &json_out, "--overwrite"]);
-    assert!(ok, "stdout: {msg}\nstderr: {err}");
-}
-
-#[test]
 fn convert_csv_applies_dialect_flags() {
     let dir = std::env::temp_dir();
     let csv = format!("{}/mosaic_e2e_csv_dialect.csv", dir.display());
@@ -2201,7 +2184,7 @@ fn convert_json_projects_columns() {
         &out,
         "-c",
         "kind,id",
-        "--columns",
+        "--column",
         "id",
         "--overwrite",
     ]);
