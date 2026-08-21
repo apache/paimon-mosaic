@@ -457,6 +457,90 @@ fn convert_csv_applies_dialect_flags() {
     let (rows, err, ok) = run(&["cat", &out, "--json"]);
     assert!(ok, "stdout: {rows}\nstderr: {err}");
     assert_eq!(rows, "{\"id\":1,\"name\":\"a'b\"}\n");
+
+    let schema = format!("{}/mosaic_e2e_csv_dialect.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{"type":"record","name":"T","fields":[{"name":"id","type":"long"},{"name":"name","type":"string"}]}"#,
+    )
+    .unwrap();
+    let explicit_out = format!("{}/mosaic_e2e_csv_dialect_explicit.mosaic", dir.display());
+    let (msg, err, ok) = run(&[
+        "convert-csv",
+        &csv,
+        "-o",
+        &explicit_out,
+        "--schema",
+        &schema,
+        "--delimiter",
+        "|",
+        "--quote",
+        "'",
+        "--escape",
+        "\\",
+        "--skip-lines",
+        "1",
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &explicit_out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(rows, "{\"id\":1,\"name\":\"a'b\"}\n");
+}
+
+#[test]
+fn convert_csv_explicit_schema_preserves_first_row_with_header_options() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_explicit_header_options.csv", dir.display());
+    std::fs::write(&csv, "1,a\n2,b\n").unwrap();
+    let schema = format!("{}/mosaic_e2e_explicit_header_options.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{"type":"record","name":"T","fields":[{"name":"id","type":"long"},{"name":"kind","type":"string"}]}"#,
+    )
+    .unwrap();
+
+    let header_out = format!("{}/mosaic_e2e_explicit_header_option.mosaic", dir.display());
+    let (msg, err, ok) = run(&[
+        "convert-csv",
+        &csv,
+        "-o",
+        &header_out,
+        "--schema",
+        &schema,
+        "--header",
+        "id,kind",
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &header_out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        [r#"{"id":1,"kind":"a"}"#, r#"{"id":2,"kind":"b"}"#]
+    );
+
+    let no_header_out = format!(
+        "{}/mosaic_e2e_explicit_no_header_option.mosaic",
+        dir.display()
+    );
+    let (msg, err, ok) = run(&[
+        "convert-csv",
+        &csv,
+        "-o",
+        &no_header_out,
+        "--schema",
+        &schema,
+        "--no-header",
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &no_header_out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        [r#"{"id":1,"kind":"a"}"#, r#"{"id":2,"kind":"b"}"#]
+    );
 }
 
 #[test]
@@ -580,15 +664,42 @@ fn convert_csv_uses_explicit_schema_file() {
 }
 
 #[test]
+fn convert_csv_requires_input_with_explicit_schema() {
+    let dir = std::env::temp_dir();
+    let schema = format!("{}/mosaic_e2e_explicit_without_input.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{"type":"record","name":"T","fields":[{"name":"id","type":"long"}]}"#,
+    )
+    .unwrap();
+    let out = format!("{}/mosaic_e2e_explicit_without_input.mosaic", dir.display());
+    let _ = std::fs::remove_file(&out);
+    let (_, err, ok) = run(&[
+        "convert-csv",
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("CSV path is required"), "{err}");
+    assert!(!std::path::Path::new(&out).exists());
+}
+
+#[test]
 fn convert_csv_explicit_schema_preserves_supported_scalar_types() {
     let dir = std::env::temp_dir();
     let csv = format!("{}/mosaic_e2e_explicit_scalar_types.csv", dir.display());
     std::fs::write(
         &csv,
         concat!(
-            "flag,i32,i64,f32,f64,date,time,instant,local,amount,id\n",
+            "flag,i32,i64,f32,f64,date,time,instant,instant_us,instant_ns,local,local_ns,amount,id\n",
             "true,7,8,1.5,2.5,2026-08-20,12:34:56.789,",
-            "2026-08-20T12:34:56+08:00,2026-08-20T12:34:56,12.34,",
+            "2026-08-20T12:34:56+08:00,",
+            "2026-08-20T12:34:56.123456+08:00,",
+            "2026-08-20T12:34:56.123456789+08:00,",
+            "2026-08-20T12:34:56,2026-08-20T12:34:56.123456789,12.34,",
             "550e8400-e29b-41d4-a716-446655440000\n"
         ),
     )
@@ -608,7 +719,10 @@ fn convert_csv_explicit_schema_preserves_supported_scalar_types() {
     {"name": "date", "type": {"type": "int", "logicalType": "date"}},
     {"name": "time", "type": {"type": "int", "logicalType": "time-millis"}},
     {"name": "instant", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+    {"name": "instant_us", "type": {"type": "long", "logicalType": "timestamp-micros"}},
+    {"name": "instant_ns", "type": {"type": "long", "logicalType": "timestamp-nanos"}},
     {"name": "local", "type": {"type": "long", "logicalType": "local-timestamp-micros"}},
+    {"name": "local_ns", "type": {"type": "long", "logicalType": "local-timestamp-nanos"}},
     {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}},
     {"name": "id", "type": {"type": "string", "logicalType": "uuid"}}
   ]
@@ -636,8 +750,11 @@ fn convert_csv_explicit_schema_preserves_supported_scalar_types() {
         "f64: Float64",
         "date: Date32",
         "time: Time32(Millisecond)",
-        "instant: Timestamp(Millisecond",
-        "local: Timestamp(Microsecond",
+        "instant: Timestamp(Millisecond, Some(\"+00:00\"))",
+        "instant_us: Timestamp(Microsecond, Some(\"+00:00\"))",
+        "instant_ns: Timestamp(Nanosecond, Some(\"+00:00\"))",
+        "local: Timestamp(Microsecond, None)",
+        "local_ns: Timestamp(Nanosecond, None)",
         "amount: Decimal128(10, 2)",
         "id: Utf8",
     ] {
@@ -651,7 +768,10 @@ fn convert_csv_explicit_schema_preserves_supported_scalar_types() {
             r#"{"flag":true,"i32":7,"i64":8,"f32":1.5,"f64":2.5,"#,
             r#""date":"2026-08-20","time":"12:34:56.789","#,
             r#""instant":"2026-08-20T04:34:56Z","#,
-            r#""local":"2026-08-20T12:34:56","amount":12.34,"#,
+            r#""instant_us":"2026-08-20T04:34:56.123456Z","#,
+            r#""instant_ns":"2026-08-20T04:34:56.123456789Z","#,
+            r#""local":"2026-08-20T12:34:56","#,
+            r#""local_ns":"2026-08-20T12:34:56.123456789","amount":12.34,"#,
             r#""id":"550e8400-e29b-41d4-a716-446655440000"}"#
         )
     );
@@ -1027,6 +1147,50 @@ fn convert_json_supports_stats() {
 }
 
 #[test]
+fn convert_explicit_schema_paths_write_rows_after_the_first_batch() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_multi_batch.csv", dir.display());
+    let mut csv_rows = String::from("id,value\n");
+    let json = format!("{}/mosaic_e2e_multi_batch.json", dir.display());
+    let mut json_rows = String::new();
+    let schema = format!("{}/mosaic_e2e_multi_batch.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{"type":"record","name":"T","fields":[{"name":"id","type":"long"},{"name":"value","type":"string"}]}"#,
+    )
+    .unwrap();
+    for id in 0..=1024 {
+        csv_rows.push_str(&format!("{id},v{id}\n"));
+        json_rows.push_str(&format!("{{\"id\":{id},\"value\":\"v{id}\"}}\n"));
+    }
+    std::fs::write(&csv, csv_rows).unwrap();
+    std::fs::write(&json, json_rows).unwrap();
+
+    for (kind, command, input) in [
+        ("csv", "convert-csv", csv.as_str()),
+        ("json", "convert", json.as_str()),
+    ] {
+        let out = format!("{}/mosaic_e2e_multi_batch_{kind}.mosaic", dir.display());
+        let (msg, err, ok) = run(&[
+            command,
+            input,
+            "-o",
+            &out,
+            "--schema",
+            &schema,
+            "--overwrite",
+        ]);
+        assert!(ok, "{kind}: stdout: {msg}\nstderr: {err}");
+        let (count, err, ok) = run(&["count", &out]);
+        assert!(ok, "{kind}: stdout: {count}\nstderr: {err}");
+        assert_eq!(count.trim(), "1025", "{kind}: {count}");
+        let (last, err, ok) = run(&["cat", &out, "--where", "id=1024", "--json"]);
+        assert!(ok, "{kind}: stdout: {last}\nstderr: {err}");
+        assert_eq!(last, "{\"id\":1024,\"value\":\"v1024\"}\n", "{kind}");
+    }
+}
+
+#[test]
 fn convert_csv_multiple_inputs_share_schema() {
     let dir = std::env::temp_dir();
     let a = format!("{}/mosaic_e2e_multi_a.csv", dir.display());
@@ -1073,9 +1237,42 @@ fn convert_csv_multiple_inputs_promotes_ints_and_floats() {
 }
 
 #[test]
-fn convert_csv_multiple_inputs_rejects_lossy_int_float_promotion() {
+fn convert_csv_multiple_inputs_accepts_float_literals_after_int_promotion() {
     let dir = std::env::temp_dir();
-    for (case, integer_rows, float_rows) in [
+    let ints = format!(
+        "{}/mosaic_e2e_multi_numeric_float_literals_ints.csv",
+        dir.display()
+    );
+    let floats = format!(
+        "{}/mosaic_e2e_multi_numeric_float_literals_floats.csv",
+        dir.display()
+    );
+    std::fs::write(&ints, "value\n1\n2\n").unwrap();
+    std::fs::write(&floats, "value\n1.5e30\n1e300\n").unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_multi_numeric_float_literals.mosaic",
+        dir.display()
+    );
+    let (msg, err, ok) = run(&["convert-csv", &ints, &floats, "-o", &out, "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(rows.lines().count(), 4, "{rows}");
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        [
+            r#"{"value":1.0}"#,
+            r#"{"value":2.0}"#,
+            r#"{"value":1.5e30}"#,
+            r#"{"value":1.0e300}"#
+        ]
+    );
+}
+
+#[test]
+fn convert_csv_inferred_float_rejects_lossy_bare_integer_literals() {
+    let dir = std::env::temp_dir();
+    for (case, first_rows, second_rows) in [
         (
             "integer_shard",
             "value\n1\n9007199254740993\n",
@@ -1086,27 +1283,32 @@ fn convert_csv_multiple_inputs_rejects_lossy_int_float_promotion() {
             "value\n1\n",
             "value\n1.5\n9007199254740993\n",
         ),
+        (
+            "float_only_shards",
+            "value\n1.5\n9007199254740993\n",
+            "value\n2.5\n",
+        ),
     ] {
-        let ints = format!(
-            "{}/mosaic_e2e_multi_numeric_lossy_{case}_ints.csv",
+        let first = format!(
+            "{}/mosaic_e2e_inferred_float_lossy_{case}_first.csv",
             dir.display()
         );
-        let floats = format!(
-            "{}/mosaic_e2e_multi_numeric_lossy_{case}_floats.csv",
+        let second = format!(
+            "{}/mosaic_e2e_inferred_float_lossy_{case}_second.csv",
             dir.display()
         );
-        std::fs::write(&ints, integer_rows).unwrap();
-        std::fs::write(&floats, float_rows).unwrap();
-        for (order, first, second) in [
-            ("int_first", ints.as_str(), floats.as_str()),
-            ("float_first", floats.as_str(), ints.as_str()),
+        std::fs::write(&first, first_rows).unwrap();
+        std::fs::write(&second, second_rows).unwrap();
+        for (order, a, b) in [
+            ("forward", first.as_str(), second.as_str()),
+            ("reverse", second.as_str(), first.as_str()),
         ] {
             let out = format!(
-                "{}/mosaic_e2e_multi_numeric_lossy_{case}_{order}.mosaic",
+                "{}/mosaic_e2e_inferred_float_lossy_{case}_{order}.mosaic",
                 dir.display()
             );
             let _ = std::fs::remove_file(&out);
-            let (_, err, ok) = run(&["convert-csv", first, second, "-o", &out, "--overwrite"]);
+            let (_, err, ok) = run(&["convert-csv", a, b, "-o", &out, "--overwrite"]);
             assert!(!ok, "{case}/{order} unexpectedly succeeded");
             assert!(
                 err.contains("cannot be represented exactly as Float64"),
@@ -1115,6 +1317,268 @@ fn convert_csv_multiple_inputs_rejects_lossy_int_float_promotion() {
             assert!(!std::path::Path::new(&out).exists(), "{case}/{order}");
         }
     }
+}
+
+#[test]
+fn convert_json_enforces_avro_time_millis_day_range() {
+    let dir = std::env::temp_dir();
+    let schema = format!("{}/mosaic_e2e_avro_time_millis_range.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{"type":"record","name":"T","fields":[{"name":"time","type":{"type":"int","logicalType":"time-millis"}}]}"#,
+    )
+    .unwrap();
+
+    let valid = format!("{}/mosaic_e2e_avro_time_millis_valid.json", dir.display());
+    std::fs::write(&valid, "{\"time\":0}\n{\"time\":86399999}\n").unwrap();
+    let valid_out = format!("{}/mosaic_e2e_avro_time_millis_valid.mosaic", dir.display());
+    let (msg, err, ok) = run(&[
+        "convert",
+        &valid,
+        "-o",
+        &valid_out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &valid_out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        [r#"{"time":"00:00:00"}"#, r#"{"time":"23:59:59.999"}"#]
+    );
+
+    for (case, raw_value, displayed_value) in [
+        ("negative", "-1", "-1"),
+        ("next_day", "86400000", "86400000"),
+        ("quoted_negative", r#""-1""#, "-1"),
+        ("quoted_next_day", r#""86400000""#, "86400000"),
+        ("leap_second", r#""23:59:60""#, "23:59:60"),
+    ] {
+        let input = format!("{}/mosaic_e2e_avro_time_millis_{case}.json", dir.display());
+        std::fs::write(&input, format!("{{\"time\":{raw_value}}}\n")).unwrap();
+        let out = format!(
+            "{}/mosaic_e2e_avro_time_millis_{case}.mosaic",
+            dir.display()
+        );
+        let _ = std::fs::remove_file(&out);
+        let (_, err, ok) = run(&[
+            "convert",
+            &input,
+            "-o",
+            &out,
+            "--schema",
+            &schema,
+            "--overwrite",
+        ]);
+        assert!(!ok, "{case} unexpectedly succeeded");
+        assert!(err.contains("out of range for Time32"), "{err}");
+        assert!(err.contains(displayed_value), "{err}");
+        assert!(!std::path::Path::new(&out).exists(), "{case}");
+    }
+}
+
+#[test]
+fn convert_csv_enforces_avro_time_millis_day_range() {
+    let dir = std::env::temp_dir();
+    let schema = format!(
+        "{}/mosaic_e2e_csv_avro_time_millis_range.avsc",
+        dir.display()
+    );
+    std::fs::write(
+        &schema,
+        r#"{"type":"record","name":"T","fields":[{"name":"time","type":{"type":"int","logicalType":"time-millis"}}]}"#,
+    )
+    .unwrap();
+
+    let valid = format!(
+        "{}/mosaic_e2e_csv_avro_time_millis_valid.csv",
+        dir.display()
+    );
+    std::fs::write(&valid, "time\n0\n86399999\n23:59:59.999\n").unwrap();
+    let valid_out = format!(
+        "{}/mosaic_e2e_csv_avro_time_millis_valid.mosaic",
+        dir.display()
+    );
+    let (msg, err, ok) = run(&[
+        "convert-csv",
+        &valid,
+        "-o",
+        &valid_out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &valid_out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        [
+            r#"{"time":"00:00:00"}"#,
+            r#"{"time":"23:59:59.999"}"#,
+            r#"{"time":"23:59:59.999"}"#
+        ]
+    );
+
+    for (case, value) in [
+        ("negative", "-1"),
+        ("next_day", "86400000"),
+        ("leap_second", "23:59:60"),
+    ] {
+        let input = format!(
+            "{}/mosaic_e2e_csv_avro_time_millis_{case}.csv",
+            dir.display()
+        );
+        std::fs::write(&input, format!("time\n{value}\n")).unwrap();
+        let out = format!(
+            "{}/mosaic_e2e_csv_avro_time_millis_{case}.mosaic",
+            dir.display()
+        );
+        let _ = std::fs::remove_file(&out);
+        let (_, err, ok) = run(&[
+            "convert-csv",
+            &input,
+            "-o",
+            &out,
+            "--schema",
+            &schema,
+            "--overwrite",
+        ]);
+        assert!(!ok, "{case} unexpectedly succeeded");
+        assert!(err.contains("must be between 0 and 86399999"), "{err}");
+        assert!(err.contains(value), "{err}");
+        assert!(!std::path::Path::new(&out).exists(), "{case}");
+    }
+}
+
+#[test]
+fn convert_csv_multiple_inputs_promotes_timestamp_precision() {
+    let dir = std::env::temp_dir();
+    let millis = format!("{}/mosaic_e2e_multi_timestamp_millis.csv", dir.display());
+    let nanos = format!("{}/mosaic_e2e_multi_timestamp_nanos.csv", dir.display());
+    std::fs::write(&millis, "ts\n2026-08-20T12:34:56.123\n").unwrap();
+    std::fs::write(&nanos, "ts\n2026-08-20T12:34:56.123456789\n").unwrap();
+    for (order, first, second, expected) in [
+        (
+            "millis_nanos",
+            millis.as_str(),
+            nanos.as_str(),
+            [
+                r#"{"ts":"2026-08-20T12:34:56.123"}"#,
+                r#"{"ts":"2026-08-20T12:34:56.123456789"}"#,
+            ],
+        ),
+        (
+            "nanos_millis",
+            nanos.as_str(),
+            millis.as_str(),
+            [
+                r#"{"ts":"2026-08-20T12:34:56.123456789"}"#,
+                r#"{"ts":"2026-08-20T12:34:56.123"}"#,
+            ],
+        ),
+    ] {
+        let out = format!(
+            "{}/mosaic_e2e_multi_timestamp_precision_{order}.mosaic",
+            dir.display()
+        );
+        let (msg, err, ok) = run(&["convert-csv", first, second, "-o", &out, "--overwrite"]);
+        assert!(ok, "{order}: stdout: {msg}\nstderr: {err}");
+        let (schema, err, ok) = run(&["schema", &out]);
+        assert!(ok, "{order}: stdout: {schema}\nstderr: {err}");
+        assert!(
+            schema.contains("ts: Timestamp(Nanosecond, None)"),
+            "{order}: {schema}"
+        );
+        let (rows, err, ok) = run(&["cat", &out, "--json"]);
+        assert!(ok, "{order}: stdout: {rows}\nstderr: {err}");
+        assert_eq!(rows.lines().collect::<Vec<_>>(), expected, "{order}");
+    }
+}
+
+#[test]
+fn convert_csv_skip_lines_are_included_in_error_line_numbers() {
+    let dir = std::env::temp_dir();
+    let schema = format!("{}/mosaic_e2e_skip_lines_errors.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{"type":"record","name":"T","fields":[{"name":"a","type":["null","long"]},{"name":"b","type":["null","string"]}]}"#,
+    )
+    .unwrap();
+
+    let explicit = format!("{}/mosaic_e2e_skip_lines_explicit.csv", dir.display());
+    std::fs::write(&explicit, "P1\nP2\na,b\n1,x\nBAD,y\n").unwrap();
+    let explicit_out = format!("{}/mosaic_e2e_skip_lines_explicit.mosaic", dir.display());
+    let (_, err, ok) = run(&[
+        "convert-csv",
+        &explicit,
+        "-o",
+        &explicit_out,
+        "--schema",
+        &schema,
+        "--skip-lines",
+        "2",
+        "--overwrite",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("at line 5"), "{err}");
+
+    let inferred = format!("{}/mosaic_e2e_skip_lines_inferred.csv", dir.display());
+    std::fs::write(&inferred, "P1\nP2\na,b\n1,x\n2,y,z\n").unwrap();
+    let inferred_out = format!("{}/mosaic_e2e_skip_lines_inferred.mosaic", dir.display());
+    let (_, err, ok) = run(&[
+        "convert-csv",
+        &inferred,
+        "-o",
+        &inferred_out,
+        "--skip-lines",
+        "2",
+        "--overwrite",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("at line 5"), "{err}");
+
+    let invalid_date = format!("{}/mosaic_e2e_skip_lines_invalid_date.csv", dir.display());
+    std::fs::write(&invalid_date, "P1\nP2\nd,note\n2026-02-30,foo at line 99\n").unwrap();
+    let invalid_date_out = format!(
+        "{}/mosaic_e2e_skip_lines_invalid_date.mosaic",
+        dir.display()
+    );
+    let (_, err, ok) = run(&[
+        "convert-csv",
+        &invalid_date,
+        "-o",
+        &invalid_date_out,
+        "--skip-lines",
+        "2",
+        "--overwrite",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("at line 4"), "{err}");
+    assert!(err.contains("foo at line 99"), "{err}");
+    assert!(!err.contains("foo at line 102"), "{err}");
+
+    let invalid_utf8 = format!("{}/mosaic_e2e_skip_lines_invalid_utf8.csv", dir.display());
+    std::fs::write(&invalid_utf8, b"P1\nP2\na,b\n1,x\n2,\xff\n").unwrap();
+    let invalid_utf8_out = format!(
+        "{}/mosaic_e2e_skip_lines_invalid_utf8.mosaic",
+        dir.display()
+    );
+    let (_, err, ok) = run(&[
+        "convert-csv",
+        &invalid_utf8,
+        "-o",
+        &invalid_utf8_out,
+        "--schema",
+        &schema,
+        "--skip-lines",
+        "2",
+        "--overwrite",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("line 5"), "{err}");
 }
 
 #[test]

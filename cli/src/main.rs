@@ -1040,7 +1040,32 @@ fn validate_json_special_value(
     }
     let data_type = field.data_type();
     match data_type {
-        DataType::Int32 | DataType::Date32 | DataType::Time32(_) if !raw.get().starts_with('"') => {
+        DataType::Time32(TimeUnit::Millisecond) if !raw.get().starts_with('"') => {
+            validate_json_integer(raw, data_type, path, record, 0, i128::from(MAX_TIME_MILLIS))?;
+        }
+        DataType::Time32(TimeUnit::Millisecond) => {
+            let value: String = serde_json::from_str(raw.get()).map_err(|_| {
+                invalid_schema(format!(
+                    "JSON field '{}' at record {record} must be a valid time-millis value",
+                    fmt::safe(path)
+                ))
+            })?;
+            let parsed = Time32MillisecondType::parse(&value).ok_or_else(|| {
+                invalid_schema(format!(
+                    "JSON field '{}' at record {record} must be a valid time-millis value; got '{}'",
+                    fmt::safe(path),
+                    fmt::safe(&value)
+                ))
+            })?;
+            if !valid_time_millis(parsed) {
+                return Err(invalid_schema(format!(
+                    "JSON field '{}' at record {record} is out of range for {data_type}; got '{}'",
+                    fmt::safe(path),
+                    fmt::safe(&value)
+                )));
+            }
+        }
+        DataType::Int32 | DataType::Date32 if !raw.get().starts_with('"') => {
             validate_json_integer(
                 raw,
                 data_type,
@@ -1173,6 +1198,12 @@ fn validate_json_integer(
     Ok(())
 }
 
+const MAX_TIME_MILLIS: i32 = 86_399_999;
+
+fn valid_time_millis(value: i32) -> bool {
+    (0..=MAX_TIME_MILLIS).contains(&value)
+}
+
 struct CsvConvertOptions {
     delimiter: String,
     escape: Option<String>,
@@ -1203,20 +1234,18 @@ fn convert_csv(
         ));
     }
     ensure_can_write(out, overwrite)?;
-    use arrow::error::ArrowError;
-    let bad = |e: ArrowError| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
     let format = csv_format(&options)?;
     let explicit_schema = schema.map(load_convert_schema).transpose()?;
     let has_explicit_schema = explicit_schema.is_some();
-    let mut inferred_csv_types = std::collections::HashMap::new();
     let schema = match explicit_schema {
         Some(schema) => schema,
         None => {
             let mut inferred: Option<Schema> = None;
             for input in inputs {
+                let (reader, line_offset) = open_csv(input, options.skip_lines)?;
                 let (schema, rows) = format
-                    .infer_schema(open_csv(input, options.skip_lines)?, None)
-                    .map_err(bad)?;
+                    .infer_schema(reader, None)
+                    .map_err(|e| csv_data_error(e, line_offset))?;
                 // A shard with no data rows has nothing to infer from; it is
                 // skipped when reading too.
                 if rows == 0 || schema.fields().is_empty() {
@@ -1225,7 +1254,6 @@ fn convert_csv(
                 let schema = promote_second_precision_csv_timestamps(csv_schema_with_csv_names(
                     schema, &options,
                 )?);
-                observe_csv_inferred_types(&mut inferred_csv_types, &schema);
                 inferred = Some(match inferred.take() {
                     Some(prev) => merge_csv_inferred_schema(prev, schema, input)?,
                     None => schema,
@@ -1239,7 +1267,6 @@ fn convert_csv(
     };
     reject_csv_unsupported_fields(&schema)?;
     let schema_index = csv_schema_index(&schema);
-    let mixed_float_fields = mixed_csv_float_fields(&schema, &inferred_csv_types);
     write_mosaic(out, overwrite, &schema, stats, |writer, rows| {
         for input in inputs {
             if has_explicit_schema {
@@ -1259,22 +1286,21 @@ fn convert_csv(
             if !layout.has_records {
                 continue;
             }
-            let reader_schema =
-                csv_reader_schema(&schema, &schema_index, &mixed_float_fields, &layout);
+            let reader_schema = csv_reader_schema(&schema, &schema_index, &layout);
             let source_mapping = csv_output_mapping(&schema, &schema_index, &layout);
             validate_csv_mapping(&schema, &layout, &source_mapping, input)?;
             let (projection, mapping) = csv_projection(&source_mapping);
             let batch_size = csv_batch_size(reader_schema.fields().len());
+            let (reader, line_offset) = open_csv(input, options.skip_lines)?;
+            debug_assert_eq!(line_offset, layout.line_offset);
             let reader = arrow::csv::ReaderBuilder::new(Arc::new(reader_schema))
                 .with_format(format.clone().with_truncated_rows(true))
                 .with_batch_size(batch_size)
                 .with_projection(projection)
-                .build(open_csv(input, options.skip_lines)?)
-                .map_err(bad)?;
+                .build(reader)
+                .map_err(|e| csv_data_error(e, line_offset))?;
             for batch in reader {
-                let batch = batch.map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                })?;
+                let batch = batch.map_err(|e| csv_data_error(e, line_offset))?;
                 let batch = align_csv_batch_to_schema(batch, &schema, &mapping, input)?;
                 *rows += batch.num_rows();
                 writer.write_batch(&batch)?;
@@ -1468,23 +1494,95 @@ fn parse_optional_csv_byte(value: Option<&str>, name: &str) -> std::io::Result<O
     value.map(|value| parse_csv_byte(value, name)).transpose()
 }
 
-fn open_csv(path: &Path, skip_lines: usize) -> std::io::Result<std::io::BufReader<std::fs::File>> {
+fn open_csv(
+    path: &Path,
+    skip_lines: usize,
+) -> std::io::Result<(std::io::BufReader<std::fs::File>, u64)> {
     use std::io::BufRead;
     let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
     let mut line = String::new();
+    let mut skipped = 0;
     for _ in 0..skip_lines {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
             break;
         }
+        skipped += 1;
     }
-    Ok(reader)
+    Ok((reader, skipped))
+}
+
+fn csv_data_error(error: arrow::error::ArrowError, line_offset: u64) -> std::io::Error {
+    // Arrow ParseError line numbers are zero-based record indexes, whereas
+    // CsvError line numbers are one-based and already include the file header.
+    let parse_error = matches!(&error, arrow::error::ArrowError::ParseError(_));
+    let line_offset = line_offset.saturating_add(parse_error as u64);
+    let message = error.to_string();
+    // ParseError appends the complete row. Do not rewrite line-shaped text
+    // inside user data such as "note at line 99".
+    let search_end = if parse_error {
+        message.find(". Row data:").unwrap_or(message.len())
+    } else {
+        message.len()
+    };
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        csv_error_message_with_line_offset(message, line_offset, search_end),
+    )
+}
+
+fn csv_error_with_line_offset(error: impl ToString, line_offset: u64) -> String {
+    let message = error.to_string();
+    let search_end = message.len();
+    csv_error_message_with_line_offset(message, line_offset, search_end)
+}
+
+fn csv_error_message_with_line_offset(
+    message: String,
+    line_offset: u64,
+    search_end: usize,
+) -> String {
+    if line_offset == 0 {
+        return message;
+    }
+    for marker in [" at line ", "(line: ", "(line ", "for line "] {
+        let Some(index) = message[..search_end].rfind(marker) else {
+            continue;
+        };
+        let value_start = index + marker.len();
+        let value_len = message[value_start..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+        if value_len == 0 {
+            continue;
+        }
+        let Ok(line) = message[value_start..value_start + value_len].parse::<u64>() else {
+            continue;
+        };
+        return format!(
+            "{}{}{}",
+            &message[..value_start],
+            line.saturating_add(line_offset),
+            &message[value_start + value_len..]
+        );
+    }
+    message
+}
+
+fn add_csv_record_line_offset(record: &mut csv::StringRecord, line_offset: u64) {
+    let Some(mut position) = record.position().cloned() else {
+        return;
+    };
+    position.set_line(position.line().saturating_add(line_offset));
+    record.set_position(Some(position));
 }
 
 struct CsvInputLayout {
     header: Option<Vec<String>>,
     columns: usize,
     has_records: bool,
+    line_offset: u64,
 }
 
 struct CsvInput {
@@ -1525,7 +1623,8 @@ fn open_csv_input(path: &Path, options: &CsvConvertOptions) -> std::io::Result<C
         .delimiter(delimiter)
         .quote(quote)
         .escape(escape);
-    let mut reader = builder.from_reader(open_csv(path, options.skip_lines)?);
+    let (reader, line_offset) = open_csv(path, options.skip_lines)?;
+    let mut reader = builder.from_reader(reader);
     let file_header = options.header.is_none() && !options.no_header;
     let header = if let Some(header) = &options.header {
         Some(parse_csv_header(header, options)?)
@@ -1533,10 +1632,13 @@ fn open_csv_input(path: &Path, options: &CsvConvertOptions) -> std::io::Result<C
         None
     } else {
         let mut record = csv::StringRecord::new();
-        if reader
-            .read_record(&mut record)
-            .map_err(|e| invalid_schema(format!("invalid CSV header: {e}")))?
-        {
+        if reader.read_record(&mut record).map_err(|e| {
+            invalid_schema(format!(
+                "invalid CSV header: {}",
+                csv_error_with_line_offset(e, line_offset)
+            ))
+        })? {
+            add_csv_record_line_offset(&mut record, line_offset);
             Some(record.iter().map(ToString::to_string).collect())
         } else {
             Some(Vec::new())
@@ -1544,9 +1646,15 @@ fn open_csv_input(path: &Path, options: &CsvConvertOptions) -> std::io::Result<C
     };
     let columns = header.as_ref().map_or(0, Vec::len);
     let mut first_record = csv::StringRecord::new();
-    let has_records = reader
-        .read_record(&mut first_record)
-        .map_err(|e| invalid_schema(format!("invalid CSV record: {e}")))?;
+    let has_records = reader.read_record(&mut first_record).map_err(|e| {
+        invalid_schema(format!(
+            "invalid CSV record: {}",
+            csv_error_with_line_offset(e, line_offset)
+        ))
+    })?;
+    if has_records {
+        add_csv_record_line_offset(&mut first_record, line_offset);
+    }
     if has_records && file_header {
         validate_csv_header_names(header.as_ref().unwrap())?;
     }
@@ -1556,6 +1664,7 @@ fn open_csv_input(path: &Path, options: &CsvConvertOptions) -> std::io::Result<C
             header,
             columns,
             has_records,
+            line_offset,
         },
         first_record: has_records.then_some(first_record),
     })
@@ -1576,15 +1685,20 @@ fn write_explicit_schema_csv_input(
     let source_mapping = csv_output_mapping(schema, schema_index, &input_reader.layout);
     validate_csv_mapping(schema, &input_reader.layout, &source_mapping, input)?;
 
+    let line_offset = input_reader.layout.line_offset;
     let first = input_reader.first_record.take().into_iter().map(Ok);
     let rest = std::iter::from_fn(|| {
         let mut record = csv::StringRecord::new();
         match input_reader.reader.read_record(&mut record) {
-            Ok(true) => Some(Ok(record)),
+            Ok(true) => {
+                add_csv_record_line_offset(&mut record, line_offset);
+                Some(Ok(record))
+            }
             Ok(false) => None,
             Err(e) => Some(Err(invalid_schema(format!(
-                "invalid CSV record in {}: {e}",
-                input.display()
+                "invalid CSV record in {}: {}",
+                input.display(),
+                csv_error_with_line_offset(e, line_offset)
             )))),
         }
     });
@@ -1701,9 +1815,7 @@ fn csv_column_array(
         DataType::Float32 => csv_primitive_column::<Float32Type>(records, source, field),
         DataType::Float64 => csv_primitive_column::<Float64Type>(records, source, field),
         DataType::Date32 => csv_primitive_column::<Date32Type>(records, source, field),
-        DataType::Time32(TimeUnit::Millisecond) => {
-            csv_primitive_column::<Time32MillisecondType>(records, source, field)
-        }
+        DataType::Time32(TimeUnit::Millisecond) => csv_time_millis_column(records, source, field),
         DataType::Timestamp(unit, timezone) => {
             csv_timestamp_column(records, source, field, unit, timezone.clone())
         }
@@ -1767,6 +1879,40 @@ fn csv_column_array(
             fmt::safe(field.name())
         ))),
     }
+}
+
+fn csv_time_millis_column(
+    records: &[csv::StringRecord],
+    source: usize,
+    field: &Field,
+) -> std::io::Result<ArrayRef> {
+    let values = records
+        .iter()
+        .map(|record| {
+            let Some(value) = csv_record_value(record, source) else {
+                return Ok(None);
+            };
+            let parsed = Time32MillisecondType::parse(value)
+                .ok_or_else(|| csv_value_parse_error(record, field, value))?;
+            if !valid_time_millis(parsed) {
+                return Err(invalid_schema(format!(
+                    "time-millis value '{}' for CSV field '{}' at line {} must be between 0 and {MAX_TIME_MILLIS}",
+                    fmt::safe(value),
+                    fmt::safe(field.name()),
+                    record
+                        .position()
+                        .map(|position| position.line().to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                )));
+            }
+            Ok(Some(parsed))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    Ok(Arc::new(
+        values
+            .into_iter()
+            .collect::<PrimitiveArray<Time32MillisecondType>>(),
+    ))
 }
 
 fn csv_primitive_column<T>(
@@ -2082,61 +2228,9 @@ fn csv_schema_index(schema: &Schema) -> std::collections::HashMap<&str, usize> {
         .collect()
 }
 
-fn mixed_csv_float_fields(
-    output_schema: &Schema,
-    inferred_types: &std::collections::HashMap<String, ObservedCsvTypes>,
-) -> std::collections::HashSet<String> {
-    // These fields are Float64 only because different shards inferred Int64
-    // and Float64. Read their raw text in every shard so integer-looking values
-    // cannot be rounded before the exactness check.
-    output_schema
-        .fields()
-        .iter()
-        .filter(|field| matches!(field.data_type(), DataType::Float64))
-        .filter(|field| {
-            inferred_types
-                .get(field.name())
-                .is_some_and(ObservedCsvTypes::is_mixed_int_float)
-        })
-        .map(|field| field.name().clone())
-        .collect()
-}
-
-#[derive(Default)]
-struct ObservedCsvTypes {
-    saw_int64: bool,
-    saw_float64: bool,
-}
-
-impl ObservedCsvTypes {
-    fn observe(&mut self, data_type: &DataType) {
-        self.saw_int64 |= matches!(data_type, DataType::Int64);
-        self.saw_float64 |= matches!(data_type, DataType::Float64);
-    }
-
-    fn is_mixed_int_float(&self) -> bool {
-        self.saw_int64 && self.saw_float64
-    }
-}
-
-fn observe_csv_inferred_types(
-    inferred_types: &mut std::collections::HashMap<String, ObservedCsvTypes>,
-    schema: &Schema,
-) {
-    for field in schema.fields() {
-        if matches!(field.data_type(), DataType::Int64 | DataType::Float64) {
-            inferred_types
-                .entry(field.name().clone())
-                .or_default()
-                .observe(field.data_type());
-        }
-    }
-}
-
 fn csv_reader_schema(
     output_schema: &Schema,
     schema_index: &std::collections::HashMap<&str, usize>,
-    mixed_float_fields: &std::collections::HashSet<String>,
     layout: &CsvInputLayout,
 ) -> Schema {
     let positional = layout.header.is_none();
@@ -2156,12 +2250,13 @@ fn csv_reader_schema(
             };
             if let Some(source) = source {
                 let output_field = output_schema.fields()[source].as_ref();
-                let data_type = if mixed_float_fields.contains(output_field.name())
-                    || matches!(output_field.data_type(), DataType::Timestamp(_, _))
-                {
-                    DataType::Utf8
-                } else {
-                    output_field.data_type().clone()
+                let data_type = match output_field.data_type() {
+                    // Arrow's Float64 decoder would round bare integer tokens
+                    // before Mosaic can enforce exactness. Preserve raw text
+                    // for every inferred Float64 field, including shards that
+                    // already infer as Float64 on their own.
+                    DataType::Float64 | DataType::Timestamp(_, _) => DataType::Utf8,
+                    data_type => data_type.clone(),
                 };
                 // Read as nullable: not-null enforcement happens when the batch
                 // is re-attached to the output schema, where the error carries
@@ -2254,7 +2349,7 @@ fn align_csv_batch_to_schema(
             Some(index) if batch.column(*index).data_type() == &DataType::Utf8 => {
                 match field.data_type() {
                     DataType::Float64 => {
-                        parse_mixed_csv_float64(batch.column(*index), field, input)
+                        parse_inferred_csv_float64(batch.column(*index), field, input)
                     }
                     DataType::Timestamp(_, _) => {
                         parse_inferred_csv_timestamp_column(batch.column(*index), field, input)
@@ -2311,7 +2406,7 @@ fn parse_inferred_csv_timestamp_column(
     csv_timestamp_array(values, unit, timezone.clone())
 }
 
-fn parse_mixed_csv_float64(
+fn parse_inferred_csv_float64(
     array: &ArrayRef,
     field: &Field,
     input: &Path,
@@ -2327,24 +2422,32 @@ fn parse_mixed_csv_float64(
                 return Ok(None);
             };
             let promoted = Float64Type::parse(value)
-                .ok_or_else(|| csv_mixed_float_parse_error(value, field, input))?;
-            // Fractional Float64 values retain normal floating-point semantics.
-            // Integral decimal tokens must round-trip exactly.
+                .ok_or_else(|| csv_inferred_float_parse_error(value, field, input))?;
+            // Float-shaped values retain normal floating-point semantics.
+            // Integer-shaped tokens must round-trip exactly.
+            let unsigned = value
+                .strip_prefix('+')
+                .or_else(|| value.strip_prefix('-'))
+                .unwrap_or(value);
+            let integer_token =
+                !unsigned.is_empty() && unsigned.bytes().all(|byte| byte.is_ascii_digit());
             if promoted.is_finite() {
-                match parse_decimal_unscaled_exact(value, 38, 0) {
-                    Ok(exact) if promoted as i128 != exact => {
-                        return Err(csv_mixed_float_parse_error(value, field, input));
+                if integer_token {
+                    match parse_decimal_unscaled_exact(value, 38, 0) {
+                        Ok(exact) if promoted as i128 != exact => {
+                            return Err(csv_inferred_float_parse_error(value, field, input));
+                        }
+                        Err(DecimalParseFailure::Invalid | DecimalParseFailure::Overflow) => {
+                            return Err(csv_inferred_float_parse_error(value, field, input));
+                        }
+                        Ok(_) | Err(DecimalParseFailure::Inexact) => {}
                     }
-                    Err(DecimalParseFailure::Invalid | DecimalParseFailure::Overflow) => {
-                        return Err(csv_mixed_float_parse_error(value, field, input));
-                    }
-                    Ok(_) | Err(DecimalParseFailure::Inexact) => {}
                 }
             } else if !matches!(
                 value.to_ascii_lowercase().as_str(),
                 "nan" | "inf" | "+inf" | "-inf" | "infinity" | "+infinity" | "-infinity"
             ) {
-                return Err(csv_mixed_float_parse_error(value, field, input));
+                return Err(csv_inferred_float_parse_error(value, field, input));
             }
             Ok(Some(promoted))
         })
@@ -2354,9 +2457,9 @@ fn parse_mixed_csv_float64(
     ))
 }
 
-fn csv_mixed_float_parse_error(value: &str, field: &Field, input: &Path) -> std::io::Error {
+fn csv_inferred_float_parse_error(value: &str, field: &Field, input: &Path) -> std::io::Error {
     invalid_schema(format!(
-        "numeric value '{}' in CSV field '{}' of {} cannot be represented exactly as Float64 during mixed Int64/Float64 schema promotion",
+        "numeric value '{}' in CSV field '{}' of {} cannot be represented exactly as Float64 during CSV schema inference",
         fmt::safe(value),
         fmt::safe(field.name()),
         input.display()
@@ -2562,9 +2665,28 @@ fn merge_csv_inferred_field(left: &Field, right: &Field, input: &Path) -> std::i
             .clone()
             .with_data_type(DataType::Float64)
             .with_nullable(nullable),
+        (
+            DataType::Timestamp(left_unit, left_timezone),
+            DataType::Timestamp(right_unit, right_timezone),
+        ) if left_timezone == right_timezone => left
+            .clone()
+            .with_data_type(DataType::Timestamp(
+                finer_timestamp_unit(left_unit, right_unit),
+                left_timezone.clone(),
+            ))
+            .with_nullable(nullable),
         _ => return Err(csv_schema_mismatch(input)),
     };
     Ok(field)
+}
+
+fn finer_timestamp_unit(left: &TimeUnit, right: &TimeUnit) -> TimeUnit {
+    match (left, right) {
+        (TimeUnit::Nanosecond, _) | (_, TimeUnit::Nanosecond) => TimeUnit::Nanosecond,
+        (TimeUnit::Microsecond, _) | (_, TimeUnit::Microsecond) => TimeUnit::Microsecond,
+        (TimeUnit::Millisecond, _) | (_, TimeUnit::Millisecond) => TimeUnit::Millisecond,
+        _ => TimeUnit::Second,
+    }
 }
 
 fn csv_schema_mismatch(input: &Path) -> std::io::Error {
@@ -3456,9 +3578,11 @@ mod tests {
         .unwrap();
         let input = format!(
             "{{\n  \"payload\": \"{}\",\n  \"amount\": \"12.34\"\n}}\n\
-             {{\"payload\":\"b\",\"amount\":1.20}} \
-             {{\"payload\":\"c\",\"amount\":3.40}}",
-            "x".repeat(80)
+             {{\"payload\":\"{}\",\"amount\":1.20}} \
+             {{\"payload\":\"{}\",\"amount\":3.40}}",
+            "x".repeat(80),
+            "b".repeat(24),
+            "c".repeat(24)
         );
         let reader = std::io::BufReader::with_capacity(7, std::io::Cursor::new(input.into_bytes()));
         let mut batch_rows = Vec::new();
@@ -3467,7 +3591,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(batch_rows, [1, 2]);
+        assert_eq!(batch_rows, [1, 1, 1]);
     }
 
     #[test]
@@ -3489,9 +3613,9 @@ mod tests {
             header: Some((0..4096).rev().map(|i| format!("field_{i}")).collect()),
             columns: 4096,
             has_records: true,
+            line_offset: 0,
         };
-        let reader_schema =
-            csv_reader_schema(&schema, &index, &std::collections::HashSet::new(), &layout);
+        let reader_schema = csv_reader_schema(&schema, &index, &layout);
         let mapping = csv_output_mapping(&schema, &index, &layout);
         assert_eq!(reader_schema.fields()[0].name(), "field_0");
         assert_eq!(reader_schema.fields()[4095].name(), "field_4095");
@@ -3500,7 +3624,7 @@ mod tests {
     }
 
     #[test]
-    fn csv_int64_to_float64_promotion_requires_exact_round_trip() {
+    fn inferred_csv_float_validates_bare_integer_tokens() {
         let field = Field::new("value", DataType::Float64, true);
         for value in [
             "-9007199254740992",
@@ -3508,9 +3632,13 @@ mod tests {
             "9007199254740994",
             "-9223372036854775808",
             "1.5",
+            "9007199254740993.0",
+            "9.007199254740993e15",
+            "1.5e30",
+            "1e300",
         ] {
             let input: ArrayRef = Arc::new(StringArray::from(vec![value]));
-            let output = parse_mixed_csv_float64(&input, &field, Path::new("safe.csv")).unwrap();
+            let output = parse_inferred_csv_float64(&input, &field, Path::new("safe.csv")).unwrap();
             let output = output
                 .as_any()
                 .downcast_ref::<PrimitiveArray<Float64Type>>()
@@ -3522,7 +3650,8 @@ mod tests {
             );
         }
         let input: ArrayRef = Arc::new(StringArray::from(vec!["NaN", "inf", "-inf"]));
-        let output = parse_mixed_csv_float64(&input, &field, Path::new("non-finite.csv")).unwrap();
+        let output =
+            parse_inferred_csv_float64(&input, &field, Path::new("non-finite.csv")).unwrap();
         let output = output
             .as_any()
             .downcast_ref::<PrimitiveArray<Float64Type>>()
@@ -3533,12 +3662,10 @@ mod tests {
         for value in [
             "-9007199254740993",
             "9007199254740993",
-            "9007199254740993.0",
-            "9.007199254740993e15",
             "9223372036854775807",
         ] {
             let input: ArrayRef = Arc::new(StringArray::from(vec![value]));
-            let err = parse_mixed_csv_float64(&input, &field, Path::new("lossy.csv"))
+            let err = parse_inferred_csv_float64(&input, &field, Path::new("lossy.csv"))
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(value), "{err}");
@@ -3546,31 +3673,59 @@ mod tests {
     }
 
     #[test]
-    fn mixed_csv_float_fields_accumulate_types_by_name() {
-        let output = Schema::new(vec![
-            Field::new("mixed", DataType::Float64, true),
-            Field::new("float_only", DataType::Float64, true),
-            Field::new("null_then_float", DataType::Float64, true),
-        ]);
-        let mut inferred_types = std::collections::HashMap::new();
-        for input in [
-            Schema::new(vec![
-                Field::new("mixed", DataType::Int64, true),
-                Field::new("float_only", DataType::Float64, true),
-                Field::new("null_then_float", DataType::Null, true),
-            ]),
-            Schema::new(vec![
-                Field::new("float_only", DataType::Float64, true),
-                Field::new("mixed", DataType::Float64, true),
-                Field::new("null_then_float", DataType::Float64, true),
-            ]),
-        ] {
-            observe_csv_inferred_types(&mut inferred_types, &input);
-        }
-        assert_eq!(inferred_types.len(), 3);
+    fn csv_error_lines_include_skipped_lines() {
         assert_eq!(
-            mixed_csv_float_fields(&output, &inferred_types),
-            std::collections::HashSet::from(["mixed".to_string()])
+            csv_error_with_line_offset("bad record at line 3", 2),
+            "bad record at line 5"
+        );
+        assert_eq!(
+            csv_error_with_line_offset("CSV error: record 2 (line: 3, byte: 7)", 2),
+            "CSV error: record 2 (line: 5, byte: 7)"
+        );
+        assert_eq!(
+            csv_error_with_line_offset("CSV parse error: record 2 (line 3, field: 0)", 2),
+            "CSV parse error: record 2 (line 5, field: 0)"
+        );
+        assert_eq!(
+            csv_error_with_line_offset(
+                "Csv error: Encountered invalid UTF-8 data for line 3 and field 1",
+                2
+            ),
+            "Csv error: Encountered invalid UTF-8 data for line 5 and field 1"
+        );
+        assert_eq!(
+            csv_data_error(
+                arrow::error::ArrowError::ParseError(
+                    "bad value at line 1. Row data: '[note at line 99]'".to_string()
+                ),
+                2
+            )
+            .to_string(),
+            "Parser error: bad value at line 4. Row data: '[note at line 99]'"
+        );
+        assert_eq!(
+            csv_error_with_line_offset("bad record without a position", 2),
+            "bad record without a position"
+        );
+    }
+
+    #[test]
+    fn timestamp_precision_merge_is_order_independent() {
+        assert_eq!(
+            finer_timestamp_unit(&TimeUnit::Millisecond, &TimeUnit::Microsecond),
+            TimeUnit::Microsecond
+        );
+        assert_eq!(
+            finer_timestamp_unit(&TimeUnit::Microsecond, &TimeUnit::Millisecond),
+            TimeUnit::Microsecond
+        );
+        assert_eq!(
+            finer_timestamp_unit(&TimeUnit::Microsecond, &TimeUnit::Nanosecond),
+            TimeUnit::Nanosecond
+        );
+        assert_eq!(
+            finer_timestamp_unit(&TimeUnit::Nanosecond, &TimeUnit::Microsecond),
+            TimeUnit::Nanosecond
         );
     }
 
@@ -3686,6 +3841,7 @@ mod tests {
             header: Some(vec!["other".to_string()]),
             columns: 1,
             has_records: true,
+            line_offset: 0,
         };
         let err = validate_csv_mapping(&schema, &layout, &[None, Some(0)], Path::new("input.csv"))
             .unwrap_err()
