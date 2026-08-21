@@ -29,6 +29,10 @@ concurrency:
   group: release-java-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  actions: read
+  contents: read
+
 jobs:
   build-native:
     runs-on: ${{ matrix.os }}
@@ -59,13 +63,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Setup Rust toolchain
+      - name: Verify pinned Rust toolchain
         run: |
-          rustup update stable
-          rustup default stable
+          rustc --version
+          cargo --version
 
       - name: Setup Python
-        if: matrix.os_name == 'linux'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -83,7 +86,7 @@ jobs:
           rustup target add "${{ matrix.target }}"
           unset ZSTD_SYS_USE_PKG_CONFIG
 
-          cargo zigbuild --release -p paimon-mosaic-jni --target "${{ matrix.target }}.2.17"
+          cargo zigbuild --release --locked -p paimon-mosaic-jni --target "${{ matrix.target }}.2.17"
 
           artifact="target/${{ matrix.target }}/release/${{ matrix.lib_name }}"
           test -f "$artifact"
@@ -111,7 +114,44 @@ jobs:
         if: matrix.os_name != 'linux'
         run: |
           rustup target add "${{ matrix.target }}"
-          cargo build --release -p paimon-mosaic-jni --target "${{ matrix.target }}"
+          cargo build --release --locked -p paimon-mosaic-jni --target "${{ matrix.target }}"
+
+      - name: Smoke-load JNI library on target runner
+        shell: bash
+        env:
+          NATIVE_LIBRARY: target/${{ matrix.target }}/release/${{ matrix.lib_name }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import ctypes
+          import os
+          import platform
+          import re
+          from pathlib import Path
+
+          machine = platform.machine().lower()
+          machine = {"amd64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
+          assert machine == os.environ["EXPECTED_ARCH"], (machine, os.environ["EXPECTED_ARCH"])
+
+          jni_source = Path("jni/src/lib.rs").read_text(encoding="utf-8")
+          # Capture the identifier before any optional Rust lifetime generics.
+          jni_exports = re.findall(
+              r'(?m)^pub\s+extern\s+"system"\s+fn\s+'
+              r'(Java_org_apache_paimon_mosaic_NativeLib_[A-Za-z0-9_]+)',
+              jni_source,
+          )
+          if len(jni_exports) != 24 or len(jni_exports) != len(set(jni_exports)):
+              raise RuntimeError(
+                  f"Expected 24 unique JNI exports from jni/src/lib.rs, found {len(jni_exports)}"
+              )
+
+          library = os.path.abspath(os.environ["NATIVE_LIBRARY"])
+          native_library = ctypes.CDLL(library)
+          for symbol in jni_exports:
+              getattr(native_library, symbol)
+          print(f"Loaded {library} and resolved {len(jni_exports)} JNI exports")
+          PY
 
       - name: Upload native library
         uses: actions/upload-artifact@v5
@@ -119,12 +159,23 @@ jobs:
           name: native-${{ matrix.os_name }}-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/${{ matrix.lib_name }}
 
-  deploy-staging:
-    if: github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
+  verify-artifacts:
+    name: Verify release JARs
     runs-on: ubuntu-latest
     needs: [build-native]
     steps:
       - uses: actions/checkout@v6
+
+      - name: Verify release versions match the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          version="${version%%-rc*}"
+          python3 tools/verify_release_versions.py "$version"
 
       - name: Download linux x86_64 native library
         uses: actions/download-artifact@v5
@@ -150,38 +201,19 @@ jobs:
           name: native-windows-x86_64
           path: java/src/main/resources/native/windows/x86_64
 
-      - name: Verify native libraries
-        run: find java/src/main/resources/native -type f | sort
-
       - name: Set up JDK ${{ env.JDK_VERSION }}
         uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JDK_VERSION }}
           distribution: 'temurin'
-          server-id: apache.releases.https
-          server-username: MAVEN_USERNAME
-          server-password: MAVEN_PASSWORD
-          gpg-private-key: ${{ secrets.GPG_SECRET_KEY }}
-          gpg-passphrase: MAVEN_GPG_PASSPHRASE
 
-      - name: Show Maven version
-        run: mvn --version
-
-      - name: Deploy to Apache Nexus staging
+      - name: Package and verify Java artifacts
         working-directory: java
-        run: |
-          REF="${{ github.ref_name }}"
-          VERSION="${REF#v}"
-          if [[ "$VERSION" == *-rc* ]]; then
-            DESC="Apache Paimon Mosaic, version ${VERSION%-rc*}, release candidate ${VERSION#*-rc}"
-          else
-            DESC="Apache Paimon Mosaic, version ${VERSION}"
-          fi
-          mvn clean deploy \
-            -Prelease \
-            -DskipTests \
-            -DstagingDescription="$DESC"
-        env:
-          MAVEN_USERNAME: ${{ secrets.NEXUS_STAGE_DEPLOYER_USER }}
-          MAVEN_PASSWORD: ${{ secrets.NEXUS_STAGE_DEPLOYER_PW }}
-          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: mvn clean verify -Prelease -Dgpg.skip=true -DskipTests
+
+      - name: Upload verified Java release inputs
+        uses: actions/upload-artifact@v5
+        with:
+          name: java-release-native-inputs
+          path: java/src/main/resources/native
+          if-no-files-found: error

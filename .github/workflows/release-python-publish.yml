@@ -22,6 +22,18 @@ name: Release Python Publish
 
 on:
   workflow_call:
+    inputs:
+      publish_authorized:
+        description: Publish only after the top-level release gates pass
+        required: true
+        type: boolean
+    secrets:
+      TEST_PYPI_API_TOKEN:
+        description: TestPyPI token used only by the RC publish action
+        required: false
+      PYPI_API_TOKEN:
+        description: PyPI token used only by the final publish action
+        required: false
 
 concurrency:
   group: release-python-publish-${{ github.ref }}
@@ -34,9 +46,47 @@ permissions:
 jobs:
   publish:
     name: Publish to PyPI
-    if: github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/')
+    if: inputs.publish_authorized == true && github.event_name == 'push' && github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Revalidate signed release tag before publication
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-connrefused \
+            --connect-timeout 10 \
+            --max-time 300 \
+            --show-error \
+            --silent \
+            https://downloads.apache.org/paimon/KEYS \
+            --output "$RUNNER_TEMP/paimon-KEYS"
+          python3 tools/validate_release_tag.py \
+            "$TAG_NAME" \
+            --keys-file "$RUNNER_TEMP/paimon-KEYS"
+
+      - name: Verify release versions match the tag
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          version="${version%%-rc*}"
+          python3 tools/verify_release_versions.py "$version"
+
       - uses: actions/download-artifact@v5
         with:
           pattern: wheels-*
@@ -54,9 +104,15 @@ jobs:
           expected_version="${expected_version/-rc/rc}"
           shopt -s nullglob
           wheels=(dist/*.whl)
+          unexpected="$(find dist -maxdepth 1 -type f ! -name '*.whl' -print)"
 
           if [[ "${#wheels[@]}" -eq 0 ]]; then
             echo "No wheels found in dist" >&2
+            exit 1
+          fi
+          if [[ -n "$unexpected" ]]; then
+            echo "Only binary wheels may be published to PyPI:" >&2
+            printf '%s\n' "$unexpected" >&2
             exit 1
           fi
 
@@ -71,19 +127,123 @@ jobs:
             esac
           done
 
-      - name: Publish to TestPyPI
+      - name: Verify wheel contents and legal metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/verify_python_wheels.py --require-all-targets dist/*.whl
+
+      - name: Verify TestPyPI RC artifact state
+        id: test_registry
         if: contains(github.ref_name, '-rc')
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          version="${version/-rc/rc}"
+          response="$RUNNER_TEMP/testpypi-version.json"
+          status="$(
+            curl \
+              --proto '=https' \
+              --tlsv1.2 \
+              --location \
+              --retry 3 \
+              --retry-connrefused \
+              --connect-timeout 10 \
+              --max-time 300 \
+              --show-error \
+              --silent \
+              --output "$response" \
+              --write-out '%{http_code}' \
+              "https://test.pypi.org/pypi/paimon-mosaic/${version}/json"
+          )"
+
+          args=(
+            pypi
+            --project paimon-mosaic
+            --version "$version"
+            --upload-directory dist-testpypi
+            --github-output "$GITHUB_OUTPUT"
+          )
+          case "$status" in
+            200) args+=(--release-json "$response") ;;
+            404) args+=(--release-not-found) ;;
+            *)
+              cat "$response" >&2
+              echo "Unexpected TestPyPI response: HTTP ${status}" >&2
+              exit 1
+              ;;
+          esac
+
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          args+=(--wheel "${wheels[@]}")
+          python3 tools/verify_registry_artifacts.py "${args[@]}"
+
+      - name: Verify final PyPI artifact state
+        id: final_registry
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${TAG_NAME#v}"
+          response="$RUNNER_TEMP/pypi-version.json"
+          status="$(
+            curl \
+              --proto '=https' \
+              --tlsv1.2 \
+              --location \
+              --retry 3 \
+              --retry-connrefused \
+              --connect-timeout 10 \
+              --max-time 300 \
+              --show-error \
+              --silent \
+              --output "$response" \
+              --write-out '%{http_code}' \
+              "https://pypi.org/pypi/paimon-mosaic/${version}/json"
+          )"
+
+          args=(
+            pypi
+            --project paimon-mosaic
+            --version "$version"
+            --upload-directory dist-pypi
+            --github-output "$GITHUB_OUTPUT"
+          )
+          case "$status" in
+            200) args+=(--release-json "$response") ;;
+            404) args+=(--release-not-found) ;;
+            *)
+              cat "$response" >&2
+              echo "Unexpected PyPI response: HTTP ${status}" >&2
+              exit 1
+              ;;
+          esac
+
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          args+=(--wheel "${wheels[@]}")
+          python3 tools/verify_registry_artifacts.py "${args[@]}"
+
+      - name: Publish to TestPyPI
+        if: contains(github.ref_name, '-rc') && steps.test_registry.outputs.publish == 'true'
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e
         with:
           repository-url: https://test.pypi.org/legacy/
-          skip-existing: true
-          packages-dir: dist
+          skip-existing: false
+          packages-dir: dist-testpypi
           password: ${{ secrets.TEST_PYPI_API_TOKEN }}
 
       - name: Publish to PyPI
-        if: ${{ !contains(github.ref_name, '-') }}
+        if: ${{ !contains(github.ref_name, '-') && steps.final_registry.outputs.publish == 'true' }}
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e
         with:
-          skip-existing: true
-          packages-dir: dist
+          skip-existing: false
+          packages-dir: dist-pypi
           password: ${{ secrets.PYPI_API_TOKEN }}

@@ -31,19 +31,23 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
   wheels-linux:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             arch: x86_64
+            target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             arch: aarch64
+            target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v6
 
@@ -69,10 +73,33 @@ jobs:
           CIBW_BUILD: "cp39-manylinux_${{ matrix.arch }}"
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
-          CIBW_BEFORE_ALL_LINUX: >
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
+          CIBW_ENVIRONMENT: "PAIMON_MOSAIC_RUST_TARGET=${{ matrix.target }} EXPECTED_ARCH=${{ matrix.arch }}"
+          CIBW_TEST_REQUIRES: "pyarrow"
+          CIBW_TEST_COMMAND: >-
+            python -c "import os, platform;
+            machine = {'amd64': 'x86_64', 'arm64': 'aarch64'}.get(platform.machine().lower(), platform.machine().lower());
+            assert machine == os.environ['EXPECTED_ARCH'], (machine, os.environ['EXPECTED_ARCH']);
+            from mosaic import _ffi;
+            options = _ffi.lib.mosaic_writer_options_default();
+            print('Loaded wheel native library, compression=', options.compression)"
+          CIBW_BEFORE_ALL_LINUX: |
+            curl \
+              --proto '=https' \
+              --tlsv1.2 \
+              --fail \
+              --location \
+              --retry 3 \
+              --retry-connrefused \
+              --connect-timeout 10 \
+              --max-time 300 \
+              --show-error \
+              --silent \
+              https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain none &&
             source $HOME/.cargo/env &&
-            cargo build --release -p paimon-mosaic-ffi &&
+            rustc --version &&
+            cargo --version &&
+            cargo build --release --locked -p paimon-mosaic-ffi &&
             cp target/release/libpaimon_mosaic_ffi.so {package}/mosaic/
 
       - name: Upload wheels
@@ -100,13 +127,13 @@ jobs:
           PEP440_VERSION=$(echo "$TAG" | sed 's/-rc/rc/')
           sed -i '' "s/^version = .*/version = \"${PEP440_VERSION}\"/" python/pyproject.toml
 
-      - name: Setup Rust toolchain
+      - name: Verify pinned Rust toolchain
         run: |
-          rustup update stable
-          rustup default stable
+          rustc --version
+          cargo --version
 
       - name: Build native library
-        run: cargo build --release -p paimon-mosaic-ffi
+        run: cargo build --release --locked -p paimon-mosaic-ffi
 
       - name: Copy native library into package
         run: cp target/release/${{ matrix.lib_name }} python/mosaic/
@@ -117,11 +144,12 @@ jobs:
           python-version: "3.12"
 
       - name: Install build tools
-        run: pip install build wheel setuptools delocate
+        run: pip install build==1.3.0 wheel==0.45.1 setuptools==79.0.1 delocate
 
       - name: Build wheel
         working-directory: python
         env:
+          PAIMON_MOSAIC_RUST_TARGET: aarch64-apple-darwin
           _PYTHON_HOST_PLATFORM: macosx-11.0-arm64
           ARCHFLAGS: "-arch arm64"
           MACOSX_DEPLOYMENT_TARGET: "11.0"
@@ -132,6 +160,32 @@ jobs:
           delocate-wheel --require-archs arm64 -w python/dist/repaired python/dist/*.whl
           rm python/dist/*.whl
           mv python/dist/repaired/*.whl python/dist/
+
+      - name: Smoke-install and import wheel on target runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(python/dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          rm -rf wheel-smoke
+          python -m pip install \
+            --disable-pip-version-check \
+            --only-binary=:all: \
+            --target wheel-smoke \
+            "${wheels[0]}"
+          python -c '
+          import os
+          import platform
+          import sys
+          machine = platform.machine().lower()
+          machine = {"amd64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
+          assert machine == "aarch64", machine
+          sys.path.insert(0, os.path.abspath("wheel-smoke"))
+          from mosaic import _ffi
+          options = _ffi.lib.mosaic_writer_options_default()
+          print("Loaded wheel native library, compression=", options.compression)
+          '
 
       - name: Upload wheel
         uses: actions/upload-artifact@v5
@@ -152,13 +206,13 @@ jobs:
           PEP440_VERSION=$(echo "$TAG" | sed 's/-rc/rc/')
           sed -i "s/^version = .*/version = \"${PEP440_VERSION}\"/" python/pyproject.toml
 
-      - name: Setup Rust toolchain
+      - name: Verify pinned Rust toolchain
         run: |
-          rustup update stable
-          rustup default stable
+          rustc --version
+          cargo --version
 
       - name: Build native library
-        run: cargo build --release -p paimon-mosaic-ffi
+        run: cargo build --release --locked -p paimon-mosaic-ffi
 
       - name: Copy native library into package
         shell: bash
@@ -170,14 +224,61 @@ jobs:
           python-version: "3.12"
 
       - name: Install build tools
-        run: pip install build wheel setuptools
+        run: pip install build==1.3.0 wheel==0.45.1 setuptools==79.0.1
 
       - name: Build wheel
         working-directory: python
+        env:
+          PAIMON_MOSAIC_RUST_TARGET: x86_64-pc-windows-msvc
         run: python -m build --wheel
+
+      - name: Smoke-install and import wheel on target runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(python/dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          rm -rf wheel-smoke
+          python -m pip install \
+            --disable-pip-version-check \
+            --only-binary=:all: \
+            --target wheel-smoke \
+            "${wheels[0]}"
+          python -c '
+          import os
+          import platform
+          import sys
+          machine = platform.machine().lower()
+          machine = {"amd64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
+          assert machine == "x86_64", machine
+          sys.path.insert(0, os.path.abspath("wheel-smoke"))
+          from mosaic import _ffi
+          options = _ffi.lib.mosaic_writer_options_default()
+          print("Loaded wheel native library, compression=", options.compression)
+          '
 
       - name: Upload wheel
         uses: actions/upload-artifact@v5
         with:
           name: wheels-windows-x86_64
           path: python/dist/*.whl
+
+  verify-wheels:
+    name: Verify release wheels
+    runs-on: ubuntu-latest
+    needs: [wheels-linux, wheels-macos, wheels-windows]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify wheel contents and legal metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/verify_python_wheels.py --require-all-targets dist/*.whl

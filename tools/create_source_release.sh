@@ -27,8 +27,6 @@
 ##
 ## Variables with defaults (if not overwritten by environment)
 ##
-MVN=${MVN:-mvn}
-
 # fail immediately
 set -o errexit
 set -o nounset
@@ -36,8 +34,8 @@ set -o pipefail
 # print command before executing
 set -o xtrace
 
-CURR_DIR=`pwd`
-if [[ `basename $CURR_DIR` != "tools" ]] ; then
+CURR_DIR=$(pwd -P)
+if [[ $(basename "${CURR_DIR}") != "tools" ]] ; then
   echo "You have to call the script from the tools/ dir"
   exit 1
 fi
@@ -50,27 +48,60 @@ fi
 
 ###########################
 
-RELEASE_VERSION=${RELEASE_VERSION}
-
-if [ -z "${RELEASE_VERSION}" ]; then
-	echo "RELEASE_VERSION is unset"
-	exit 1
+RELEASE_VERSION=${RELEASE_VERSION:-}
+if [[ -z "${RELEASE_VERSION}" ]]; then
+  echo "RELEASE_VERSION is unset" >&2
+  exit 1
 fi
 
-rm -rf release
-mkdir release
 cd ..
+
+INDEX_FLAGGED_PATHS=$(
+  git ls-files -v |
+    awk 'substr($0, 1, 1) == "S" || substr($0, 1, 1) ~ /[a-z]/'
+)
+if [[ -n "${INDEX_FLAGGED_PATHS}" ]]; then
+  echo "Git index flags such as assume-unchanged or skip-worktree are not allowed." >&2
+  printf '%s\n' "${INDEX_FLAGGED_PATHS}" >&2
+  exit 1
+fi
+
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+  echo "The source release must be created from a clean Git worktree" >&2
+  git status --short >&2
+  exit 1
+fi
+
+git rev-parse --verify 'HEAD^{commit}' > /dev/null
+
+rm -rf tools/release
+mkdir tools/release
 
 echo "Creating source package"
 
 ARCHIVE="apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz"
-# Archive from Git objects so filesystem metadata such as macOS xattrs is not included.
-git archive --format=tar --prefix="paimon-mosaic-${RELEASE_VERSION}/" 'HEAD^{tree}' . \
-  ':(exclude).gitignore' ':(exclude).gitattributes' \
-  ':(exclude).asf.yaml' ':(exclude).github' \
-  ':(exclude)deploysettings.xml' ':(exclude)target' \
-  ':(exclude).idea' ':(exclude)*.iml' ':(exclude).DS_Store' \
-  | gzip -n > "tools/release/${ARCHIVE}"
+ARCHIVE_PATH="tools/release/${ARCHIVE}"
+ARCHIVE_ROOT="paimon-mosaic-${RELEASE_VERSION}"
+python3 tools/verify_source_archive.py create \
+  --repository . \
+  --commit HEAD \
+  --prefix "${ARCHIVE_ROOT}/" \
+  --output "${ARCHIVE_PATH}"
+
+CHECK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/paimon-source-check.XXXXXX")
+trap 'rm -rf "${CHECK_DIR}"' EXIT
+tar xzf "${ARCHIVE_PATH}" -C "${CHECK_DIR}"
+(
+  cd "${CHECK_DIR}/${ARCHIVE_ROOT}"
+  python3 tools/verify_release_versions.py "${RELEASE_VERSION}"
+
+  echo "Verifying locked dependencies and generated legal metadata"
+  cargo metadata --locked --format-version 1 --no-deps > /dev/null
+  python3 tools/dependencies.py check
+  python3 tools/generate_license_reports.py --check
+)
+rm -rf "${CHECK_DIR}"
+trap - EXIT
 
 cd tools/release
 
@@ -83,8 +114,19 @@ gpg --verify "${ARCHIVE}.asc" "${ARCHIVE}"
 echo "Verifying tarball integrity"
 tar tzf "${ARCHIVE}" > /dev/null
 
+for REQUIRED_FILE in \
+  Cargo.lock \
+  LICENSE \
+  NOTICE \
+  core/LICENSE \
+  core/NOTICE \
+  DEPENDENCIES.rust.tsv
+do
+  tar tzf "${ARCHIVE}" "${ARCHIVE_ROOT}/${REQUIRED_FILE}" > /dev/null
+done
+
 echo ""
 echo "Source release created successfully. Artifacts in tools/release/:"
-ls -la ${CURR_DIR}/release/apache-paimon-mosaic-*
+ls -la "${CURR_DIR}"/release/apache-paimon-mosaic-*
 echo ""
 echo "Next: upload contents to SVN (see docs/creating-a-release.html)."

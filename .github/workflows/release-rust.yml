@@ -15,10 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Publish paimon-mosaic-core crate to crates.io.
+# Verify paimon-mosaic-core packaging and, only when authorized by release.yml,
+# publish a final release to crates.io.
 #
-# Trigger: called by release.yml or manually dispatched.
-# Pre-release tags (containing '-') only run dry-run checks without publishing.
+# Direct workflow_dispatch is always a dry run.
 #
 # Token auth: add secret CARGO_REGISTRY_TOKEN for crates.io publishing.
 
@@ -26,6 +26,16 @@ name: Release Rust
 
 on:
   workflow_call:
+    inputs:
+      publish:
+        description: Publish a final tag after all top-level release gates pass
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        description: crates.io token used only by the authorized publish step
+        required: false
   workflow_dispatch:
 
 concurrency:
@@ -33,23 +43,134 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
+  verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Setup Rust toolchain
+      - name: Validate final publication authorization
+        if: inputs.publish == true
+        shell: bash
         run: |
-          rustup update stable
-          rustup default stable
+          set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != "apache/paimon-mosaic" \
+             || "$GITHUB_REF" != refs/tags/v* \
+             || "$GITHUB_REF_NAME" == *-* ]]; then
+            echo "Publication is allowed only for an authorized canonical final tag" >&2
+            exit 1
+          fi
+
+      - name: Revalidate signed final tag before publication
+        if: inputs.publish == true
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-connrefused \
+            --connect-timeout 10 \
+            --max-time 300 \
+            --show-error \
+            --silent \
+            https://downloads.apache.org/paimon/KEYS \
+            --output "$RUNNER_TEMP/paimon-KEYS"
+          python3 tools/validate_release_tag.py \
+            "$TAG_NAME" \
+            --keys-file "$RUNNER_TEMP/paimon-KEYS"
+
+      - name: Verify release versions match the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          version="${version%%-rc*}"
+          python3 tools/verify_release_versions.py "$version"
+
+      - name: Verify pinned Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
 
       - name: Dry run
-        run: cargo publish -p paimon-mosaic-core --dry-run
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_files="$(cargo package -p paimon-mosaic-core --locked --list)"
+          grep -qx Cargo.lock <<<"$package_files"
+          grep -qx DEPENDENCIES.rust.tsv <<<"$package_files"
+          grep -qx LICENSE <<<"$package_files"
+          grep -qx NOTICE <<<"$package_files"
+          cargo publish -p paimon-mosaic-core --locked --registry crates-io --dry-run
+          # Cargo keeps dry-run archives in implementation-specific temporary
+          # paths. Repackage the same verified source into the stable path used
+          # for the registry checksum comparison.
+          cargo package -p paimon-mosaic-core --locked --no-verify
+
+      - name: Verify crates.io artifact state
+        id: registry
+        if: inputs.publish == true
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${TAG_NAME#v}"
+          crate="target/package/paimon-mosaic-core-${version}.crate"
+          test -f "$crate"
+
+          response="$RUNNER_TEMP/crates-io-version.json"
+          status="$(
+            curl \
+              --proto '=https' \
+              --tlsv1.2 \
+              --location \
+              --retry 3 \
+              --retry-connrefused \
+              --connect-timeout 10 \
+              --max-time 300 \
+              --show-error \
+              --silent \
+              --user-agent 'Apache Paimon Mosaic release workflow' \
+              --output "$response" \
+              --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/paimon-mosaic-core/${version}"
+          )"
+
+          args=(
+            crates-io
+            --crate-name paimon-mosaic-core
+            --version "$version"
+            --artifact "$crate"
+            --github-output "$GITHUB_OUTPUT"
+          )
+          case "$status" in
+            200) args+=(--version-json "$response") ;;
+            404) args+=(--version-not-found) ;;
+            *)
+              cat "$response" >&2
+              echo "Unexpected crates.io response: HTTP ${status}" >&2
+              exit 1
+              ;;
+          esac
+          python3 tools/verify_registry_artifacts.py "${args[@]}"
 
       - name: Publish paimon-mosaic-core to crates.io
-        if: github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-')
-        run: cargo publish -p paimon-mosaic-core
+        if: inputs.publish == true && github.event_name == 'push' && github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-') && steps.registry.outputs.publish == 'true'
+        run: cargo publish -p paimon-mosaic-core --locked --registry crates-io --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

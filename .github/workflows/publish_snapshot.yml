@@ -22,14 +22,18 @@ on:
   schedule:
     # At the end of every day
     - cron: '0 0 * * *'
-  workflow_dispatch:
+  repository_dispatch:
+    types: [publish-snapshot]
 
 env:
   JDK_VERSION: 8
 
+permissions:
+  contents: read
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.number || github.run_id }}
-  cancel-in-progress: true
+  group: publish-snapshot-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   build-native:
@@ -61,10 +65,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Setup Rust toolchain
+      - name: Verify pinned Rust toolchain
         run: |
-          rustup update stable
-          rustup default stable
+          rustc --version
+          cargo --version
 
       - name: Cache Rust dependencies
         uses: actions/cache@v5
@@ -96,7 +100,7 @@ jobs:
           rustup target add "${{ matrix.target }}"
           unset ZSTD_SYS_USE_PKG_CONFIG
 
-          cargo zigbuild --release -p paimon-mosaic-jni --target "${{ matrix.target }}.2.17"
+          cargo zigbuild --release --locked -p paimon-mosaic-jni --target "${{ matrix.target }}.2.17"
 
           artifact="target/${{ matrix.target }}/release/${{ matrix.lib_name }}"
           test -f "$artifact"
@@ -124,7 +128,7 @@ jobs:
         if: matrix.os_name != 'linux'
         run: |
           rustup target add "${{ matrix.target }}"
-          cargo build --release -p paimon-mosaic-jni --target "${{ matrix.target }}"
+          cargo build --release --locked -p paimon-mosaic-jni --target "${{ matrix.target }}"
 
       - name: Upload native library
         uses: actions/upload-artifact@v5
@@ -133,11 +137,13 @@ jobs:
           path: target/${{ matrix.target }}/release/${{ matrix.lib_name }}
 
   publish-snapshot:
-    if: github.repository == 'apache/paimon-mosaic'
+    if: github.repository == 'apache/paimon-mosaic' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     needs: [build-native]
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Download linux x86_64 native library
         uses: actions/download-artifact@v5
