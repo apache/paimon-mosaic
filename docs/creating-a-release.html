@@ -69,19 +69,19 @@
                 <li><a href="#promote-the-release">Promote the release</a></li>
             </ol>
 
-            <h3>Automated Publishing</h3>
-            <p>When a version tag is pushed, the <code>Release</code> workflow orchestrates language-specific release jobs:</p>
+            <h3>Automated and Local Publishing</h3>
+            <p>When a version tag is pushed, the <code>Release</code> workflow orchestrates language-specific release jobs. Java signing and Nexus deployment are intentionally completed on the Release Manager's machine:</p>
             <table>
                 <thead>
                     <tr><th>Component</th><th>Tag Pattern</th><th>Published To</th><th>Pre-release (<code>-rc</code>) Behavior</th><th>Ordering</th></tr>
                 </thead>
                 <tbody>
                     <tr><td>Rust crate</td><td><code>v0.1.0</code></td><td>crates.io</td><td>Dry-run only</td><td>Runs in parallel</td></tr>
-                    <tr><td>Java binding</td><td><code>v0.1.0</code></td><td>Apache Nexus staging</td><td>Deploys to staging</td><td>Runs in parallel</td></tr>
+                    <tr><td>Java binding</td><td><code>v0.1.0</code></td><td>CI artifacts, then Apache Nexus staging</td><td>CI packages only; the Release Manager deploys locally</td><td>CI runs in parallel; local deploy follows a successful run</td></tr>
                     <tr><td>Python binding</td><td><code>v0.1.0</code></td><td>PyPI</td><td>Publishes to TestPyPI</td><td>Publishes only after Rust and Java jobs succeed</td></tr>
                 </tbody>
             </table>
-            <p>The Release Manager's primary responsibility is managing the <strong>source release</strong> (tarball + signature) and coordinating the community vote. Language artifact publishing is handled by CI once the tag is pushed.</p>
+            <p>The Release Manager manages the <strong>source release</strong> (tarball + signature), performs the local signed Java staging deployment, and coordinates the community vote. Rust and Python publishing remain handled by CI.</p>
 
             <!-- ============================================================ -->
             <h2 id="decide-to-release">Decide to Release</h2>
@@ -140,14 +140,11 @@ svn ci -m "Add &lt;YOUR_NAME&gt;'s public key"</code></pre>
                 </thead>
                 <tbody>
                     <tr><td><code>CARGO_REGISTRY_TOKEN</code></td><td>crates.io publishing</td></tr>
-                    <tr><td><code>NEXUS_STAGE_DEPLOYER_USER</code></td><td>Apache Nexus staging</td></tr>
-                    <tr><td><code>NEXUS_STAGE_DEPLOYER_PW</code></td><td>Apache Nexus staging</td></tr>
-                    <tr><td><code>GPG_SECRET_KEY</code></td><td>Java artifact signing</td></tr>
-                    <tr><td><code>GPG_PASSPHRASE</code></td><td>Java artifact signing</td></tr>
                     <tr><td><code>PYPI_API_TOKEN</code></td><td>PyPI publishing</td></tr>
                     <tr><td><code>TEST_PYPI_API_TOKEN</code></td><td>TestPyPI publishing</td></tr>
                 </tbody>
             </table>
+            <p>Do not store the Java signing key or Nexus credentials in GitHub Actions secrets. Configure them only on the Release Manager's machine as described in <a href="https://github.com/apache/paimon-mosaic/blob/main/tools/README.md">the release tools guide</a>.</p>
 
             <h3>Clone into a Fresh Workspace</h3>
 <pre><code>git clone https://github.com/apache/paimon-mosaic.git
@@ -219,11 +216,30 @@ git push origin ${RC_TAG}</code></pre>
             <p>After pushing, verify in <a href="https://github.com/apache/paimon-mosaic/actions">GitHub Actions</a> that the <code>Release</code> workflow succeeds:</p>
             <ul>
                 <li><strong>Rust release</strong> &mdash; dry-run check (does not publish for RC tags)</li>
-                <li><strong>Java release</strong> &mdash; builds native JNI libraries for 4 platforms, deploys JAR to Apache Nexus staging</li>
+                <li><strong>Java release</strong> &mdash; builds native JNI libraries for 4 platforms, verifies the release profile without signing, and uploads the JARs as workflow artifacts</li>
                 <li><strong>Python wheels</strong> &mdash; builds wheels for 4 platforms</li>
                 <li><strong>Python publish</strong> &mdash; publishes to TestPyPI only after the Rust, Java, and Python wheel jobs succeed</li>
             </ul>
             <p>If only the Python publish job fails due to a transient PyPI or TestPyPI issue, use <strong>Re-run failed jobs</strong> on the <code>Release</code> workflow. The successful Rust, Java, and Python wheel jobs do not need to be repeated.</p>
+
+            <h3>Deploy Java Artifacts to Nexus Staging</h3>
+            <p>Open the successful <code>Release</code> workflow run for <code>${RC_TAG}</code> and copy its run id from the URL. Then check out the exact RC tag and perform a dry-run before the signed deployment:</p>
+<pre><code>RELEASE_RUN_ID="12345678901"
+
+git checkout ${RC_TAG}
+git tag -v ${RC_TAG}
+
+./tools/deploy_java_staging.sh \
+  --release-version ${RELEASE_VERSION} \
+  --rc ${RC_NUM} \
+  --run-id ${RELEASE_RUN_ID} \
+  --dry-run
+
+./tools/deploy_java_staging.sh \
+  --release-version ${RELEASE_VERSION} \
+  --rc ${RC_NUM} \
+  --run-id ${RELEASE_RUN_ID}</code></pre>
+            <p>The script requires the workflow run ref, RC tag, release version, RC number, commit SHA, and local checkout to agree. It rejects tracked, untracked, or ignored Java package and release-tool inputs and validates the generated JARs during Maven's <code>verify</code> phase before the same lifecycle reaches Nexus deployment. Record the resulting <code>orgapachepaimon-XXXX</code> staging repository id for the vote email. See <a href="https://github.com/apache/paimon-mosaic/blob/main/tools/README.md">the release tools guide</a> for local GPG and Maven credential setup.</p>
 
             <h3>Create Source Release Artifacts</h3>
             <p>Create source release artifacts from the same commit as the RC tag:</p>

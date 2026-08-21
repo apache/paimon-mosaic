@@ -35,6 +35,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  release-script-test:
+    name: Release script (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check shell syntax
+        run: |
+          /bin/bash -n tools/deploy_java_staging.sh
+          /bin/bash -n tools/validate_java_staging_artifacts.sh
+          /bin/bash -n tools/tests/deploy_java_staging_test.sh
+
+      - name: Test Java staging deploy safety
+        run: /bin/bash tools/tests/deploy_java_staging_test.sh
+
   check:
     runs-on: ubuntu-latest
     steps:
