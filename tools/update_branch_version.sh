@@ -58,16 +58,20 @@ fi
 OLD_VERSION_CLEAN=$(echo "$OLD_VERSION" | sed 's/-SNAPSHOT//')
 NEW_VERSION_CLEAN=$(echo "$NEW_VERSION" | sed 's/-SNAPSHOT//')
 
-# Change version in all pom files (match both exact and -SNAPSHOT suffix).
-export OLD_VERSION_CLEAN NEW_VERSION
+# Change the project version in all pom files. This is structural rather than
+# textual: a dependency or plugin element carrying the same version string must
+# not be rewritten along with it.
 find . -name 'pom.xml' -not -path '*/target/*' -type f \
-  -exec perl -pi -e '
-    BEGIN {
-      $old = quotemeta($ENV{"OLD_VERSION_CLEAN"});
-      $new = $ENV{"NEW_VERSION"};
-    }
-    s{<version>${old}(?:-SNAPSHOT)?</version>}{<version>${new}</version>}g;
-  ' {} +
+  -exec python3 tools/bump_pom_version.py "$OLD_VERSION" "$NEW_VERSION" {} +
+
+# Only the project version element may change. Anything more means the match
+# escaped into a dependency, plugin, or parent version.
+POM_LINES_CHANGED=$(git diff --numstat -- '*pom.xml' | awk '{sum += $1} END {print sum + 0}')
+if [[ "${POM_LINES_CHANGED}" != "1" ]]; then
+  echo "expected exactly one changed pom.xml line, got ${POM_LINES_CHANGED}" >&2
+  git diff -- '*pom.xml' >&2
+  exit 1
+fi
 
 # Change workspace package versions and versioned path dependencies together.
 # The TOML-aware helper also supports retrying a partially completed bump.

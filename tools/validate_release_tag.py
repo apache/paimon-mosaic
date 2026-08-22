@@ -34,6 +34,12 @@ NUMBER = r"(?:0|[1-9][0-9]*)"
 FINAL_TAG = re.compile(rf"^v({NUMBER})\.({NUMBER})\.({NUMBER})$")
 RC_TAG = re.compile(rf"^v({NUMBER})\.({NUMBER})\.({NUMBER})-rc([1-9][0-9]*)$")
 VALID_SIGNATURE = re.compile(r"^\[GNUPG:\] VALIDSIG ([0-9A-F]+)\b", re.MULTILINE)
+# GnuPG emits VALIDSIG next to REVKEYSIG and EXPKEYSIG, so a VALIDSIG match alone
+# does not establish trust. Only `git verify-tag` currently rejects those by exit
+# code; `gpg --verify` exits 0 for EXPKEYSIG.
+UNTRUSTED_SIGNATURE = re.compile(
+    r"^\[GNUPG:\] (REVKEYSIG|EXPKEYSIG|EXPSIG)\b", re.MULTILINE
+)
 
 
 class TagValidationError(RuntimeError):
@@ -209,6 +215,11 @@ def verify_signature(repo: Path, tag: str, env: dict[str, str]) -> str:
         check=False,
     )
     status = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    untrusted = UNTRUSTED_SIGNATURE.search(status)
+    if untrusted:
+        raise TagValidationError(
+            f"{tag} signature is not trusted: GnuPG reported {untrusted.group(1)}"
+        )
     match = VALID_SIGNATURE.search(status)
     if result.returncode != 0 or not match:
         detail = status.strip() or "no OpenPGP verification status"

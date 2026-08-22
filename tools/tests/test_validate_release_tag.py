@@ -95,6 +95,11 @@ def short_temporary_root(platform_name: str = os.name) -> Path:
     return Path("/tmp").resolve()
 
 
+# sockaddr_un.sun_path holds 104 bytes on macOS and 108 on Linux; gpg-agent
+# refuses to start when $GNUPGHOME/S.gpg-agent does not fit.
+GPG_AGENT_SOCKET_LIMIT = 104
+
+
 @pytest.fixture(scope="module")
 def signing_keys():
     temporary_root = short_temporary_root()
@@ -107,15 +112,25 @@ def signing_keys():
         yield trusted, untrusted
 
 
-def test_signing_key_homes_use_a_short_canonical_temporary_root(signing_keys):
-    temporary_root = short_temporary_root()
-
+def test_signing_key_homes_fit_the_gpg_agent_socket_limit(signing_keys):
     for home, _, _ in signing_keys:
         assert home == home.resolve()
-        assert home.parent.parent == temporary_root
+        assert home.parent.parent == short_temporary_root()
+        assert len(str(home / "S.gpg-agent")) < GPG_AGENT_SOCKET_LIMIT
 
-    assert short_temporary_root("posix") == Path("/tmp").resolve()
-    assert short_temporary_root("nt") == Path(tempfile.gettempdir()).resolve()
+
+def test_short_temporary_root_ignores_a_long_platform_temporary_dir(monkeypatch):
+    # The macOS default (/var/folders/<random>/T) is long enough on its own to
+    # push a nested GNUPGHOME past the socket limit, so the POSIX branch must not
+    # be derived from tempfile.gettempdir().
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: f"/var/folders/{'n' * 64}/T")
+    nested = (
+        short_temporary_root("posix")
+        / "pm-gpg-abcd1234"
+        / "Trusted-Release"
+        / "S.gpg-agent"
+    )
+    assert len(str(nested)) < GPG_AGENT_SOCKET_LIMIT
 
 
 def repository(tmp_path: Path) -> Path:
@@ -310,3 +325,59 @@ def test_lightweight_tag_is_rejected(tmp_path, signing_keys):
 
     with pytest.raises(validator.TagValidationError, match="annotated signed"):
         validator.validate_release_tag(repo, "v4.0.0-rc1", keys)
+
+
+def revoke_key(home: Path, fingerprint: str) -> None:
+    certificate = home / "openpgp-revocs.d" / f"{fingerprint}.rev"
+    # GnuPG prefixes the armor header with a colon so the certificate cannot be
+    # imported by accident.
+    armored = "\n".join(
+        line[1:] if line.startswith(":") else line
+        for line in certificate.read_text(encoding="utf-8").splitlines()
+    )
+    revocation = home.parent / f"{fingerprint}.revoke.asc"
+    revocation.write_text(armored + "\n", encoding="utf-8")
+    env = os.environ.copy()
+    env["GNUPGHOME"] = str(home)
+    run(["gpg", "--batch", "--yes", "--import", str(revocation)], cwd=home, env=env)
+
+
+def test_tag_signed_by_a_revoked_key_is_rejected(tmp_path):
+    root = Path(tmp_path).resolve()
+    home, fingerprint, keys = generate_key(root, "Compromised Release")
+    repo = repository(tmp_path)
+    sign_tag(repo, "v5.0.0-rc1", home, fingerprint)
+
+    # The key is revoked only after it signed the tag, and the revocation reaches
+    # the verifier the way ASF distributes it: inside the published KEYS file.
+    revoke_key(home, fingerprint)
+    env = os.environ.copy()
+    env["GNUPGHOME"] = str(home)
+    keys.write_text(
+        run(["gpg", "--batch", "--armor", "--export", fingerprint], cwd=root, env=env)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        validator.TagValidationError, match="is not trusted: GnuPG reported REVKEYSIG"
+    ):
+        validator.validate_release_tag(repo, "v5.0.0-rc1", keys)
+
+
+@pytest.mark.parametrize("status", ["EXPKEYSIG", "EXPSIG"])
+def test_untrusted_gnupg_statuses_are_rejected(monkeypatch, status):
+    fingerprint = "0" * 40
+    # GnuPG emits VALIDSIG next to EXPKEYSIG, and `gpg --verify` exits 0 for it,
+    # so neither a VALIDSIG match nor a zero exit code may imply trust.
+    canned = subprocess.CompletedProcess(
+        args=["git", "verify-tag"],
+        returncode=0,
+        stdout=f"[GNUPG:] {status} DEADBEEF Release Manager\n"
+        f"[GNUPG:] VALIDSIG {fingerprint} 2026-01-01 0 0 4 0 22 8 00 {fingerprint}\n",
+        stderr="",
+    )
+    monkeypatch.setattr(validator, "run", lambda *a, **k: canned)
+
+    with pytest.raises(validator.TagValidationError, match=status):
+        validator.verify_signature(Path("."), "v6.0.0-rc1", {})
