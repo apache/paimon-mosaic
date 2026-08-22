@@ -483,6 +483,20 @@ def test_verify_wheel_rejects_too_many_entries_before_archive_read(
         verifier.verify_wheel(wheel, root)
 
 
+def test_archive_bounds_match_the_java_verifier():
+    # Both verifiers declare their own copies and, unlike the target matrix,
+    # nothing cross-checks them at import time. Divergence would leave one
+    # artifact type less protected than the other.
+    import verify_java_jars
+
+    for name in (
+        "MAX_ARCHIVE_ENTRY_SIZE",
+        "MAX_ARCHIVE_TOTAL_SIZE",
+        "MAX_ARCHIVE_ENTRIES",
+    ):
+        assert getattr(verifier, name) == getattr(verify_java_jars, name), name
+
+
 def test_target_matrix_guard_rejects_drift(monkeypatch):
     monkeypatch.setitem(
         verifier.EXPECTED_WHEEL_TAG,
