@@ -16,22 +16,22 @@
 # under the License.
 
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools==79.0.1", "wheel==0.45.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "paimon-mosaic"
 version = "0.3.0"
 description = "Python bindings for the Mosaic columnar-bucket hybrid file format"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 requires-python = ">=3.9"
 dependencies = ["pyarrow"]
 
 [project.optional-dependencies]
 test = ["pytest"]
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.packages.find]
 include = ["mosaic*"]
-
-[tool.setuptools.package-data]
-mosaic = ["libpaimon_mosaic_ffi.dylib", "libpaimon_mosaic_ffi.so", "paimon_mosaic_ffi.dll"]
