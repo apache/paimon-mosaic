@@ -323,7 +323,10 @@ def verify_record(archive: ZipFile, file_names: set[str], record_path: str) -> N
                 digest.update(chunk)
                 actual_size += len(chunk)
         actual_hash = base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode()
-        if not hmac.compare_digest(actual_hash, expected_hash):
+        # PEP 376 specifies unpadded urlsafe base64, but older packaging tools
+        # still emit padded digests; comparing those verbatim rejects an intact
+        # wheel.
+        if not hmac.compare_digest(actual_hash, expected_hash.rstrip("=")):
             raise ValueError(f"{record_path} hash mismatch for {entry_path}")
         if actual_size != expected_size:
             raise ValueError(

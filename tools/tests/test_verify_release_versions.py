@@ -198,6 +198,27 @@ class VerifyReleaseVersionsTest(unittest.TestCase):
             capture_output=True,
         )
 
+    def test_update_rejects_a_path_dependency_outside_the_retry_window(
+        self,
+    ) -> None:
+        # An earlier partial run or a manual edit left ffi pinned to an unrelated
+        # version. Rewriting it silently would still pass the post-write check,
+        # which only compares against the new version.
+        self.write_workspace("0.3.0", "0.3.0", "0.9.9", "0.3.0")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"ffi/Cargo\.toml: path dependency mosaic-core requires 0\.9\.9",
+        ):
+            verify_release_versions.update_cargo_versions(
+                self.root, "0.3.0", "0.4.0"
+            )
+
+        self.assertEqual(
+            self.load_manifest("ffi")["dependencies"]["mosaic-core"]["version"],
+            "0.9.9",
+        )
+
     def test_update_repairs_a_partially_completed_bump_and_is_idempotent(
         self,
     ) -> None:

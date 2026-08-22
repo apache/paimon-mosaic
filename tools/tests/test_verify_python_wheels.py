@@ -560,6 +560,21 @@ def find_record_row(rows, suffix):
     return next(row for row in rows if row[0].endswith(suffix))
 
 
+def test_verify_wheel_accepts_padded_record_hashes(tmp_path, monkeypatch):
+    # PEP 376 specifies unpadded urlsafe base64, but older packaging tools still
+    # emit padding. An intact wheel must not be rejected over that difference.
+    def pad_hashes(rows):
+        for row in rows:
+            algorithm, _, digest = row[1].partition("=")
+            if algorithm == "sha256" and digest:
+                row[1] = f"{algorithm}={digest}{'=' * (-len(digest) % 4)}"
+
+    wheel, root = build_wheel(tmp_path, mutate_record=pad_hashes)
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    verifier.verify_wheel(wheel, root)
+
+
 @pytest.mark.parametrize(
     "mutate_record,error",
     (

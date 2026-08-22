@@ -528,6 +528,26 @@ def update_cargo_versions(root: Path, old_version: str, new_version: str) -> lis
         for dependency in path_dependencies(root, packages)
         if dependency.requirement is not None
     ]
+    # Requirements are rewritten unconditionally below, so hold them to the same
+    # retry window as [package].version. Otherwise a manifest left pointing at an
+    # unrelated version is silently overwritten, and the post-write check cannot
+    # notice because it only compares against new_version. Requirements are
+    # semver ranges, so test acceptance rather than equality.
+    acceptance: dict[tuple[str, str], bool] = {}
+    for dependency in dependencies:
+        for candidate in (old_version, new_version):
+            key = (dependency.requirement, candidate)
+            if key not in acceptance:
+                acceptance[key] = cargo_requirement_accepts(*key)
+            if acceptance[key]:
+                break
+        else:
+            manifest = dependency.manifest.relative_to(root)
+            raise ValueError(
+                f"{manifest}: path dependency {dependency.alias} requires "
+                f"{dependency.requirement}, which accepts neither {old_version} "
+                f"nor {new_version}"
+            )
     dependencies_by_manifest = {}
     for dependency in dependencies:
         dependencies_by_manifest.setdefault(dependency.manifest, []).append(dependency)
