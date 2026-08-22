@@ -535,6 +535,26 @@ fn convert(
     stats: Option<&str>,
     overwrite: bool,
 ) -> std::io::Result<()> {
+    convert_with_json_record_limit(
+        input,
+        out,
+        schema,
+        columns,
+        stats,
+        overwrite,
+        MAX_JSON_RECORD_BYTES,
+    )
+}
+
+fn convert_with_json_record_limit(
+    input: &Path,
+    out: &Path,
+    schema: Option<&Path>,
+    columns: &[String],
+    stats: Option<&str>,
+    overwrite: bool,
+    max_record_bytes: usize,
+) -> std::io::Result<()> {
     use arrow::error::ArrowError;
     let bad = |e: ArrowError| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
     if !is_json_input(input) {
@@ -546,8 +566,12 @@ fn convert(
     let columns = parse_convert_columns(columns)?;
     ensure_can_write(out, overwrite)?;
     let explicit_schema = schema.map(load_convert_schema).transpose()?;
-    let open =
-        || -> std::io::Result<_> { Ok(std::io::BufReader::new(std::fs::File::open(input)?)) };
+    let open = || -> std::io::Result<_> {
+        Ok(std::io::BufReader::with_capacity(
+            JSON_INPUT_BUFFER_BYTES,
+            JsonRecordLimitReader::new(std::fs::File::open(input)?, max_record_bytes),
+        ))
+    };
     let has_explicit_schema = explicit_schema.is_some();
     let schema = match explicit_schema {
         Some(schema) => schema,
@@ -592,11 +616,330 @@ fn write_validated_json_input<R: std::io::BufRead>(
 
 const DEFAULT_JSON_BATCH_SIZE: usize = 1024;
 const TARGET_CONVERT_BATCH_BYTES: usize = 16 * 1024 * 1024;
-// Hard ceiling on a single raw JSON record. Guards against a hostile input
-// where one record is arbitrarily large: `Deserializer::into_iter::<Box<RawValue>>`
-// buffers the whole record before yielding, and `normalize_json_decimal_record`
-// reallocates it into a fresh `String`. Enforced before normalization runs.
-const MAX_JSON_RECORD_BYTES: usize = 256 * 1024 * 1024;
+const JSON_INPUT_BUFFER_BYTES: usize = 1024 * 1024;
+// Hard ceiling on a single raw JSON root value. A streaming lexical reader
+// enforces it before serde_json or Arrow can materialize the value.
+const MAX_JSON_RECORD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_NORMALIZED_JSON_RECORD_BYTES: usize = MAX_JSON_RECORD_BYTES;
+const MAX_JSON_STRUCTURAL_UNITS: usize = 100_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JsonRecordScanState {
+    BetweenRecords,
+    Compound {
+        depth: usize,
+        in_string: bool,
+        escaped: bool,
+    },
+    String {
+        escaped: bool,
+    },
+    Scalar,
+}
+
+struct JsonRecordScanner {
+    state: JsonRecordScanState,
+    record: usize,
+    record_bytes: usize,
+    line_bytes: usize,
+    max_record_bytes: usize,
+    structural_units: usize,
+    max_structural_units: usize,
+}
+
+impl JsonRecordScanner {
+    #[inline]
+    fn new(max_record_bytes: usize) -> Self {
+        Self::new_with_limits(max_record_bytes, MAX_JSON_STRUCTURAL_UNITS)
+    }
+
+    fn new_with_limits(max_record_bytes: usize, max_structural_units: usize) -> Self {
+        Self {
+            state: JsonRecordScanState::BetweenRecords,
+            record: 0,
+            record_bytes: 0,
+            line_bytes: 0,
+            max_record_bytes,
+            structural_units: 0,
+            max_structural_units,
+        }
+    }
+
+    #[inline(always)]
+    fn count_record_byte(&mut self) -> std::io::Result<()> {
+        if self.record_bytes >= self.max_record_bytes {
+            return Err(invalid_schema(format!(
+                "JSON record {} exceeds the {} byte limit",
+                self.record, self.max_record_bytes
+            )));
+        }
+        self.record_bytes += 1;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn count_structural_units(&mut self, units: usize) -> std::io::Result<()> {
+        if units
+            > self
+                .max_structural_units
+                .saturating_sub(self.structural_units)
+        {
+            return Err(invalid_schema(format!(
+                "JSON record {} exceeds the {} structural unit limit",
+                self.record, self.max_structural_units
+            )));
+        }
+        self.structural_units += units;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn scan(&mut self, byte: u8) -> std::io::Result<()> {
+        let mut reprocess = true;
+        while reprocess {
+            reprocess = false;
+            match self.state {
+                JsonRecordScanState::BetweenRecords => {
+                    if is_json_whitespace(byte) {
+                        continue;
+                    }
+                    self.record = self.record.saturating_add(1);
+                    self.record_bytes = 0;
+                    self.structural_units = 0;
+                    self.count_record_byte()?;
+                    self.count_structural_units(matches!(byte, b'{' | b'[' | b'"') as usize)?;
+                    self.state = match byte {
+                        b'{' | b'[' => JsonRecordScanState::Compound {
+                            depth: 1,
+                            in_string: false,
+                            escaped: false,
+                        },
+                        b'"' => JsonRecordScanState::String { escaped: false },
+                        _ => JsonRecordScanState::Scalar,
+                    };
+                }
+                JsonRecordScanState::Compound {
+                    mut depth,
+                    mut in_string,
+                    mut escaped,
+                } => {
+                    self.count_record_byte()?;
+                    if in_string {
+                        if escaped {
+                            escaped = false;
+                        } else if byte == b'\\' {
+                            escaped = true;
+                        } else if byte == b'"' {
+                            in_string = false;
+                        }
+                    } else {
+                        match byte {
+                            b'"' => {
+                                self.count_structural_units(1)?;
+                                in_string = true;
+                            }
+                            b'{' | b'[' => {
+                                self.count_structural_units(1)?;
+                                depth = depth.saturating_add(1);
+                            }
+                            b'}' | b']' => {
+                                self.count_structural_units(1)?;
+                                depth = depth.saturating_sub(1);
+                            }
+                            b',' | b':' => self.count_structural_units(1)?,
+                            _ => {}
+                        }
+                    }
+                    self.state = if depth == 0 && !in_string {
+                        JsonRecordScanState::BetweenRecords
+                    } else {
+                        JsonRecordScanState::Compound {
+                            depth,
+                            in_string,
+                            escaped,
+                        }
+                    };
+                }
+                JsonRecordScanState::String { mut escaped } => {
+                    self.count_record_byte()?;
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        self.state = JsonRecordScanState::BetweenRecords;
+                        continue;
+                    }
+                    self.state = JsonRecordScanState::String { escaped };
+                }
+                JsonRecordScanState::Scalar => {
+                    if is_json_whitespace(byte) {
+                        self.state = JsonRecordScanState::BetweenRecords;
+                    } else if matches!(byte, b'{' | b'[' | b'"') {
+                        self.state = JsonRecordScanState::BetweenRecords;
+                        reprocess = true;
+                    } else {
+                        self.count_record_byte()?;
+                    }
+                }
+            }
+        }
+        self.count_line_byte(byte)
+    }
+
+    #[inline(always)]
+    fn count_line_byte(&mut self, byte: u8) -> std::io::Result<()> {
+        if self.line_bytes >= self.max_record_bytes {
+            return Err(invalid_schema(format!(
+                "JSON input line exceeds the {} byte limit",
+                self.max_record_bytes
+            )));
+        }
+        self.line_bytes += 1;
+        if byte == b'\n' {
+            self.line_bytes = 0;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn scan_chunk(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let ordinary = self.ordinary_prefix_len(&bytes[offset..]);
+            if ordinary == 0 {
+                self.scan(bytes[offset])?;
+                offset += 1;
+            } else {
+                self.advance_ordinary(&bytes[offset..offset + ordinary])?;
+                offset += ordinary;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn ordinary_prefix_len(&self, bytes: &[u8]) -> usize {
+        let special = match self.state {
+            JsonRecordScanState::BetweenRecords => bytes
+                .iter()
+                .position(|&byte| byte == b'\n' || !matches!(byte, b' ' | b'\r' | b'\t')),
+            JsonRecordScanState::Compound {
+                in_string: false, ..
+            } => bytes
+                .iter()
+                .position(|&byte| matches!(byte, b'"' | b'{' | b'}' | b'[' | b']' | b'\n')),
+            JsonRecordScanState::Compound {
+                in_string: true,
+                escaped: false,
+                ..
+            }
+            | JsonRecordScanState::String { escaped: false } => {
+                memchr::memchr3(b'"', b'\\', b'\n', bytes)
+            }
+            JsonRecordScanState::Compound {
+                in_string: true,
+                escaped: true,
+                ..
+            }
+            | JsonRecordScanState::String { escaped: true } => Some(0),
+            JsonRecordScanState::Scalar => bytes
+                .iter()
+                .position(|&byte| is_json_whitespace(byte) || matches!(byte, b'{' | b'[' | b'"')),
+        };
+        special.unwrap_or(bytes.len())
+    }
+
+    #[inline(always)]
+    fn advance_ordinary(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let len = bytes.len();
+        if matches!(self.state, JsonRecordScanState::BetweenRecords) {
+            return self.advance_line(len);
+        }
+        if matches!(
+            self.state,
+            JsonRecordScanState::Compound {
+                in_string: false,
+                ..
+            }
+        ) {
+            self.count_structural_units(memchr::memchr2_iter(b',', b':', bytes).count())?;
+        }
+
+        let record_remaining = self.max_record_bytes.saturating_sub(self.record_bytes);
+        let line_remaining = self.max_record_bytes.saturating_sub(self.line_bytes);
+        if len <= record_remaining.min(line_remaining) {
+            self.record_bytes += len;
+            self.line_bytes += len;
+            return Ok(());
+        }
+
+        if record_remaining <= line_remaining {
+            self.record_bytes = self.max_record_bytes.saturating_add(1);
+            return Err(invalid_schema(format!(
+                "JSON record {} exceeds the {} byte limit",
+                self.record, self.max_record_bytes
+            )));
+        }
+        self.line_bytes = self.max_record_bytes.saturating_add(1);
+        Err(invalid_schema(format!(
+            "JSON input line exceeds the {} byte limit",
+            self.max_record_bytes
+        )))
+    }
+
+    #[inline(always)]
+    fn advance_line(&mut self, len: usize) -> std::io::Result<()> {
+        let remaining = self.max_record_bytes.saturating_sub(self.line_bytes);
+        if len <= remaining {
+            self.line_bytes += len;
+            return Ok(());
+        }
+        self.line_bytes = self.max_record_bytes.saturating_add(1);
+        Err(invalid_schema(format!(
+            "JSON input line exceeds the {} byte limit",
+            self.max_record_bytes
+        )))
+    }
+}
+
+fn is_json_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\n' | b'\r' | b'\t')
+}
+
+struct JsonRecordLimitReader<R> {
+    inner: R,
+    scanner: JsonRecordScanner,
+}
+
+impl<R> JsonRecordLimitReader<R> {
+    fn new(inner: R, max_record_bytes: usize) -> Self {
+        Self {
+            inner,
+            scanner: JsonRecordScanner::new(max_record_bytes),
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for JsonRecordLimitReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.scanner.scan_chunk(&buffer[..read])?;
+        Ok(read)
+    }
+}
+
+#[cfg(test)]
+fn validate_json_record_limits<R: std::io::Read>(
+    reader: R,
+    max_record_bytes: usize,
+) -> std::io::Result<()> {
+    std::io::copy(
+        &mut JsonRecordLimitReader::new(reader, max_record_bytes),
+        &mut std::io::sink(),
+    )?;
+    Ok(())
+}
 
 fn for_each_validated_json_batch<R, F>(
     reader: R,
@@ -618,7 +961,8 @@ where
             .map_err(bad)
     };
     let fields = json_special_fields(schema);
-    let normalize_decimals = schema_has_decimal(schema);
+    let decimal_plan =
+        schema_has_decimal(schema).then(|| JsonDecimalStructPlan::from_fields(schema.fields()));
     let mut decoder = build_decoder()?;
     let mut batch_bytes = 0_usize;
     let records = serde_json::Deserializer::from_reader(reader).into_iter::<Box<RawValue>>();
@@ -627,17 +971,10 @@ where
         let record = index + 1;
         let raw = raw.map_err(|e| invalid_schema(format!("invalid JSON record {record}: {e}")))?;
         let raw_bytes = raw.get().as_bytes();
-        if raw_bytes.len() > MAX_JSON_RECORD_BYTES {
-            return Err(invalid_schema(format!(
-                "JSON record {record} is {} bytes, exceeds the {} byte limit",
-                raw_bytes.len(),
-                MAX_JSON_RECORD_BYTES
-            )));
-        }
         validate_json_special_values(raw_bytes, &fields, record)?;
         let normalized;
-        let decode_bytes = if normalize_decimals {
-            normalized = normalize_json_decimal_record(&raw, schema, record)?;
+        let decode_bytes = if let Some(plan) = &decimal_plan {
+            normalized = normalize_json_decimal_record(&raw, plan, record)?;
             normalized.as_bytes()
         } else {
             raw_bytes
@@ -701,44 +1038,180 @@ fn data_type_has_decimal(data_type: &DataType) -> bool {
     }
 }
 
-fn normalize_json_decimal_record(
-    raw: &RawValue,
-    schema: &Schema,
-    record: usize,
-) -> std::io::Result<String> {
-    let values: std::collections::BTreeMap<String, Box<RawValue>> = serde_json::from_str(raw.get())
-        .map_err(|e| invalid_schema(format!("invalid JSON record {record}: {e}")))?;
-    let mut normalized = String::from("{");
-    for (index, (name, value)) in values.iter().enumerate() {
-        if index != 0 {
-            normalized.push(',');
+struct JsonDecimalStructPlan {
+    by_name: std::collections::HashMap<String, Option<JsonDecimalValuePlan>>,
+    #[cfg(test)]
+    lookup_count: std::cell::Cell<usize>,
+}
+
+enum JsonDecimalValuePlan {
+    Decimal { precision: u8, scale: i8 },
+    List(Box<JsonDecimalValuePlan>),
+    Map(Box<JsonDecimalValuePlan>),
+    Struct(JsonDecimalStructPlan),
+}
+
+impl JsonDecimalStructPlan {
+    fn from_fields(fields: &Fields) -> Self {
+        let mut by_name = std::collections::HashMap::with_capacity(fields.len());
+        for field in fields {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                by_name.entry(field.name().clone())
+            {
+                entry.insert(JsonDecimalValuePlan::from_data_type(field.data_type()));
+            }
         }
-        normalized.push_str(
-            &serde_json::to_string(name)
-                .map_err(|e| invalid_schema(format!("invalid JSON field name: {e}")))?,
-        );
-        normalized.push(':');
-        if let Some(field) = schema.fields().iter().find(|field| field.name() == name) {
-            normalized.push_str(&normalize_json_decimal_value(value, field, name, record)?);
-        } else {
-            normalized.push_str(value.get());
+        Self {
+            by_name,
+            #[cfg(test)]
+            lookup_count: std::cell::Cell::new(0),
         }
     }
-    normalized.push('}');
-    Ok(normalized)
+
+    fn lookup(&self, name: &str) -> Option<&JsonDecimalValuePlan> {
+        #[cfg(test)]
+        self.lookup_count
+            .set(self.lookup_count.get().saturating_add(1));
+        self.by_name.get(name).and_then(Option::as_ref)
+    }
+
+    #[cfg(test)]
+    fn lookup_count(&self) -> usize {
+        self.lookup_count.get()
+            + self
+                .by_name
+                .values()
+                .filter_map(Option::as_ref)
+                .map(JsonDecimalValuePlan::lookup_count)
+                .sum::<usize>()
+    }
+}
+
+impl JsonDecimalValuePlan {
+    fn from_data_type(data_type: &DataType) -> Option<Self> {
+        if !data_type_has_decimal(data_type) {
+            return None;
+        }
+        match data_type {
+            DataType::Decimal128(precision, scale) => Some(Self::Decimal {
+                precision: *precision,
+                scale: *scale,
+            }),
+            DataType::List(field) => {
+                Self::from_data_type(field.data_type()).map(|plan| Self::List(Box::new(plan)))
+            }
+            DataType::Map(entries, _) => {
+                let DataType::Struct(fields) = entries.data_type() else {
+                    return None;
+                };
+                fields
+                    .get(1)
+                    .and_then(|field| Self::from_data_type(field.data_type()))
+                    .map(|plan| Self::Map(Box::new(plan)))
+            }
+            DataType::Struct(fields) => {
+                Some(Self::Struct(JsonDecimalStructPlan::from_fields(fields)))
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn lookup_count(&self) -> usize {
+        match self {
+            Self::Decimal { .. } => 0,
+            Self::List(plan) | Self::Map(plan) => plan.lookup_count(),
+            Self::Struct(plan) => plan.lookup_count(),
+        }
+    }
+}
+
+fn normalize_json_decimal_record(
+    raw: &RawValue,
+    plan: &JsonDecimalStructPlan,
+    record: usize,
+) -> std::io::Result<String> {
+    normalize_json_decimal_record_with_limit(raw, plan, record, MAX_NORMALIZED_JSON_RECORD_BYTES)
+}
+
+fn normalize_json_decimal_record_with_limit(
+    raw: &RawValue,
+    plan: &JsonDecimalStructPlan,
+    record: usize,
+    max_bytes: usize,
+) -> std::io::Result<String> {
+    let values: std::collections::BTreeMap<std::borrow::Cow<'_, str>, &RawValue> =
+        serde_json::from_str(raw.get())
+            .map_err(|e| invalid_schema(format!("invalid JSON record {record}: {e}")))?;
+    let mut normalized = CappedJsonString::new(raw.get().len().min(max_bytes), max_bytes, record);
+    normalized.push_str("{")?;
+    for (index, (name, value)) in values.iter().enumerate() {
+        if index != 0 {
+            normalized.push_str(",")?;
+        }
+        let encoded_name = serde_json::to_string(name.as_ref())
+            .map_err(|e| invalid_schema(format!("invalid JSON field name: {e}")))?;
+        normalized.push_str(&encoded_name)?;
+        normalized.push_str(":")?;
+        if let Some(value_plan) = plan.lookup(name.as_ref()) {
+            normalize_json_decimal_value(
+                &mut normalized,
+                value,
+                value_plan,
+                name.as_ref(),
+                record,
+            )?;
+        } else {
+            normalized.push_str(value.get())?;
+        }
+    }
+    normalized.push_str("}")?;
+    Ok(normalized.into_string())
+}
+
+struct CappedJsonString {
+    value: String,
+    max_bytes: usize,
+    record: usize,
+}
+
+impl CappedJsonString {
+    fn new(capacity: usize, max_bytes: usize, record: usize) -> Self {
+        Self {
+            value: String::with_capacity(capacity),
+            max_bytes,
+            record,
+        }
+    }
+
+    fn push_str(&mut self, value: &str) -> std::io::Result<()> {
+        if value.len() > self.max_bytes.saturating_sub(self.value.len()) {
+            return Err(invalid_schema(format!(
+                "normalized JSON record {} exceeds the {} byte limit",
+                self.record, self.max_bytes
+            )));
+        }
+        self.value.push_str(value);
+        Ok(())
+    }
+
+    fn into_string(self) -> String {
+        self.value
+    }
 }
 
 fn normalize_json_decimal_value(
+    normalized: &mut CappedJsonString,
     raw: &RawValue,
-    field: &Field,
+    plan: &JsonDecimalValuePlan,
     path: &str,
     record: usize,
-) -> std::io::Result<String> {
-    if raw.get() == "null" || !data_type_has_decimal(field.data_type()) {
-        return Ok(raw.get().to_string());
+) -> std::io::Result<()> {
+    if raw.get() == "null" {
+        return normalized.push_str(raw.get());
     }
-    match field.data_type() {
-        DataType::Decimal128(precision, scale) => {
+    match plan {
+        JsonDecimalValuePlan::Decimal { precision, scale } => {
             let raw_text = raw.get();
             let value = if raw_text.starts_with('"') {
                 serde_json::from_str::<String>(raw_text)
@@ -747,95 +1220,71 @@ fn normalize_json_decimal_value(
                 raw_text.to_string()
             };
             let unscaled = parse_decimal_exact(&value, *precision, *scale).map_err(|e| {
+                let data_type = DataType::Decimal128(*precision, *scale);
                 invalid_schema(format!(
                     "cannot parse '{}' as {} for JSON field '{}' at record {record}: {e}",
                     fmt::safe(&value),
-                    field.data_type(),
+                    data_type,
                     fmt::safe(path)
                 ))
             })?;
-            serde_json::to_string(&format_decimal_unscaled(unscaled, *scale))
-                .map_err(|e| invalid_schema(format!("invalid JSON decimal: {e}")))
+            let encoded = serde_json::to_string(&format_decimal_unscaled(unscaled, *scale))
+                .map_err(|e| invalid_schema(format!("invalid JSON decimal: {e}")))?;
+            normalized.push_str(&encoded)
         }
-        DataType::List(item) => {
-            let values: Vec<Box<RawValue>> = serde_json::from_str(raw.get())
+        JsonDecimalValuePlan::List(item) => {
+            let values: Vec<&RawValue> = serde_json::from_str(raw.get())
                 .map_err(|e| invalid_schema(format!("invalid JSON array: {e}")))?;
             let child_path = format!("{path}[]");
-            let mut normalized = String::from("[");
+            normalized.push_str("[")?;
             for (index, value) in values.iter().enumerate() {
                 if index != 0 {
-                    normalized.push(',');
+                    normalized.push_str(",")?;
                 }
-                normalized.push_str(&normalize_json_decimal_value(
-                    value,
-                    item,
-                    &child_path,
-                    record,
-                )?);
+                normalize_json_decimal_value(normalized, value, item, &child_path, record)?;
             }
-            normalized.push(']');
-            Ok(normalized)
+            normalized.push_str("]")
         }
-        DataType::Map(entries, _) => {
-            let DataType::Struct(fields) = entries.data_type() else {
-                return Ok(raw.get().to_string());
-            };
-            let Some(value_field) = fields.get(1) else {
-                return Ok(raw.get().to_string());
-            };
-            let values: std::collections::BTreeMap<String, Box<RawValue>> =
+        JsonDecimalValuePlan::Map(value_plan) => {
+            let values: std::collections::BTreeMap<std::borrow::Cow<'_, str>, &RawValue> =
                 serde_json::from_str(raw.get())
                     .map_err(|e| invalid_schema(format!("invalid JSON map: {e}")))?;
             let child_path = format!("{path}{{}}");
-            let mut normalized = String::from("{");
+            normalized.push_str("{")?;
             for (index, (name, value)) in values.iter().enumerate() {
                 if index != 0 {
-                    normalized.push(',');
+                    normalized.push_str(",")?;
                 }
-                normalized.push_str(
-                    &serde_json::to_string(name)
-                        .map_err(|e| invalid_schema(format!("invalid JSON map key: {e}")))?,
-                );
-                normalized.push(':');
-                normalized.push_str(&normalize_json_decimal_value(
-                    value,
-                    value_field,
-                    &child_path,
-                    record,
-                )?);
+                let encoded_name = serde_json::to_string(name.as_ref())
+                    .map_err(|e| invalid_schema(format!("invalid JSON map key: {e}")))?;
+                normalized.push_str(&encoded_name)?;
+                normalized.push_str(":")?;
+                normalize_json_decimal_value(normalized, value, value_plan, &child_path, record)?;
             }
-            normalized.push('}');
-            Ok(normalized)
+            normalized.push_str("}")
         }
-        DataType::Struct(fields) => {
-            let values: std::collections::BTreeMap<String, Box<RawValue>> =
+        JsonDecimalValuePlan::Struct(struct_plan) => {
+            let values: std::collections::BTreeMap<std::borrow::Cow<'_, str>, &RawValue> =
                 serde_json::from_str(raw.get())
                     .map_err(|e| invalid_schema(format!("invalid JSON object: {e}")))?;
-            let mut normalized = String::from("{");
+            normalized.push_str("{")?;
             for (index, (name, value)) in values.iter().enumerate() {
                 if index != 0 {
-                    normalized.push(',');
+                    normalized.push_str(",")?;
                 }
-                normalized.push_str(
-                    &serde_json::to_string(name)
-                        .map_err(|e| invalid_schema(format!("invalid JSON field name: {e}")))?,
-                );
-                normalized.push(':');
-                if let Some(child) = fields.iter().find(|field| field.name() == name) {
-                    normalized.push_str(&normalize_json_decimal_value(
-                        value,
-                        child,
-                        &format!("{path}.{name}"),
-                        record,
-                    )?);
+                let encoded_name = serde_json::to_string(name.as_ref())
+                    .map_err(|e| invalid_schema(format!("invalid JSON field name: {e}")))?;
+                normalized.push_str(&encoded_name)?;
+                normalized.push_str(":")?;
+                if let Some(child) = struct_plan.lookup(name.as_ref()) {
+                    let child_path = format!("{path}.{}", name.as_ref());
+                    normalize_json_decimal_value(normalized, value, child, &child_path, record)?;
                 } else {
-                    normalized.push_str(value.get());
+                    normalized.push_str(value.get())?;
                 }
             }
-            normalized.push('}');
-            Ok(normalized)
+            normalized.push_str("}")
         }
-        _ => Ok(raw.get().to_string()),
     }
 }
 
@@ -957,14 +1406,22 @@ impl<'de> Visitor<'de> for JsonSpecialRecordVisitor<'_> {
     where
         M: MapAccess<'de>,
     {
+        let mut values = std::collections::BTreeMap::new();
         while let Some(name) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-            if let Some(field) = self.fields.get(name.as_ref()) {
-                let raw: &RawValue = map.next_value()?;
-                validate_json_special_value(raw, field, name.as_ref(), self.record)
-                    .map_err(M::Error::custom)?;
+            if self.fields.contains_key(name.as_ref()) {
+                let raw: &'de RawValue = map.next_value()?;
+                values.insert(name, raw);
             } else {
                 map.next_value::<IgnoredAny>()?;
             }
+        }
+        for (name, raw) in values {
+            let field = self
+                .fields
+                .get(name.as_ref())
+                .expect("only schema fields are retained");
+            validate_json_special_value(raw, field, name.as_ref(), self.record)
+                .map_err(M::Error::custom)?;
         }
         Ok(())
     }
@@ -1247,52 +1704,66 @@ fn convert_csv(
     }
     ensure_can_write(out, overwrite)?;
     let format = csv_format(&options)?;
+    let dialect = CsvDialect::from_options(&options)?;
     let explicit_schema = schema.map(load_convert_schema).transpose()?;
-    let has_explicit_schema = explicit_schema.is_some();
-    let schema = match explicit_schema {
-        Some(schema) => schema,
-        None => {
-            let mut inferred: Option<Schema> = None;
+    if let Some(schema) = explicit_schema {
+        reject_csv_unsupported_fields(&schema)?;
+        let schema_index = csv_schema_index(&schema);
+        return write_mosaic(out, overwrite, &schema, stats, |writer, rows| {
             for input in inputs {
-                let (reader, line_offset) = open_csv(input, options.skip_lines)?;
-                let (schema, rows) = format
-                    .infer_schema(reader, None)
-                    .map_err(|e| csv_data_error(e, line_offset))?;
-                // A shard with no data rows has nothing to infer from; it is
-                // skipped when reading too.
-                if rows == 0 || schema.fields().is_empty() {
-                    continue;
-                }
-                let schema = promote_second_precision_csv_timestamps(csv_schema_with_csv_names(
-                    schema, &options,
-                )?);
-                inferred = Some(match inferred.take() {
-                    Some(prev) => merge_csv_inferred_schema(prev, schema, input)?,
-                    None => schema,
-                });
-            }
-            let schema = inferred.ok_or_else(|| {
-                invalid_schema("no CSV data to infer a schema from; provide --schema")
-            })?;
-            apply_required_fields(csv_schema_with_null_fallback(schema), required_fields)?
-        }
-    };
-    reject_csv_unsupported_fields(&schema)?;
-    let schema_index = csv_schema_index(&schema);
-    write_mosaic(out, overwrite, &schema, stats, |writer, rows| {
-        for input in inputs {
-            if has_explicit_schema {
+                let mut source = OpenCsvSource::open(input, options.skip_lines)?;
                 write_explicit_schema_csv_input(
                     writer,
                     rows,
-                    input,
+                    &mut source,
                     &schema,
                     &schema_index,
                     &options,
+                    dialect,
                 )?;
-                continue;
             }
-            let layout = csv_input_layout(input, &options)?;
+            Ok(())
+        });
+    }
+
+    let mut sources = inputs
+        .iter()
+        .map(|input| {
+            OpenCsvSource::open(input, options.skip_lines)
+                .and_then(|source| prepare_inferred_csv_input(source, &options, dialect))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut inferred: Option<Schema> = None;
+    for source in &mut sources {
+        if !source.layout.has_records {
+            continue;
+        }
+        let line_offset = source.line_offset;
+        let reader = source.reader()?;
+        let (schema, rows) = format
+            .infer_schema(reader, None)
+            .map_err(|e| csv_data_error(e, line_offset))?;
+        // A shard with no data rows has nothing to infer from; it is skipped
+        // when reading too.
+        if rows == 0 || schema.fields().is_empty() {
+            continue;
+        }
+        let schema =
+            promote_second_precision_csv_timestamps(csv_schema_with_csv_names(schema, &options)?);
+        inferred = Some(match inferred.take() {
+            Some(prev) => merge_csv_inferred_schema(prev, schema, &source.path)?,
+            None => schema,
+        });
+    }
+    let schema = inferred
+        .ok_or_else(|| invalid_schema("no CSV data to infer a schema from; provide --schema"))?;
+    let schema = apply_required_fields(csv_schema_with_null_fallback(schema), required_fields)?;
+    reject_csv_unsupported_fields(&schema)?;
+    let schema_index = csv_schema_index(&schema);
+    write_mosaic(out, overwrite, &schema, stats, |writer, rows| {
+        for source in &mut sources {
+            let input = source.path.clone();
+            let layout = source.layout.clone();
             // Empty and header-only shards contribute no rows, so their header
             // cannot affect the schema inferred from non-empty inputs.
             if !layout.has_records {
@@ -1300,11 +1771,12 @@ fn convert_csv(
             }
             let reader_schema = csv_reader_schema(&schema, &schema_index, &layout);
             let source_mapping = csv_output_mapping(&schema, &schema_index, &layout);
-            validate_csv_mapping(&schema, &layout, &source_mapping, input)?;
+            validate_csv_mapping(&schema, &layout, &source_mapping, &input)?;
             let (projection, mapping) = csv_projection(&source_mapping);
-            let batch_size = csv_batch_size(reader_schema.fields().len());
-            let (reader, line_offset) = open_csv(input, options.skip_lines)?;
-            debug_assert_eq!(line_offset, layout.line_offset);
+            let batch_size =
+                inferred_csv_batch_size(reader_schema.fields().len(), source.max_record_bytes);
+            let line_offset = source.line_offset;
+            let reader = source.reader()?;
             let reader = arrow::csv::ReaderBuilder::new(Arc::new(reader_schema))
                 .with_format(format.clone().with_truncated_rows(true))
                 .with_batch_size(batch_size)
@@ -1313,7 +1785,7 @@ fn convert_csv(
                 .map_err(|e| csv_data_error(e, line_offset))?;
             for batch in reader {
                 let batch = batch.map_err(|e| csv_data_error(e, line_offset))?;
-                let batch = align_csv_batch_to_schema(batch, &schema, &mapping, input)?;
+                let batch = align_csv_batch_to_schema(batch, &schema, &mapping, &input)?;
                 *rows += batch.num_rows();
                 writer.write_batch(&batch)?;
             }
@@ -1477,17 +1949,32 @@ fn ensure_can_write(out: &Path, overwrite: bool) -> std::io::Result<()> {
 }
 
 fn csv_format(options: &CsvConvertOptions) -> std::io::Result<arrow::csv::reader::Format> {
-    let delimiter = parse_csv_byte(&options.delimiter, "delimiter")?;
-    let escape = parse_optional_csv_byte(options.escape.as_deref(), "escape")?;
-    let quote = parse_csv_byte(&options.quote, "quote")?;
+    let dialect = CsvDialect::from_options(options)?;
     let format = arrow::csv::reader::Format::default()
         .with_header(!options.no_header && options.header.is_none())
-        .with_delimiter(delimiter)
-        .with_quote(quote);
-    Ok(match escape {
+        .with_delimiter(dialect.delimiter)
+        .with_quote(dialect.quote);
+    Ok(match dialect.escape {
         Some(escape) => format.with_escape(escape),
         None => format,
     })
+}
+
+#[derive(Clone, Copy)]
+struct CsvDialect {
+    delimiter: u8,
+    escape: Option<u8>,
+    quote: u8,
+}
+
+impl CsvDialect {
+    fn from_options(options: &CsvConvertOptions) -> std::io::Result<Self> {
+        Ok(Self {
+            delimiter: parse_csv_byte(&options.delimiter, "delimiter")?,
+            escape: parse_optional_csv_byte(options.escape.as_deref(), "escape")?,
+            quote: parse_csv_byte(&options.quote, "quote")?,
+        })
+    }
 }
 
 fn parse_csv_byte(value: &str, name: &str) -> std::io::Result<u8> {
@@ -1504,24 +1991,6 @@ fn parse_csv_byte(value: &str, name: &str) -> std::io::Result<u8> {
 
 fn parse_optional_csv_byte(value: Option<&str>, name: &str) -> std::io::Result<Option<u8>> {
     value.map(|value| parse_csv_byte(value, name)).transpose()
-}
-
-fn open_csv(
-    path: &Path,
-    skip_lines: usize,
-) -> std::io::Result<(std::io::BufReader<std::fs::File>, u64)> {
-    use std::io::BufRead;
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
-    let mut line = String::new();
-    let mut skipped = 0;
-    for _ in 0..skip_lines {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        skipped += 1;
-    }
-    Ok((reader, skipped))
 }
 
 fn csv_data_error(error: arrow::error::ArrowError, line_offset: u64) -> std::io::Error {
@@ -1547,6 +2016,19 @@ fn csv_error_with_line_offset(error: impl ToString, line_offset: u64) -> String 
     let message = error.to_string();
     let search_end = message.len();
     csv_error_message_with_line_offset(message, line_offset, search_end)
+}
+
+fn csv_read_error(error: csv::Error, context: &str, line_offset: u64) -> std::io::Error {
+    if error.is_io_error() {
+        if let csv::ErrorKind::Io(error) = error.into_kind() {
+            return error;
+        }
+        unreachable!("csv::Error::is_io_error must imply ErrorKind::Io");
+    }
+    invalid_schema(format!(
+        "{context}: {}",
+        csv_error_with_line_offset(error, line_offset)
+    ))
 }
 
 fn csv_error_message_with_line_offset(
@@ -1590,17 +2072,101 @@ fn add_csv_record_line_offset(record: &mut csv::StringRecord, line_offset: u64) 
     record.set_position(Some(position));
 }
 
+#[derive(Clone)]
 struct CsvInputLayout {
     header: Option<Vec<String>>,
     columns: usize,
     has_records: bool,
+}
+
+struct CsvInput<R> {
+    reader: csv::Reader<R>,
+    layout: CsvInputLayout,
+    first_record: Option<csv::StringRecord>,
+}
+
+struct OpenCsvSource {
+    path: PathBuf,
+    reader: Option<std::io::BufReader<std::fs::File>>,
     line_offset: u64,
 }
 
-struct CsvInput {
-    reader: csv::Reader<std::io::BufReader<std::fs::File>>,
+impl OpenCsvSource {
+    fn open(path: &Path, skip_lines: usize) -> std::io::Result<Self> {
+        use std::io::BufRead;
+
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut skipped = 0_u64;
+        for _ in 0..skip_lines {
+            if reader.skip_until(b'\n')? == 0 {
+                break;
+            }
+            skipped = skipped.saturating_add(1);
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            reader: Some(reader),
+            line_offset: skipped,
+        })
+    }
+
+    fn guarded_reader(
+        &mut self,
+        dialect: CsvDialect,
+    ) -> std::io::Result<CsvRecordLimitReader<std::io::BufReader<std::fs::File>>> {
+        let reader = self
+            .reader
+            .take()
+            .ok_or_else(|| invalid_schema("CSV source was already consumed"))?;
+        Ok(CsvRecordLimitReader::new(
+            reader,
+            self.path.clone(),
+            dialect,
+            MAX_CSV_COLUMNS,
+            MAX_CSV_RECORD_BYTES,
+        ))
+    }
+}
+
+struct PreparedCsvInput {
+    path: PathBuf,
+    snapshot: tempfile::TempPath,
     layout: CsvInputLayout,
-    first_record: Option<csv::StringRecord>,
+    line_offset: u64,
+    max_record_bytes: usize,
+}
+
+impl PreparedCsvInput {
+    fn reader(&self) -> std::io::Result<std::io::BufReader<std::fs::File>> {
+        Ok(std::io::BufReader::new(std::fs::File::open(
+            self.snapshot.as_ref() as &Path,
+        )?))
+    }
+}
+
+fn prepare_inferred_csv_input(
+    mut source: OpenCsvSource,
+    options: &CsvConvertOptions,
+    dialect: CsvDialect,
+) -> std::io::Result<PreparedCsvInput> {
+    let mut snapshot = tempfile::NamedTempFile::new()?;
+    let mut reader = source.guarded_reader(dialect)?;
+    std::io::copy(&mut reader, snapshot.as_file_mut())?;
+    let max_record_bytes = reader.max_observed_record_bytes();
+    let layout = {
+        let reader = std::io::BufReader::new(snapshot.reopen()?);
+        let CsvInput { layout, .. } =
+            open_csv_input_from_reader(&source.path, options, reader, source.line_offset)?;
+        layout
+    };
+    Ok(PreparedCsvInput {
+        path: source.path,
+        snapshot: snapshot.into_temp_path(),
+        layout,
+        line_offset: source.line_offset,
+        max_record_bytes,
+    })
 }
 
 const DEFAULT_CSV_BATCH_SIZE: usize = 1024;
@@ -1609,58 +2175,176 @@ const DEFAULT_CSV_BATCH_SIZE: usize = 1024;
 // bounded for very wide records by reducing the number of rows per batch.
 const TARGET_CSV_DECODE_CELLS: usize = 64 * 1024;
 // Hard ceiling on the inferred column count. The width comes from the CSV
-// header row, which is attacker-controllable; without this cap a pathological
-// header could force csv_reader_schema to allocate a Vec of millions of Fields.
+// header or first no-header logical record, which is attacker-controllable;
+// without this cap inference could allocate millions of Arrow Fields.
 const MAX_CSV_COLUMNS: usize = 65_535;
+// A single decoded CSV record is otherwise allowed to exceed the batch byte
+// budget and can allocate several times its payload before it is flushed.
+const MAX_CSV_RECORD_BYTES: usize = 64 * 1024 * 1024;
+const CSV_LIMIT_SCAN_BUFFER_BYTES: usize = 8 * 1024;
 
-fn csv_batch_size(columns: usize) -> usize {
-    if columns == 0 {
-        return DEFAULT_CSV_BATCH_SIZE;
-    }
-    (TARGET_CSV_DECODE_CELLS / columns).clamp(1, DEFAULT_CSV_BATCH_SIZE)
+struct CsvRecordLimitReader<R> {
+    inner: R,
+    scanner: CsvRecordLimitScanner,
 }
 
-fn explicit_csv_row_cells(source_columns: usize, output_columns: usize) -> usize {
-    source_columns.max(output_columns)
-}
-
-fn csv_input_layout(path: &Path, options: &CsvConvertOptions) -> std::io::Result<CsvInputLayout> {
-    Ok(open_csv_input(path, options)?.layout)
-}
-
-fn open_csv_input(path: &Path, options: &CsvConvertOptions) -> std::io::Result<CsvInput> {
-    let delimiter = parse_csv_byte(&options.delimiter, "delimiter")?;
-    let escape = parse_optional_csv_byte(options.escape.as_deref(), "escape")?;
-    let quote = parse_csv_byte(&options.quote, "quote")?;
-    let mut builder = csv::ReaderBuilder::new();
-    builder
-        .has_headers(false)
-        .flexible(true)
-        .delimiter(delimiter)
-        .quote(quote)
-        .escape(escape);
-    let (reader, line_offset) = open_csv(path, options.skip_lines)?;
-    let mut reader = builder.from_reader(reader);
-    let file_header = options.header.is_none() && !options.no_header;
-    let header = if let Some(header) = &options.header {
-        Some(parse_csv_header(header, options)?)
-    } else if options.no_header {
-        None
-    } else {
-        let mut record = csv::StringRecord::new();
-        if reader.read_record(&mut record).map_err(|e| {
-            invalid_schema(format!(
-                "invalid CSV header: {}",
-                csv_error_with_line_offset(e, line_offset)
-            ))
-        })? {
-            add_csv_record_line_offset(&mut record, line_offset);
-            Some(record.iter().map(ToString::to_string).collect())
-        } else {
-            Some(Vec::new())
+impl<R> CsvRecordLimitReader<R> {
+    fn new(
+        inner: R,
+        path: PathBuf,
+        dialect: CsvDialect,
+        max_columns: usize,
+        max_record_bytes: usize,
+    ) -> Self {
+        Self {
+            inner,
+            scanner: CsvRecordLimitScanner::new(path, dialect, max_columns, max_record_bytes),
         }
-    };
-    let columns = header.as_ref().map_or(0, Vec::len);
+    }
+
+    fn max_observed_record_bytes(&self) -> usize {
+        self.scanner.max_observed_record_bytes
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CsvRecordLimitReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = if buffer.is_empty() {
+            self.inner.read(buffer)?
+        } else {
+            let capacity = buffer.len().min(CSV_LIMIT_SCAN_BUFFER_BYTES);
+            self.inner.read(&mut buffer[..capacity])?
+        };
+        if read == 0 {
+            self.scanner.finish()?;
+        } else {
+            self.scanner.scan(&buffer[..read])?;
+        }
+        Ok(read)
+    }
+}
+
+struct CsvRecordLimitScanner {
+    parser: csv_core::Reader,
+    path: PathBuf,
+    fields: usize,
+    decoded_bytes: usize,
+    max_observed_record_bytes: usize,
+    record: usize,
+    max_columns: usize,
+    max_record_bytes: usize,
+    scratch: Vec<u8>,
+    finished: bool,
+}
+
+impl CsvRecordLimitScanner {
+    fn new(
+        path: PathBuf,
+        dialect: CsvDialect,
+        max_columns: usize,
+        max_record_bytes: usize,
+    ) -> Self {
+        let mut builder = csv_core::ReaderBuilder::new();
+        builder
+            .delimiter(dialect.delimiter)
+            .quote(dialect.quote)
+            .escape(dialect.escape);
+        Self {
+            parser: builder.build(),
+            path,
+            fields: 0,
+            decoded_bytes: 0,
+            max_observed_record_bytes: 0,
+            record: 1,
+            max_columns,
+            max_record_bytes,
+            scratch: vec![0; CSV_LIMIT_SCAN_BUFFER_BYTES],
+            finished: false,
+        }
+    }
+
+    fn scan(&mut self, input: &[u8]) -> std::io::Result<()> {
+        let mut offset = 0;
+        while offset < input.len() {
+            let (result, consumed, decoded) =
+                self.parser.read_field(&input[offset..], &mut self.scratch);
+            self.add_decoded_bytes(decoded)?;
+            offset = offset.saturating_add(consumed);
+            match result {
+                csv_core::ReadFieldResult::InputEmpty => break,
+                csv_core::ReadFieldResult::OutputFull => {
+                    debug_assert!(consumed > 0 || decoded > 0);
+                }
+                csv_core::ReadFieldResult::Field { record_end } => {
+                    self.finish_field(record_end)?;
+                }
+                csv_core::ReadFieldResult::End => {
+                    self.finished = true;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        loop {
+            let (result, consumed, decoded) = self.parser.read_field(&[], &mut self.scratch);
+            debug_assert_eq!(consumed, 0);
+            self.add_decoded_bytes(decoded)?;
+            match result {
+                csv_core::ReadFieldResult::Field { record_end } => {
+                    self.finish_field(record_end)?;
+                }
+                csv_core::ReadFieldResult::End | csv_core::ReadFieldResult::InputEmpty => {
+                    self.finished = true;
+                    return Ok(());
+                }
+                csv_core::ReadFieldResult::OutputFull => {
+                    debug_assert!(decoded > 0);
+                }
+            }
+        }
+    }
+
+    fn add_decoded_bytes(&mut self, bytes: usize) -> std::io::Result<()> {
+        self.decoded_bytes = self.decoded_bytes.saturating_add(bytes);
+        if self.decoded_bytes > self.max_record_bytes {
+            return Err(invalid_schema(format!(
+                "CSV record {} in {} exceeds the {} decoded byte limit",
+                self.record,
+                self.path.display(),
+                self.max_record_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    fn finish_field(&mut self, record_end: bool) -> std::io::Result<()> {
+        self.fields = self.fields.saturating_add(1);
+        if self.fields > self.max_columns || (!record_end && self.fields == self.max_columns) {
+            let columns = self.fields.saturating_add((!record_end) as usize);
+            return Err(invalid_schema(format!(
+                "CSV input {} has at least {} columns, exceeds the {} column limit",
+                self.path.display(),
+                columns,
+                self.max_columns
+            )));
+        }
+        if record_end {
+            self.max_observed_record_bytes = self.max_observed_record_bytes.max(self.decoded_bytes);
+            self.fields = 0;
+            self.decoded_bytes = 0;
+            self.record = self.record.saturating_add(1);
+        }
+        Ok(())
+    }
+}
+
+fn ensure_csv_column_limit(path: &Path, columns: usize) -> std::io::Result<()> {
     if columns > MAX_CSV_COLUMNS {
         return Err(invalid_schema(format!(
             "CSV input {} has {} columns, exceeds the {} column limit",
@@ -1669,26 +2353,90 @@ fn open_csv_input(path: &Path, options: &CsvConvertOptions) -> std::io::Result<C
             MAX_CSV_COLUMNS
         )));
     }
+    Ok(())
+}
+
+fn csv_batch_size(columns: usize) -> usize {
+    if columns == 0 {
+        return DEFAULT_CSV_BATCH_SIZE;
+    }
+    (TARGET_CSV_DECODE_CELLS / columns).clamp(1, DEFAULT_CSV_BATCH_SIZE)
+}
+
+fn inferred_csv_batch_size(columns: usize, max_record_bytes: usize) -> usize {
+    let cell_bound = csv_batch_size(columns);
+    if max_record_bytes == 0 {
+        return cell_bound;
+    }
+    cell_bound.min((TARGET_CONVERT_BATCH_BYTES / max_record_bytes).max(1))
+}
+
+fn explicit_csv_row_cells(source_columns: usize, output_columns: usize) -> usize {
+    source_columns.max(output_columns)
+}
+
+fn open_csv_input_from_reader<R: std::io::Read>(
+    path: &Path,
+    options: &CsvConvertOptions,
+    reader: R,
+    line_offset: u64,
+) -> std::io::Result<CsvInput<R>> {
+    let dialect = CsvDialect::from_options(options)?;
+    let mut builder = csv::ReaderBuilder::new();
+    builder
+        .has_headers(false)
+        .flexible(true)
+        .delimiter(dialect.delimiter)
+        .quote(dialect.quote)
+        .escape(dialect.escape);
+    let mut reader = builder.from_reader(reader);
+    let file_header = options.header.is_none() && !options.no_header;
+    let header = if let Some(header) = &options.header {
+        Some(parse_csv_header(header, options)?)
+    } else if options.no_header {
+        None
+    } else {
+        let mut record = csv::StringRecord::new();
+        if reader
+            .read_record(&mut record)
+            .map_err(|e| csv_read_error(e, "invalid CSV header", line_offset))?
+        {
+            add_csv_record_line_offset(&mut record, line_offset);
+            Some(record.iter().map(ToString::to_string).collect())
+        } else {
+            Some(Vec::new())
+        }
+    };
+    if let Some(header) = &header {
+        ensure_csv_column_limit(path, header.len())?;
+    }
     let mut first_record = csv::StringRecord::new();
-    let has_records = reader.read_record(&mut first_record).map_err(|e| {
-        invalid_schema(format!(
-            "invalid CSV record: {}",
-            csv_error_with_line_offset(e, line_offset)
-        ))
-    })?;
+    let has_records = reader
+        .read_record(&mut first_record)
+        .map_err(|e| csv_read_error(e, "invalid CSV record", line_offset))?;
     if has_records {
         add_csv_record_line_offset(&mut first_record, line_offset);
+        ensure_csv_column_limit(path, first_record.len())?;
     }
     if has_records && file_header {
         validate_csv_header_names(header.as_ref().unwrap())?;
     }
+    let columns = header.as_ref().map_or_else(
+        || {
+            if has_records {
+                first_record.len()
+            } else {
+                0
+            }
+        },
+        Vec::len,
+    );
     Ok(CsvInput {
         reader,
         layout: CsvInputLayout {
             header,
             columns,
             has_records,
-            line_offset,
         },
         first_record: has_records.then_some(first_record),
     })
@@ -1697,33 +2445,36 @@ fn open_csv_input(path: &Path, options: &CsvConvertOptions) -> std::io::Result<C
 fn write_explicit_schema_csv_input(
     writer: &mut paimon_mosaic_core::writer::MosaicWriter<paimon_mosaic_core::writer::FileSink>,
     rows: &mut usize,
-    input: &Path,
+    source: &mut OpenCsvSource,
     schema: &Schema,
     schema_index: &std::collections::HashMap<&str, usize>,
     options: &CsvConvertOptions,
+    dialect: CsvDialect,
 ) -> std::io::Result<()> {
-    let mut input_reader = open_csv_input(input, options)?;
+    let input = source.path.clone();
+    let line_offset = source.line_offset;
+    let reader = source.guarded_reader(dialect)?;
+    let mut input_reader = open_csv_input_from_reader(&input, options, reader, line_offset)?;
     if !input_reader.layout.has_records {
         return Ok(());
     }
     let source_mapping = csv_output_mapping(schema, schema_index, &input_reader.layout);
-    validate_csv_mapping(schema, &input_reader.layout, &source_mapping, input)?;
+    validate_csv_mapping(schema, &input_reader.layout, &source_mapping, &input)?;
 
-    let line_offset = input_reader.layout.line_offset;
     let first = input_reader.first_record.take().into_iter().map(Ok);
     let rest = std::iter::from_fn(|| {
         let mut record = csv::StringRecord::new();
         match input_reader.reader.read_record(&mut record) {
             Ok(true) => {
                 add_csv_record_line_offset(&mut record, line_offset);
-                Some(Ok(record))
+                Some(ensure_csv_column_limit(&input, record.len()).map(|_| record))
             }
             Ok(false) => None,
-            Err(e) => Some(Err(invalid_schema(format!(
-                "invalid CSV record in {}: {}",
-                input.display(),
-                csv_error_with_line_offset(e, line_offset)
-            )))),
+            Err(e) => Some(Err(csv_read_error(
+                e,
+                &format!("invalid CSV record in {}", input.display()),
+                line_offset,
+            ))),
         }
     });
     for_each_explicit_csv_batch(
@@ -3558,6 +4309,17 @@ mod tests {
     }
 
     #[test]
+    fn inferred_csv_batch_size_bounds_accumulated_record_payload() {
+        assert_eq!(inferred_csv_batch_size(1, 0), DEFAULT_CSV_BATCH_SIZE);
+        assert_eq!(
+            inferred_csv_batch_size(1, 2 * 1024 * 1024),
+            TARGET_CONVERT_BATCH_BYTES / (2 * 1024 * 1024)
+        );
+        assert_eq!(inferred_csv_batch_size(1, MAX_CSV_RECORD_BYTES), 1);
+        assert_eq!(inferred_csv_batch_size(TARGET_CSV_DECODE_CELLS, 1), 1);
+    }
+
+    #[test]
     fn explicit_csv_batch_bound_includes_output_schema_width() {
         assert_eq!(explicit_csv_row_cells(1, 4096), 4096);
         assert_eq!(csv_batch_size(explicit_csv_row_cells(1, 4096)), 16);
@@ -3630,6 +4392,202 @@ mod tests {
     }
 
     #[test]
+    fn json_record_limit_stops_at_limit_plus_one_without_reading_the_tail() {
+        use std::cell::Cell;
+        use std::io::Read;
+        use std::rc::Rc;
+
+        struct OneByteCountingReader {
+            bytes: std::io::Cursor<Vec<u8>>,
+            reads: Rc<Cell<usize>>,
+        }
+
+        impl Read for OneByteCountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let len = buf.len().min(1);
+                let read = self.bytes.read(&mut buf[..len])?;
+                self.reads.set(self.reads.get() + read);
+                Ok(read)
+            }
+        }
+
+        let reads = Rc::new(Cell::new(0));
+        let reader = OneByteCountingReader {
+            bytes: std::io::Cursor::new(
+                format!(r#"{{"payload":"{}"}}"#, "x".repeat(256)).into_bytes(),
+            ),
+            reads: Rc::clone(&reads),
+        };
+        let err = validate_json_record_limits(reader, 16)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "JSON record 1 exceeds the 16 byte limit");
+        assert_eq!(reads.get(), 17);
+    }
+
+    #[test]
+    fn json_record_limit_accepts_multiline_and_adjacent_values() {
+        let input = b"{\n\"a\":1\n}{\"b\":[2,3]}1\"cool\"\"stuff\" 3{} [0]";
+        let reader = std::io::BufReader::with_capacity(2, std::io::Cursor::new(input));
+        validate_json_record_limits(reader, 64).unwrap();
+    }
+
+    #[test]
+    fn json_record_chunk_scanner_matches_byte_scanner() {
+        let inputs: &[&[u8]] = &[
+            br#"{"a":[1,{"b":"x\\\"y"}]} {"c":2}"#,
+            b"{\n\"a\":\"line\nvalue\"\n}\r\n[1,2,3]",
+            br#"1{"a":2}["x"]"y" false null"#,
+        ];
+        for input in inputs {
+            for chunk_size in [1, 2, 3, 7, 64] {
+                let mut byte_scanner = JsonRecordScanner::new_with_limits(32, 64);
+                let byte_result = input
+                    .iter()
+                    .try_for_each(|&byte| byte_scanner.scan(byte))
+                    .map_err(|error| error.to_string());
+
+                let mut chunk_scanner = JsonRecordScanner::new_with_limits(32, 64);
+                let chunk_result = input
+                    .chunks(chunk_size)
+                    .try_for_each(|chunk| chunk_scanner.scan_chunk(chunk))
+                    .map_err(|error| error.to_string());
+
+                assert_eq!(chunk_result, byte_result, "chunk size {chunk_size}");
+                assert_eq!(chunk_scanner.state, byte_scanner.state);
+                assert_eq!(chunk_scanner.record, byte_scanner.record);
+                assert_eq!(chunk_scanner.record_bytes, byte_scanner.record_bytes);
+                assert_eq!(chunk_scanner.line_bytes, byte_scanner.line_bytes);
+                assert_eq!(
+                    chunk_scanner.structural_units,
+                    byte_scanner.structural_units
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn json_record_limit_rejects_dense_structural_input() {
+        let mut scanner = JsonRecordScanner::new_with_limits(usize::MAX, 5);
+        let err = scanner
+            .scan_chunk(br#"{"values":[0,0,0,0]}"#)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "JSON record 1 exceeds the 5 structural unit limit");
+    }
+
+    #[test]
+    fn json_record_limit_does_not_accumulate_whitespace_across_short_lines() {
+        let input = format!("{{}}\n{}{{}}", " \n".repeat(32));
+        let reader = std::io::BufReader::with_capacity(3, std::io::Cursor::new(input.into_bytes()));
+        validate_json_record_limits(reader, 16).unwrap();
+    }
+
+    #[test]
+    fn convert_json_record_limit_covers_every_schema_dispatch() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mosaic_json_record_limit_{}_{}",
+            std::process::id(),
+            suffix
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let input = dir.join("input.jsonl");
+        let ordinary_schema = dir.join("ordinary.avsc");
+        let validated_schema = dir.join("validated.avsc");
+        std::fs::write(
+            &input,
+            format!(r#"{{"selected":"ok","unselected":"{}"}}"#, "x".repeat(128)),
+        )
+        .unwrap();
+        std::fs::write(
+            &ordinary_schema,
+            r#"{"type":"record","name":"T","fields":[{"name":"selected","type":"string"},{"name":"unselected","type":"string"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &validated_schema,
+            r#"{"type":"record","name":"T","fields":[{"name":"amount","type":{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}},{"name":"unselected","type":"string"}]}"#,
+        )
+        .unwrap();
+
+        let cases = [
+            (None, Vec::new()),
+            (None, vec!["selected".to_string()]),
+            (Some(ordinary_schema.as_path()), Vec::new()),
+            (Some(validated_schema.as_path()), Vec::new()),
+        ];
+        for (index, (schema, columns)) in cases.into_iter().enumerate() {
+            let out = dir.join(format!("out-{index}.mosaic"));
+            let err =
+                convert_with_json_record_limit(&input, &out, schema, &columns, None, false, 32)
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                err.contains("JSON record 1 exceeds the 32 byte limit"),
+                "{err}"
+            );
+            assert!(!out.exists());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn convert_json_record_limit_bounds_arrow_line_whitespace() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mosaic_json_whitespace_limit_{}_{}",
+            std::process::id(),
+            suffix
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let input = dir.join("input.jsonl");
+        let out = dir.join("out.mosaic");
+        std::fs::write(&input, format!("{{}}{}\n", " ".repeat(128))).unwrap();
+        let err = convert_with_json_record_limit(&input, &out, None, &[], None, false, 16)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("JSON input line exceeds the 16 byte limit"),
+            "{err}"
+        );
+        assert!(!out.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn convert_json_record_limit_bounds_many_values_on_one_arrow_line() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mosaic_json_line_limit_{}_{}",
+            std::process::id(),
+            suffix
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let input = dir.join("input.jsonl");
+        let out = dir.join("out.mosaic");
+        std::fs::write(&input, "{}".repeat(32)).unwrap();
+        let err = convert_with_json_record_limit(&input, &out, None, &[], None, false, 16)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("JSON input line exceeds the 16 byte limit"),
+            "{err}"
+        );
+        assert!(!out.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn csv_projection_remaps_output_columns() {
         let (projection, mapping) = csv_projection(&[Some(5), None, Some(1)]);
         assert_eq!(projection, [5, 1]);
@@ -3648,7 +4606,6 @@ mod tests {
             header: Some((0..4096).rev().map(|i| format!("field_{i}")).collect()),
             columns: 4096,
             has_records: true,
-            line_offset: 0,
         };
         let reader_schema = csv_reader_schema(&schema, &index, &layout);
         let mapping = csv_output_mapping(&schema, &index, &layout);
@@ -3801,6 +4758,143 @@ mod tests {
     }
 
     #[test]
+    fn decimal_normalization_plan_preserves_nested_semantics_and_order() {
+        let decimal = DataType::Decimal128(10, 2);
+        let map_entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("keys", DataType::Utf8, false),
+                Field::new("values", decimal.clone(), false),
+            ])),
+            false,
+        );
+        let nested = Field::new(
+            "nested",
+            DataType::Struct(Fields::from(vec![
+                Field::new("decimal", decimal.clone(), false),
+                Field::new(
+                    "list",
+                    DataType::List(Arc::new(Field::new("item", decimal.clone(), false))),
+                    false,
+                ),
+                Field::new("map", DataType::Map(Arc::new(map_entries), false), false),
+                Field::new("plain", DataType::Utf8, false),
+            ])),
+            false,
+        );
+        let schema = Schema::new(vec![Field::new("top", decimal, false), nested]);
+        let plan = JsonDecimalStructPlan::from_fields(schema.fields());
+        let raw: Box<RawValue> = serde_json::from_str(
+            r#"{"unknown":{"keep":[1]},"top":1.2,"nested":{"unknown":true,"list":[2,3.40],"map":{"z":"4.50","a":5},"decimal":"6.7","plain":"same"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            normalize_json_decimal_record(&raw, &plan, 1).unwrap(),
+            r#"{"nested":{"decimal":"6.70","list":["2.00","3.40"],"map":{"a":"5.00","z":"4.50"},"plain":"same","unknown":true},"top":"1.20","unknown":{"keep":[1]}}"#
+        );
+    }
+
+    #[test]
+    fn decimal_normalization_plan_uses_one_name_lookup_per_object_key() {
+        const WIDTH: usize = 1024;
+        let decimal = DataType::Decimal128(10, 2);
+        let nested_fields = (0..WIDTH)
+            .map(|i| Field::new(format!("n{i}"), DataType::Utf8, false))
+            .chain(std::iter::once(Field::new(
+                "nested_amount",
+                decimal.clone(),
+                false,
+            )))
+            .collect::<Vec<_>>();
+        let root_fields = (0..WIDTH)
+            .map(|i| Field::new(format!("r{i}"), DataType::Utf8, false))
+            .chain([
+                Field::new("amount", decimal, false),
+                Field::new(
+                    "nested",
+                    DataType::Struct(Fields::from(nested_fields)),
+                    false,
+                ),
+            ])
+            .collect::<Vec<_>>();
+        let schema = Schema::new(root_fields);
+        let plan = JsonDecimalStructPlan::from_fields(schema.fields());
+
+        let mut nested = String::from("{");
+        for i in 0..WIDTH {
+            if i != 0 {
+                nested.push(',');
+            }
+            nested.push_str(&format!(r#""n{i}":"v""#));
+        }
+        nested.push_str(r#","nested_amount":1.2,"unknown_nested":true}"#);
+        let mut input = String::from("{");
+        for i in 0..WIDTH {
+            if i != 0 {
+                input.push(',');
+            }
+            input.push_str(&format!(r#""r{i}":"v""#));
+        }
+        input.push_str(&format!(
+            r#","amount":1.2,"nested":{nested},"unknown_root":true}}"#
+        ));
+        let raw: Box<RawValue> = serde_json::from_str(&input).unwrap();
+        normalize_json_decimal_record(&raw, &plan, 1).unwrap();
+        assert_eq!(plan.lookup_count(), 2 * WIDTH + 5);
+    }
+
+    #[test]
+    fn decimal_normalization_plan_keeps_first_duplicate_schema_field() {
+        let schema = Schema::new(vec![
+            Field::new("amount", DataType::Utf8, false),
+            Field::new("amount", DataType::Decimal128(10, 2), false),
+        ]);
+        let plan = JsonDecimalStructPlan::from_fields(schema.fields());
+        let raw: Box<RawValue> = serde_json::from_str(r#"{"amount":1.2}"#).unwrap();
+        assert_eq!(
+            normalize_json_decimal_record(&raw, &plan, 1).unwrap(),
+            r#"{"amount":1.2}"#
+        );
+    }
+
+    #[test]
+    fn decimal_normalization_rejects_expansion_past_hard_limit() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(10, 2),
+            false,
+        )]);
+        let plan = JsonDecimalStructPlan::from_fields(schema.fields());
+        let raw: Box<RawValue> = serde_json::from_str(r#"{"amount":1}"#).unwrap();
+        let err = normalize_json_decimal_record_with_limit(&raw, &plan, 7, raw.get().len())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "normalized JSON record 7 exceeds the {} byte limit",
+                raw.get().len()
+            )
+        );
+    }
+
+    #[test]
+    fn json_special_validation_uses_the_last_duplicate_record_field() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(10, 2),
+            false,
+        )]);
+        let fields = json_special_fields(&schema);
+        validate_json_special_values(br#"{"amount":"bad","amount":"2.00"}"#, &fields, 1).unwrap();
+
+        let err = validate_json_special_values(br#"{"amount":"2.00","amount":"bad"}"#, &fields, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot parse 'bad'"), "{err}");
+    }
+
+    #[test]
     fn local_timestamp_timezone_detection_ignores_fractional_precision() {
         for value in [
             "2026-08-20T12:34:56Z",
@@ -3878,7 +4972,6 @@ mod tests {
             header: Some(vec!["other".to_string()]),
             columns: 1,
             has_records: true,
-            line_offset: 0,
         };
         let err = validate_csv_mapping(&schema, &layout, &[None, Some(0)], Path::new("input.csv"))
             .unwrap_err()
@@ -4056,14 +5149,323 @@ mod tests {
             header: None,
             skip_lines: 0,
         };
-        let err = match open_csv_input(&path, &options) {
+        let dialect = CsvDialect::from_options(&options).unwrap();
+        let source = OpenCsvSource::open(&path, options.skip_lines).unwrap();
+        let err = match prepare_inferred_csv_input(source, &options, dialect) {
             Ok(_) => panic!("expected CSV width guard to reject this header"),
             Err(err) => err.to_string(),
         };
         let _ = std::fs::remove_file(&path);
-        assert!(
-            err.contains("exceeds the") && err.contains("column limit"),
-            "unexpected error: {err}"
+        assert_eq!(
+            err,
+            format!(
+                "CSV input {} has at least {} columns, exceeds the {} column limit",
+                path.display(),
+                MAX_CSV_COLUMNS + 1,
+                MAX_CSV_COLUMNS
+            )
         );
+    }
+
+    #[test]
+    fn open_csv_input_rejects_too_many_no_header_columns() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("mosaic_test_wide_no_header.csv");
+        let record = std::iter::repeat_n("1", MAX_CSV_COLUMNS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(&path, format!("{record}\n")).unwrap();
+        let options = CsvConvertOptions {
+            delimiter: ",".to_string(),
+            escape: None,
+            quote: "\"".to_string(),
+            no_header: true,
+            header: None,
+            skip_lines: 0,
+        };
+        let dialect = CsvDialect::from_options(&options).unwrap();
+        let source = OpenCsvSource::open(&path, options.skip_lines).unwrap();
+        let err = match prepare_inferred_csv_input(source, &options, dialect) {
+            Ok(_) => panic!("expected CSV width guard to reject this record"),
+            Err(err) => err.to_string(),
+        };
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            err,
+            format!(
+                "CSV input {} has at least {} columns, exceeds the {} column limit",
+                path.display(),
+                MAX_CSV_COLUMNS + 1,
+                MAX_CSV_COLUMNS
+            )
+        );
+    }
+
+    #[test]
+    fn open_csv_input_records_no_header_width() {
+        let path = std::env::temp_dir().join("mosaic_test_no_header_width.csv");
+        std::fs::write(&path, "a,b\n").unwrap();
+        let options = CsvConvertOptions {
+            delimiter: ",".to_string(),
+            escape: None,
+            quote: "\"".to_string(),
+            no_header: true,
+            header: None,
+            skip_lines: 0,
+        };
+        let dialect = CsvDialect::from_options(&options).unwrap();
+        let source = OpenCsvSource::open(&path, options.skip_lines).unwrap();
+        let input = prepare_inferred_csv_input(source, &options, dialect).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(input.layout.columns, 2);
+    }
+
+    #[test]
+    fn csv_record_guard_is_quote_and_escape_aware_across_chunks() {
+        let dialect = CsvDialect {
+            delimiter: b',',
+            escape: Some(b'\\'),
+            quote: b'"',
+        };
+        let input = b"\"a,b\",\"line\nvalue\",\"escaped\\\"quote\"\n";
+        for chunk_size in [1, 2, 3, 7] {
+            let mut scanner =
+                CsvRecordLimitScanner::new(PathBuf::from("input.csv"), dialect, 3, 64);
+            for chunk in input.chunks(chunk_size) {
+                scanner.scan(chunk).unwrap();
+            }
+            scanner.finish().unwrap();
+        }
+
+        let mut scanner = CsvRecordLimitScanner::new(PathBuf::from("input.csv"), dialect, 3, 4);
+        let err = scanner.scan(b"\"ab\ncd\",x,y\n").unwrap_err().to_string();
+        assert!(err.contains("exceeds the 4 decoded byte limit"), "{err}");
+    }
+
+    #[test]
+    fn csv_record_guard_rejects_late_width_without_reading_tail() {
+        use std::cell::Cell;
+        use std::io::Read;
+        use std::rc::Rc;
+
+        struct OneByteCountingReader {
+            bytes: std::io::Cursor<Vec<u8>>,
+            reads: Rc<Cell<usize>>,
+        }
+
+        impl Read for OneByteCountingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let capacity = buffer.len().min(1);
+                let read = self.bytes.read(&mut buffer[..capacity])?;
+                self.reads.set(self.reads.get().saturating_add(read));
+                Ok(read)
+            }
+        }
+
+        let data = b"a,b\n1,2,3,this-tail-must-not-be-read".to_vec();
+        let reads = Rc::new(Cell::new(0));
+        let inner = OneByteCountingReader {
+            bytes: std::io::Cursor::new(data.clone()),
+            reads: Rc::clone(&reads),
+        };
+        let dialect = CsvDialect {
+            delimiter: b',',
+            escape: None,
+            quote: b'"',
+        };
+        let mut reader =
+            CsvRecordLimitReader::new(inner, PathBuf::from("input.csv"), dialect, 2, 64);
+        let err = std::io::copy(&mut reader, &mut std::io::sink())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has at least 3 columns"), "{err}");
+        assert!(
+            reads.get() < data.len(),
+            "{} >= {}",
+            reads.get(),
+            data.len()
+        );
+    }
+
+    #[test]
+    fn inferred_csv_decode_replays_snapshot_after_source_replacement() {
+        use std::io::Read;
+
+        let path = std::env::temp_dir().join(format!(
+            "mosaic_csv_snapshot_{}_{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "name\noriginal\n").unwrap();
+        let options = CsvConvertOptions {
+            delimiter: ",".to_string(),
+            escape: None,
+            quote: "\"".to_string(),
+            no_header: false,
+            header: None,
+            skip_lines: 0,
+        };
+        let dialect = CsvDialect::from_options(&options).unwrap();
+        let source = OpenCsvSource::open(&path, options.skip_lines).unwrap();
+        let prepared = prepare_inferred_csv_input(source, &options, dialect).unwrap();
+
+        std::fs::write(&path, "name\nreplacement\n").unwrap();
+        let mut replay = String::new();
+        prepared
+            .reader()
+            .unwrap()
+            .read_to_string(&mut replay)
+            .unwrap();
+        assert_eq!(replay, "name\noriginal\n");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn convert_csv_rejects_wide_positional_input_before_inference() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mosaic_csv_width_{}_{}",
+            std::process::id(),
+            suffix
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let input = dir.join("wide.csv");
+        let first_record = std::iter::repeat_n("1", MAX_CSV_COLUMNS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(&input, format!("{first_record}\nshort\n")).unwrap();
+        for (index, (no_header, header)) in [(true, None), (false, Some("only".to_string()))]
+            .into_iter()
+            .enumerate()
+        {
+            let out = dir.join(format!("wide-{index}.mosaic"));
+            let err = convert_csv(
+                std::slice::from_ref(&input),
+                &out,
+                None,
+                &[],
+                CsvConvertOptions {
+                    delimiter: ",".to_string(),
+                    escape: None,
+                    quote: "\"".to_string(),
+                    no_header,
+                    header,
+                    skip_lines: 0,
+                },
+                None,
+                false,
+            )
+            .unwrap_err()
+            .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "CSV input {} has at least {} columns, exceeds the {} column limit",
+                    input.display(),
+                    MAX_CSV_COLUMNS + 1,
+                    MAX_CSV_COLUMNS
+                )
+            );
+            assert!(!out.exists());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn convert_csv_skip_lines_discards_non_utf8_bytes() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mosaic_csv_skip_bytes_{}_{}",
+            std::process::id(),
+            suffix
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let input = dir.join("input.csv");
+        let out = dir.join("out.mosaic");
+        std::fs::write(&input, [b"\xff\n".as_slice(), b"name\nok\n"].concat()).unwrap();
+
+        convert_csv(
+            std::slice::from_ref(&input),
+            &out,
+            None,
+            &[],
+            CsvConvertOptions {
+                delimiter: ",".to_string(),
+                escape: None,
+                quote: "\"".to_string(),
+                no_header: false,
+                header: None,
+                skip_lines: 1,
+            },
+            None,
+            false,
+        )
+        .unwrap();
+
+        let reader = open(&out).unwrap();
+        assert_eq!(reader.schema().columns.len(), 1);
+        assert_eq!(reader.schema().columns[0].name, "name");
+        assert_eq!(reader.row_group_num_rows(0).unwrap(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn convert_csv_rejects_wide_later_record_with_explicit_schema() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mosaic_csv_later_width_{}_{}",
+            std::process::id(),
+            suffix
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let input = dir.join("input.csv");
+        let schema = dir.join("schema.avsc");
+        let out = dir.join("out.mosaic");
+        let wide_record = std::iter::repeat_n("2", MAX_CSV_COLUMNS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(&input, format!("1\n{wide_record}\n")).unwrap();
+        std::fs::write(
+            &schema,
+            r#"{"type":"record","name":"T","fields":[{"name":"id","type":"long"}]}"#,
+        )
+        .unwrap();
+
+        let err = convert_csv(
+            std::slice::from_ref(&input),
+            &out,
+            Some(&schema),
+            &[],
+            CsvConvertOptions {
+                delimiter: ",".to_string(),
+                escape: None,
+                quote: "\"".to_string(),
+                no_header: true,
+                header: None,
+                skip_lines: 0,
+            },
+            None,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(&format!("exceeds the {} column limit", MAX_CSV_COLUMNS)),
+            "{err}"
+        );
+        assert!(!out.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

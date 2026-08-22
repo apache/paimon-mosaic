@@ -120,6 +120,10 @@ accepts a comma-separated list.
 `--stats id` builds min/max for those columns, which `cat --where` then uses
 to skip row groups that cannot match.
 `convert` accepts JSON inputs only; use `convert-csv` for CSV inputs.
+Each JSON root value is limited to 16 MiB and 100,000 structural units
+(container boundaries, separators, and string starts) before serde or Arrow
+materializes it. Schema-aware decimal normalization is subject to the same
+16 MiB output limit.
 
 ```text
 $ mosaic convert data.json -o data.mosaic
@@ -153,12 +157,17 @@ Backslash escaping is disabled by default so literal values such as
 `C:\temp\file` are preserved; pass `--escape '\'` only for CSV dialects that
 use a separate escape character. `--delimiter`, `--quote`, and `--skip-lines`
 control the CSV dialect; `--skip-lines N` drops N physical lines before CSV
-parsing begins. Avro `bytes`, `array`, and `map` fields are rejected because
-the CSV decoder supports scalar text fields only. `--header` and `--no-header`
-are mutually exclusive. Inferred local timestamps reject explicit offsets and
-direct users to `--schema` to select timestamp semantics; second-precision
-values are stored with millisecond precision. Explicit-schema local timestamps
-and decimals use the same offset and exact-scale rules as JSON conversion.
+parsing begins without decoding skipped bytes as UTF-8. Every logical CSV
+record is limited to 65,535 columns and 64 MiB of decoded field payload before
+csv or Arrow materializes it. Schema inference snapshots the guarded input, so
+decode replays exactly the bytes used for inference even if the source path is
+replaced or modified. Avro `bytes`, `array`, and `map` fields are rejected
+because the CSV decoder supports scalar text fields only. `--header` and
+`--no-header` are mutually exclusive. Inferred local timestamps reject
+explicit offsets and direct users to `--schema` to select timestamp semantics;
+second-precision values are stored with millisecond precision. Explicit-schema
+local timestamps and decimals use the same offset and exact-scale rules as JSON
+conversion.
 `--stats id` builds min/max for those columns, which `cat --where` then uses to
 skip row groups that cannot match.
 

@@ -886,9 +886,12 @@ dependencies = [
  "arrow",
  "clap",
  "csv",
+ "csv-core",
+ "memchr",
  "paimon-mosaic-core",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

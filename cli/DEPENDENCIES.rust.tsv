@@ -42,6 +42,8 @@ crunchy@0.2.4							X
 csv@1.4.0							X		X
 csv-core@0.1.13							X		X
 equivalent@1.0.2	X						X
+errno@0.3.14	X						X
+fastrand@2.5.0	X						X
 find-msvc-tools@0.1.11	X						X
 flatbuffers@25.12.19	X
 futures-core@0.3.34	X						X
@@ -68,6 +70,7 @@ lexical-write-float@1.0.6	X						X
 lexical-write-integer@1.0.6	X						X
 libc@0.2.189	X						X
 libm@0.2.16							X
+linux-raw-sys@0.12.1	X	X					X
 log@0.4.33	X						X
 memchr@2.8.3							X		X
 num-bigint@0.4.8	X						X
@@ -88,6 +91,7 @@ regex@1.13.1	X						X
 regex-automata@0.4.18	X						X
 regex-syntax@0.8.11	X						X
 rustc_version@0.4.1	X						X
+rustix@1.1.4	X	X					X
 rustversion@1.0.23	X						X
 ryu@1.0.23	X			X
 semver@1.0.28	X						X
@@ -101,6 +105,7 @@ slab@0.4.12							X
 strsim@0.11.1							X
 syn@2.0.119	X						X
 syn@3.0.3	X						X
+tempfile@3.27.0	X						X
 tiny-keccak@2.0.2					X
 unicode-ident@1.0.24	X						X	X
 utf8parse@0.2.2	X						X
