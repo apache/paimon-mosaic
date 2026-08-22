@@ -30,6 +30,8 @@ from native_binary import TARGET_ARCHITECTURE, verify_native_target
 
 
 MAX_ARCHIVE_ENTRY_SIZE = 256 * 1024 * 1024
+MAX_ARCHIVE_TOTAL_SIZE = 1024 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 65536
 MAX_JAVA_CLASS_SIZE = 16 * 1024 * 1024
 TARGETS = (
     "x86_64-unknown-linux-gnu",
@@ -80,7 +82,15 @@ def repository_root() -> Path:
 def validated_entries(archive: ZipFile) -> dict[str, ZipInfo]:
     entries: dict[str, ZipInfo] = {}
     normalized_names: dict[str, str] = {}
-    for info in archive.infolist():
+    # The per-entry cap does not bound the aggregate, so bound the total and the
+    # entry count too.
+    total_size = 0
+    infos = archive.infolist()
+    if len(infos) > MAX_ARCHIVE_ENTRIES:
+        raise ValueError(
+            f"archive declares more than {MAX_ARCHIVE_ENTRIES} entries: {len(infos)}"
+        )
+    for info in infos:
         name = info.orig_filename
         if not name or "\x00" in name or name != info.filename:
             raise ValueError(f"invalid archive entry path: {name!r}")
@@ -96,6 +106,12 @@ def validated_entries(archive: ZipFile) -> dict[str, ZipInfo]:
             raise ValueError(
                 f"archive entry {name!r} exceeds the size limit of "
                 f"{MAX_ARCHIVE_ENTRY_SIZE} bytes: {info.file_size} bytes"
+            )
+        total_size += info.file_size
+        if total_size > MAX_ARCHIVE_TOTAL_SIZE:
+            raise ValueError(
+                f"archive exceeds the total size limit of "
+                f"{MAX_ARCHIVE_TOTAL_SIZE} bytes"
             )
         if name in entries:
             raise ValueError(f"archive contains duplicate raw entry name: {name!r}")

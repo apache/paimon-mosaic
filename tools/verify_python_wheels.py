@@ -37,6 +37,8 @@ from native_binary import TARGET_ARCHITECTURE, verify_native_target
 
 
 MAX_ARCHIVE_ENTRY_SIZE = 256 * 1024 * 1024
+MAX_ARCHIVE_TOTAL_SIZE = 1024 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 65536
 NATIVE_LIBRARY = {
     "x86_64-unknown-linux-gnu": "mosaic/libpaimon_mosaic_ffi.so",
     "aarch64-unknown-linux-gnu": "mosaic/libpaimon_mosaic_ffi.so",
@@ -181,7 +183,15 @@ def parse_dist_info_name(dist_info: str) -> tuple[str, str]:
 def validate_archive_paths(archive: ZipFile) -> set[str]:
     names = set()
     normalized_names = set()
-    for info in archive.infolist():
+    # The per-entry cap does not bound the aggregate, and every entry is streamed
+    # through hashlib to check RECORD, so bound the total and the entry count too.
+    total_size = 0
+    entries = archive.infolist()
+    if len(entries) > MAX_ARCHIVE_ENTRIES:
+        raise ValueError(
+            f"wheel declares more than {MAX_ARCHIVE_ENTRIES} entries: {len(entries)}"
+        )
+    for info in entries:
         raw_name = info.orig_filename
         if not raw_name or "\x00" in raw_name or raw_name != info.filename:
             raise ValueError(f"invalid wheel entry path: {raw_name!r}")
@@ -197,6 +207,12 @@ def validate_archive_paths(archive: ZipFile) -> set[str]:
             raise ValueError(
                 f"wheel entry {raw_name!r} exceeds the size limit of "
                 f"{MAX_ARCHIVE_ENTRY_SIZE} bytes: {info.file_size} bytes"
+            )
+        total_size += info.file_size
+        if total_size > MAX_ARCHIVE_TOTAL_SIZE:
+            raise ValueError(
+                f"wheel exceeds the total size limit of "
+                f"{MAX_ARCHIVE_TOTAL_SIZE} bytes"
             )
 
         normalized_name = posixpath.normpath(raw_name)

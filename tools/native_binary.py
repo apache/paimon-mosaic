@@ -43,6 +43,10 @@ MACHO_CPU_ARCHITECTURE = {
     0x0100000C: "aarch64",
 }
 
+# A Mosaic native library exports on the order of a hundred symbols; the bound
+# exists to keep hostile input from driving quadratic hash-membership work.
+MAX_DYNAMIC_SYMBOLS = 100_000
+
 MOSAIC_SYMBOL_FAMILIES = {
     "JNI": {
         "Java_org_apache_paimon_mosaic_NativeLib_nativeReaderExportSchema",
@@ -666,6 +670,14 @@ def parse_elf(data: bytes) -> NativeBinary | None:
     ):
         raise ValueError(
             f"ELF dynamic symbol section {symbol_section_index} is malformed"
+        )
+    # Membership in the loader hash is checked per symbol, and a table that
+    # funnels every symbol into one bucket makes each check linear. Bound the
+    # entry count so a crafted library cannot force quadratic work.
+    if symbol_section.size // symbol_entry_size > MAX_DYNAMIC_SYMBOLS:
+        raise ValueError(
+            f"ELF dynamic symbol section {symbol_section_index} declares more "
+            f"than {MAX_DYNAMIC_SYMBOLS} symbols"
         )
     if (
         elf_virtual_range(

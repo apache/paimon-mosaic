@@ -751,6 +751,20 @@ def test_elf_rejects_dynsym_entries_beyond_dt_hash_symbol_count():
         )
 
 
+def test_elf_rejects_an_unbounded_dynamic_symbol_table(monkeypatch):
+    # Hash membership is checked once per symbol and a single-bucket table makes
+    # each check linear, so the entry count must be bounded before that loop.
+    monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 2)
+    data = build_elf()
+
+    with pytest.raises(ValueError, match="more than 2 symbols"):
+        verify_jni_target(
+            data,
+            "x86_64-unknown-linux-gnu",
+            "libpaimon_mosaic_jni.so",
+        )
+
+
 def test_elf_does_not_accept_exports_unreachable_from_dt_hash():
     data = build_elf(hash_reachable=False)
 
