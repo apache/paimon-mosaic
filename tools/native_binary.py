@@ -317,16 +317,21 @@ def parse_elf_sysv_hash(data: bytes, section: ElfSection) -> ElfSysvHash:
         raise ValueError("ELF DT_HASH bucket index is out of bounds")
     if any(index >= symbol_count for index in chains):
         raise ValueError("ELF DT_HASH chain index is out of bounds")
-    verified = set()
-    for bucket in buckets:
-        seen = set()
+    # Each dynamic symbol belongs to exactly one bucket's chain. Recording the
+    # owning bucket keeps this linear and distinguishes a cycle within one chain
+    # from two buckets aliasing the same node, which would let contains() resolve
+    # a symbol through the wrong bucket.
+    owner: dict[int, int] = {}
+    for bucket_index, bucket in enumerate(buckets):
         index = bucket
-        while index and index not in verified:
-            if index in seen:
+        while index:
+            previous = owner.get(index)
+            if previous == bucket_index:
                 raise ValueError("ELF DT_HASH contains a chain cycle")
-            seen.add(index)
+            if previous is not None:
+                raise ValueError("ELF DT_HASH bucket chains alias")
+            owner[index] = bucket_index
             index = chains[index]
-        verified.update(seen)
     return ElfSysvHash(buckets, chains)
 
 
@@ -1555,7 +1560,9 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
                 name_offset == 0
                 or not symbol_type & 0x01
                 or symbol_type & 0x10
-                or basic_type == 0
+                # N_INDR aliases another symbol and N_PBUD is a prebound
+                # undefined reference, so neither one defines code here.
+                or basic_type not in (0x02, 0x0E)
             ):
                 continue
             name = ascii_symbol(

@@ -821,7 +821,10 @@ def test_elf_hash_validates_shared_chain_once(
 ):
     bucket_count = 32
     symbol_count = 64
-    buckets = (1,) * bucket_count
+    # A symbol's hash selects exactly one bucket, so only one bucket may head the
+    # chain. The walk is still 63 nodes deep, which is what the read count below
+    # measures.
+    buckets = (1,) + (0,) * (bucket_count - 1)
 
     class CountingChains:
         def __init__(self):
@@ -869,6 +872,30 @@ def test_elf_hash_validates_shared_chain_once(
     parser(b"", section)
 
     assert chains.reads <= symbol_count * 2
+
+
+def test_elf_sysv_hash_rejects_buckets_that_alias_a_chain():
+    bucket_count, symbol_count = 2, 3
+    # Both buckets head the chain at index 1. A symbol's hash selects exactly one
+    # bucket, and contains() compares only indices while walking, so an aliased
+    # chain would let a symbol resolve under a name that hashes elsewhere.
+    buckets = (1, 1)
+    chains = (0, 2, 0)
+    table = struct.pack("<II", bucket_count, symbol_count)
+    table += struct.pack(f"<{bucket_count}I", *buckets)
+    table += struct.pack(f"<{symbol_count}I", *chains)
+    section = verifier.ElfSection(
+        section_type=5,
+        flags=0,
+        address=0,
+        offset=0,
+        size=len(table),
+        link=0,
+        entry_size=4,
+    )
+
+    with pytest.raises(ValueError, match="bucket chains alias"):
+        verifier.parse_elf_sysv_hash(table, section)
 
 
 def test_elf_does_not_accept_exports_unreachable_from_dt_gnu_hash():
@@ -1224,10 +1251,10 @@ def test_macho_rejects_out_of_bounds_export_trie_metadata(
 
 @pytest.mark.parametrize(
     "symbol_type",
-    (0x0E, 0x1F),
-    ids=("local", "private-extern"),
+    (0x0E, 0x1F, 0x0B, 0x0D),
+    ids=("local", "private-extern", "indirect", "prebound-undefined"),
 )
-def test_macho_symtab_does_not_treat_local_or_private_extern_as_exports(
+def test_macho_symtab_only_accepts_symbols_the_dylib_defines(
     symbol_type,
 ):
     data = build_macho(symbol_type=symbol_type)
