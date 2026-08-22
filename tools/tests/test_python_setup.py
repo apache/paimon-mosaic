@@ -48,24 +48,59 @@ def load_setup_module(monkeypatch):
     return runpy.run_path(str(SETUP_PY))
 
 
-def test_find_native_lib_prefers_release_over_debug_and_packaged(
-    tmp_path, monkeypatch
-):
-    setup_module = load_setup_module(monkeypatch)
+def prepare_tree(tmp_path, setup_module, profiles=("release", "debug"), packaged=True):
     python_directory = tmp_path / "python"
     setup_module["_find_native_lib"].__globals__["__file__"] = str(
         python_directory / "setup.py"
     )
     library_name = setup_module["_lib_name"]()
-    packaged = python_directory / "mosaic" / library_name
-    release = tmp_path / "target/release" / library_name
-    debug = tmp_path / "target/debug" / library_name
-    packaged.parent.mkdir(parents=True)
-    release.parent.mkdir(parents=True)
-    debug.parent.mkdir(parents=True)
-    packaged.write_bytes(b"stale")
-    release.write_bytes(b"release")
-    debug.write_bytes(b"debug")
+    created = {}
+    if packaged:
+        path = python_directory / "mosaic" / library_name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"stale")
+        created["packaged"] = path
+    else:
+        (python_directory / "mosaic").mkdir(parents=True, exist_ok=True)
+    for profile in profiles:
+        path = tmp_path / "target" / profile / library_name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(profile.encode())
+        created[profile] = path
+    return library_name, created
+
+
+def test_find_native_lib_prefers_release_over_debug_and_packaged(
+    tmp_path, monkeypatch
+):
+    setup_module = load_setup_module(monkeypatch)
+    _, created = prepare_tree(tmp_path, setup_module)
     monkeypatch.delenv("MOSAIC_LIB_PATH", raising=False)
 
-    assert Path(setup_module["_find_native_lib"]()).resolve() == release.resolve()
+    assert (
+        Path(setup_module["_find_native_lib"]()).resolve()
+        == created["release"].resolve()
+    )
+
+
+def test_find_native_lib_prefers_the_env_path_over_a_built_library(
+    tmp_path, monkeypatch
+):
+    setup_module = load_setup_module(monkeypatch)
+    library_name, created = prepare_tree(tmp_path, setup_module)
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / library_name).write_bytes(b"external")
+    monkeypatch.setenv("MOSAIC_LIB_PATH", str(external))
+
+    resolved = Path(setup_module["_find_native_lib"]()).resolve()
+    assert resolved == (external / library_name).resolve()
+    assert resolved != created["release"].resolve()
+
+
+def test_find_native_lib_returns_none_when_no_library_exists(tmp_path, monkeypatch):
+    setup_module = load_setup_module(monkeypatch)
+    prepare_tree(tmp_path, setup_module, profiles=(), packaged=False)
+    monkeypatch.delenv("MOSAIC_LIB_PATH", raising=False)
+
+    assert setup_module["_find_native_lib"]() is None

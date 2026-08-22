@@ -1023,9 +1023,11 @@ def test_pe_rejects_named_forwarded_export():
 
 def test_pe_accepts_required_functions_with_unrelated_data_export():
     unrelated = "unrelated_data"
+    # Inside non-executable .rdata (0x1000-0x5000) but past the export directory,
+    # which ends at 0x178d; an RVA inside that directory is a forwarder instead.
     data = build_pe(
         symbols=JNI_SYMBOLS | {unrelated},
-        symbol_rvas={unrelated: 0x1350},
+        symbol_rvas={unrelated: 0x2000},
     )
 
     verify_jni_target(
@@ -1033,6 +1035,9 @@ def test_pe_accepts_required_functions_with_unrelated_data_export():
         "x86_64-pc-windows-msvc",
         "paimon_mosaic_jni.dll",
     )
+    # verify_jni_target only fails on missing symbols, so assert the data export
+    # was actually filtered rather than merely tolerated.
+    assert verifier.native_binary(data).exported_symbols == frozenset(JNI_SYMBOLS)
 
 
 def test_pe_accepts_required_functions_with_unrelated_forwarder():
@@ -1047,6 +1052,8 @@ def test_pe_accepts_required_functions_with_unrelated_forwarder():
         "x86_64-pc-windows-msvc",
         "paimon_mosaic_jni.dll",
     )
+    # A forwarder resolves elsewhere, so it must not appear as a local export.
+    assert verifier.native_binary(data).exported_symbols == frozenset(JNI_SYMBOLS)
 
 
 def test_pe_rejects_unsorted_export_name_pointer_table():
