@@ -41,6 +41,7 @@ Then open http://localhost:8090 in your browser.
 ```
 docs/
 ├── index.html                        # Home page (overview, benchmarks, types)
+├── cli.html                          # Command-line interface guide
 ├── design.html                       # Format specification & binary layout
 ├── java-api.html                     # Java API guide
 ├── python-api.html                   # Python API guide

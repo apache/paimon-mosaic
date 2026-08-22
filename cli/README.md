@@ -34,7 +34,7 @@ mosaic <command> <file>
 
 ## Commands
 
-All inspection and query commands accept `--json`; `convert` writes a file.
+All inspection and query commands accept `--json`; `convert` and `convert-csv` write files.
 
 | Command | Shows | Reads |
 |---------|-------|-------|
@@ -48,7 +48,8 @@ All inspection and query commands accept `--json`; `convert` writes a file.
 | `cat` | rows as a table (all rows by default; `-n` to limit) | column data |
 | `head` | first N rows (default 10) | column data |
 | `count` | total row count | footer + index |
-| `convert` | import CSV or JSON into a new file | writes file |
+| `convert` | import JSON into a new file | writes file |
+| `convert-csv` | import CSV into a new file | writes file |
 
 ## Inspect
 
@@ -97,12 +98,83 @@ $ mosaic head data.mosaic --json
 
 ## Convert
 
-Import CSV or JSON lines into a new Mosaic file; the schema is inferred.
+Import a JSON data file (`.json`/`.ndjson`/`.jsonl`, one object per line) into
+a new Mosaic file; the schema is inferred from the input unless `--schema` is
+provided. A field with no non-null value cannot be inferred and is reported as
+an error — pass `--schema` for such data.
 An existing output is kept unless `--overwrite` is given.
+`--schema` accepts the supported subset of an Avro record schema: primitive
+fields except raw `bytes`, nullable unions with one non-null branch, arrays/maps, and `date`,
+`time-millis`, `timestamp-*`, `local-timestamp-*`, `decimal`, and `uuid`
+logical types. It is not a general Avro name resolver: nested records, enums,
+named-type references, and non-decimal `fixed` fields are rejected.
+Avro arrays and maps are converted recursively. Avro `timestamp-*` logical
+types remain UTC instants, while `local-timestamp-*` remains timezone-free;
+inputs with an explicit offset are rejected for local timestamps. Decimal
+inputs must be exactly representable at the schema scale (extra trailing zero
+digits are accepted). UUID values are validated during import but stored as
+`Utf8`; the Avro logical-type marker is not preserved in Mosaic. Unknown logical
+types are ignored and use their underlying Avro type.
+Use `-c`/`--column` to project top-level fields; each occurrence
+accepts a comma-separated list.
+`--stats id` builds min/max for those columns, which `cat --where` then uses
+to skip row groups that cannot match.
+`convert` accepts JSON inputs only; use `convert-csv` for CSV inputs.
+Each JSON root value is limited to 16 MiB and 100,000 structural units
+(container boundaries, separators, and string starts) before serde or Arrow
+materializes it. Schema-aware decimal normalization is subject to the same
+16 MiB output limit.
+
+```text
+$ mosaic convert data.json -o data.mosaic
+$ mosaic convert data.json -o data.mosaic --schema schema.avsc
+$ mosaic convert data.json -o data.mosaic -c id,kind
+$ mosaic convert data.json -o data.mosaic --stats id
+```
+
+## Convert CSV
+
+Import CSV into a new Mosaic file, either with an Avro record schema file
+given via `--schema`, or with a schema inferred from the CSV data. For multiple
+inputs with headers, inferred fields are matched by name rather than position,
+and compatible `Int64`/`Float64` fields are promoted to `Float64`. In every
+inferred `Float64` field, bare integer literals must be exactly representable;
+decimal and exponent forms use `Float64` rounding, but finite literals that
+overflow to infinity are rejected. Compatible timestamp precisions are widened
+to the finest observed unit; other field-name or type conflicts require
+`--schema`. Empty and header-only files are skipped.
+CSV cannot say what type an all-empty column is, so columns inferred as Arrow
+`Null` fall back to nullable `Utf8` and their values remain null. Use
+`--schema` when such a column should have another type. When a CSV schema is
+inferred, `--require col` marks an inferred field as not null (repeat it for
+multiple fields); combining `--require` with `--schema` is rejected.
+
+With `--schema`, fields are matched to CSV columns by header name (by position
+with `--no-header`); a schema field absent from the header is filled with
+nulls, but the conversion fails if the field is required or if no schema field
+matches the header at all.
+Backslash escaping is disabled by default so literal values such as
+`C:\temp\file` are preserved; pass `--escape '\'` only for CSV dialects that
+use a separate escape character. `--delimiter`, `--quote`, and `--skip-lines`
+control the CSV dialect; `--skip-lines N` drops N physical lines before CSV
+parsing begins without decoding skipped bytes as UTF-8. Every logical CSV
+record is limited to 65,535 columns and 64 MiB of decoded field payload before
+csv or Arrow materializes it. Schema inference snapshots the guarded input, so
+decode replays exactly the bytes used for inference even if the source path is
+replaced or modified. Avro `bytes`, `array`, and `map` fields are rejected
+because the CSV decoder supports scalar text fields only. `--header` and
+`--no-header` are mutually exclusive. Inferred local timestamps reject
+explicit offsets and direct users to `--schema` to select timestamp semantics;
+second-precision values are stored with millisecond precision. Explicit-schema
+local timestamps and decimals use the same offset and exact-scale rules as JSON
+conversion.
 `--stats id` builds min/max for those columns, which `cat --where` then uses to
 skip row groups that cannot match.
 
 ```text
-$ mosaic convert data.csv -o data.mosaic --stats id
-wrote data.mosaic (200 rows, 5 columns)
+$ mosaic convert-csv data.csv -o data.mosaic
+
+$ mosaic convert-csv data.csv -o data.mosaic --schema schema.avsc
+$ mosaic convert-csv data.csv -o data.mosaic --require id --require ts
+$ mosaic convert-csv data.csv -o data.mosaic --stats id
 ```

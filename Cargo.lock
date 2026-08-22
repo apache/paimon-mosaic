@@ -885,9 +885,13 @@ version = "0.3.0"
 dependencies = [
  "arrow",
  "clap",
+ "csv",
+ "csv-core",
+ "memchr",
  "paimon-mosaic-core",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

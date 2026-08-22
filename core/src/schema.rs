@@ -47,6 +47,9 @@ impl MosaicSchema {
     pub fn validate(columns: &[(String, DataType, bool)]) -> Result<(), String> {
         let mut seen = HashSet::new();
         for (name, data_type, _nullable) in columns {
+            if name.is_empty() {
+                return Err("empty column name".to_string());
+            }
             if !seen.insert(name.as_str()) {
                 return Err(format!("duplicate column name: {}", name));
             }
@@ -333,6 +336,15 @@ fn common_prefix_length(a: &[u8], b: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_rejects_empty_column_names() {
+        let columns = vec![("".to_string(), DataType::Int32, true)];
+        assert_eq!(
+            MosaicSchema::validate(&columns),
+            Err("empty column name".to_string())
+        );
+    }
 
     #[test]
     fn test_bucket_assignment() {
