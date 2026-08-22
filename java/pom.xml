@@ -286,6 +286,10 @@
                         <artifactId>nexus-staging-maven-plugin</artifactId>
                         <version>1.7.0</version>
                         <extensions>true</extensions>
+                        <!-- Deploying under this profile uploads to the ASF
+                             staging repository. The repository must stay open
+                             until the PMC vote passes, so it is never released
+                             automatically. -->
                         <configuration>
                             <serverId>apache.releases.https</serverId>
                             <nexusUrl>https://repository.apache.org/</nexusUrl>
