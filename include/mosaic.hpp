@@ -86,6 +86,16 @@ struct WriterOptions {
     uint8_t compression = 1;  // ZSTD
     int zstd_level = 1;
     uint32_t num_buckets = 0;
+    // Target size (bytes) of a row group before it is flushed. The writer
+    // buffers every row of the in-progress row group in memory and flushes
+    // (compresses + writes) only once this much data has accumulated.
+    // The 256 MB default suits batch/server workloads. For a long-lived
+    // streaming writer (continuous ingestion, mobile/embedded sensors) it
+    // holds an unbounded amount of data in RAM — RSS grows ~1:1 with buffered
+    // rows until the cap, and a session shorter than the cap flushes nothing
+    // until close(), so the whole session lives in memory. Set this to a few
+    // MB (e.g. 8 MB) for such workloads to bound memory and spread out
+    // compression into small, frequent flushes.
     uint64_t row_group_max_size = 256ULL * 1024 * 1024;
     uint32_t max_dict_total_bytes = 32 * 1024;
     uint32_t max_dict_entries = 255;

@@ -224,13 +224,28 @@ w.endMap();</code></pre>
                     <tr><td><code>numBuckets(int)</code></td><td>0</td><td>Number of buckets (0 = auto)</td></tr>
                     <tr><td><code>compression(int)</code></td><td>ZSTD (1)</td><td>0 = none, 1 = Zstd</td></tr>
                     <tr><td><code>zstdLevel(int)</code></td><td>1</td><td>Zstd compression level</td></tr>
-                    <tr><td><code>rowGroupMaxSize(long)</code></td><td>256 MB</td><td>Max uncompressed bytes per row group</td></tr>
+                    <tr><td><code>rowGroupMaxSize(long)</code></td><td>256 MB</td><td>Target uncompressed bytes per row group before flush; bounds in-memory buffering (see note below)</td></tr>
                     <tr><td><code>maxDictTotalBytes(int)</code></td><td>32 KB</td><td>Max dictionary size per column</td></tr>
                     <tr><td><code>maxDictEntries(int)</code></td><td>255</td><td>Max distinct values for DICT encoding</td></tr>
                     <tr><td><code>statsColumns(String...)</code></td><td>(empty)</td><td>Column names to build min/max stats for filter pushdown</td></tr>
                     <tr><td><code>pageSizeThreshold(int)</code></td><td>32 KB</td><td>Min avg column page size to enable paged mode (per-column compression)</td></tr>
                 </tbody>
             </table>
+
+            <div class="warning">
+                <strong>Memory &amp; long-lived writers.</strong>
+                The writer buffers every row of the in-progress row group in memory and flushes
+                only once <code>rowGroupMaxSize</code> of data has accumulated. The 256 MB default
+                is tuned for batch/server workloads. For a <em>long-lived streaming writer</em>
+                &mdash; continuous ingestion, mobile/embedded sensors, anything writing small
+                batches over a long session &mdash; this default holds an unbounded amount of data
+                in RAM (RSS grows ~1:1 with buffered rows until the cap, and a session shorter
+                than the cap flushes nothing until <code>close()</code>), which looks like a memory
+                leak and can trigger OOM on memory-constrained devices. Set
+                <code>rowGroupMaxSize</code> to a few MB (e.g. 8 MB) for such workloads:
+<pre><code><span class="ty">WriterOptions</span> opts = <span class="kw">new</span> <span class="ty">WriterOptions</span>()
+    .rowGroupMaxSize(<span class="num">8</span> * <span class="num">1024</span> * <span class="num">1024</span>);  <span class="cmt">// 8 MB — streaming/mobile</span></code></pre>
+            </div>
 
             <h3>Writer Methods</h3>
             <table>

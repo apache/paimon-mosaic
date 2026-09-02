@@ -28,6 +28,25 @@ pub const ENCODING_DICT: u8 = 2;
 pub const ENCODING_ALL_NULL: u8 = 3;
 
 pub const DEFAULT_NUM_BUCKETS: usize = 100;
+/// Default target size (in bytes) of a row group before it is flushed to the
+/// output.
+///
+/// A writer buffers every row of the in-progress row group in memory and only
+/// flushes (compresses and writes) once the buffered data reaches this size.
+/// The 256 MB default is tuned for batch and server workloads, where a large
+/// row group maximizes compression ratio and amortizes seek cost across wide
+/// tables.
+///
+/// For a **long-lived streaming writer** — continuous ingestion, mobile or
+/// embedded sensors, anything that writes small batches over a long session —
+/// this default holds an unbounded amount of data in RAM (process RSS grows
+/// roughly 1:1 with the buffered rows, until the cap is reached), which looks
+/// and behaves like a memory leak and can trigger OOM on memory-constrained
+/// devices. A session shorter than this cap flushes nothing until `close()`,
+/// so the *entire* session lives in memory. Set
+/// [`WriterOptions::row_group_max_size`](crate::writer::WriterOptions::row_group_max_size)
+/// to a few MB (e.g. 8 MB) for such workloads to bound memory and spread
+/// compression work into small, frequent flushes.
 pub const DEFAULT_ROW_GROUP_MAX_SIZE: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_ZSTD_LEVEL: i32 = 1;
 pub const DEFAULT_DICT_MAX_TOTAL_BYTES: usize = 32 * 1024;

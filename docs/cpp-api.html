@@ -204,7 +204,7 @@ val_b-&gt;Append(<span class="str">"a"</span>);</code></pre>
                     <tr><td><code>num_buckets</code></td><td>uint32_t</td><td>0</td><td>Number of buckets (0 = auto)</td></tr>
                     <tr><td><code>compression</code></td><td>uint8_t</td><td>1</td><td>0=none, 1=zstd</td></tr>
                     <tr><td><code>zstd_level</code></td><td>int32_t</td><td>1</td><td>Zstd compression level</td></tr>
-                    <tr><td><code>row_group_max_size</code></td><td>uint64_t</td><td>256 MB</td><td>Max row group size</td></tr>
+                    <tr><td><code>row_group_max_size</code></td><td>uint64_t</td><td>256 MB</td><td>Target row group size (bytes) before flush; bounds in-memory buffering (see note below)</td></tr>
                     <tr><td><code>max_dict_total_bytes</code></td><td>uint32_t</td><td>32 KB</td><td>Max dict size per column</td></tr>
                     <tr><td><code>max_dict_entries</code></td><td>uint32_t</td><td>255</td><td>Max dict entries per column</td></tr>
                     <tr><td><code>stats_columns</code></td><td>const char* const*</td><td>NULL</td><td>Column names to build min/max stats for</td></tr>
@@ -212,6 +212,24 @@ val_b-&gt;Append(<span class="str">"a"</span>);</code></pre>
                     <tr><td><code>page_size_threshold</code></td><td>uint32_t</td><td>32 KB</td><td>Min avg column page size to enable paged mode</td></tr>
                 </tbody>
             </table>
+
+            <div class="warning">
+                <strong>Memory &amp; long-lived writers.</strong>
+                The writer buffers every row of the in-progress row group in memory and
+                flushes (compresses + writes) only once <code>row_group_max_size</code> of
+                data has accumulated. The 256 MB default is tuned for batch/server workloads.
+                For a <em>long-lived streaming writer</em> &mdash; continuous ingestion, mobile
+                or embedded sensors, anything that writes small batches over a long session
+                &mdash; this default holds an unbounded amount of data in RAM: process RSS
+                grows roughly 1:1 with the buffered rows until the cap is reached, and a
+                session shorter than the cap flushes nothing until <code>close()</code>, so
+                the entire session lives in memory. This looks and behaves like a memory leak
+                and can trigger OOM on memory-constrained devices. Set
+                <code>row_group_max_size</code> to a few MB (e.g. 8 MB) for such workloads to
+                bound peak memory and spread compression into small, frequent flushes:
+<pre><code><span class="ty">mosaic</span>::<span class="ty">WriterOptions</span> opts;
+opts.row_group_max_size = <span class="num">8</span> * <span class="num">1024</span> * <span class="num">1024</span>;  <span class="cmt">// 8 MB — streaming/mobile</span></code></pre>
+            </div>
 
             <h3>Writer Methods</h3>
             <table>

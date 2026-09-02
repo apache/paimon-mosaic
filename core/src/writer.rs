@@ -87,10 +87,29 @@ impl OutputFile for FileSink {
     }
 }
 
+/// Tuning knobs for [`MosaicWriter`].
+///
+/// # Memory
+///
+/// `row_group_max_size` is the single most important knob for memory: a writer
+/// keeps every row of the in-progress row group buffered in memory and flushes
+/// only once that much data has accumulated. See
+/// [`DEFAULT_ROW_GROUP_MAX_SIZE`] for the tradeoff and the recommendation for
+/// long-lived streaming writers.
 pub struct WriterOptions {
     pub compression: u8,
     pub zstd_level: i32,
     pub num_buckets: usize,
+    /// Target size (in bytes) of a row group before it is flushed.
+    ///
+    /// The writer buffers all rows of the current row group in memory until
+    /// this size is reached, then compresses and writes them as one row group.
+    /// Smaller values bound peak memory and produce smaller, more frequent
+    /// flushes; larger values improve compression ratio and reduce row-group
+    /// count. The default (256 MB) suits batch/server workloads; for
+    /// long-lived streaming writers (continuous ingestion, mobile/embedded
+    /// sensors) set this to a few MB (e.g. 8 MB) to avoid unbounded memory
+    /// growth.
     pub row_group_max_size: u64,
     pub max_dict_total_bytes: usize,
     pub max_dict_entries: usize,
