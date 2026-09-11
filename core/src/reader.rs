@@ -1004,7 +1004,8 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
         // Classify buckets and collect Round 1 ranges:
         // - Monolithic buckets: read entire compressed blob
         // - Paged buckets with all columns projected: read entire bucket (skip round 2)
-        // - Paged buckets with partial projection: read directory only (round 2 fetches slots)
+        // - Paged buckets with partial projection: read the whole bucket when it is at most
+        //   SMALL_PAGED_BUCKET_WHOLE_READ, otherwise read the directory (round 2 fetches slots)
         let mut bucket_kinds = Vec::with_capacity(self.num_buckets);
         let mut r1_ranges: Vec<(u64, usize)> = Vec::new();
         let mut r1_bucket_ids: Vec<usize> = Vec::new();
