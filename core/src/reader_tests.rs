@@ -4659,13 +4659,122 @@ fn test_paged_adjacent_columns_coalesced_read() {
         assert_eq!(c4.value(r), (r * 10 + 4) as i64);
     }
 
-    // After open: 1 tail-prefetch IO covers footer + schema + index
-    // projected read should do: round1 (directory) + round2 (3 adjacent slots coalesced)
-    // = 2 read_ranges calls, each coalesced into 1 read_at
+    // After open: 1 tail-prefetch IO covers footer + schema + index.
+    // The bucket is below SMALL_PAGED_BUCKET_WHOLE_READ, so the projected read fetches the
+    // whole bucket (directory + slots) in a single read_at instead of two dependent rounds.
+    let projection_reads = reader.input().read_count.load(Ordering::Relaxed) - open_reads;
+    assert_eq!(
+        projection_reads, 1,
+        "expected 1 read_at call (whole small bucket)"
+    );
+}
+
+#[test]
+fn test_paged_partial_projection_large_bucket_two_rounds() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingInputFile {
+        data: Vec<u8>,
+        read_count: AtomicUsize,
+    }
+
+    impl InputFile for CountingInputFile {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+            self.read_count.fetch_add(1, Ordering::Relaxed);
+            let start = offset as usize;
+            let end = start + buf.len();
+            if end > self.data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "read past end",
+                ));
+            }
+            buf.copy_from_slice(&self.data[start..end]);
+            Ok(())
+        }
+    }
+
+    // Incompressible 64-byte strings so that the single paged bucket exceeds
+    // SMALL_PAGED_BUCKET_WHOLE_READ and the partial projection needs the directory round.
+    fn cell(r: usize, c: usize) -> String {
+        let mut x = (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (c as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        let mut out = String::with_capacity(64);
+        for _ in 0..4 {
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+            x ^= x >> 33;
+            out.push_str(&format!("{:016x}", x));
+        }
+        out
+    }
+
+    let columns: Vec<(String, DataType, bool)> = (0..10)
+        .map(|i| (format!("c{}", i), DataType::Utf8, true))
+        .collect();
+    let num_rows = 4_000;
+    let rows: Vec<Vec<Value>> = (0..num_rows)
+        .map(|r| {
+            (0..10)
+                .map(|c| Value::String(cell(r, c).into_bytes()))
+                .collect()
+        })
+        .collect();
+
+    let out = MemOutputFile::new();
+    let mut writer = MosaicWriter::new(
+        out,
+        &columns_to_arrow_schema(&columns),
+        WriterOptions {
+            compression: COMPRESSION_ZSTD,
+            page_size_threshold: 1,
+            num_buckets: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let batch = values_to_batch(&rows, &columns);
+    writer.write_batch(&batch).unwrap();
+    writer.close().unwrap();
+    let data = writer.output().buf.clone();
+    let len = data.len() as u64;
+    assert!(
+        data.len() > SMALL_PAGED_BUCKET_WHOLE_READ,
+        "fixture must exceed the whole-read threshold"
+    );
+
+    let input = CountingInputFile {
+        data: data.clone(),
+        read_count: AtomicUsize::new(0),
+    };
+    let reader = MosaicReader::new(input, len).unwrap();
+    let open_reads = reader.input().read_count.load(Ordering::Relaxed);
+    let idx = |name: &str| {
+        reader
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap()
+    };
+    let projection = [idx("c2"), idx("c3"), idx("c4")];
+
+    let mut rg = reader.row_group_reader_projected(0, &projection).unwrap();
+    let batch = rg.read_columns().unwrap();
+    assert_eq!(batch.num_rows(), num_rows);
+    assert_eq!(batch.num_columns(), 3);
+    for (name, c) in [("c2", 2usize), ("c3", 3), ("c4", 4)] {
+        let col = batch_col_string(&batch, name);
+        for r in 0..num_rows {
+            assert_eq!(col.value(r), cell(r, c));
+        }
+    }
+
+    // Directory first, then the three adjacent slots coalesced into one range.
     let projection_reads = reader.input().read_count.load(Ordering::Relaxed) - open_reads;
     assert_eq!(
         projection_reads, 2,
-        "expected 2 read_at calls (dir + coalesced slots)"
+        "expected the directory read followed by one coalesced slot read"
     );
 }
 
@@ -5170,4 +5279,67 @@ fn test_unknown_paged_encoding_returns_invalid_data_without_panicking() {
         .expect_err("unknown paged encoding must be rejected");
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     assert!(err.to_string().contains("unsupported encoding 255"));
+}
+
+#[test]
+fn test_small_paged_bucket_partial_projection_opens_in_one_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingInputFile {
+        data: Vec<u8>,
+        read_count: AtomicUsize,
+    }
+
+    impl InputFile for CountingInputFile {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+            self.read_count.fetch_add(1, Ordering::Relaxed);
+            let start = offset as usize;
+            buf.copy_from_slice(&self.data[start..start + buf.len()]);
+            Ok(())
+        }
+    }
+
+    let columns = vec![
+        ("a".to_string(), DataType::Int32, true),
+        ("b".to_string(), DataType::Utf8, true),
+        ("c".to_string(), DataType::Float64, true),
+        ("d".to_string(), DataType::Int64, true),
+    ];
+    let rows: Vec<Vec<Value>> = (0..100)
+        .map(|i| {
+            vec![
+                Value::Integer(i),
+                Value::String(format!("user_{}", i).into_bytes()),
+                Value::Double(i as f64 * 0.5),
+                Value::BigInt(i as i64 * 10),
+            ]
+        })
+        .collect();
+    let (_, data) = write_and_read_paged(columns, &rows);
+
+    let len = data.len() as u64;
+    let input = CountingInputFile {
+        data,
+        read_count: AtomicUsize::new(0),
+    };
+    let mut reader = MosaicReader::new(input, len).unwrap();
+    reader.project(&["c"]).unwrap();
+    let reads_after_open = reader.input().read_count.load(Ordering::Relaxed);
+
+    // The bucket is far below the whole-read threshold: a partial projection must fetch the
+    // bucket in a single round trip instead of reading the directory and then the slot.
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let reads_for_open = reader.input().read_count.load(Ordering::Relaxed) - reads_after_open;
+    assert_eq!(
+        reads_for_open, 1,
+        "row group open must issue exactly one read"
+    );
+
+    let batch = rg.read_columns().unwrap();
+    assert_eq!(batch.num_rows(), 100);
+    assert_eq!(batch.num_columns(), 1);
+    let c = batch_col_f64(&batch, "c");
+    for i in 0..100usize {
+        assert!((c.value(i) - i as f64 * 0.5).abs() < 1e-10);
+    }
 }
