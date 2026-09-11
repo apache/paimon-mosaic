@@ -330,6 +330,7 @@ impl<S: OutputFile> MosaicWriter<S> {
                 ),
             ));
         }
+        self.validate_batch_schema(batch)?;
 
         for (i, col) in self.schema.columns.iter().enumerate() {
             let array = batch.column(self.batch_col_map[i]);
@@ -383,6 +384,25 @@ impl<S: OutputFile> MosaicWriter<S> {
 
         if self.current_buffered_size >= self.row_group_max_size {
             self.flush_row_group()?;
+        }
+        Ok(())
+    }
+
+    fn validate_batch_schema(&self, batch: &RecordBatch) -> io::Result<()> {
+        let batch_schema = batch.schema();
+        for (i, col) in self.schema.columns.iter().enumerate() {
+            let batch_field = batch_schema.field(self.batch_col_map[i]);
+            if batch_field.name() != &col.name {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "field name mismatch at column {}: schema has '{}' but batch has '{}'",
+                        self.batch_col_map[i],
+                        col.name,
+                        batch_field.name()
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -1024,7 +1044,7 @@ mod tests {
 
         let batch2 = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int32, false),
+                Field::new("id", DataType::Int32, true),
                 Field::new("name", DataType::Utf8, true),
             ])),
             vec![
@@ -1035,6 +1055,86 @@ mod tests {
         .unwrap();
         let result = writer.write_batch(&batch2);
         assert!(result.is_ok());
+
+        let batch3 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![None, Some("world")])),
+            ],
+        )
+        .unwrap();
+        let result = writer.write_batch(&batch3);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_write_batch_rejects_reordered_schema() {
+        let arrow_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let out = MemOutputFile::new();
+        let mut writer = MosaicWriter::new(out, &arrow_schema, WriterOptions::default()).unwrap();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        writer.write_batch(&batch).unwrap();
+
+        let reordered_schema = Schema::new(vec![
+            Field::new("b", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
+        ]);
+        let reordered_batch = RecordBatch::try_new(
+            Arc::new(reordered_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![30, 40])),
+                Arc::new(Int32Array::from(vec![3, 4])),
+            ],
+        )
+        .unwrap();
+
+        let err = writer.write_batch(&reordered_batch).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("field name mismatch"));
+    }
+
+    #[test]
+    fn test_write_batch_name_mismatch_reports_mapped_batch_index() {
+        let arrow_schema = Schema::new(vec![
+            Field::new("z", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
+        ]);
+        let out = MemOutputFile::new();
+        let mut writer = MosaicWriter::new(out, &arrow_schema, WriterOptions::default()).unwrap();
+
+        let mismatched_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("z", DataType::Int32, false),
+                Field::new("x", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![3, 4])),
+            ],
+        )
+        .unwrap();
+
+        let err = writer.write_batch(&mismatched_batch).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "field name mismatch at column 1: schema has 'a' but batch has 'x'"
+        );
     }
 
     #[test]
