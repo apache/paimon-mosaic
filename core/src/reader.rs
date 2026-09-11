@@ -32,6 +32,9 @@ use crate::varint;
 
 const COALESCE_GAP: u64 = 1024 * 1024;
 const COALESCE_MAX_RANGE: u64 = 32 * 1024 * 1024;
+/// Paged buckets up to this size are fetched whole in round 1 even for partial projections,
+/// which saves the dependent directory-then-slots round trip.
+const SMALL_PAGED_BUCKET_WHOLE_READ: usize = 1024 * 1024;
 
 /// A forged `uncompressed_size` would otherwise make `zstd::bulk::decompress`
 /// pre-allocate an arbitrarily large buffer before it ever sees the data.
@@ -1005,6 +1008,9 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
         let mut bucket_kinds = Vec::with_capacity(self.num_buckets);
         let mut r1_ranges: Vec<(u64, usize)> = Vec::new();
         let mut r1_bucket_ids: Vec<usize> = Vec::new();
+        // Paged buckets fetched whole in round 1 (all columns projected, or a small bucket),
+        // so they need no round 2.
+        let mut whole_bucket_read = vec![false; self.num_buckets];
 
         for b in 0..self.num_buckets {
             let layout = if needed_buckets[b] {
@@ -1044,7 +1050,8 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                             ),
                         ));
                     }
-                    if all_projected_in_bucket[b] {
+                    if all_projected_in_bucket[b] || total_size <= SMALL_PAGED_BUCKET_WHOLE_READ {
+                        whole_bucket_read[b] = true;
                         r1_ranges.push((meta.bucket_offsets[b], total_size));
                     } else {
                         r1_ranges.push((meta.bucket_offsets[b], dir_size));
@@ -1173,12 +1180,27 @@ impl<I: InputFile> ReaderAccess for MosaicReader<I> {
                         ));
                     }
 
-                    if all_projected_in_bucket[b] {
+                    if whole_bucket_read[b] {
                         let num_primary_in_bucket = global_indices.len();
                         let mut column_readers: Vec<Option<ColumnPageReader>> =
                             Vec::with_capacity(num_columns);
                         let mut data_offset = dir_size;
                         for i in 0..num_columns {
+                            let is_projected = if i < num_primary_in_bucket {
+                                projected[global_indices[i]]
+                            } else {
+                                bucket_children
+                                    .get(i - num_primary_in_bucket)
+                                    .map(|child| child.parent_logical_col)
+                                    .filter(|&parent| parent < num_primary_in_bucket)
+                                    .map(|parent| projected[global_indices[parent]])
+                                    .unwrap_or(false)
+                            };
+                            if !is_projected {
+                                column_readers.push(None);
+                                data_offset += slot_sizes[i];
+                                continue;
+                            }
                             let col_type = phys_types[i].clone();
                             let col_rows = if i < num_primary_in_bucket {
                                 meta.num_rows
