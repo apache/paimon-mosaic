@@ -149,15 +149,19 @@ pub struct MosaicWriter<S: OutputFile> {
     state: WriterState,
 }
 
+fn batch_column_map(schema: &MosaicSchema) -> Vec<usize> {
+    let mut batch_col_map = vec![0; schema.original_order.len()];
+    for (input_index, &sorted_index) in schema.original_order.iter().enumerate() {
+        batch_col_map[sorted_index] = input_index;
+    }
+    batch_col_map
+}
+
 impl<S: OutputFile> MosaicWriter<S> {
     pub fn new(out: S, schema: &Schema, options: WriterOptions) -> io::Result<Self> {
         let mosaic_schema = MosaicSchema::from_arrow(schema, options.num_buckets)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let batch_col_map: Vec<usize> = mosaic_schema
-            .columns
-            .iter()
-            .map(|col| schema.index_of(&col.name).unwrap())
-            .collect();
+        let batch_col_map = batch_column_map(&mosaic_schema);
         Self::from_mosaic_schema_with_map(out, mosaic_schema, options, batch_col_map)
     }
 
@@ -854,6 +858,18 @@ mod tests {
         assert_eq!(1, state.write_calls);
         assert_eq!(0, state.flush_calls);
         assert!(state.bytes.is_empty());
+    }
+
+    #[test]
+    fn test_batch_column_map_inverts_original_order() {
+        let arrow_schema = Schema::new(vec![
+            Field::new("zebra", DataType::Int32, true),
+            Field::new("alpha", DataType::Int32, true),
+            Field::new("middle", DataType::Int32, true),
+        ]);
+        let mosaic_schema = MosaicSchema::from_arrow(&arrow_schema, 2).unwrap();
+
+        assert_eq!(batch_column_map(&mosaic_schema), vec![1, 2, 0]);
     }
 
     #[test]
