@@ -240,12 +240,11 @@ impl MosaicSchema {
     pub fn serialize(&self) -> Vec<u8> {
         let num_columns = self.columns.len();
 
-        let raw_names: Vec<Vec<u8>> = self
+        let raw_refs: Vec<&[u8]> = self
             .columns
             .iter()
-            .map(|c| c.name.as_bytes().to_vec())
+            .map(|column| column.name.as_bytes())
             .collect();
-        let raw_refs: Vec<&[u8]> = raw_names.iter().map(|v| v.as_slice()).collect();
 
         let plain_size = front_coded_size(&raw_refs);
 
@@ -254,12 +253,8 @@ impl MosaicSchema {
         let mut bpe_size = usize::MAX;
 
         if bpe::is_ascii_only(&raw_refs) {
-            let rules = bpe::build_vocabulary(&raw_refs);
+            let (rules, names) = bpe::build_vocabulary_and_encode(&raw_refs);
             if !rules.is_empty() {
-                let names: Vec<Vec<u8>> = raw_refs
-                    .iter()
-                    .map(|name| bpe::encode(name, &rules))
-                    .collect();
                 let name_refs: Vec<&[u8]> = names.iter().map(|v| v.as_slice()).collect();
                 bpe_size = 1 + rules.len() * 2 + front_coded_size(&name_refs);
                 bpe_rules = rules;
