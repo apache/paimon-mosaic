@@ -41,6 +41,8 @@ jobs:
     needs: [release-preflight]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+
       - uses: actions/download-artifact@v5
         with:
           pattern: wheels-*
@@ -74,6 +76,11 @@ jobs:
                 ;;
             esac
           done
+
+          python3 tools/verify_release_artifacts.py \
+            --require-all-python-targets \
+            python \
+            "${wheels[@]}"
 
       - name: Publish to TestPyPI
         if: >-

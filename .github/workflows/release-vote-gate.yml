@@ -27,15 +27,20 @@ on:
       - "docs/verifying-a-release-candidate.html"
       - "java/pom.xml"
       - "java/src/test/java/org/apache/paimon/mosaic/MosaicNativeLoaderSmokeTest.java"
+      - "python/pyproject.toml"
+      - "python/setup.py"
       - "tools/create_source_release.sh"
       - "tools/deploy_java_staging.sh"
       - "tools/update_branch_version.sh"
+      - "tools/verify_release_artifacts.py"
       - "tools/verify_release_versions.py"
       - "tools/verify_source_archive.py"
       - "tools/tests/test_create_source_release.py"
       - "tools/tests/deploy_java_staging_test.sh"
+      - "tools/tests/test_python_setup.py"
       - "tools/tests/test_release_vote_workflow.py"
       - "tools/tests/test_update_branch_version.py"
+      - "tools/tests/test_verify_release_artifacts.py"
       - "tools/tests/test_verify_release_versions.py"
       - "tools/tests/test_verify_source_archive.py"
   push:
@@ -47,15 +52,20 @@ on:
       - "docs/verifying-a-release-candidate.html"
       - "java/pom.xml"
       - "java/src/test/java/org/apache/paimon/mosaic/MosaicNativeLoaderSmokeTest.java"
+      - "python/pyproject.toml"
+      - "python/setup.py"
       - "tools/create_source_release.sh"
       - "tools/deploy_java_staging.sh"
       - "tools/update_branch_version.sh"
+      - "tools/verify_release_artifacts.py"
       - "tools/verify_release_versions.py"
       - "tools/verify_source_archive.py"
       - "tools/tests/test_create_source_release.py"
       - "tools/tests/deploy_java_staging_test.sh"
+      - "tools/tests/test_python_setup.py"
       - "tools/tests/test_release_vote_workflow.py"
       - "tools/tests/test_update_branch_version.py"
+      - "tools/tests/test_verify_release_artifacts.py"
       - "tools/tests/test_verify_release_versions.py"
       - "tools/tests/test_verify_source_archive.py"
   workflow_dispatch:
@@ -77,14 +87,16 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        run: python -m pip install pytest PyYAML
+        run: python -m pip install pytest PyYAML setuptools wheel
 
       - name: Run release vote tests
         run: |
           python -m pytest -q \
             tools/tests/test_create_source_release.py \
+            tools/tests/test_python_setup.py \
             tools/tests/test_release_vote_workflow.py \
             tools/tests/test_update_branch_version.py \
+            tools/tests/test_verify_release_artifacts.py \
             tools/tests/test_verify_release_versions.py \
             tools/tests/test_verify_source_archive.py
 
@@ -116,11 +128,14 @@ jobs:
         run: |
           set -euo pipefail
           python -m compileall -q \
+            tools/verify_release_artifacts.py \
             tools/verify_release_versions.py \
             tools/verify_source_archive.py \
             tools/tests/test_create_source_release.py \
+            tools/tests/test_python_setup.py \
             tools/tests/test_release_vote_workflow.py \
             tools/tests/test_update_branch_version.py \
+            tools/tests/test_verify_release_artifacts.py \
             tools/tests/test_verify_release_versions.py \
             tools/tests/test_verify_source_archive.py
           bash -n tools/create_source_release.sh

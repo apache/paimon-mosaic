@@ -75,11 +75,15 @@ jobs:
             cargo build --release -p paimon-mosaic-ffi &&
             cp target/release/libpaimon_mosaic_ffi.so {package}/mosaic/
 
+      - name: Verify wheel legal payload
+        run: python3 tools/verify_release_artifacts.py python wheelhouse/*.whl
+
       - name: Upload wheels
         uses: actions/upload-artifact@v5
         with:
           name: wheels-linux-${{ matrix.arch }}
           path: wheelhouse/*.whl
+          if-no-files-found: error
 
   wheels-macos:
     runs-on: ${{ matrix.os }}
@@ -133,11 +137,15 @@ jobs:
           rm python/dist/*.whl
           mv python/dist/repaired/*.whl python/dist/
 
+      - name: Verify wheel legal payload
+        run: python3 tools/verify_release_artifacts.py python python/dist/*.whl
+
       - name: Upload wheel
         uses: actions/upload-artifact@v5
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: python/dist/*.whl
+          if-no-files-found: error
 
   wheels-windows:
     runs-on: windows-latest
@@ -176,8 +184,13 @@ jobs:
         working-directory: python
         run: python -m build --wheel
 
+      - name: Verify wheel legal payload
+        shell: bash
+        run: python tools/verify_release_artifacts.py python python/dist/*.whl
+
       - name: Upload wheel
         uses: actions/upload-artifact@v5
         with:
           name: wheels-windows-x86_64
           path: python/dist/*.whl
+          if-no-files-found: error

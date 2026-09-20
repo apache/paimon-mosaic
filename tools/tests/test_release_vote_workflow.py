@@ -30,6 +30,7 @@ RELEASE_PREFLIGHT_WORKFLOW = ROOT / ".github/workflows/release-preflight.yml"
 GATE_WORKFLOW = ROOT / ".github/workflows/release-vote-gate.yml"
 RUST_RELEASE_WORKFLOW = ROOT / ".github/workflows/release-rust.yml"
 JAVA_RELEASE_WORKFLOW = ROOT / ".github/workflows/release-java.yml"
+PYTHON_WHEELS_WORKFLOW = ROOT / ".github/workflows/release-python.yml"
 PYTHON_PUBLISH_WORKFLOW = ROOT / ".github/workflows/release-python-publish.yml"
 RELEASE_DOCUMENTATION = ROOT / "docs/creating-a-release.html"
 CREDENTIALED_RELEASE_WORKFLOWS = (
@@ -64,15 +65,20 @@ REQUIRED_GATE_PATHS = {
     "docs/verifying-a-release-candidate.html",
     "java/pom.xml",
     "java/src/test/java/org/apache/paimon/mosaic/MosaicNativeLoaderSmokeTest.java",
+    "python/pyproject.toml",
+    "python/setup.py",
     "tools/create_source_release.sh",
     "tools/deploy_java_staging.sh",
     "tools/update_branch_version.sh",
+    "tools/verify_release_artifacts.py",
     "tools/verify_release_versions.py",
     "tools/verify_source_archive.py",
     "tools/tests/test_create_source_release.py",
     "tools/tests/deploy_java_staging_test.sh",
+    "tools/tests/test_python_setup.py",
     "tools/tests/test_release_vote_workflow.py",
     "tools/tests/test_update_branch_version.py",
+    "tools/tests/test_verify_release_artifacts.py",
     "tools/tests/test_verify_release_versions.py",
     "tools/tests/test_verify_source_archive.py",
 }
@@ -112,8 +118,10 @@ python3 tools/verify_source_archive.py verify \\
 """
 GATE_TEST_COMMAND = """python -m pytest -q \\
   tools/tests/test_create_source_release.py \\
+  tools/tests/test_python_setup.py \\
   tools/tests/test_release_vote_workflow.py \\
   tools/tests/test_update_branch_version.py \\
+  tools/tests/test_verify_release_artifacts.py \\
   tools/tests/test_verify_release_versions.py \\
   tools/tests/test_verify_source_archive.py
 """
@@ -135,11 +143,14 @@ python3 tools/verify_source_archive.py verify \\
 """
 GATE_STATIC_COMMAND = """set -euo pipefail
 python -m compileall -q \\
+  tools/verify_release_artifacts.py \\
   tools/verify_release_versions.py \\
   tools/verify_source_archive.py \\
   tools/tests/test_create_source_release.py \\
+  tools/tests/test_python_setup.py \\
   tools/tests/test_release_vote_workflow.py \\
   tools/tests/test_update_branch_version.py \\
+  tools/tests/test_verify_release_artifacts.py \\
   tools/tests/test_verify_release_versions.py \\
   tools/tests/test_verify_source_archive.py
 bash -n tools/create_source_release.sh
@@ -223,7 +234,9 @@ def assert_gate_contract(workflow: dict) -> None:
         assert "if" not in step
         assert "continue-on-error" not in step
 
-    assert install_step["run"] == "python -m pip install pytest PyYAML"
+    assert install_step["run"] == (
+        "python -m pip install pytest PyYAML setuptools wheel"
+    )
     assert test_step["run"] == GATE_TEST_COMMAND
     assert staging_step["shell"] == "bash"
     assert staging_step["run"] == "bash tools/tests/deploy_java_staging_test.sh"
@@ -427,6 +440,8 @@ def test_java_release_packages_and_smokes_unsigned_artifact() -> None:
         "Verify multi-platform Java package",
     )
     assert "META-INF/DEPENDENCIES" in verify_step["run"]
+    assert "THIRD-PARTY-LICENSES.html" in verify_step["run"]
+    assert "verify_release_artifacts.py java" in verify_step["run"]
     assert "org/apache/paimon/mosaic/NativeLib.class" in verify_step["run"]
     assert "org.apache.paimon.mosaic.MosaicNativeLoaderSmokeTest" in (
         verify_step["run"]
@@ -460,6 +475,35 @@ def test_java_release_packages_and_smokes_unsigned_artifact() -> None:
     )
     assert "MosaicNativeLoaderSmokeTest.java" in smoke_step["run"]
     assert "javac -cp \"$jar_file\"" in smoke_step["run"]
+
+
+def test_python_release_verifies_each_wheel_and_complete_publish_set() -> None:
+    wheels = load_workflow(PYTHON_WHEELS_WORKFLOW)
+    publish = load_workflow(PYTHON_PUBLISH_WORKFLOW)
+
+    for job_name in ("wheels-linux", "wheels-macos", "wheels-windows"):
+        verify_step = job_step(
+            wheels,
+            job_name,
+            "Verify wheel legal payload",
+        )
+        assert "verify_release_artifacts.py python" in verify_step["run"]
+        upload_step = next(
+            step
+            for step in wheels["jobs"][job_name]["steps"]
+            if step.get("uses") == "actions/upload-artifact@v5"
+        )
+        assert upload_step["with"]["if-no-files-found"] == "error"
+
+    checkout_steps = [
+        step
+        for step in publish["jobs"]["publish"]["steps"]
+        if step.get("uses") == "actions/checkout@v6"
+    ]
+    assert len(checkout_steps) == 1
+    verify_step = job_step(publish, "publish", "Verify wheel versions")
+    assert "--require-all-python-targets" in verify_step["run"]
+    assert "verify_release_artifacts.py" in verify_step["run"]
 
 
 def test_java_release_never_receives_signing_or_nexus_credentials() -> None:
@@ -710,6 +754,12 @@ def test_release_documentation_describes_local_java_staging() -> None:
 def test_release_documentation_describes_source_archive_preflight() -> None:
     source = RELEASE_DOCUMENTATION.read_text(encoding="utf-8")
     assert "temporary source archive" in source
+
+
+def test_release_documentation_states_binding_vote_threshold() -> None:
+    source = RELEASE_DOCUMENTATION.read_text(encoding="utf-8")
+    assert "at least three binding <code>+1</code> votes" in source
+    assert "ASF majority approval rule" in source
 
 
 def test_release_documentation_preserves_previous_rc_output_before_retry() -> None:

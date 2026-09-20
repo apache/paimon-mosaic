@@ -16,7 +16,7 @@
 # under the License.
 
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -34,4 +34,11 @@ test = ["pytest"]
 include = ["mosaic*"]
 
 [tool.setuptools.package-data]
-mosaic = ["libpaimon_mosaic_ffi.dylib", "libpaimon_mosaic_ffi.so", "paimon_mosaic_ffi.dll"]
+mosaic = [
+    "libpaimon_mosaic_ffi.dylib",
+    "libpaimon_mosaic_ffi.so",
+    "paimon_mosaic_ffi.dll",
+    "LICENSE",
+    "NOTICE",
+    "THIRD-PARTY-LICENSES.html",
+]

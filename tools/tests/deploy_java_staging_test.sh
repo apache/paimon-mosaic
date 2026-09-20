@@ -53,6 +53,7 @@ new_fixture() {
   MOCK_LOG="$FIXTURE/mock.log"
   mkdir -p "$FIXTURE/tools" "$FIXTURE/java/src/test/java/org/apache/paimon/mosaic" "$MOCK_BIN"
   cp "$SOURCE_REPO/tools/deploy_java_staging.sh" "$FIXTURE/tools/"
+  cp "$SOURCE_REPO/tools/verify_release_artifacts.py" "$FIXTURE/tools/"
   cp "$SOURCE_REPO/java/src/test/java/org/apache/paimon/mosaic/MosaicNativeLoaderSmokeTest.java" \
     "$FIXTURE/java/src/test/java/org/apache/paimon/mosaic/"
   cat > "$FIXTURE/java/pom.xml" <<'POM'
@@ -132,6 +133,10 @@ native/windows/x86_64/paimon_mosaic_jni.dll
 META-INF/LICENSE
 META-INF/NOTICE
 META-INF/DEPENDENCIES
+META-INF/licenses/x86_64-unknown-linux-gnu/THIRD-PARTY-LICENSES.html
+META-INF/licenses/aarch64-unknown-linux-gnu/THIRD-PARTY-LICENSES.html
+META-INF/licenses/aarch64-apple-darwin/THIRD-PARTY-LICENSES.html
+META-INF/licenses/x86_64-pc-windows-msvc/THIRD-PARTY-LICENSES.html
 ENTRIES
 if [[ "${OMIT_NATIVE_ENTRY:-0}" == 1 ]]; then
   exit 0
@@ -143,6 +148,19 @@ MOCK
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'java %s\n' "$*" >> "$MOCK_LOG"
+MOCK
+  cat > "$MOCK_BIN/python3" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'python3 %s\n' "$*" >> "$MOCK_LOG"
+case "${1:-}" in
+  */tools/verify_release_artifacts.py)
+    exit 0
+    ;;
+  *)
+    exec /usr/bin/python3 "$@"
+    ;;
+esac
 MOCK
   cat > "$MOCK_BIN/file" <<'MOCK'
 #!/usr/bin/env bash
@@ -207,6 +225,8 @@ done
 assert_contains "$MOCK_LOG" "mvn clean verify -Prelease -Dgpg.skip=true -DskipTests"
 assert_not_contains "$MOCK_LOG" "mvn deploy"
 [[ $(grep -c '^java ' "$MOCK_LOG") -eq 2 ]] || fail "dry-run must smoke local and CI JARs"
+[[ $(grep -c '^python3 .*verify_release_artifacts.py java ' "$MOCK_LOG") -eq 2 ]] ||
+  fail "dry-run must content-verify local and CI JARs"
 pass "successful dry-run validates all five artifacts and both JARs"
 
 new_fixture

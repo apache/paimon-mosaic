@@ -201,10 +201,16 @@ jobs:
             native/windows/x86_64/paimon_mosaic_jni.dll \
             META-INF/LICENSE \
             META-INF/NOTICE \
-            META-INF/DEPENDENCIES
+            META-INF/DEPENDENCIES \
+            META-INF/licenses/x86_64-unknown-linux-gnu/THIRD-PARTY-LICENSES.html \
+            META-INF/licenses/aarch64-unknown-linux-gnu/THIRD-PARTY-LICENSES.html \
+            META-INF/licenses/aarch64-apple-darwin/THIRD-PARTY-LICENSES.html \
+            META-INF/licenses/x86_64-pc-windows-msvc/THIRD-PARTY-LICENSES.html
           do
             jar tf "$jar_file" | grep -qx "$entry"
           done
+
+          python3 tools/verify_release_artifacts.py java "$jar_file"
 
           java -cp "$jar_file:java/target/test-classes" \
             org.apache.paimon.mosaic.MosaicNativeLoaderSmokeTest

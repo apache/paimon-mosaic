@@ -20,14 +20,40 @@
 import os
 import platform
 import shutil
+from pathlib import Path
 
 from setuptools import Distribution, setup
 from setuptools.command.build_py import build_py
 from wheel.bdist_wheel import bdist_wheel
 
 
-def _lib_name():
-    system = platform.system()
+TARGET_BY_PLATFORM = {
+    ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
+    ("Linux", "amd64"): "x86_64-unknown-linux-gnu",
+    ("Linux", "aarch64"): "aarch64-unknown-linux-gnu",
+    ("Linux", "arm64"): "aarch64-unknown-linux-gnu",
+    ("Darwin", "arm64"): "aarch64-apple-darwin",
+    ("Darwin", "aarch64"): "aarch64-apple-darwin",
+    ("Windows", "amd64"): "x86_64-pc-windows-msvc",
+    ("Windows", "x86_64"): "x86_64-pc-windows-msvc",
+}
+LEGAL_FILES = ("LICENSE", "NOTICE", "THIRD-PARTY-LICENSES.html")
+
+
+def _target_triple(system=None, machine=None):
+    system = system or platform.system()
+    machine = (machine or platform.machine()).lower()
+    target = TARGET_BY_PLATFORM.get((system, machine))
+    if target is None:
+        raise RuntimeError(
+            f"unsupported release wheel platform: system={system!r}, "
+            f"machine={machine!r}"
+        )
+    return target
+
+
+def _lib_name(system=None):
+    system = system or platform.system()
     if system == "Darwin":
         return "libpaimon_mosaic_ffi.dylib"
     elif system == "Windows":
@@ -53,15 +79,42 @@ def _find_native_lib():
     return None
 
 
+def _stage_release_payload():
+    here = Path(__file__).resolve().parent
+    package_dir = here / "mosaic"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    created = []
+
+    native_name = _lib_name()
+    native_destination = package_dir / native_name
+    native_source = _find_native_lib()
+    if native_destination.is_file():
+        pass
+    elif native_source:
+        shutil.copy2(native_source, native_destination)
+        created.append(native_destination)
+    else:
+        return []
+
+    legal_dir = here / "licenses" / _target_triple()
+    for name in LEGAL_FILES:
+        source = legal_dir / name
+        if not source.is_file():
+            raise RuntimeError(f"missing release wheel legal file: {source}")
+        destination = package_dir / name
+        shutil.copy2(source, destination)
+        created.append(destination)
+    return created
+
+
 class BuildPyWithNativeLib(build_py):
     def run(self):
-        src = _find_native_lib()
-        if src:
-            dst = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "mosaic", _lib_name()
-            )
-            shutil.copy2(src, dst)
-        super().run()
+        created = _stage_release_payload()
+        try:
+            super().run()
+        finally:
+            for path in created:
+                path.unlink(missing_ok=True)
 
 
 class PlatformWheel(bdist_wheel):
@@ -83,7 +136,8 @@ class BinaryDistribution(Distribution):
         return True
 
 
-setup(
-    cmdclass={"build_py": BuildPyWithNativeLib, "bdist_wheel": PlatformWheel},
-    distclass=BinaryDistribution,
-)
+if __name__ == "__main__":
+    setup(
+        cmdclass={"build_py": BuildPyWithNativeLib, "bdist_wheel": PlatformWheel},
+        distclass=BinaryDistribution,
+    )

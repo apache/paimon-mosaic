@@ -250,7 +250,11 @@ else
 fi
 
 check_java_package_inputs_clean() {
-  local paths=(java tools/deploy_java_staging.sh)
+  local paths=(
+    java
+    tools/deploy_java_staging.sh
+    tools/verify_release_artifacts.py
+  )
   local untracked
 
   if ! git -C "$REPO_DIR" diff --quiet -- "${paths[@]}" ||
@@ -559,13 +563,18 @@ validate_maven_artifacts() {
       native/windows/x86_64/paimon_mosaic_jni.dll \
       META-INF/LICENSE \
       META-INF/NOTICE \
-      META-INF/DEPENDENCIES
+      META-INF/DEPENDENCIES \
+      META-INF/licenses/x86_64-unknown-linux-gnu/THIRD-PARTY-LICENSES.html \
+      META-INF/licenses/aarch64-unknown-linux-gnu/THIRD-PARTY-LICENSES.html \
+      META-INF/licenses/aarch64-apple-darwin/THIRD-PARTY-LICENSES.html \
+      META-INF/licenses/x86_64-pc-windows-msvc/THIRD-PARTY-LICENSES.html
     do
       if ! jar tf "$main_jar" | grep -qx "$entry"; then
         echo "Packaged jar is missing required entry: $main_jar: $entry" >&2
         exit 1
       fi
     done
+    python3 "$REPO_DIR/tools/verify_release_artifacts.py" java "$main_jar"
   done
 
   local test_classes="$REPO_DIR/java/target/test-classes"
