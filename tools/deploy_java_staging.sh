@@ -218,8 +218,6 @@ if [[ ! "$RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
-NATIVE_DIR="$SCRIPT_DIR/release/java-native-${TAG}"
-
 if [[ -n "$MAVEN_SETTINGS" && ! -f "$MAVEN_SETTINGS" ]]; then
   echo "--maven-settings does not exist: $MAVEN_SETTINGS" >&2
   exit 1
@@ -332,8 +330,20 @@ fi
 
 validate_github_run
 
-rm -rf "$NATIVE_DIR"
-mkdir -p "$NATIVE_DIR"
+cleanup_download_dir() {
+  if [[ -n "$NATIVE_DIR" ]]; then
+    rm -rf "$NATIVE_DIR"
+  fi
+}
+
+cleanup_download_only() {
+  local status=$?
+  cleanup_download_dir
+  exit "$status"
+}
+trap cleanup_download_only EXIT
+
+NATIVE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/paimon-mosaic-java-staging.XXXXXX")
 for artifact in \
   native-linux-x86_64 \
   native-linux-aarch64 \
@@ -455,8 +465,11 @@ xml_escape() {
 }
 
 cleanup_all() {
+  local status=$?
+  cleanup_download_dir
   cleanup_native_resources
   cleanup_temp_settings
+  exit "$status"
 }
 trap cleanup_all EXIT
 
