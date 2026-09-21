@@ -170,6 +170,19 @@ impl<S: OutputFile> MosaicWriter<S> {
         schema: MosaicSchema,
         options: WriterOptions,
     ) -> io::Result<Self> {
+        let columns = schema
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+        MosaicSchema::validate(&columns)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let batch_col_map: Vec<usize> = (0..schema.columns.len()).collect();
         Self::from_mosaic_schema_with_map(out, schema, options, batch_col_map)
     }
@@ -870,6 +883,58 @@ mod tests {
         let mosaic_schema = MosaicSchema::from_arrow(&arrow_schema, 2).unwrap();
 
         assert_eq!(batch_column_map(&mosaic_schema), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn test_new_rejects_empty_column_name_before_writing() {
+        let arrow_schema = Schema::new(vec![Field::new("", DataType::Int32, true)]);
+        let state = Arc::new(Mutex::new(FailingOutputState::default()));
+        let out = FailOnceOutputFile {
+            state: Arc::clone(&state),
+            fail: false,
+        };
+
+        let result = MosaicWriter::new(out, &arrow_schema, WriterOptions::default());
+        let error = match result {
+            Ok(writer) => {
+                std::mem::forget(writer);
+                panic!("empty column name should be rejected");
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(io::ErrorKind::InvalidInput, error.kind());
+        assert!(error.to_string().contains("empty column name"));
+        let state = state.lock().unwrap();
+        assert_eq!(0, state.write_calls);
+        assert_eq!(0, state.flush_calls);
+        assert!(state.bytes.is_empty());
+    }
+
+    #[test]
+    fn test_from_mosaic_schema_rejects_empty_column_name_before_writing() {
+        let schema = MosaicSchema::new(vec![("".to_string(), DataType::Int32, true)], 1);
+        let state = Arc::new(Mutex::new(FailingOutputState::default()));
+        let out = FailOnceOutputFile {
+            state: Arc::clone(&state),
+            fail: false,
+        };
+
+        let result = MosaicWriter::from_mosaic_schema(out, schema, WriterOptions::default());
+        let error = match result {
+            Ok(writer) => {
+                std::mem::forget(writer);
+                panic!("empty column name should be rejected");
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(io::ErrorKind::InvalidInput, error.kind());
+        assert!(error.to_string().contains("empty column name"));
+        let state = state.lock().unwrap();
+        assert_eq!(0, state.write_calls);
+        assert_eq!(0, state.flush_calls);
+        assert!(state.bytes.is_empty());
     }
 
     #[test]
