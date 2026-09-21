@@ -118,17 +118,25 @@ def python_wheel_tags(path: Path) -> tuple[str, str, str]:
 
 def python_wheel_target(path: Path) -> str:
     _, _, platform_tag = python_wheel_tags(path)
-    name = platform_tag.lower()
     patterns = (
         (r"(?:manylinux.*|linux)_x86_64$", "x86_64-unknown-linux-gnu"),
         (r"(?:manylinux.*|linux)_aarch64$", "aarch64-unknown-linux-gnu"),
         (r"macosx.*_arm64$", "aarch64-apple-darwin"),
         (r"win_amd64$", "x86_64-pc-windows-msvc"),
     )
-    matches = [target for pattern, target in patterns if re.search(pattern, name)]
-    if len(matches) != 1:
-        raise ValueError(f"{path}: unsupported or ambiguous wheel platform tag")
-    return matches[0]
+    targets = set()
+    for name in platform_tag.lower().split("."):
+        matches = [
+            target for pattern, target in patterns if re.search(pattern, name)
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"{path}: unsupported or ambiguous wheel platform tag {name!r}"
+            )
+        targets.add(matches[0])
+    if len(targets) != 1:
+        raise ValueError(f"{path}: ambiguous wheel platform tags")
+    return targets.pop()
 
 
 def verify_python_wheel(path: Path) -> str:
@@ -175,11 +183,14 @@ def verify_python_wheel(path: Path) -> str:
             for line in metadata_text.splitlines()
             if line.startswith("Tag:")
         }
-        expected_tag = f"{python_tag}-{abi_tag}-{platform_tag}"
-        if tags != {expected_tag}:
+        expected_tags = {
+            f"{python_tag}-{abi_tag}-{platform}"
+            for platform in platform_tag.split(".")
+        }
+        if tags != expected_tags:
             raise ValueError(
                 f"{path}: WHEEL tags are {sorted(tags)}, "
-                f"expected only {expected_tag!r}"
+                f"expected {sorted(expected_tags)}"
             )
     return target
 

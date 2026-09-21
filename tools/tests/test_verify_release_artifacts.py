@@ -112,6 +112,43 @@ def test_python_verifier_accepts_platform_wheel(
     assert verifier.verify_python_wheel(wheel) == target
 
 
+def test_python_verifier_accepts_compressed_platform_tags(tmp_path: Path) -> None:
+    target = "aarch64-unknown-linux-gnu"
+    wheel = tmp_path / (
+        "paimon_mosaic-0.3.0-py3-none-"
+        "manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
+    )
+    files = python_files(target)
+    files["paimon_mosaic-0.3.0.dist-info/WHEEL"] = (
+        "Wheel-Version: 1.0\n"
+        "Tag: py3-none-manylinux_2_17_aarch64\n"
+        "Tag: py3-none-manylinux2014_aarch64\n"
+    )
+    write_archive(wheel, files)
+
+    assert verifier.verify_python_wheel(wheel) == target
+
+
+def test_python_verifier_rejects_cross_target_compressed_tags(
+    tmp_path: Path,
+) -> None:
+    target = "aarch64-unknown-linux-gnu"
+    wheel = tmp_path / (
+        "paimon_mosaic-0.3.0-py3-none-"
+        "manylinux_2_17_x86_64.manylinux2014_aarch64.whl"
+    )
+    files = python_files(target)
+    files["paimon_mosaic-0.3.0.dist-info/WHEEL"] = (
+        "Wheel-Version: 1.0\n"
+        "Tag: py3-none-manylinux_2_17_x86_64\n"
+        "Tag: py3-none-manylinux2014_aarch64\n"
+    )
+    write_archive(wheel, files)
+
+    with pytest.raises(ValueError, match="ambiguous wheel platform tags"):
+        verifier.verify_python_wheel(wheel)
+
+
 def test_python_verifier_rejects_native_wheel_without_legal_files(
     tmp_path: Path,
 ) -> None:
