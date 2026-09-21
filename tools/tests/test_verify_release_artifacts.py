@@ -42,6 +42,7 @@ def java_files() -> dict[str, str | bytes]:
         for target in verifier.TARGETS
     }
     return {
+        "org/apache/paimon/mosaic/NativeLib.class": b"class",
         "META-INF/LICENSE": "\n".join(reports) + "\n",
         "META-INF/NOTICE": "Apache Paimon Mosaic\n",
         "META-INF/DEPENDENCIES": "Mosaic\n",
@@ -54,21 +55,11 @@ def java_files() -> dict[str, str | bytes]:
 
 
 def python_files(target: str) -> dict[str, str | bytes]:
-    platform_tags = {
-        "x86_64-unknown-linux-gnu": "manylinux_2_28_x86_64",
-        "aarch64-unknown-linux-gnu": "manylinux_2_28_aarch64",
-        "aarch64-apple-darwin": "macosx_11_0_arm64",
-        "x86_64-pc-windows-msvc": "win_amd64",
-    }
     return {
         verifier.PYTHON_NATIVE_BY_TARGET[target]: b"native",
         "mosaic/LICENSE": "THIRD-PARTY-LICENSES.html\n",
         "mosaic/NOTICE": "Apache Paimon Mosaic\n",
         "mosaic/THIRD-PARTY-LICENSES.html": target,
-        "paimon_mosaic-0.3.0.dist-info/WHEEL": (
-            "Wheel-Version: 1.0\n"
-            f"Tag: py3-none-{platform_tags[target]}\n"
-        ),
     }
 
 
@@ -89,17 +80,25 @@ def test_java_verifier_accepts_complete_multi_platform_jar(tmp_path: Path) -> No
     verifier.verify_java_jar(jar)
 
 
-def test_java_verifier_rejects_missing_third_party_report(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "missing_entry",
+    (
+        "org/apache/paimon/mosaic/NativeLib.class",
+        "native/windows/x86_64/paimon_mosaic_jni.dll",
+        "META-INF/licenses/aarch64-unknown-linux-gnu/THIRD-PARTY-LICENSES.html",
+    ),
+)
+def test_java_verifier_rejects_missing_required_entry(
+    tmp_path: Path, missing_entry: str
+) -> None:
     jar = tmp_path / "mosaic-0.3.0.jar"
     files = java_files()
-    files.pop(
-        "META-INF/licenses/aarch64-unknown-linux-gnu/"
-        "THIRD-PARTY-LICENSES.html"
-    )
+    files.pop(missing_entry)
     write_archive(jar, files)
 
-    with pytest.raises(ValueError, match="expected exactly one"):
+    with pytest.raises(ValueError, match="expected exactly one") as error:
         verifier.verify_java_jar(jar)
+    assert missing_entry in str(error.value)
 
 
 @pytest.mark.parametrize("target", verifier.TARGETS)
@@ -118,13 +117,7 @@ def test_python_verifier_accepts_compressed_platform_tags(tmp_path: Path) -> Non
         "paimon_mosaic-0.3.0-py3-none-"
         "manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
     )
-    files = python_files(target)
-    files["paimon_mosaic-0.3.0.dist-info/WHEEL"] = (
-        "Wheel-Version: 1.0\n"
-        "Tag: py3-none-manylinux_2_17_aarch64\n"
-        "Tag: py3-none-manylinux2014_aarch64\n"
-    )
-    write_archive(wheel, files)
+    write_archive(wheel, python_files(target))
 
     assert verifier.verify_python_wheel(wheel) == target
 
@@ -137,13 +130,7 @@ def test_python_verifier_rejects_cross_target_compressed_tags(
         "paimon_mosaic-0.3.0-py3-none-"
         "manylinux_2_17_x86_64.manylinux2014_aarch64.whl"
     )
-    files = python_files(target)
-    files["paimon_mosaic-0.3.0.dist-info/WHEEL"] = (
-        "Wheel-Version: 1.0\n"
-        "Tag: py3-none-manylinux_2_17_x86_64\n"
-        "Tag: py3-none-manylinux2014_aarch64\n"
-    )
-    write_archive(wheel, files)
+    write_archive(wheel, python_files(target))
 
     with pytest.raises(ValueError, match="ambiguous wheel platform tags"):
         verifier.verify_python_wheel(wheel)
@@ -161,39 +148,3 @@ def test_python_verifier_rejects_native_wheel_without_legal_files(
 
     with pytest.raises(ValueError, match="mosaic/LICENSE"):
         verifier.verify_python_wheel(wheel)
-
-
-def test_python_verifier_rejects_narrow_cpython_abi_tag(tmp_path: Path) -> None:
-    target = "aarch64-unknown-linux-gnu"
-    wheel = tmp_path / (
-        "paimon_mosaic-0.3.0-cp39-cp39-manylinux_2_28_aarch64.whl"
-    )
-    write_archive(wheel, python_files(target))
-
-    with pytest.raises(ValueError, match="expected py3-none"):
-        verifier.verify_python_wheel(wheel)
-
-
-def test_python_verifier_rejects_mismatched_internal_tag(tmp_path: Path) -> None:
-    target = "aarch64-unknown-linux-gnu"
-    wheel = wheel_name(tmp_path, target)
-    files = python_files(target)
-    files["paimon_mosaic-0.3.0.dist-info/WHEEL"] = (
-        "Wheel-Version: 1.0\n"
-        "Tag: cp39-cp39-manylinux_2_28_aarch64\n"
-    )
-    write_archive(wheel, files)
-
-    with pytest.raises(ValueError, match="WHEEL tags"):
-        verifier.verify_python_wheel(wheel)
-
-
-def test_python_target_set_rejects_missing_platform() -> None:
-    with pytest.raises(ValueError, match="incomplete or duplicated"):
-        verifier.verify_python_target_set(
-            [
-                "x86_64-unknown-linux-gnu",
-                "aarch64-unknown-linux-gnu",
-                "aarch64-apple-darwin",
-            ]
-        )

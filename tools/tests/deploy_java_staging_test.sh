@@ -124,26 +124,8 @@ if [[ "$file" == *-sources.jar ]]; then
   printf '%s\n' org/apache/paimon/mosaic/NativeLib.java
   exit 0
 fi
-cat <<'ENTRIES'
-org/apache/paimon/mosaic/NativeLib.class
-native/linux/x86_64/libpaimon_mosaic_jni.so
-native/linux/aarch64/libpaimon_mosaic_jni.so
-native/macos/aarch64/libpaimon_mosaic_jni.dylib
-native/windows/x86_64/paimon_mosaic_jni.dll
-META-INF/LICENSE
-META-INF/NOTICE
-META-INF/DEPENDENCIES
-META-INF/licenses/x86_64-unknown-linux-gnu/THIRD-PARTY-LICENSES.html
-META-INF/licenses/aarch64-unknown-linux-gnu/THIRD-PARTY-LICENSES.html
-META-INF/licenses/aarch64-apple-darwin/THIRD-PARTY-LICENSES.html
-META-INF/licenses/x86_64-pc-windows-msvc/THIRD-PARTY-LICENSES.html
-ENTRIES
-if [[ "${OMIT_NATIVE_ENTRY:-0}" == 1 ]]; then
-  exit 0
-fi
+exit 2
 MOCK
-  # Rewrite the mock when an entry must be omitted; doing it here keeps the
-  # normal listing easy to audit.
   cat > "$MOCK_BIN/java" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -155,7 +137,7 @@ set -euo pipefail
 printf 'python3 %s\n' "$*" >> "$MOCK_LOG"
 case "${1:-}" in
   */tools/verify_release_artifacts.py)
-    exit 0
+    exit "${INVALID_JAR_PAYLOAD:-0}"
     ;;
   *)
     exec /usr/bin/python3 "$@"
@@ -185,17 +167,6 @@ MOCK
   : > "$MOCK_LOG"
 }
 
-omit_native_from_mock_jar() {
-  python3 - "$MOCK_BIN/jar" <<'PY'
-from pathlib import Path
-import sys
-path = Path(sys.argv[1])
-text = path.read_text()
-text = text.replace("native/windows/x86_64/paimon_mosaic_jni.dll\n", "")
-path.write_text(text)
-PY
-}
-
 run_stage() {
   env \
     PATH="$MOCK_BIN:$PATH" \
@@ -204,6 +175,7 @@ run_stage() {
     MOCK_TAG=v1.2.3-rc1 \
     OMIT_CI_JAVADOC="${OMIT_CI_JAVADOC:-0}" \
     OMIT_LOCAL_MAIN="${OMIT_LOCAL_MAIN:-0}" \
+    INVALID_JAR_PAYLOAD="${INVALID_JAR_PAYLOAD:-0}" \
     "$FIXTURE/tools/deploy_java_staging.sh" \
       --release-version 1.2.3 \
       --rc 1 \
@@ -269,11 +241,13 @@ fi
 assert_not_contains "$MOCK_LOG" "mvn deploy"
 unset OMIT_CI_JAVADOC
 new_fixture
-omit_native_from_mock_jar
+INVALID_JAR_PAYLOAD=1
 if run_stage > "$FIXTURE/output" 2>&1; then
-  fail "missing native JAR entry should fail"
+  fail "invalid JAR payload should fail"
 fi
+assert_contains "$MOCK_LOG" "verify_release_artifacts.py java "
 assert_not_contains "$MOCK_LOG" "mvn deploy"
-pass "missing required JAR or native entry blocks deploy"
+unset INVALID_JAR_PAYLOAD
+pass "missing required JAR or invalid payload blocks deploy"
 
 echo "PASS: $TESTS focused Java staging tests"

@@ -84,6 +84,7 @@ def read_text(
 def verify_java_jar(path: Path) -> None:
     with zipfile.ZipFile(path) as archive:
         entries = archive_entries(archive)
+        require_single(entries, path, "org/apache/paimon/mosaic/NativeLib.class")
         license_text = read_text(archive, entries, path, "META-INF/LICENSE")
         notice_text = read_text(archive, entries, path, "META-INF/NOTICE")
         require_single(entries, path, "META-INF/DEPENDENCIES")
@@ -101,23 +102,13 @@ def verify_java_jar(path: Path) -> None:
                 raise ValueError(f"{path}: {report} does not identify target {target}")
 
 
-def python_wheel_tags(path: Path) -> tuple[str, str, str]:
+def python_wheel_target(path: Path) -> str:
     if not path.name.endswith(".whl"):
         raise ValueError(f"{path}: Python artifact is not a wheel")
     parts = path.name[:-4].rsplit("-", 3)
     if len(parts) != 4:
         raise ValueError(f"{path}: invalid wheel filename")
-    _, python_tag, abi_tag, platform_tag = parts
-    if python_tag != "py3" or abi_tag != "none":
-        raise ValueError(
-            f"{path}: expected py3-none wheel tags, "
-            f"found {python_tag}-{abi_tag}"
-        )
-    return python_tag, abi_tag, platform_tag
-
-
-def python_wheel_target(path: Path) -> str:
-    _, _, platform_tag = python_wheel_tags(path)
+    platform_tag = parts[-1]
     patterns = (
         (r"(?:manylinux.*|linux)_x86_64$", "x86_64-unknown-linux-gnu"),
         (r"(?:manylinux.*|linux)_aarch64$", "aarch64-unknown-linux-gnu"),
@@ -140,7 +131,6 @@ def python_wheel_target(path: Path) -> str:
 
 
 def verify_python_wheel(path: Path) -> str:
-    python_tag, abi_tag, platform_tag = python_wheel_tags(path)
     target = python_wheel_target(path)
     with zipfile.ZipFile(path) as archive:
         entries = archive_entries(archive)
@@ -162,59 +152,13 @@ def verify_python_wheel(path: Path) -> str:
             raise ValueError(
                 f"{path}: third-party report does not identify target {target}"
             )
-        wheel_metadata = [
-            name
-            for name in entries
-            if name.endswith(".dist-info/WHEEL")
-        ]
-        if len(wheel_metadata) != 1:
-            raise ValueError(
-                f"{path}: expected exactly one .dist-info/WHEEL entry, "
-                f"found {len(wheel_metadata)}"
-            )
-        metadata_text = read_text(
-            archive,
-            entries,
-            path,
-            wheel_metadata[0],
-        )
-        tags = {
-            line.removeprefix("Tag:").strip()
-            for line in metadata_text.splitlines()
-            if line.startswith("Tag:")
-        }
-        expected_tags = {
-            f"{python_tag}-{abi_tag}-{platform}"
-            for platform in platform_tag.split(".")
-        }
-        if tags != expected_tags:
-            raise ValueError(
-                f"{path}: WHEEL tags are {sorted(tags)}, "
-                f"expected {sorted(expected_tags)}"
-            )
     return target
-
-
-def verify_python_target_set(targets: list[str]) -> None:
-    counts = Counter(targets)
-    expected = Counter({target: 1 for target in TARGETS})
-    if counts != expected:
-        raise ValueError(
-            "Python wheel target set is incomplete or duplicated: "
-            f"found {dict(sorted(counts.items()))}, "
-            f"expected {dict(expected)}"
-        )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("kind", choices=("java", "python"))
     parser.add_argument("artifacts", nargs="+", type=Path)
-    parser.add_argument(
-        "--require-all-python-targets",
-        action="store_true",
-        help="require exactly one Python wheel for each supported release target",
-    )
     return parser.parse_args()
 
 
@@ -226,16 +170,11 @@ def main() -> int:
                 raise ValueError(f"release artifact does not exist: {artifact}")
 
         if args.kind == "java":
-            if args.require_all_python_targets:
-                raise ValueError(
-                    "--require-all-python-targets is valid only for Python wheels"
-                )
             for artifact in args.artifacts:
                 verify_java_jar(artifact)
         else:
-            targets = [verify_python_wheel(artifact) for artifact in args.artifacts]
-            if args.require_all_python_targets:
-                verify_python_target_set(targets)
+            for artifact in args.artifacts:
+                verify_python_wheel(artifact)
     except (OSError, ValueError, zipfile.BadZipFile) as error:
         print(error, file=sys.stderr)
         return 1

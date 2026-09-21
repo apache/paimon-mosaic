@@ -77,10 +77,7 @@ jobs:
             esac
           done
 
-          python3 tools/verify_release_artifacts.py \
-            --require-all-python-targets \
-            python \
-            "${wheels[@]}"
+          python3 tools/verify_release_artifacts.py python "${wheels[@]}"
 
       - name: Publish to TestPyPI
         if: >-

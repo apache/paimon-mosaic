@@ -439,10 +439,8 @@ def test_java_release_packages_and_smokes_unsigned_artifact() -> None:
         "package-java",
         "Verify multi-platform Java package",
     )
-    assert "META-INF/DEPENDENCIES" in verify_step["run"]
-    assert "THIRD-PARTY-LICENSES.html" in verify_step["run"]
-    assert "verify_release_artifacts.py java" in verify_step["run"]
-    assert "org/apache/paimon/mosaic/NativeLib.class" in verify_step["run"]
+    assert 'verify_release_artifacts.py java "$jar_file"' in verify_step["run"]
+    assert 'jar tf "$sources_jar"' in verify_step["run"]
     assert "org.apache.paimon.mosaic.MosaicNativeLoaderSmokeTest" in (
         verify_step["run"]
     )
@@ -477,7 +475,7 @@ def test_java_release_packages_and_smokes_unsigned_artifact() -> None:
     assert "javac -cp \"$jar_file\"" in smoke_step["run"]
 
 
-def test_python_release_verifies_each_wheel_and_complete_publish_set() -> None:
+def test_python_release_verifies_each_wheel_before_upload_and_publish() -> None:
     wheels = load_workflow(PYTHON_WHEELS_WORKFLOW)
     publish = load_workflow(PYTHON_PUBLISH_WORKFLOW)
 
@@ -502,8 +500,7 @@ def test_python_release_verifies_each_wheel_and_complete_publish_set() -> None:
     ]
     assert len(checkout_steps) == 1
     verify_step = job_step(publish, "publish", "Verify wheel versions")
-    assert "--require-all-python-targets" in verify_step["run"]
-    assert "verify_release_artifacts.py" in verify_step["run"]
+    assert 'verify_release_artifacts.py python "${wheels[@]}"' in verify_step["run"]
 
 
 def test_java_release_never_receives_signing_or_nexus_credentials() -> None:

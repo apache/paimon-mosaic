@@ -530,7 +530,6 @@ validate_maven_artifacts() {
   local ci_javadoc_jar="$NATIVE_DIR/java-package/mosaic-${RELEASE_VERSION}-javadoc.jar"
   local artifact
   local main_jar
-  local entry
 
   for artifact in \
     "$jar_file" \
@@ -555,25 +554,6 @@ validate_maven_artifacts() {
 
   for main_jar in "$jar_file" "$ci_jar"
   do
-    for entry in \
-      org/apache/paimon/mosaic/NativeLib.class \
-      native/linux/x86_64/libpaimon_mosaic_jni.so \
-      native/linux/aarch64/libpaimon_mosaic_jni.so \
-      native/macos/aarch64/libpaimon_mosaic_jni.dylib \
-      native/windows/x86_64/paimon_mosaic_jni.dll \
-      META-INF/LICENSE \
-      META-INF/NOTICE \
-      META-INF/DEPENDENCIES \
-      META-INF/licenses/x86_64-unknown-linux-gnu/THIRD-PARTY-LICENSES.html \
-      META-INF/licenses/aarch64-unknown-linux-gnu/THIRD-PARTY-LICENSES.html \
-      META-INF/licenses/aarch64-apple-darwin/THIRD-PARTY-LICENSES.html \
-      META-INF/licenses/x86_64-pc-windows-msvc/THIRD-PARTY-LICENSES.html
-    do
-      if ! jar tf "$main_jar" | grep -qx "$entry"; then
-        echo "Packaged jar is missing required entry: $main_jar: $entry" >&2
-        exit 1
-      fi
-    done
     python3 "$REPO_DIR/tools/verify_release_artifacts.py" java "$main_jar"
   done
 
