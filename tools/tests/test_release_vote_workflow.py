@@ -156,6 +156,7 @@ cargo install cargo-about \\
   --features cli \\
   --root "${cargo_about_root}"
 export PATH="${cargo_about_root}/bin:${PATH}"
+cargo fetch --locked
 python3 tools/generate_license_reports.py --check
 """
 VERIFY_SOURCE_ARCHIVE_COMMAND = """set -euo pipefail
