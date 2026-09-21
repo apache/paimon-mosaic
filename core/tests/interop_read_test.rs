@@ -17,6 +17,10 @@
 
 //! Interop read tests: reads .mosaic files written by Java and Python,
 //! verifying that Rust can correctly read files produced by other languages.
+//!
+//! These tests are ignored in Rust-only test runs because Cargo cannot produce
+//! their cross-language fixtures. CI and the release verification guide run
+//! them explicitly after the corresponding Java or Python producer.
 
 #![allow(
     clippy::approx_constant,
@@ -70,6 +74,7 @@ fn open_file(filename: &str) -> MosaicReader<ByteArrayInputFile> {
 // ======================== 1. Read java_written.mosaic ========================
 
 #[test]
+#[ignore = "requires java_written.mosaic from the explicit Java interop workflow"]
 fn test_read_java_written_file() {
     let reader = open_file("java_written.mosaic");
     let num_rgs = reader.num_row_groups();
@@ -147,6 +152,7 @@ fn test_read_java_written_file() {
 // ======================== 2. Read python_written.mosaic ========================
 
 #[test]
+#[ignore = "requires python_written.mosaic from the explicit Python interop workflow"]
 fn test_read_python_written_file() {
     let reader = open_file("python_written.mosaic");
     let num_rgs = reader.num_row_groups();
