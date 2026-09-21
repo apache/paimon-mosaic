@@ -153,6 +153,7 @@ cargo_about_root="${RUNNER_TEMP}/cargo-about"
 cargo install cargo-about \\
   --version "${CARGO_ABOUT_VERSION}" \\
   --locked \\
+  --features cli \\
   --root "${cargo_about_root}"
 export PATH="${cargo_about_root}/bin:${PATH}"
 python3 tools/generate_license_reports.py --check
