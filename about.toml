@@ -27,8 +27,8 @@ accepted = [
     "Zlib",
 ]
 
-# Release reports describe linked runtime components. Build-only and test-only
-# crates are not bundled in the native libraries.
+# cargo-about discovers license texts. tools/generate_license_reports.py then
+# intersects its JSON with each root/target's normal, non-proc-macro cargo tree.
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
 

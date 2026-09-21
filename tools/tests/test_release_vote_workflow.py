@@ -69,7 +69,7 @@ LICENSE_REPORT_GATE_PATHS = {
     "Cargo.lock",
     "LICENSE",
     "NOTICE",
-    "about.hbs",
+    "about.html.template",
     "about.toml",
     "rust-toolchain.toml",
     "tools/generate_license_reports.py",

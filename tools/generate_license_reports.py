@@ -22,15 +22,18 @@ from __future__ import annotations
 import argparse
 import difflib
 import html
+from html.parser import HTMLParser
 import json
 import subprocess
 import sys
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
 
 CARGO_ABOUT_VERSION = "0.9.1"
+HTML_TEMPLATE = "about.html.template"
 TARGETS = (
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
@@ -42,8 +45,30 @@ TARGETS = (
 @dataclass(frozen=True)
 class Report:
     manifest: str
+    package: str
     target: str
     output: str
+
+
+@dataclass(frozen=True)
+class RuntimeInventory:
+    packages: dict[str, dict]
+    features: dict[str, frozenset[str]]
+
+
+@dataclass(frozen=True)
+class UsedBy:
+    label: str
+    url: str
+    package_key: str | None = None
+
+
+@dataclass(frozen=True)
+class LicenseRecord:
+    name: str
+    spdx_id: str
+    text: str
+    used_by: tuple[UsedBy, ...]
 
 
 @dataclass(frozen=True)
@@ -53,14 +78,20 @@ class BundledComponent:
     component: str
     component_url: str
     license_name: str
-    anchor: str
+    spdx_id: str
     forbidden_features: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class ThirdPartyNotice:
-    packages: tuple[tuple[str, str, str], ...]
+    packages: tuple[tuple[str, str, str, str], ...]
     text: str
+
+
+@dataclass(frozen=True)
+class RustUnicodeAttribution:
+    version: str
+    license_text: str
 
 
 BUNDLED_COMPONENTS = (
@@ -70,12 +101,24 @@ BUNDLED_COMPONENTS = (
         component="vendored Zstandard C sources",
         component_url="https://github.com/facebook/zstd",
         license_name="BSD 3-Clause License",
-        anchor="bundled-zstandard-bsd-3-clause",
+        spdx_id="BSD-3-Clause",
         # The legacy decoder links additional BSD-2-Clause source files. Keep
         # it disabled unless those separate notices are added to this report.
         forbidden_features=("legacy",),
     ),
 )
+
+
+class CopyrightLibraryParser(HTMLParser):
+    """Extract text tokens from COPYRIGHT-library.html without regex parsing."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tokens: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        if text := data.strip():
+            self.tokens.append(text)
 
 
 def repository_root() -> Path:
@@ -88,6 +131,7 @@ def report_specs() -> list[Report]:
         reports.append(
             Report(
                 manifest="jni/Cargo.toml",
+                package="paimon-mosaic-jni",
                 target=target,
                 output=(
                     "java/src/main/binary-resources/META-INF/licenses/"
@@ -98,6 +142,7 @@ def report_specs() -> list[Report]:
         reports.append(
             Report(
                 manifest="ffi/Cargo.toml",
+                package="paimon-mosaic-ffi",
                 target=target,
                 output=f"python/licenses/{target}/THIRD-PARTY-LICENSES.html",
             )
@@ -121,7 +166,7 @@ def cargo_metadata(root: Path, report: Report) -> dict:
         [
             "cargo",
             "metadata",
-            "--locked",
+            "--frozen",
             "--format-version",
             "1",
             "--manifest-path",
@@ -132,10 +177,13 @@ def cargo_metadata(root: Path, report: Report) -> dict:
         cwd=root,
         text=True,
     )
-    return json.loads(output)
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("cargo metadata returned invalid JSON") from error
 
 
-def generate_base_report(root: Path, report: Report, output: Path) -> str:
+def cargo_about_data(root: Path, report: Report, output: Path) -> dict:
     subprocess.run(
         [
             "cargo",
@@ -149,41 +197,274 @@ def generate_base_report(root: Path, report: Report, output: Path) -> str:
             report.manifest,
             "--target",
             report.target,
+            "--format",
+            "json",
             "--output-file",
             str(output),
-            str(root / "about.hbs"),
         ],
         cwd=root,
         check=True,
     )
-    return output.read_text(encoding="utf-8")
+    try:
+        return json.loads(output.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError("cargo-about returned invalid JSON") from error
 
 
-def package_by_name(metadata: dict, crate_name: str) -> dict:
-    resolved = {node["id"] for node in metadata["resolve"]["nodes"]}
+def cargo_tree_output(root: Path, report: Report) -> str:
+    return subprocess.check_output(
+        [
+            "cargo",
+            "tree",
+            "--frozen",
+            "--manifest-path",
+            report.manifest,
+            "--package",
+            report.package,
+            "--target",
+            report.target,
+            "--edges",
+            "normal,no-proc-macro",
+            "--prefix",
+            "none",
+            "--no-dedupe",
+            "--format",
+            "{p}|{f}",
+        ],
+        cwd=root,
+        text=True,
+    )
+
+
+def runtime_inventory_from_tree(metadata: dict, tree_output: str) -> RuntimeInventory:
+    resolve = metadata.get("resolve")
+    packages = metadata.get("packages")
+    if not isinstance(resolve, dict) or not isinstance(packages, list):
+        raise RuntimeError("cargo metadata is missing packages or resolve data")
+    nodes = resolve.get("nodes")
+    if not isinstance(nodes, list):
+        raise RuntimeError("cargo metadata is missing resolved nodes")
+
+    resolved_ids = {node.get("id") for node in nodes}
+    by_name_version: dict[tuple[str, str], list[dict]] = {}
+    for package in packages:
+        if package.get("id") not in resolved_ids:
+            continue
+        key = (str(package.get("name")), str(package.get("version")))
+        by_name_version.setdefault(key, []).append(package)
+
+    selected: dict[str, dict] = {}
+    features: dict[str, set[str]] = {}
+    for line_number, line in enumerate(tree_output.splitlines(), start=1):
+        if not line:
+            continue
+        package_text, separator, feature_text = line.partition("|")
+        if not separator:
+            raise RuntimeError(
+                f"cargo tree line {line_number} has no feature separator: {line!r}"
+            )
+        fields = package_text.split(maxsplit=2)
+        if len(fields) < 2 or not fields[1].startswith("v"):
+            raise RuntimeError(
+                f"cargo tree line {line_number} has no package version: {line!r}"
+            )
+        key = (fields[0], fields[1][1:])
+        matches = by_name_version.get(key, [])
+        if not matches:
+            raise RuntimeError(
+                "cargo tree runtime package is missing from target metadata: "
+                f"{key[0]} {key[1]}"
+            )
+        if len(matches) != 1:
+            sources = sorted(
+                f"{package.get('id')} source={package.get('source')!r}"
+                for package in matches
+            )
+            raise RuntimeError(
+                "ambiguous cargo tree runtime package with the same name/version: "
+                f"{key[0]} {key[1]} ({'; '.join(sources)})"
+            )
+
+        package = matches[0]
+        package_id = package["id"]
+        selected[package_id] = package
+        enabled = features.setdefault(package_id, set())
+        enabled.update(
+            feature for feature in feature_text.split(",") if feature
+        )
+
+    if not selected:
+        raise RuntimeError("cargo tree returned no runtime packages")
+    return RuntimeInventory(
+        packages=selected,
+        features={
+            package_id: frozenset(enabled)
+            for package_id, enabled in features.items()
+        },
+    )
+
+
+def runtime_inventory(
+    root: Path, report: Report, metadata: dict
+) -> RuntimeInventory:
+    inventory = runtime_inventory_from_tree(
+        metadata, cargo_tree_output(root, report)
+    )
+    roots = [
+        package
+        for package in inventory.packages.values()
+        if package["name"] == report.package
+    ]
+    if len(roots) != 1:
+        raise RuntimeError(
+            f"expected runtime root {report.package}, found {len(roots)}"
+        )
+    return inventory
+
+
+def package_url(package: dict) -> str:
+    repository = package.get("repository") or package.get("homepage")
+    if repository:
+        return str(repository)
+    if package.get("source") is not None:
+        return f"https://crates.io/crates/{package['name']}"
+    return ""
+
+
+def stable_package_key(package: dict) -> str:
+    return f"{package['name']}@{package['version']}"
+
+
+def package_used_by(package: dict) -> UsedBy:
+    return UsedBy(
+        label=f"{package['name']} {package['version']}",
+        url=package_url(package),
+        package_key=stable_package_key(package),
+    )
+
+
+def validate_package_identity(actual: dict, expected: dict) -> None:
+    for field in ("id", "name", "version", "source"):
+        if actual.get(field) != expected.get(field):
+            raise RuntimeError(
+                "cargo-about package identity does not match cargo metadata: "
+                f"{field}={actual.get(field)!r}, expected {expected.get(field)!r}"
+            )
+
+
+def filtered_cargo_licenses(
+    about_data: dict, inventory: RuntimeInventory
+) -> tuple[LicenseRecord, ...]:
+    crates = about_data.get("crates")
+    licenses = about_data.get("licenses")
+    if not isinstance(crates, list) or not isinstance(licenses, list):
+        raise RuntimeError("cargo-about JSON is missing crates or licenses")
+
+    about_packages: dict[str, dict] = {}
+    for item in crates:
+        package = item.get("package") if isinstance(item, dict) else None
+        if not isinstance(package, dict) or not isinstance(package.get("id"), str):
+            raise RuntimeError("cargo-about JSON contains an invalid crate")
+        package_id = package["id"]
+        if package_id in about_packages:
+            raise RuntimeError(
+                f"cargo-about JSON contains duplicate package {package_id}"
+            )
+        about_packages[package_id] = package
+
+    missing = sorted(set(inventory.packages) - set(about_packages))
+    if missing:
+        raise RuntimeError(
+            "cargo-about JSON is missing runtime packages: " + ", ".join(missing)
+        )
+    for package_id, package in inventory.packages.items():
+        validate_package_identity(about_packages[package_id], package)
+
+    records = []
+    covered: set[str] = set()
+    for license_item in licenses:
+        if not isinstance(license_item, dict):
+            raise RuntimeError("cargo-about JSON contains an invalid license")
+        usages = license_item.get("used_by")
+        if not isinstance(usages, list):
+            raise RuntimeError(
+                "cargo-about JSON contains a license without used_by"
+            )
+        filtered = []
+        for usage in usages:
+            package = usage.get("crate") if isinstance(usage, dict) else None
+            if not isinstance(package, dict) or not isinstance(
+                package.get("id"), str
+            ):
+                raise RuntimeError(
+                    "cargo-about JSON contains an invalid license package"
+                )
+            package_id = package["id"]
+            if package_id not in inventory.packages:
+                continue
+            validate_package_identity(package, inventory.packages[package_id])
+            filtered.append(package_used_by(package))
+            covered.add(package_id)
+
+        if not filtered:
+            continue
+        for field in ("name", "id", "text"):
+            if not isinstance(license_item.get(field), str):
+                raise RuntimeError(
+                    f"cargo-about license is missing string field {field}"
+                )
+        records.append(
+            LicenseRecord(
+                name=license_item["name"],
+                spdx_id=license_item["id"],
+                text=license_item["text"],
+                used_by=tuple(
+                    sorted(
+                        filtered,
+                        key=lambda item: (
+                            item.label,
+                            item.package_key or "",
+                        ),
+                    )
+                ),
+            )
+        )
+
+    uncovered = sorted(set(inventory.packages) - covered)
+    if uncovered:
+        raise RuntimeError(
+            "cargo-about licenses are missing runtime packages: "
+            + ", ".join(uncovered)
+        )
+    return tuple(records)
+
+
+def runtime_package_by_name(
+    inventory: RuntimeInventory, crate_name: str
+) -> dict:
     matches = [
         package
-        for package in metadata["packages"]
-        if package["id"] in resolved and package["name"] == crate_name
+        for package in inventory.packages.values()
+        if package["name"] == crate_name
     ]
     if len(matches) != 1:
-        versions = [package["version"] for package in matches]
+        versions = sorted(
+            f"{package['version']} ({package['id']})" for package in matches
+        )
         raise RuntimeError(
-            f"expected exactly one resolved {crate_name} package, found {versions}"
+            f"expected exactly one runtime {crate_name} package, found {versions}"
         )
     return matches[0]
 
 
 def verify_component_features(
-    metadata: dict, package: dict, component: BundledComponent
+    inventory: RuntimeInventory, package: dict, component: BundledComponent
 ) -> None:
-    node = next(
-        (node for node in metadata["resolve"]["nodes"] if node["id"] == package["id"]),
-        None,
-    )
-    if node is None:
-        raise RuntimeError(f"resolved node is missing for {component.crate}")
-    enabled = set(node.get("features", []))
+    enabled = inventory.features.get(package["id"])
+    if enabled is None:
+        raise RuntimeError(
+            f"target-specific cargo tree features are missing for {component.crate}"
+        )
     forbidden = sorted(enabled.intersection(component.forbidden_features))
     if forbidden:
         raise RuntimeError(
@@ -192,27 +473,173 @@ def verify_component_features(
         )
 
 
-def package_marker(package: dict) -> str:
-    return f">{package['name']} {package['version']}</a>"
+def bundled_component_licenses(
+    inventory: RuntimeInventory,
+) -> tuple[LicenseRecord, ...]:
+    records = []
+    for component in BUNDLED_COMPONENTS:
+        package = runtime_package_by_name(inventory, component.crate)
+        verify_component_features(inventory, package, component)
+        crate_root = Path(package["manifest_path"]).parent
+        license_file = crate_root / component.license_path
+        if not license_file.is_file():
+            raise RuntimeError(f"bundled license file is missing: {license_file}")
+        records.append(
+            LicenseRecord(
+                name=component.license_name,
+                spdx_id=component.spdx_id,
+                text=license_file.read_text(encoding="utf-8"),
+                used_by=(
+                    UsedBy(
+                        label=(
+                            f"{component.component}, bundled by "
+                            f"{component.crate} {package['version']}"
+                        ),
+                        url=component.component_url,
+                    ),
+                ),
+            )
+        )
+    return tuple(records)
 
 
-def included_third_party_packages(base_report: str, metadata: dict) -> list[dict]:
-    return sorted(
+def field_values(record: tuple[str, ...], field: str) -> list[str]:
+    values = []
+    for index, token in enumerate(record):
+        if token != field:
+            continue
+        if index + 1 >= len(record):
+            raise RuntimeError(
+                f"COPYRIGHT-library.html has no value after {field}"
+            )
+        values.append(record[index + 1])
+    return values
+
+
+def copyright_record(
+    tokens: list[str], file_or_directory: str
+) -> tuple[str, ...]:
+    starts = [
+        index
+        for index, token in enumerate(tokens[:-1])
+        if token == "File/Directory:" and tokens[index + 1] == file_or_directory
+    ]
+    if len(starts) != 1:
+        raise RuntimeError(
+            "COPYRIGHT-library.html must contain exactly one mapping for "
+            f"{file_or_directory}, found {len(starts)}"
+        )
+    start = starts[0]
+    end = next(
         (
-            package
-            for package in metadata["packages"]
-            if package.get("source") is not None
-            and package_marker(package) in base_report
+            index
+            for index in range(start + 2, len(tokens))
+            if tokens[index] == "File/Directory:"
         ),
-        key=lambda package: (package["name"], package["version"]),
+        len(tokens),
+    )
+    return tuple(tokens[start:end])
+
+
+def rust_unicode_attribution(root: Path) -> RustUnicodeAttribution:
+    toolchain_data = tomllib.loads(
+        (root / "rust-toolchain.toml").read_text(encoding="utf-8")
+    )
+    try:
+        pinned_version = str(toolchain_data["toolchain"]["channel"])
+    except (KeyError, TypeError) as error:
+        raise RuntimeError(
+            "rust-toolchain.toml is missing toolchain.channel"
+        ) from error
+
+    version_output = subprocess.check_output(
+        ["rustc", "--version", "--verbose"], cwd=root, text=True
+    )
+    releases = [
+        line.partition(":")[2].strip()
+        for line in version_output.splitlines()
+        if line.startswith("release:")
+    ]
+    if releases != [pinned_version]:
+        raise RuntimeError(
+            f"rustc version does not match rust-toolchain.toml: "
+            f"pinned {pinned_version}, found {releases}"
+        )
+
+    sysroot = Path(
+        subprocess.check_output(
+            ["rustc", "--print", "sysroot"], cwd=root, text=True
+        ).strip()
+    )
+    copyright_path = sysroot / "share/doc/rust/COPYRIGHT-library.html"
+    license_path = sysroot / "share/doc/rust/licenses/Unicode-3.0.txt"
+    if not copyright_path.is_file():
+        raise RuntimeError(
+            f"pinned rustc COPYRIGHT-library.html is missing: {copyright_path}"
+        )
+    if not license_path.is_file():
+        raise RuntimeError(
+            f"pinned rustc Unicode-3.0 license is missing: {license_path}"
+        )
+
+    parser = CopyrightLibraryParser()
+    parser.feed(copyright_path.read_text(encoding="utf-8"))
+    unicode_path = "library/core/src/unicode/unicode_data.rs"
+    record = copyright_record(parser.tokens, unicode_path)
+    if field_values(record, "License:") != ["Unicode-3.0"]:
+        raise RuntimeError(
+            f"COPYRIGHT-library.html does not map {unicode_path} to Unicode-3.0"
+        )
+    copyrights = field_values(record, "Copyright:")
+    if not copyrights:
+        raise RuntimeError(
+            f"COPYRIGHT-library.html has no copyright for {unicode_path}"
+        )
+
+    license_text = license_path.read_text(encoding="utf-8")
+    missing_copyrights = [
+        copyright for copyright in copyrights if copyright not in license_text
+    ]
+    if missing_copyrights:
+        raise RuntimeError(
+            "pinned Unicode-3.0 license does not contain COPYRIGHT-library "
+            "attribution: "
+            + ", ".join(missing_copyrights)
+        )
+    return RustUnicodeAttribution(
+        version=pinned_version, license_text=license_text
+    )
+
+
+def rust_unicode_license(
+    attribution: RustUnicodeAttribution,
+) -> LicenseRecord:
+    return LicenseRecord(
+        name="Unicode License v3",
+        spdx_id="Unicode-3.0",
+        text=attribution.license_text,
+        used_by=(
+            UsedBy(
+                label=(
+                    f"Rust standard library {attribution.version} "
+                    "core Unicode data"
+                ),
+                url="https://github.com/rust-lang/rust",
+            ),
+        ),
     )
 
 
 def third_party_notices(
-    base_report: str, metadata: dict
+    inventory: RuntimeInventory,
 ) -> tuple[ThirdPartyNotice, ...]:
-    grouped: dict[str, list[tuple[str, str, str]]] = {}
-    for package in included_third_party_packages(base_report, metadata):
+    grouped: dict[str, list[tuple[str, str, str, str]]] = {}
+    for package in sorted(
+        inventory.packages.values(),
+        key=lambda item: (item["name"], item["version"], item["id"]),
+    ):
+        if package.get("source") is None:
+            continue
         crate_root = Path(package["manifest_path"]).parent
         notice_paths = sorted(
             {
@@ -222,13 +649,16 @@ def third_party_notices(
                 if path.is_file()
             }
         )
-        repository = package.get("repository") or (
-            f"https://crates.io/crates/{package['name']}"
-        )
+        repository = package_url(package)
         for notice_path in notice_paths:
             notice_text = notice_path.read_text(encoding="utf-8").rstrip() + "\n"
             grouped.setdefault(notice_text, []).append(
-                (package["name"], package["version"], repository)
+                (
+                    package["name"],
+                    package["version"],
+                    repository,
+                    stable_package_key(package),
+                )
             )
 
     return tuple(
@@ -244,143 +674,191 @@ def third_party_notices(
     )
 
 
-def bundled_component_html(base_report: str, metadata: dict) -> str:
-    items = []
-    for component in BUNDLED_COMPONENTS:
-        package = package_by_name(metadata, component.crate)
-        verify_component_features(metadata, package, component)
-        marker = f">{component.crate} {package['version']}</a>"
-        if marker not in base_report:
-            raise RuntimeError(
-                f"cargo-about report omitted resolved crate {component.crate} "
-                f"{package['version']}"
+def license_overview(
+    licenses: tuple[LicenseRecord, ...],
+) -> tuple[tuple[str, str, int, str], ...]:
+    grouped: dict[str, tuple[str, int, str]] = {}
+    anchors: dict[str, int] = {}
+    for license_record in licenses:
+        count = anchors.get(license_record.spdx_id, 0) + 1
+        anchors[license_record.spdx_id] = count
+        anchor = license_record.spdx_id
+        if count > 1:
+            anchor = f"{anchor}-{count}"
+
+        existing = grouped.get(license_record.spdx_id)
+        used_by_count = len(license_record.used_by)
+        if existing is None:
+            grouped[license_record.spdx_id] = (
+                license_record.name,
+                used_by_count,
+                anchor,
             )
-
-        crate_root = Path(package["manifest_path"]).parent
-        license_file = crate_root / component.license_path
-        if not license_file.is_file():
-            raise RuntimeError(f"bundled license file is missing: {license_file}")
-        license_text = license_file.read_text(encoding="utf-8")
-        repository = package.get("repository") or (
-            f"https://crates.io/crates/{component.crate}"
-        )
-
-        items.append(
-            "\n".join(
-                [
-                    '            <li class="license bundled-subcomponent">',
-                    f'                <h3 id="{html.escape(component.anchor)}">'
-                    f"{html.escape(component.license_name)}</h3>",
-                    "                <h4>Bundled component:</h4>",
-                    '                <ul class="license-used-by">',
-                    "                    <li>",
-                    f'                        <a href="{html.escape(component.component_url, quote=True)}">'
-                    f"{html.escape(component.component)}</a>, bundled by",
-                    f'                        <a href="{html.escape(repository, quote=True)}">'
-                    f"{html.escape(component.crate)} {html.escape(package['version'])}</a>",
-                    "                    </li>",
-                    "                </ul>",
-                    f'                <pre class="license-text">{html.escape(license_text)}</pre>',
-                    "            </li>",
-                ]
+        else:
+            name, previous_count, first_anchor = existing
+            if name != license_record.name:
+                raise RuntimeError(
+                    f"license {license_record.spdx_id} has inconsistent names "
+                    f"{name!r} and {license_record.name!r}"
+                )
+            grouped[license_record.spdx_id] = (
+                name,
+                previous_count + used_by_count,
+                first_anchor,
             )
-        )
-
-    return "\n".join(
-        [
-            "",
-            "        <h2>Licenses for source components bundled inside crates:</h2>",
-            "        <p>",
-            "            The following components are compiled into the native library but",
-            "            have licenses in nested crate source directories, so they require",
-            "            explicit entries in addition to the crate-level licenses above.",
-            "        </p>",
-            '        <ul class="licenses-list bundled-subcomponents">',
-            *items,
-            "        </ul>",
-        ]
+    return tuple(
+        (spdx_id, name, count, anchor)
+        for spdx_id, (name, count, anchor) in grouped.items()
     )
 
 
-def third_party_notices_html(notices: tuple[ThirdPartyNotice, ...]) -> str:
+def render_overview(licenses: tuple[LicenseRecord, ...]) -> str:
+    lines = []
+    for _, name, count, anchor in license_overview(licenses):
+        lines.append(
+            "            <li>"
+            f'<a href="#{html.escape(anchor, quote=True)}">'
+            f"{html.escape(name)}</a> ({count})</li>"
+        )
+    return "\n".join(lines)
+
+
+def render_licenses(licenses: tuple[LicenseRecord, ...]) -> str:
+    lines = []
+    anchor_counts: dict[str, int] = {}
+    for license_record in licenses:
+        count = anchor_counts.get(license_record.spdx_id, 0) + 1
+        anchor_counts[license_record.spdx_id] = count
+        anchor = license_record.spdx_id
+        if count > 1:
+            anchor = f"{anchor}-{count}"
+
+        used_by_lines = []
+        for usage in license_record.used_by:
+            attribute = ""
+            if usage.package_key is not None:
+                attribute = (
+                    ' data-package="'
+                    + html.escape(usage.package_key, quote=True)
+                    + '"'
+                )
+            escaped_label = html.escape(usage.label)
+            if usage.url:
+                rendered_usage = (
+                    f'<a href="{html.escape(usage.url, quote=True)}">'
+                    f"{escaped_label}</a>"
+                )
+            else:
+                rendered_usage = escaped_label
+            used_by_lines.append(
+                f"                    <li{attribute}>{rendered_usage}</li>"
+            )
+
+        lines.extend(
+            [
+                '            <li class="license">',
+                f'                <h3 id="{html.escape(anchor, quote=True)}">'
+                f"{html.escape(license_record.name)}</h3>",
+                "                <h4>Used by:</h4>",
+                '                <ul class="license-used-by">',
+                *used_by_lines,
+                "                </ul>",
+                '                <pre class="license-text">'
+                f"{html.escape(license_record.text)}</pre>",
+                "            </li>",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def render_third_party_notices(
+    notices: tuple[ThirdPartyNotice, ...],
+) -> str:
     if not notices:
         return ""
 
-    items = []
+    lines = [
+        "        <h2>Required third-party notices and attributions:</h2>",
+        '        <ul class="licenses-list third-party-notices">',
+    ]
     for index, notice in enumerate(notices, start=1):
-        used_by = []
-        for name, version, repository in notice.packages:
-            used_by.extend(
-                [
-                    "                    <li>",
-                    f'                        <a href="{html.escape(repository, quote=True)}">'
-                    f"{html.escape(name)} {html.escape(version)}</a>",
-                    "                    </li>",
-                ]
-            )
-        items.append(
-            "\n".join(
-                [
-                    '            <li class="license third-party-notice">',
-                    f'                <h3 id="third-party-notice-{index}">'
-                    "Required notice or attribution</h3>",
-                    "                <h4>Provided by:</h4>",
-                    '                <ul class="license-used-by">',
-                    *used_by,
-                    "                </ul>",
-                    f'                <pre class="license-text">{html.escape(notice.text)}</pre>',
-                    "            </li>",
-                ]
-            )
+        lines.extend(
+            [
+                '            <li class="license third-party-notice">',
+                f'                <h3 id="third-party-notice-{index}">'
+                "Required notice or attribution</h3>",
+                "                <h4>Provided by:</h4>",
+                '                <ul class="license-used-by">',
+            ]
         )
+        for name, version, repository, package_key in notice.packages:
+            label = html.escape(f"{name} {version}")
+            if repository:
+                rendered = (
+                    f'<a href="{html.escape(repository, quote=True)}">'
+                    f"{label}</a>"
+                )
+            else:
+                rendered = label
+            lines.append(
+                "                    "
+                f'<li data-package="{html.escape(package_key, quote=True)}">'
+                f"{rendered}</li>"
+            )
+        lines.extend(
+            [
+                "                </ul>",
+                '                <pre class="license-text">'
+                f"{html.escape(notice.text)}</pre>",
+                "            </li>",
+            ]
+        )
+    lines.append("        </ul>")
+    return "\n".join(lines)
 
-    return "\n".join(
-        [
-            "",
-            "        <h2>Required third-party notices and attributions:</h2>",
-            '        <ul class="licenses-list third-party-notices">',
-            *items,
-            "        </ul>",
-        ]
-    )
+
+def render_template(template: str, replacements: dict[str, str]) -> str:
+    result = template
+    for placeholder, value in replacements.items():
+        if result.count(placeholder) != 1:
+            raise RuntimeError(
+                f"HTML template must contain {placeholder} exactly once"
+            )
+        result = result.replace(placeholder, value)
+    remaining = [
+        placeholder
+        for placeholder in (
+            "@@TARGET@@",
+            "@@ROOT_CRATE@@",
+            "@@OVERVIEW@@",
+            "@@LICENSES@@",
+            "@@THIRD_PARTY_NOTICES@@",
+        )
+        if placeholder in result
+    ]
+    if remaining:
+        raise RuntimeError(
+            "HTML template has unreplaced placeholders: " + ", ".join(remaining)
+        )
+    return "\n".join(line.rstrip() for line in result.rstrip().splitlines()) + "\n"
 
 
 def complete_report(
-    base_report: str,
+    template: str,
     report: Report,
-    metadata: dict,
+    licenses: tuple[LicenseRecord, ...],
     notices: tuple[ThirdPartyNotice, ...],
 ) -> str:
-    description = (
-        "\n        <p><strong>Rust target:</strong> "
-        f"<code>{html.escape(report.target)}</code></p>"
-        "\n        <p><strong>Root crate:</strong> "
-        f"<code>{html.escape(Path(report.manifest).parent.name)}</code></p>"
+    return render_template(
+        template,
+        {
+            "@@TARGET@@": html.escape(report.target),
+            "@@ROOT_CRATE@@": html.escape(report.package),
+            "@@OVERVIEW@@": render_overview(licenses),
+            "@@LICENSES@@": render_licenses(licenses),
+            "@@THIRD_PARTY_NOTICES@@": render_third_party_notices(notices),
+        },
     )
-    first_paragraph_end = base_report.find("</p>")
-    if first_paragraph_end == -1:
-        raise RuntimeError("about.hbs output has no introductory paragraph")
-    first_paragraph_end += len("</p>")
-    result = (
-        base_report[:first_paragraph_end]
-        + description
-        + base_report[first_paragraph_end:]
-    )
-
-    closing_main = result.rfind("    </main>")
-    if closing_main == -1:
-        raise RuntimeError("about.hbs output has no closing main element")
-    result = (
-        result[:closing_main]
-        + bundled_component_html(base_report, metadata)
-        + third_party_notices_html(notices)
-        + "\n"
-        + result[closing_main:]
-    )
-    # Some upstream license files contain insignificant trailing spaces. Keep
-    # generated reports friendly to git's whitespace checks without changing
-    # any license wording.
-    return "\n".join(line.rstrip() for line in result.rstrip().splitlines()) + "\n"
 
 
 def binary_license(apache_license: str, heading: str, details: list[str]) -> str:
@@ -422,19 +900,27 @@ def binary_notice(
 
 def generated_files(root: Path) -> dict[Path, str]:
     verify_cargo_about(root)
+    template = (root / HTML_TEMPLATE).read_text(encoding="utf-8")
+    unicode_attribution = rust_unicode_attribution(root)
     result = {}
     notices_by_report = {}
     with tempfile.TemporaryDirectory(prefix="paimon-license-reports-") as temp_dir:
         temp_root = Path(temp_dir)
         for index, report in enumerate(report_specs()):
-            base = generate_base_report(
-                root, report, temp_root / f"report-{index}.html"
-            )
             metadata = cargo_metadata(root, report)
-            notices = third_party_notices(base, metadata)
+            inventory = runtime_inventory(root, report, metadata)
+            about_data = cargo_about_data(
+                root, report, temp_root / f"report-{index}.json"
+            )
+            licenses = (
+                filtered_cargo_licenses(about_data, inventory)
+                + bundled_component_licenses(inventory)
+                + (rust_unicode_license(unicode_attribution),)
+            )
+            notices = third_party_notices(inventory)
             notices_by_report[(report.manifest, report.target)] = notices
             result[root / report.output] = complete_report(
-                base, report, metadata, notices
+                template, report, licenses, notices
             )
 
     apache_license = (root / "LICENSE").read_text(encoding="utf-8")
@@ -555,7 +1041,12 @@ def main() -> int:
     root = repository_root()
     try:
         files = generated_files(root)
-    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+    except (
+        OSError,
+        RuntimeError,
+        subprocess.CalledProcessError,
+        tomllib.TOMLDecodeError,
+    ) as error:
         print(f"failed to generate license reports: {error}", file=sys.stderr)
         return 1
 

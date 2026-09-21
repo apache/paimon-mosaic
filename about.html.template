@@ -1,4 +1,4 @@
-{{!
+<!--
   Licensed to the Apache Software Foundation (ASF) under one
   or more contributor license agreements.  See the NOTICE file
   distributed with this work for additional information
@@ -15,7 +15,7 @@
   KIND, either express or implied.  See the License for the
   specific language governing permissions and limitations
   under the License.
-}}
+-->
 <!doctype html>
 <html lang="en">
 
@@ -52,35 +52,26 @@
 
 <body>
     <main class="container">
-        <h1>Bundled Rust Components and Licenses</h1>
+        <h1>Bundled Runtime Components and Licenses</h1>
         <p>
-            This document lists the Rust components compiled into this Apache
-            Paimon Mosaic binary distribution, together with their versions,
-            copyright notices, and complete license texts.
+            This document lists the runtime components compiled into this
+            Apache Paimon Mosaic binary distribution, together with their
+            versions, copyright notices, and complete license texts.
         </p>
+        <p><strong>Rust target:</strong> <code>@@TARGET@@</code></p>
+        <p><strong>Root crate:</strong> <code>@@ROOT_CRATE@@</code></p>
 
         <h2>Overview of licenses:</h2>
         <ul class="licenses-overview">
-            {{#each overview}}
-            <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
-            {{/each}}
+@@OVERVIEW@@
         </ul>
 
-        <h2>Rust crate license texts:</h2>
+        <h2>Runtime component license texts:</h2>
         <ul class="licenses-list">
-            {{#each licenses}}
-            <li class="license">
-                <h3 id="{{id}}">{{name}}</h3>
-                <h4>Used by:</h4>
-                <ul class="license-used-by">
-                    {{#each used_by}}
-                    <li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
-                    {{/each}}
-                </ul>
-                <pre class="license-text">{{text}}</pre>
-            </li>
-            {{/each}}
+@@LICENSES@@
         </ul>
+
+@@THIRD_PARTY_NOTICES@@
     </main>
 </body>
 

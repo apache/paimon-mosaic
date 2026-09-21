@@ -1,3 +1,21 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
 <!doctype html>
 <html lang="en">
 
@@ -34,32 +52,33 @@
 
 <body>
     <main class="container">
-        <h1>Bundled Rust Components and Licenses</h1>
+        <h1>Bundled Runtime Components and Licenses</h1>
         <p>
-            This document lists the Rust components compiled into this Apache
-            Paimon Mosaic binary distribution, together with their versions,
-            copyright notices, and complete license texts.
+            This document lists the runtime components compiled into this
+            Apache Paimon Mosaic binary distribution, together with their
+            versions, copyright notices, and complete license texts.
         </p>
         <p><strong>Rust target:</strong> <code>aarch64-unknown-linux-gnu</code></p>
-        <p><strong>Root crate:</strong> <code>ffi</code></p>
+        <p><strong>Root crate:</strong> <code>paimon-mosaic-ffi</code></p>
 
         <h2>Overview of licenses:</h2>
         <ul class="licenses-overview">
-            <li><a href="#Apache-2.0">Apache License 2.0</a> (28)</li>
+            <li><a href="#Apache-2.0">Apache License 2.0</a> (23)</li>
             <li><a href="#MIT">MIT License</a> (4)</li>
+            <li><a href="#BSD-3-Clause">BSD 3-Clause License</a> (1)</li>
             <li><a href="#Unicode-3.0">Unicode License v3</a> (1)</li>
         </ul>
 
-        <h2>Rust crate license texts:</h2>
+        <h2>Runtime component license texts:</h2>
         <ul class="licenses-list">
             <li class="license">
                 <h3 id="Apache-2.0">Apache License 2.0</h3>
                 <h4>Used by:</h4>
                 <ul class="license-used-by">
-                    <li><a href="https://github.com/apache/arrow-rs">arrow-array 58.4.0</a></li>
-                    <li><a href="https://github.com/apache/arrow-rs">arrow-buffer 58.4.0</a></li>
-                    <li><a href="https://github.com/apache/arrow-rs">arrow-data 58.4.0</a></li>
-                    <li><a href="https://github.com/apache/arrow-rs">arrow-schema 58.4.0</a></li>
+                    <li data-package="arrow-array@58.4.0"><a href="https://github.com/apache/arrow-rs">arrow-array 58.4.0</a></li>
+                    <li data-package="arrow-buffer@58.4.0"><a href="https://github.com/apache/arrow-rs">arrow-buffer 58.4.0</a></li>
+                    <li data-package="arrow-data@58.4.0"><a href="https://github.com/apache/arrow-rs">arrow-data 58.4.0</a></li>
+                    <li data-package="arrow-schema@58.4.0"><a href="https://github.com/apache/arrow-rs">arrow-schema 58.4.0</a></li>
                 </ul>
                 <pre class="license-text">
                                  Apache License
@@ -266,11 +285,10 @@
 </pre>
             </li>
             <li class="license">
-                <h3 id="Apache-2.0">Apache License 2.0</h3>
+                <h3 id="Apache-2.0-2">Apache License 2.0</h3>
                 <h4>Used by:</h4>
                 <ul class="license-used-by">
-                    <li><a href="https://github.com/google/zerocopy">zerocopy-derive 0.8.56</a></li>
-                    <li><a href="https://github.com/google/zerocopy">zerocopy 0.8.56</a></li>
+                    <li data-package="zerocopy@0.8.56"><a href="https://github.com/google/zerocopy">zerocopy 0.8.56</a></li>
                 </ul>
                 <pre class="license-text">                                 Apache License
                            Version 2.0, January 2004
@@ -477,10 +495,10 @@
 </pre>
             </li>
             <li class="license">
-                <h3 id="Apache-2.0">Apache License 2.0</h3>
+                <h3 id="Apache-2.0-3">Apache License 2.0</h3>
                 <h4>Used by:</h4>
                 <ul class="license-used-by">
-                    <li><a href="https://crates.io/crates/paimon-mosaic-core">paimon-mosaic-core 0.3.0</a></li>
+                    <li data-package="paimon-mosaic-core@0.3.0">paimon-mosaic-core 0.3.0</li>
                 </ul>
                 <pre class="license-text">                                 Apache License
                            Version 2.0, January 2004
@@ -686,10 +704,10 @@
 </pre>
             </li>
             <li class="license">
-                <h3 id="Apache-2.0">Apache License 2.0</h3>
+                <h3 id="Apache-2.0-4">Apache License 2.0</h3>
                 <h4>Used by:</h4>
                 <ul class="license-used-by">
-                    <li><a href="https://github.com/strawlab/iana-time-zone">iana-time-zone 0.1.65</a></li>
+                    <li data-package="iana-time-zone@0.1.65"><a href="https://github.com/strawlab/iana-time-zone">iana-time-zone 0.1.65</a></li>
                 </ul>
                 <pre class="license-text">                              Apache License
                         Version 2.0, January 2004
@@ -895,18 +913,18 @@ limitations under the License.
 </pre>
             </li>
             <li class="license">
-                <h3 id="Apache-2.0">Apache License 2.0</h3>
+                <h3 id="Apache-2.0-5">Apache License 2.0</h3>
                 <h4>Used by:</h4>
                 <ul class="license-used-by">
-                    <li><a href="https://github.com/tkaitchuck/ahash">ahash 0.8.12</a></li>
-                    <li><a href="https://github.com/bitflags/bitflags">bitflags 2.13.1</a></li>
-                    <li><a href="https://github.com/rust-lang/cfg-if">cfg-if 1.0.4</a></li>
-                    <li><a href="https://github.com/rust-lang/hashbrown">hashbrown 0.17.1</a></li>
-                    <li><a href="https://github.com/rust-num/num-bigint">num-bigint 0.4.8</a></li>
-                    <li><a href="https://github.com/rust-num/num-complex">num-complex 0.4.6</a></li>
-                    <li><a href="https://github.com/rust-num/num-integer">num-integer 0.1.47</a></li>
-                    <li><a href="https://github.com/rust-num/num-traits">num-traits 0.2.19</a></li>
-                    <li><a href="https://github.com/matklad/once_cell">once_cell 1.21.4</a></li>
+                    <li data-package="ahash@0.8.12"><a href="https://github.com/tkaitchuck/ahash">ahash 0.8.12</a></li>
+                    <li data-package="bitflags@2.13.1"><a href="https://github.com/bitflags/bitflags">bitflags 2.13.1</a></li>
+                    <li data-package="cfg-if@1.0.4"><a href="https://github.com/rust-lang/cfg-if">cfg-if 1.0.4</a></li>
+                    <li data-package="hashbrown@0.17.1"><a href="https://github.com/rust-lang/hashbrown">hashbrown 0.17.1</a></li>
+                    <li data-package="num-bigint@0.4.8"><a href="https://github.com/rust-num/num-bigint">num-bigint 0.4.8</a></li>
+                    <li data-package="num-complex@0.4.6"><a href="https://github.com/rust-num/num-complex">num-complex 0.4.6</a></li>
+                    <li data-package="num-integer@0.1.47"><a href="https://github.com/rust-num/num-integer">num-integer 0.1.47</a></li>
+                    <li data-package="num-traits@0.2.19"><a href="https://github.com/rust-num/num-traits">num-traits 0.2.19</a></li>
+                    <li data-package="once_cell@1.21.4"><a href="https://github.com/matklad/once_cell">once_cell 1.21.4</a></li>
                 </ul>
                 <pre class="license-text">                              Apache License
                         Version 2.0, January 2004
@@ -1112,10 +1130,10 @@ limitations under the License.
 </pre>
             </li>
             <li class="license">
-                <h3 id="Apache-2.0">Apache License 2.0</h3>
+                <h3 id="Apache-2.0-6">Apache License 2.0</h3>
                 <h4>Used by:</h4>
                 <ul class="license-used-by">
-                    <li><a href="https://github.com/rust-random/getrandom">getrandom 0.3.4</a></li>
+                    <li data-package="getrandom@0.3.4"><a href="https://github.com/rust-random/getrandom">getrandom 0.3.4</a></li>
                 </ul>
                 <pre class="license-text">                              Apache License
                         Version 2.0, January 2004
@@ -1321,18 +1339,14 @@ limitations under the License.
 </pre>
             </li>
             <li class="license">
-                <h3 id="Apache-2.0">Apache License 2.0</h3>
+                <h3 id="Apache-2.0-7">Apache License 2.0</h3>
                 <h4>Used by:</h4>
                 <ul class="license-used-by">
-                    <li><a href="https://crates.io/crates/paimon-mosaic-ffi">paimon-mosaic-ffi 0.3.0</a></li>
-                    <li><a href="https://github.com/VoidStarKat/half-rs">half 2.7.1</a></li>
-                    <li><a href="https://github.com/rust-lang/libc">libc 0.2.189</a></li>
-                    <li><a href="https://github.com/dtolnay/proc-macro2">proc-macro2 1.0.107</a></li>
-                    <li><a href="https://github.com/dtolnay/quote">quote 1.0.47</a></li>
-                    <li><a href="https://github.com/dtolnay/syn">syn 2.0.119</a></li>
-                    <li><a href="https://github.com/dtolnay/unicode-ident">unicode-ident 1.0.24</a></li>
-                    <li><a href="https://github.com/gyscos/zstd-rs">zstd-safe 7.2.4</a></li>
-                    <li><a href="https://github.com/gyscos/zstd-rs">zstd-sys 2.0.16+zstd.1.5.7</a></li>
+                    <li data-package="half@2.7.1"><a href="https://github.com/VoidStarKat/half-rs">half 2.7.1</a></li>
+                    <li data-package="libc@0.2.189"><a href="https://github.com/rust-lang/libc">libc 0.2.189</a></li>
+                    <li data-package="paimon-mosaic-ffi@0.3.0">paimon-mosaic-ffi 0.3.0</li>
+                    <li data-package="zstd-safe@7.2.4"><a href="https://github.com/gyscos/zstd-rs">zstd-safe 7.2.4</a></li>
+                    <li data-package="zstd-sys@2.0.16+zstd.1.5.7"><a href="https://github.com/gyscos/zstd-rs">zstd-sys 2.0.16+zstd.1.5.7</a></li>
                 </ul>
                 <pre class="license-text">Apache License
 Version 2.0, January 2004
@@ -1410,10 +1424,10 @@ limitations under the License.
 </pre>
             </li>
             <li class="license">
-                <h3 id="Apache-2.0">Apache License 2.0</h3>
+                <h3 id="Apache-2.0-8">Apache License 2.0</h3>
                 <h4>Used by:</h4>
                 <ul class="license-used-by">
-                    <li><a href="https://github.com/chronotope/chrono">chrono 0.4.45</a></li>
+                    <li data-package="chrono@0.4.45"><a href="https://github.com/chronotope/chrono">chrono 0.4.45</a></li>
                 </ul>
                 <pre class="license-text">Rust-chrono is dual-licensed under The MIT License [1] and
 Apache 2.0 License [2]. Copyright (c) 2014--2026, Kang Seonghoon and
@@ -1661,7 +1675,7 @@ limitations under the License.
                 <h3 id="MIT">MIT License</h3>
                 <h4>Used by:</h4>
                 <ul class="license-used-by">
-                    <li><a href="https://github.com/tokio-rs/bytes">bytes 1.12.1</a></li>
+                    <li data-package="bytes@1.12.1"><a href="https://github.com/tokio-rs/bytes">bytes 1.12.1</a></li>
                 </ul>
                 <pre class="license-text">Copyright (c) 2018 Carl Lerche
 
@@ -1691,10 +1705,10 @@ DEALINGS IN THE SOFTWARE.
 </pre>
             </li>
             <li class="license">
-                <h3 id="MIT">MIT License</h3>
+                <h3 id="MIT-2">MIT License</h3>
                 <h4>Used by:</h4>
                 <ul class="license-used-by">
-                    <li><a href="https://github.com/apache/arrow-rs">arrow-array 58.4.0</a></li>
+                    <li data-package="arrow-array@58.4.0"><a href="https://github.com/apache/arrow-rs">arrow-array 58.4.0</a></li>
                 </ul>
                 <pre class="license-text">MIT License
 
@@ -1720,10 +1734,10 @@ SOFTWARE.
 </pre>
             </li>
             <li class="license">
-                <h3 id="MIT">MIT License</h3>
+                <h3 id="MIT-3">MIT License</h3>
                 <h4>Used by:</h4>
                 <ul class="license-used-by">
-                    <li><a href="https://github.com/rust-lang/compiler-builtins">libm 0.2.16</a></li>
+                    <li data-package="libm@0.2.16"><a href="https://github.com/rust-lang/compiler-builtins">libm 0.2.16</a></li>
                 </ul>
                 <pre class="license-text">MIT License
 
@@ -1746,10 +1760,10 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 </pre>
             </li>
             <li class="license">
-                <h3 id="MIT">MIT License</h3>
+                <h3 id="MIT-4">MIT License</h3>
                 <h4>Used by:</h4>
                 <ul class="license-used-by">
-                    <li><a href="https://github.com/gyscos/zstd-rs">zstd 0.13.3</a></li>
+                    <li data-package="zstd@0.13.3"><a href="https://github.com/gyscos/zstd-rs">zstd 0.13.3</a></li>
                 </ul>
                 <pre class="license-text">The MIT License (MIT)
 Copyright (c) 2016 Alexandre Bury
@@ -1762,16 +1776,54 @@ THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRES
 </pre>
             </li>
             <li class="license">
+                <h3 id="BSD-3-Clause">BSD 3-Clause License</h3>
+                <h4>Used by:</h4>
+                <ul class="license-used-by">
+                    <li><a href="https://github.com/facebook/zstd">vendored Zstandard C sources, bundled by zstd-sys 2.0.16+zstd.1.5.7</a></li>
+                </ul>
+                <pre class="license-text">BSD License
+
+For Zstandard software
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+ * Neither the name Facebook, nor Meta, nor the names of its contributors may
+   be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS &quot;AS IS&quot; AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+</pre>
+            </li>
+            <li class="license">
                 <h3 id="Unicode-3.0">Unicode License v3</h3>
                 <h4>Used by:</h4>
                 <ul class="license-used-by">
-                    <li><a href="https://github.com/dtolnay/unicode-ident">unicode-ident 1.0.24</a></li>
+                    <li><a href="https://github.com/rust-lang/rust">Rust standard library 1.97.1 core Unicode data</a></li>
                 </ul>
                 <pre class="license-text">UNICODE LICENSE V3
 
 COPYRIGHT AND PERMISSION NOTICE
 
-Copyright © 1991-2023 Unicode, Inc.
+Copyright © 1991-2024 Unicode, Inc.
 
 NOTICE TO USER: Carefully read the following legal agreement. BY
 DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
@@ -1810,73 +1862,16 @@ authorization of the copyright holder.
             </li>
         </ul>
 
-        <h2>Licenses for source components bundled inside crates:</h2>
-        <p>
-            The following components are compiled into the native library but
-            have licenses in nested crate source directories, so they require
-            explicit entries in addition to the crate-level licenses above.
-        </p>
-        <ul class="licenses-list bundled-subcomponents">
-            <li class="license bundled-subcomponent">
-                <h3 id="bundled-zstandard-bsd-3-clause">BSD 3-Clause License</h3>
-                <h4>Bundled component:</h4>
-                <ul class="license-used-by">
-                    <li>
-                        <a href="https://github.com/facebook/zstd">vendored Zstandard C sources</a>, bundled by
-                        <a href="https://github.com/gyscos/zstd-rs">zstd-sys 2.0.16+zstd.1.5.7</a>
-                    </li>
-                </ul>
-                <pre class="license-text">BSD License
-
-For Zstandard software
-
-Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
-
-Redistribution and use in source and binary forms, with or without modification,
-are permitted provided that the following conditions are met:
-
- * Redistributions of source code must retain the above copyright notice, this
-   list of conditions and the following disclaimer.
-
- * Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
-
- * Neither the name Facebook, nor Meta, nor the names of its contributors may
-   be used to endorse or promote products derived from this software without
-   specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS &quot;AS IS&quot; AND
-ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
-ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
-ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-</pre>
-            </li>
-        </ul>
         <h2>Required third-party notices and attributions:</h2>
         <ul class="licenses-list third-party-notices">
             <li class="license third-party-notice">
                 <h3 id="third-party-notice-1">Required notice or attribution</h3>
                 <h4>Provided by:</h4>
                 <ul class="license-used-by">
-                    <li>
-                        <a href="https://github.com/apache/arrow-rs">arrow-array 58.4.0</a>
-                    </li>
-                    <li>
-                        <a href="https://github.com/apache/arrow-rs">arrow-buffer 58.4.0</a>
-                    </li>
-                    <li>
-                        <a href="https://github.com/apache/arrow-rs">arrow-data 58.4.0</a>
-                    </li>
-                    <li>
-                        <a href="https://github.com/apache/arrow-rs">arrow-schema 58.4.0</a>
-                    </li>
+                    <li data-package="arrow-array@58.4.0"><a href="https://github.com/apache/arrow-rs">arrow-array 58.4.0</a></li>
+                    <li data-package="arrow-buffer@58.4.0"><a href="https://github.com/apache/arrow-rs">arrow-buffer 58.4.0</a></li>
+                    <li data-package="arrow-data@58.4.0"><a href="https://github.com/apache/arrow-rs">arrow-data 58.4.0</a></li>
+                    <li data-package="arrow-schema@58.4.0"><a href="https://github.com/apache/arrow-rs">arrow-schema 58.4.0</a></li>
                 </ul>
                 <pre class="license-text">Apache Arrow
 Copyright 2016-2026 The Apache Software Foundation
