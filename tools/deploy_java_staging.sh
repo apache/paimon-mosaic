@@ -554,7 +554,7 @@ validate_maven_artifacts() {
 
   for main_jar in "$jar_file" "$ci_jar"
   do
-    python3 "$REPO_DIR/tools/verify_release_artifacts.py" java "$main_jar"
+    python3 -I "$REPO_DIR/tools/verify_release_artifacts.py" java "$main_jar"
   done
 
   local test_classes="$REPO_DIR/java/target/test-classes"

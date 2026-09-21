@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 import pytest
 import yaml
@@ -33,10 +34,12 @@ JAVA_RELEASE_WORKFLOW = ROOT / ".github/workflows/release-java.yml"
 PYTHON_WHEELS_WORKFLOW = ROOT / ".github/workflows/release-python.yml"
 PYTHON_PUBLISH_WORKFLOW = ROOT / ".github/workflows/release-python-publish.yml"
 RELEASE_DOCUMENTATION = ROOT / "docs/creating-a-release.html"
+JAVA_POM = ROOT / "java/pom.xml"
 CREDENTIALED_RELEASE_WORKFLOWS = (
     (RUST_RELEASE_WORKFLOW, "publish"),
     (PYTHON_PUBLISH_WORKFLOW, "publish"),
 )
+CARGO_ABOUT_VERSION = "0.9.1"
 TAG_CONDITION = "startsWith(github.ref, 'refs/tags/')"
 RUST_PUBLISH_CONDITION = (
     "github.event_name != 'workflow_dispatch' && "
@@ -58,7 +61,30 @@ PYTHON_PUBLISH_CONDITION = (
     "github.event_name != 'workflow_dispatch' && "
     "!contains(github.ref_name, '-')"
 )
-REQUIRED_GATE_PATHS = {
+LICENSE_REPORT_GATE_PATHS = {
+    "Cargo.toml",
+    "core/Cargo.toml",
+    "ffi/Cargo.toml",
+    "jni/Cargo.toml",
+    "Cargo.lock",
+    "LICENSE",
+    "NOTICE",
+    "about.hbs",
+    "about.toml",
+    "rust-toolchain.toml",
+    "tools/generate_license_reports.py",
+    "tools/tests/test_generate_license_reports.py",
+    "java/src/main/binary-resources/META-INF/LICENSE",
+    "java/src/main/binary-resources/META-INF/NOTICE",
+    (
+        "java/src/main/binary-resources/META-INF/licenses/*/"
+        "THIRD-PARTY-LICENSES.html"
+    ),
+    "python/licenses/*/LICENSE",
+    "python/licenses/*/NOTICE",
+    "python/licenses/*/THIRD-PARTY-LICENSES.html",
+}
+REQUIRED_GATE_PATHS = LICENSE_REPORT_GATE_PATHS | {
     ".gitattributes",
     ".github/workflows/**",
     "docs/creating-a-release.html",
@@ -75,6 +101,7 @@ REQUIRED_GATE_PATHS = {
     "tools/verify_source_archive.py",
     "tools/tests/test_create_source_release.py",
     "tools/tests/deploy_java_staging_test.sh",
+    "tools/tests/test_generate_license_reports.py",
     "tools/tests/test_python_setup.py",
     "tools/tests/test_release_vote_workflow.py",
     "tools/tests/test_update_branch_version.py",
@@ -82,6 +109,28 @@ REQUIRED_GATE_PATHS = {
     "tools/tests/test_verify_release_versions.py",
     "tools/tests/test_verify_source_archive.py",
 }
+BINARY_LEGAL_RESOURCE_INCLUDES = (
+    "META-INF/LICENSE",
+    "META-INF/NOTICE",
+    (
+        "META-INF/licenses/x86_64-unknown-linux-gnu/"
+        "THIRD-PARTY-LICENSES.html"
+    ),
+    (
+        "META-INF/licenses/aarch64-unknown-linux-gnu/"
+        "THIRD-PARTY-LICENSES.html"
+    ),
+    (
+        "META-INF/licenses/aarch64-apple-darwin/"
+        "THIRD-PARTY-LICENSES.html"
+    ),
+    (
+        "META-INF/licenses/x86_64-pc-windows-msvc/"
+        "THIRD-PARTY-LICENSES.html"
+    ),
+)
+POM_NAMESPACE_URI = "http://maven.apache.org/POM/4.0.0"
+POM_NAMESPACE = {"m": POM_NAMESPACE_URI}
 RELEASE_WORKFLOW_BY_JOB = {
     "rust": "./.github/workflows/release-rust.yml",
     "java": "./.github/workflows/release-java.yml",
@@ -99,6 +148,15 @@ VERIFY_RELEASE_COMMAND = (
     'python3 tools/verify_release_versions.py "${TAG_NAME}" '
     "--verify-signature"
 )
+VERIFY_LICENSE_REPORTS_COMMAND = """set -euo pipefail
+cargo_about_root="${RUNNER_TEMP}/cargo-about"
+cargo install cargo-about \\
+  --version "${CARGO_ABOUT_VERSION}" \\
+  --locked \\
+  --root "${cargo_about_root}"
+export PATH="${cargo_about_root}/bin:${PATH}"
+python3 tools/generate_license_reports.py --check
+"""
 VERIFY_SOURCE_ARCHIVE_COMMAND = """set -euo pipefail
 release_version="${GITHUB_REF_NAME#v}"
 release_version="${release_version%-rc*}"
@@ -118,6 +176,7 @@ python3 tools/verify_source_archive.py verify \\
 """
 GATE_TEST_COMMAND = """python -m pytest -q \\
   tools/tests/test_create_source_release.py \\
+  tools/tests/test_generate_license_reports.py \\
   tools/tests/test_python_setup.py \\
   tools/tests/test_release_vote_workflow.py \\
   tools/tests/test_update_branch_version.py \\
@@ -143,10 +202,12 @@ python3 tools/verify_source_archive.py verify \\
 """
 GATE_STATIC_COMMAND = """set -euo pipefail
 python -m compileall -q \\
+  tools/generate_license_reports.py \\
   tools/verify_release_artifacts.py \\
   tools/verify_release_versions.py \\
   tools/verify_source_archive.py \\
   tools/tests/test_create_source_release.py \\
+  tools/tests/test_generate_license_reports.py \\
   tools/tests/test_python_setup.py \\
   tools/tests/test_release_vote_workflow.py \\
   tools/tests/test_update_branch_version.py \\
@@ -207,6 +268,62 @@ def job_step(workflow: dict, job_name: str, name: str) -> dict:
     return matches[0]
 
 
+def assert_license_report_step(step: dict) -> None:
+    assert "if" not in step
+    assert "continue-on-error" not in step
+    assert step["shell"] == "bash"
+    assert step["env"] == {"CARGO_ABOUT_VERSION": CARGO_ABOUT_VERSION}
+    assert step["run"] == VERIFY_LICENSE_REPORTS_COMMAND
+
+
+def binary_legal_resource(pom: ET.Element) -> ET.Element:
+    release_profiles = [
+        profile
+        for profile in pom.findall("m:profiles/m:profile", POM_NAMESPACE)
+        if profile.findtext("m:id", namespaces=POM_NAMESPACE) == "release"
+    ]
+    assert len(release_profiles) == 1
+    plugins = release_profiles[0].findall(
+        "m:build/m:plugins/m:plugin", POM_NAMESPACE
+    )
+    resources_plugins = [
+        plugin
+        for plugin in plugins
+        if plugin.findtext("m:groupId", namespaces=POM_NAMESPACE)
+        == "org.apache.maven.plugins"
+        and plugin.findtext("m:artifactId", namespaces=POM_NAMESPACE)
+        == "maven-resources-plugin"
+    ]
+    assert len(resources_plugins) == 1
+    executions = [
+        execution
+        for execution in resources_plugins[0].findall(
+            "m:executions/m:execution", POM_NAMESPACE
+        )
+        if execution.findtext("m:id", namespaces=POM_NAMESPACE)
+        == "copy-binary-legal-resources"
+    ]
+    assert len(executions) == 1
+    resources = executions[0].findall(
+        "m:configuration/m:resources/m:resource", POM_NAMESPACE
+    )
+    assert len(resources) == 1
+    return resources[0]
+
+
+def assert_binary_legal_resource_contract(pom: ET.Element) -> None:
+    resource = binary_legal_resource(pom)
+    assert resource.findtext("m:directory", namespaces=POM_NAMESPACE) == (
+        "src/main/binary-resources"
+    )
+    assert resource.findtext("m:filtering", namespaces=POM_NAMESPACE) == "false"
+    includes = tuple(
+        include.text
+        for include in resource.findall("m:includes/m:include", POM_NAMESPACE)
+    )
+    assert includes == BINARY_LEGAL_RESOURCE_INCLUDES
+
+
 def assert_gate_contract(workflow: dict) -> None:
     triggers = workflow["on"]
     assert "workflow_dispatch" in triggers
@@ -220,10 +337,12 @@ def assert_gate_contract(workflow: dict) -> None:
     assert "continue-on-error" not in job
 
     install_step = gate_step(workflow, "Install test dependencies")
+    license_step = gate_step(workflow, "Verify generated license reports")
     test_step = gate_step(workflow, "Run release vote tests")
     staging_step = gate_step(workflow, "Test local Java staging")
     source_tree_step = gate_step(workflow, "Verify current source tree")
     static_step = gate_step(workflow, "Run static checks")
+    assert_license_report_step(license_step)
     for step in (
         install_step,
         test_step,
@@ -295,6 +414,10 @@ def assert_release_preflight_contract(workflow: dict) -> None:
     checkout_options = checkout.get("with", {})
     assert checkout_options.get("fetch-depth") == "0"
     assert "ref" not in checkout_options
+
+    assert_license_report_step(
+        named_step(workflow, "Verify generated license reports")
+    )
 
     import_step = named_step(workflow, "Import release verification keys")
     assert import_step["if"] == TAG_CONDITION
@@ -473,6 +596,32 @@ def test_java_release_packages_and_smokes_unsigned_artifact() -> None:
     )
     assert "MosaicNativeLoaderSmokeTest.java" in smoke_step["run"]
     assert "javac -cp \"$jar_file\"" in smoke_step["run"]
+
+
+def test_java_release_resource_copy_is_an_exact_legal_allowlist() -> None:
+    assert_binary_legal_resource_contract(ET.parse(JAVA_POM).getroot())
+
+
+@pytest.mark.parametrize(
+    "unsafe_include",
+    (None, "**/*.class", "arbitrary.bin", "**/*"),
+)
+def test_java_release_resource_copy_rejects_unsafe_mutations(
+    unsafe_include: str | None,
+) -> None:
+    pom = ET.parse(JAVA_POM).getroot()
+    resource = binary_legal_resource(pom)
+    includes = resource.find("m:includes", POM_NAMESPACE)
+    assert includes is not None
+    if unsafe_include is None:
+        resource.remove(includes)
+    else:
+        ET.SubElement(
+            includes, f"{{{POM_NAMESPACE_URI}}}include"
+        ).text = unsafe_include
+
+    with pytest.raises(AssertionError):
+        assert_binary_legal_resource_contract(pom)
 
 
 def test_python_release_verifies_each_wheel_before_upload_and_publish() -> None:
@@ -801,7 +950,10 @@ def test_release_vote_gate_verifies_current_source_tree() -> None:
 
 
 @pytest.mark.parametrize("event", ("pull_request", "push"))
-@pytest.mark.parametrize("required_path", (".github/workflows/**", ".gitattributes"))
+@pytest.mark.parametrize(
+    "required_path",
+    (".github/workflows/**", ".gitattributes", *sorted(LICENSE_REPORT_GATE_PATHS)),
+)
 def test_gate_contract_rejects_missing_release_input_path(
     event: str,
     required_path: str,
@@ -811,6 +963,47 @@ def test_gate_contract_rejects_missing_release_input_path(
 
     with pytest.raises(AssertionError):
         assert_gate_contract(workflow)
+
+
+@pytest.mark.parametrize(
+    ("workflow_path", "job_name", "contract"),
+    (
+        (
+            RELEASE_PREFLIGHT_WORKFLOW,
+            "release-preflight",
+            assert_release_preflight_contract,
+        ),
+        (GATE_WORKFLOW, "release-vote-gate", assert_gate_contract),
+    ),
+)
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing-check", "wrong-version", "masked-command", "step-continue"),
+)
+def test_contract_rejects_license_report_check_mutations(
+    workflow_path: Path,
+    job_name: str,
+    contract,
+    mutation: str,
+) -> None:
+    workflow = copy.deepcopy(load_workflow(workflow_path))
+    step = job_step(workflow, job_name, "Verify generated license reports")
+    if mutation == "missing-check":
+        step["run"] = step["run"].replace(
+            "python3 tools/generate_license_reports.py --check",
+            "python3 tools/generate_license_reports.py",
+        )
+    elif mutation == "wrong-version":
+        step["env"]["CARGO_ABOUT_VERSION"] = "0.9.2"
+    elif mutation == "masked-command":
+        step["run"] += " || true"
+    elif mutation == "step-continue":
+        step["continue-on-error"] = "true"
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+
+    with pytest.raises(AssertionError):
+        contract(workflow)
 
 
 @pytest.mark.parametrize("event", ("pull_request", "push"))

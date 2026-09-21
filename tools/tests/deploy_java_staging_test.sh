@@ -135,6 +135,9 @@ MOCK
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'python3 %s\n' "$*" >> "$MOCK_LOG"
+if [[ "${1:-}" == "-I" ]]; then
+  shift
+fi
 case "${1:-}" in
   */tools/verify_release_artifacts.py)
     exit "${INVALID_JAR_PAYLOAD:-0}"
@@ -197,8 +200,8 @@ done
 assert_contains "$MOCK_LOG" "mvn clean verify -Prelease -Dgpg.skip=true -DskipTests"
 assert_not_contains "$MOCK_LOG" "mvn deploy"
 [[ $(grep -c '^java ' "$MOCK_LOG") -eq 2 ]] || fail "dry-run must smoke local and CI JARs"
-[[ $(grep -c '^python3 .*verify_release_artifacts.py java ' "$MOCK_LOG") -eq 2 ]] ||
-  fail "dry-run must content-verify local and CI JARs"
+[[ $(grep -c '^python3 -I .*verify_release_artifacts.py java ' "$MOCK_LOG") -eq 2 ]] ||
+  fail "dry-run must content-verify local and CI JARs in isolated mode"
 pass "successful dry-run validates all five artifacts and both JARs"
 
 new_fixture
@@ -232,6 +235,23 @@ if run_stage --dry-run > "$FIXTURE/output" 2>&1; then
 fi
 assert_not_contains "$MOCK_LOG" "mvn "
 pass "wrong run SHA and dirty Java/script inputs fail before Maven"
+
+new_fixture
+cat > "$FIXTURE/tools/zipfile.py" <<'PYMODULE'
+raise SystemExit("shadow zipfile imported")
+PYMODULE
+if python3 "$FIXTURE/tools/verify_release_artifacts.py" --help \
+  > "$FIXTURE/non-isolated-output" 2>&1; then
+  fail "non-isolated verifier should import the adjacent shadow module"
+fi
+assert_contains "$FIXTURE/non-isolated-output" "shadow zipfile imported"
+python3 -I "$FIXTURE/tools/verify_release_artifacts.py" --help \
+  > "$FIXTURE/isolated-output" 2>&1
+assert_contains "$FIXTURE/isolated-output" "usage:"
+run_stage --dry-run > "$FIXTURE/output" 2>&1
+[[ $(grep -c '^python3 -I .*verify_release_artifacts.py java ' "$MOCK_LOG") -eq 2 ]] ||
+  fail "staging must isolate both verifier executions from adjacent modules"
+pass "isolated verifier ignores adjacent Python shadow module"
 
 new_fixture
 OMIT_CI_JAVADOC=1

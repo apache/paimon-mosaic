@@ -132,6 +132,14 @@
                                         <resource>
                                             <directory>src/main/binary-resources</directory>
                                             <filtering>false</filtering>
+                                            <includes>
+                                                <include>META-INF/LICENSE</include>
+                                                <include>META-INF/NOTICE</include>
+                                                <include>META-INF/licenses/x86_64-unknown-linux-gnu/THIRD-PARTY-LICENSES.html</include>
+                                                <include>META-INF/licenses/aarch64-unknown-linux-gnu/THIRD-PARTY-LICENSES.html</include>
+                                                <include>META-INF/licenses/aarch64-apple-darwin/THIRD-PARTY-LICENSES.html</include>
+                                                <include>META-INF/licenses/x86_64-pc-windows-msvc/THIRD-PARTY-LICENSES.html</include>
+                                            </includes>
                                         </resource>
                                     </resources>
                                 </configuration>
