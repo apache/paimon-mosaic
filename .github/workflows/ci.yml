@@ -188,7 +188,7 @@ jobs:
 
       - name: Install Python dependencies
         working-directory: python
-        run: pip install pyarrow pytest
+        run: pip install pyarrow pytest build "setuptools>=77" wheel
 
       - name: Run Python tests
         working-directory: python

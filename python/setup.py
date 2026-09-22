@@ -69,6 +69,9 @@ def _stage_legal_files(destination_dir):
         source = os.path.join(here, LEGAL_SOURCE_FILES[name])
         destination = os.path.join(destination_dir, name)
         if not os.path.isfile(source):
+            # An extracted sdist carries these files alongside setup.py.
+            source = os.path.join(here, name)
+        if not os.path.isfile(source):
             raise RuntimeError(f"required binary legal file is missing: {source}")
         if os.path.exists(destination):
             with open(source, "rb") as source_file:
@@ -77,7 +80,7 @@ def _stage_legal_files(destination_dir):
                 destination_bytes = destination_file.read()
             if source_bytes != destination_bytes:
                 raise RuntimeError(
-                    f"staged binary legal file does not match repository copy: {destination}"
+                    f"staged binary legal file does not match source: {destination}"
                 )
             continue
         shutil.copy2(source, destination)
