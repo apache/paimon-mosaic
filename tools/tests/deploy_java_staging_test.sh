@@ -51,7 +51,12 @@ new_fixture() {
   FIXTURES=$((FIXTURES + 1))
   MOCK_BIN="$FIXTURE/mock-bin"
   MOCK_LOG="$FIXTURE/mock.log"
-  mkdir -p "$FIXTURE/tools" "$FIXTURE/java/src/test/java/org/apache/paimon/mosaic" "$MOCK_BIN"
+  STAGE_TMPDIR="$FIXTURE/tmp"
+  mkdir -p \
+    "$FIXTURE/tools" \
+    "$FIXTURE/java/src/test/java/org/apache/paimon/mosaic" \
+    "$MOCK_BIN" \
+    "$STAGE_TMPDIR"
   cp "$SOURCE_REPO/tools/deploy_java_staging.sh" "$FIXTURE/tools/"
   cp "$SOURCE_REPO/java/src/test/java/org/apache/paimon/mosaic/MosaicNativeLoaderSmokeTest.java" \
     "$FIXTURE/java/src/test/java/org/apache/paimon/mosaic/"
@@ -83,6 +88,9 @@ while [[ $# -gt 0 ]]; do
     *) shift ;;
   esac
 done
+if [[ -n "${FAIL_DOWNLOAD_ARTIFACT:-}" && "$name" == "$FAIL_DOWNLOAD_ARTIFACT" ]]; then
+  exit 41
+fi
 mkdir -p "$dir"
 case "$name" in
   native-linux-x86_64) file=libpaimon_mosaic_jni.so ;;
@@ -181,9 +189,11 @@ PY
 run_stage() {
   env \
     PATH="$MOCK_BIN:$PATH" \
+    TMPDIR="$STAGE_TMPDIR" \
     MOCK_LOG="$MOCK_LOG" \
     MOCK_RUN_SHA="${MOCK_RUN_SHA:-$HEAD_SHA}" \
     MOCK_TAG=v1.2.3-rc1 \
+    FAIL_DOWNLOAD_ARTIFACT="${FAIL_DOWNLOAD_ARTIFACT:-}" \
     OMIT_CI_JAVADOC="${OMIT_CI_JAVADOC:-0}" \
     OMIT_LOCAL_MAIN="${OMIT_LOCAL_MAIN:-0}" \
     "$FIXTURE/tools/deploy_java_staging.sh" \
@@ -192,6 +202,14 @@ run_stage() {
       --run-id 12345 \
       --skip-native-file-check \
       "$@"
+}
+
+assert_stage_cleanup() {
+  [[ ! -e "$FIXTURE/tools/release" ]] ||
+    fail "Java staging must not create tools/release"
+  if compgen -G "$STAGE_TMPDIR/paimon-mosaic-java-staging.*" >/dev/null; then
+    fail "Java staging temporary download directory was not removed"
+  fi
 }
 
 pass() {
@@ -204,21 +222,32 @@ run_stage --dry-run > "$FIXTURE/output" 2>&1
 for artifact in native-linux-x86_64 native-linux-aarch64 native-macos-aarch64 native-windows-x86_64 java-package; do
   assert_contains "$MOCK_LOG" "--name $artifact"
 done
+assert_contains "$MOCK_LOG" "--dir $STAGE_TMPDIR/paimon-mosaic-java-staging."
 assert_contains "$MOCK_LOG" "mvn clean verify -Prelease -Dgpg.skip=true -DskipTests"
 assert_not_contains "$MOCK_LOG" "mvn deploy"
 [[ $(grep -c '^java ' "$MOCK_LOG") -eq 2 ]] || fail "dry-run must smoke local and CI JARs"
-pass "successful dry-run validates all five artifacts and both JARs"
+assert_stage_cleanup
+[[ ! -e "$FIXTURE/java/src/main/resources/native" ]] ||
+  fail "default cleanup must remove staged Java resources"
+pass "successful dry-run validates artifacts and removes staging downloads"
 
 new_fixture
 settings="$FIXTURE/settings.xml"
 printf '<settings/>\n' > "$settings"
-run_stage --maven-settings "$settings" --staging-description "Mosaic RC staging" > "$FIXTURE/output" 2>&1
+run_stage \
+  --maven-settings "$settings" \
+  --staging-description "Mosaic RC staging" \
+  --no-cleanup \
+  > "$FIXTURE/output" 2>&1
 verify_line=$(grep -n '^mvn .*clean verify ' "$MOCK_LOG" | cut -d: -f1)
 deploy_line=$(grep -n '^mvn .*deploy ' "$MOCK_LOG" | cut -d: -f1)
 [[ -n "$verify_line" && -n "$deploy_line" && "$verify_line" -lt "$deploy_line" ]] || fail "verify must run before deploy"
 assert_contains "$MOCK_LOG" "-s $settings clean verify"
 assert_contains "$MOCK_LOG" "-s $settings deploy -Prelease -DstagingDescription=Mosaic RC staging"
-pass "successful real run verifies before deploy and forwards Maven options"
+assert_stage_cleanup
+[[ -f "$FIXTURE/java/src/main/resources/native/linux/x86_64/libpaimon_mosaic_jni.so" ]] ||
+  fail "--no-cleanup must preserve staged Java resources"
+pass "successful real run preserves only requested Java resources"
 
 new_fixture
 MOCK_RUN_SHA=0000000000000000000000000000000000000000
@@ -227,6 +256,14 @@ if run_stage --dry-run > "$FIXTURE/output" 2>&1; then
 fi
 assert_not_contains "$MOCK_LOG" "mvn "
 unset MOCK_RUN_SHA
+new_fixture
+FAIL_DOWNLOAD_ARTIFACT=native-linux-aarch64
+if run_stage --dry-run > "$FIXTURE/output" 2>&1; then
+  fail "failed artifact download should fail"
+fi
+assert_not_contains "$MOCK_LOG" "mvn "
+assert_stage_cleanup
+unset FAIL_DOWNLOAD_ARTIFACT
 new_fixture
 printf '\n<!-- dirty -->\n' >> "$FIXTURE/java/pom.xml"
 if run_stage --dry-run > "$FIXTURE/output" 2>&1; then
@@ -239,7 +276,7 @@ if run_stage --dry-run > "$FIXTURE/output" 2>&1; then
   fail "dirty deploy script should fail"
 fi
 assert_not_contains "$MOCK_LOG" "mvn "
-pass "wrong run SHA and dirty Java/script inputs fail before Maven"
+pass "early failures do not leave staging downloads"
 
 new_fixture
 OMIT_CI_JAVADOC=1
@@ -247,6 +284,7 @@ if run_stage > "$FIXTURE/output" 2>&1; then
   fail "missing CI Javadoc JAR should fail"
 fi
 assert_not_contains "$MOCK_LOG" "mvn deploy"
+assert_stage_cleanup
 unset OMIT_CI_JAVADOC
 new_fixture
 omit_native_from_mock_jar
@@ -254,6 +292,7 @@ if run_stage > "$FIXTURE/output" 2>&1; then
   fail "missing native JAR entry should fail"
 fi
 assert_not_contains "$MOCK_LOG" "mvn deploy"
-pass "missing required JAR or native entry blocks deploy"
+assert_stage_cleanup
+pass "failing runs remove staging downloads and block deploy"
 
 echo "PASS: $TESTS focused Java staging tests"
