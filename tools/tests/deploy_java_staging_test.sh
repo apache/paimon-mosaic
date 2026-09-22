@@ -22,6 +22,7 @@ set -o nounset
 set -o pipefail
 
 SOURCE_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+REAL_PYTHON=$(command -v python3)
 TEST_ROOT=$(mktemp -d)
 trap 'rm -rf "$TEST_ROOT"' EXIT
 TESTS=0
@@ -131,11 +132,21 @@ native/macos/aarch64/libpaimon_mosaic_jni.dylib
 native/windows/x86_64/paimon_mosaic_jni.dll
 META-INF/LICENSE
 META-INF/NOTICE
+META-INF/LICENSE-binary
 META-INF/DEPENDENCIES
 ENTRIES
 if [[ "${OMIT_NATIVE_ENTRY:-0}" == 1 ]]; then
   exit 0
 fi
+MOCK
+  cat > "$MOCK_BIN/python3" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1-}" == */tools/verify_binary_artifact.py ]]; then
+  printf 'python3 %s\n' "$*" >> "$MOCK_LOG"
+  exit 0
+fi
+exec "$REAL_PYTHON" "$@"
 MOCK
   # Rewrite the mock when an entry must be omitted; doing it here keeps the
   # normal listing easy to audit.
@@ -184,6 +195,7 @@ run_stage() {
     MOCK_LOG="$MOCK_LOG" \
     MOCK_RUN_SHA="${MOCK_RUN_SHA:-$HEAD_SHA}" \
     MOCK_TAG=v1.2.3-rc1 \
+    REAL_PYTHON="$REAL_PYTHON" \
     OMIT_CI_JAVADOC="${OMIT_CI_JAVADOC:-0}" \
     OMIT_LOCAL_MAIN="${OMIT_LOCAL_MAIN:-0}" \
     "$FIXTURE/tools/deploy_java_staging.sh" \
@@ -207,6 +219,8 @@ done
 assert_contains "$MOCK_LOG" "mvn clean verify -Prelease -Dgpg.skip=true -DskipTests"
 assert_not_contains "$MOCK_LOG" "mvn deploy"
 [[ $(grep -c '^java ' "$MOCK_LOG") -eq 2 ]] || fail "dry-run must smoke local and CI JARs"
+[[ $(grep -c '^python3 .*verify_binary_artifact.py' "$MOCK_LOG") -eq 2 ]] ||
+  fail "dry-run must verify local and CI JAR contents"
 pass "successful dry-run validates all five artifacts and both JARs"
 
 new_fixture

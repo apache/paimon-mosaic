@@ -60,6 +60,8 @@ EXEMPT_FILES = {
     "ffi/DEPENDENCIES.rust.tsv",
     "jni/DEPENDENCIES.rust.tsv",
     "LICENSE",
+    "LICENSE-binary",
+    "LICENSE-binary-ffi",
     "NOTICE",
     "core/LICENSE",
     "core/NOTICE",

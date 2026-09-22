@@ -51,6 +51,9 @@ jobs:
       - name: Check dependency licenses (Apache-compatible)
         run: cargo deny check licenses
 
+      - name: Check binary legal inventory
+        run: python3 tools/verify_binary_artifact.py --source
+
       - name: Format
         run: cargo fmt --all -- --check
 
