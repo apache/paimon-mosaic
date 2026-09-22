@@ -80,7 +80,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Test with coverage
-        run: cargo llvm-cov --summary-only -- --skip test_read_java_written_file --skip test_read_python_written_file
+        run: cargo llvm-cov --summary-only
 
   cpp-test:
     runs-on: ubuntu-latest
@@ -154,7 +154,7 @@ jobs:
         run: mvn test "-DargLine=-Djava.library.path=${{ github.workspace }}/target/release"
 
       - name: Read Java-written interop file (Rust)
-        run: cargo test --release -p paimon-mosaic-core --test interop_read_test test_read_java_written_file
+        run: cargo test --release -p paimon-mosaic-core --test interop_read_test test_read_java_written_file -- --ignored --exact
 
   python-test:
     runs-on: ubuntu-latest
@@ -194,4 +194,4 @@ jobs:
           MOSAIC_LIB_PATH: ${{ github.workspace }}/target/release
 
       - name: Read Python-written interop file (Rust)
-        run: cargo test --release -p paimon-mosaic-core --test interop_read_test test_read_python_written_file
+        run: cargo test --release -p paimon-mosaic-core --test interop_read_test test_read_python_written_file -- --ignored --exact
