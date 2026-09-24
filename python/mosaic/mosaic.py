@@ -16,6 +16,7 @@
 # under the License.
 
 import ctypes
+import operator
 
 import pyarrow as pa
 
@@ -221,7 +222,16 @@ class MosaicWriter:
     def _on_write(self, ctx, data, length):
         try:
             buf = (ctypes.c_char * length).from_address(ctypes.cast(data, ctypes.c_void_p).value)
-            self._stream.write(buf)
+            view = memoryview(buf)
+            offset = 0
+            while offset < length:
+                written = self._stream.write(view[offset:])
+                if written is None:
+                    return -1
+                written = operator.index(written)
+                if written <= 0 or written > length - offset:
+                    return -1
+                offset += written
             self._pos += length
             return 0
         except Exception:
