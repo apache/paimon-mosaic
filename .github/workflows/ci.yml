@@ -51,6 +51,9 @@ jobs:
       - name: Check dependency licenses (Apache-compatible)
         run: cargo deny check licenses
 
+      - name: Check binary legal inventory
+        run: python3 tools/verify_binary_artifact.py --source
+
       - name: Format
         run: cargo fmt --all -- --check
 
@@ -185,7 +188,7 @@ jobs:
 
       - name: Install Python dependencies
         working-directory: python
-        run: pip install pyarrow pytest
+        run: pip install pyarrow pytest build "setuptools>=77" wheel
 
       - name: Run Python tests
         working-directory: python

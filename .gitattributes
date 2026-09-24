@@ -17,5 +17,5 @@
 # operating systems are collected by the publish job.
 *.html text eol=lf
 *.txt text eol=lf
-LICENSE text eol=lf
+LICENSE* text eol=lf
 NOTICE text eol=lf
