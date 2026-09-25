@@ -47,6 +47,9 @@ impl MosaicSchema {
     pub fn validate(columns: &[(String, DataType, bool)]) -> Result<(), String> {
         let mut seen = HashSet::new();
         for (name, data_type, _nullable) in columns {
+            if name.is_empty() {
+                return Err("empty column name".to_string());
+            }
             if !seen.insert(name.as_str()) {
                 return Err(format!("duplicate column name: {}", name));
             }
@@ -349,6 +352,17 @@ mod tests {
         let schema = MosaicSchema::new(columns, 2);
         let data = schema.serialize();
         assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_column_name() {
+        let columns = vec![("".to_string(), DataType::Int32, true)];
+        assert!(MosaicSchema::validate(&columns).is_err());
+
+        // Without the check, such a schema reaches the writer and produces a file
+        // that deserialize() refuses, leaving the data unreadable.
+        let serialized = MosaicSchema::new(columns, 1).serialize();
+        assert!(MosaicSchema::deserialize(&serialized).is_err());
     }
 
     #[test]
