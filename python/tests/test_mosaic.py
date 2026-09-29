@@ -15,9 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import ctypes
 import io
 import struct
 import traceback
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
@@ -44,6 +46,13 @@ def _reader_from_bytes(data):
     return MosaicReader.from_input_file(
         lambda offset, length: data[offset : offset + length], len(data)
     )
+
+
+def _invoke_write_callback(stream, data, position=0):
+    state = SimpleNamespace(_stream=stream, _pos=position)
+    buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
+    result = MosaicWriter._on_write(state, None, buf, len(data))
+    return result, state._pos
 
 
 class TestRoundtrip:
@@ -752,6 +761,65 @@ class TestConvenience:
 
 
 class TestWriter:
+    def test_write_callback_handles_full_write(self):
+        class FullWriteOutput(io.BytesIO):
+            def __init__(self):
+                super().__init__()
+                self.request_sizes = []
+
+            def write(self, data):
+                self.request_sizes.append(len(data))
+                return super().write(data)
+
+        stream = FullWriteOutput()
+        result, position = _invoke_write_callback(stream, b"abcdef", position=7)
+
+        assert result == 0
+        assert position == 13
+        assert stream.getvalue() == b"abcdef"
+        assert stream.request_sizes == [6]
+
+    def test_write_callback_retries_short_writes(self):
+        class ShortWriteOutput(io.BytesIO):
+            def __init__(self):
+                super().__init__()
+                self.request_sizes = []
+
+            def write(self, data):
+                self.request_sizes.append(len(data))
+                return super().write(data[:2])
+
+        stream = ShortWriteOutput()
+        result, position = _invoke_write_callback(stream, b"abcdef", position=7)
+
+        assert result == 0
+        assert position == 13
+        assert stream.getvalue() == b"abcdef"
+        assert stream.request_sizes == [6, 4, 2]
+
+    @pytest.mark.parametrize("stall_result", [0, None], ids=["zero", "none"])
+    def test_write_callback_rejects_stall_without_advancing_position(
+        self, stall_result
+    ):
+        class StallingOutput(io.BytesIO):
+            def __init__(self):
+                super().__init__()
+                self.request_sizes = []
+
+            def write(self, data):
+                self.request_sizes.append(len(data))
+                if len(self.request_sizes) == 1:
+                    return super().write(data[:2])
+                return stall_result
+
+        stream = StallingOutput()
+        result, position = _invoke_write_callback(stream, b"abcdef", position=7)
+
+        assert result == -1
+        assert position == 7
+        assert stream.getvalue() == b"ab"
+        assert stream.request_sizes == [6, 4]
+
     def test_estimated_file_size(self):
         pa_schema = pa.schema(
             [pa.field("x", pa.int32()), pa.field("y", pa.utf8())]
