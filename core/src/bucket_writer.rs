@@ -16,17 +16,26 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::sync::Arc;
 
 use arrow_array::*;
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
 
+use crate::integer_buffer::IntegerBuffer;
 use crate::spec::*;
 use crate::types;
 use crate::values;
 use crate::varint;
+
+pub(crate) struct BucketEncodingPlan {
+    pub(crate) encodings: Vec<u8>,
+    pub(crate) has_nulls: Vec<bool>,
+    // The original finish_paged payload sizes, excluding const metadata and
+    // the two-byte page prefix. Keep these for the existing layout heuristic.
+    pub(crate) page_sizes: Vec<Option<usize>>,
+}
 
 pub struct PagedBucketOutput {
     pub encodings: Vec<u8>,
@@ -68,6 +77,7 @@ pub struct BucketWriter {
 
     null_bitmaps: Vec<Vec<u8>>,
     value_buffers: Vec<Vec<u8>>,
+    integer_buffers: Vec<Option<Box<IntegerBuffer>>>,
     non_null_counts: Vec<usize>,
 
     const_tracking: Vec<bool>,
@@ -94,13 +104,33 @@ impl BucketWriter {
         let (physical_types, children) = expand_col_types(col_types);
         let total_columns = physical_types.len();
         let fixed_widths: Vec<i32> = physical_types.iter().map(types::fixed_width).collect();
+        let integer_buffers: Vec<_> = physical_types
+            .iter()
+            .map(|dt| match dt {
+                DataType::Int16 => Some(Box::new(IntegerBuffer::new(2))),
+                DataType::Int32 => Some(Box::new(IntegerBuffer::new(4))),
+                DataType::Int64 => Some(Box::new(IntegerBuffer::new(8))),
+                _ => None,
+            })
+            .collect();
+        let value_buffers = integer_buffers
+            .iter()
+            .map(|integer| {
+                if integer.is_some() {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(1024)
+                }
+            })
+            .collect();
 
         BucketWriter {
             num_primary,
             total_columns,
             fixed_widths,
             null_bitmaps: vec![vec![0u8; 128]; total_columns],
-            value_buffers: vec![Vec::with_capacity(1024); total_columns],
+            value_buffers,
+            integer_buffers,
             non_null_counts: vec![0; total_columns],
             const_tracking: vec![true; total_columns],
             first_value_len: vec![0; total_columns],
@@ -325,6 +355,15 @@ impl BucketWriter {
             return Ok(0);
         }
 
+        if self.integer_buffers[col].is_some() {
+            return match &typed {
+                TypedArrayRef::Int16(a) => self.append_integer_column(col, a, start_row),
+                TypedArrayRef::Int32(a) => self.append_integer_column(col, a, start_row),
+                TypedArrayRef::Int64(a) => self.append_integer_column(col, a, start_row),
+                _ => unreachable!("integer buffer requires an integer array"),
+            };
+        }
+
         if null_count == 0 {
             if let Some(col_size) =
                 self.append_no_null_batch(col, &typed, start_row, num_new_rows)?
@@ -358,6 +397,100 @@ impl BucketWriter {
             }
         }
         Ok(col_size)
+    }
+
+    fn append_integer_column<T: arrow_array::types::ArrowPrimitiveType>(
+        &mut self,
+        col: usize,
+        array: &PrimitiveArray<T>,
+        start_row: usize,
+    ) -> io::Result<usize>
+    where
+        T::Native: Into<i64>,
+    {
+        if array.null_count() == 0 {
+            return Ok(self.append_integer_values(col, array.values()));
+        }
+        let nulls = array.nulls().expect("nullable integer batch");
+        append_null_bitmap(&mut self.null_bitmaps[col], start_row, nulls);
+        let mut scratch = [0i64; 4096];
+        let mut used = 0;
+        let mut size = 0;
+        for row in nulls.valid_indices() {
+            scratch[used] = array.value(row).into();
+            used += 1;
+            if used == scratch.len() {
+                size += self.append_integer_values(col, &scratch);
+                used = 0;
+            }
+        }
+        size += self.append_integer_values(col, &scratch[..used]);
+        Ok(size)
+    }
+
+    fn append_integer_values<T: Copy + Into<i64>>(&mut self, col: usize, values: &[T]) -> usize {
+        if values.is_empty() {
+            return 0;
+        }
+        let width = self.fixed_widths[col] as usize;
+        let mask = u64::MAX >> (64 - width * 8);
+        let mut dict_start = 0;
+        if self.const_tracking[col] {
+            let first = self.integer_buffers[col]
+                .as_ref()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap_or(values[0].into() as u64 & mask);
+            self.first_value_len[col] = width;
+            if let Some(first_different) = values
+                .iter()
+                .position(|&v| (v.into() as u64 & mask) != first)
+            {
+                // Preserve lazy dictionary activation: seed the constant prefix
+                // once, then track values starting at the first different key.
+                debug_assert_eq!(self.dict_tracking[col], DictTracking::Pending);
+                self.const_tracking[col] = false;
+                let dict = self.long_dict_maps[col].get_or_insert_with(HashMap::new);
+                dict.clear();
+                dict.insert(first, 0);
+                self.dict_tracking[col] = DictTracking::Active;
+                dict_start = first_different;
+            } else {
+                dict_start = values.len();
+            }
+        }
+        if self.dict_tracking[col] == DictTracking::Active {
+            let dict = self.long_dict_maps[col].as_mut().unwrap();
+            if dict.len() <= self.max_dict_entries {
+                for &value in &values[dict_start..] {
+                    let key = value.into() as u64 & mask;
+                    let next = dict.len();
+                    dict.entry(key).or_insert(next);
+                    if dict.len() > self.max_dict_entries {
+                        break;
+                    }
+                }
+            }
+            if dict.len() > self.max_dict_entries {
+                self.long_dict_maps[col] = None;
+                self.dict_tracking[col] = DictTracking::Disabled;
+            }
+        }
+        self.integer_buffers[col]
+            .as_mut()
+            .unwrap()
+            .extend_from_slice(values);
+        self.non_null_counts[col] += values.len();
+        // Row-group boundaries and dictionary decisions use the logical width,
+        // never the compact allocation size.
+        values.len() * width
+    }
+
+    fn logical_value_size(&self, col: usize) -> usize {
+        self.integer_buffers[col]
+            .as_ref()
+            .map_or(self.value_buffers[col].len(), |b| b.logical_len())
     }
 
     fn append_no_null_batch(
@@ -617,7 +750,7 @@ impl BucketWriter {
                 let dict_size = self.get_dict_size(i);
                 if dict_size >= 2
                     && dict_size <= self.max_dict_entries
-                    && self.dict_encoded_size(i) < self.value_buffers[i].len()
+                    && self.dict_encoded_size(i) < self.logical_value_size(i)
                 {
                     encodings[i] = ENCODING_DICT;
                 } else {
@@ -629,104 +762,142 @@ impl BucketWriter {
         (encodings, has_nulls)
     }
 
-    #[allow(clippy::needless_range_loop)]
-    pub fn finish(&self) -> Vec<u8> {
+    /// Encode into a caller-owned sink without materializing the whole bucket.
+    pub(crate) fn write_encoded(&self, out: &mut impl Write) -> io::Result<()> {
         if self.num_rows == 0 {
-            return Vec::new();
+            return Ok(());
         }
-
-        let (encodings, has_nulls) = self.compute_encodings();
-
-        let mut out = Vec::new();
-
-        // Header: only written when ARRAY columns exist (backward compatible with v1)
+        let plan = self.encoding_plan();
         if !self.children.is_empty() {
-            varint::encode(&mut out, self.num_primary as u32);
-            varint::encode(&mut out, self.children.len() as u32);
+            write_varint(out, self.num_primary as u32)?;
+            write_varint(out, self.children.len() as u32)?;
             for child in &self.children {
-                varint::encode(&mut out, child.num_elements as u32);
+                write_varint(out, child.num_elements as u32)?;
             }
         }
-
-        // Encoding flags: 2 bits per column
-        let encoding_flags_bytes = (self.total_columns * 2).div_ceil(8);
-        let ef_start = out.len();
-        out.resize(ef_start + encoding_flags_bytes, 0);
-        for i in 0..self.total_columns {
-            let byte_idx = (i * 2) / 8;
-            let bit_idx = (i * 2) % 8;
-            out[ef_start + byte_idx] |= encodings[i] << bit_idx;
+        let mut flags = vec![0; (self.total_columns * 2).div_ceil(8)];
+        for (i, &encoding) in plan.encodings.iter().enumerate() {
+            flags[i / 4] |= encoding << ((i % 4) * 2);
         }
-
-        // Has-nulls flags: 1 bit per column
-        let has_nulls_bytes = self.total_columns.div_ceil(8);
-        let hn_start = out.len();
-        out.resize(hn_start + has_nulls_bytes, 0);
-        for i in 0..self.total_columns {
-            if has_nulls[i] {
-                out[hn_start + i / 8] |= 1 << (i % 8);
+        out.write_all(&flags)?;
+        flags.clear();
+        flags.resize(self.total_columns.div_ceil(8), 0);
+        for (i, &has_nulls) in plan.has_nulls.iter().enumerate() {
+            if has_nulls {
+                flags[i / 8] |= 1 << (i % 8);
             }
         }
-
-        // CONST metadata
-        for i in 0..self.total_columns {
-            if encodings[i] == ENCODING_CONST {
-                let len = self.first_value_len[i];
-                out.extend_from_slice(&self.value_buffers[i][..len]);
+        out.write_all(&flags)?;
+        for (col, &encoding) in plan.encodings.iter().enumerate() {
+            if encoding == ENCODING_CONST {
+                self.write_const(col, out)?;
             }
         }
-
-        // Dict metadata
-        for i in 0..self.total_columns {
-            if encodings[i] == ENCODING_DICT {
-                if let Some(ref dict) = self.long_dict_maps[i] {
-                    let num_entries = dict.len();
-                    varint::encode(&mut out, num_entries as u32);
-                    let w = self.fixed_widths[i];
-                    let mut keys = vec![0u64; num_entries];
-                    for (&key, &idx) in dict {
-                        keys[idx] = key;
-                    }
-                    for key in &keys {
-                        write_fixed_key_to_vec(&mut out, *key, w);
-                    }
-                } else if let Some(ref dict) = self.byte_dict_maps[i] {
-                    let num_entries = dict.len();
-                    varint::encode(&mut out, num_entries as u32);
-                    let mut keys: Vec<(&Vec<u8>, &usize)> = dict.iter().collect();
-                    keys.sort_by_key(|&(_, idx)| *idx);
-                    for (key, _) in keys {
-                        out.extend_from_slice(key);
-                    }
-                }
+        for (col, &encoding) in plan.encodings.iter().enumerate() {
+            if encoding == ENCODING_DICT {
+                self.write_dictionary(col, out)?;
             }
         }
-
-        // Null bitmaps (per-column row count)
-        for i in 0..self.total_columns {
-            if has_nulls[i] && encodings[i] != ENCODING_ALL_NULL {
-                let nbytes = self.col_num_rows(i).div_ceil(8);
-                out.extend_from_slice(&self.null_bitmaps[i][..nbytes]);
+        for (col, &has_nulls) in plan.has_nulls.iter().enumerate() {
+            if has_nulls && plan.encodings[col] != ENCODING_ALL_NULL {
+                self.write_nulls(col, out)?;
             }
         }
-
-        // Column data
-        for i in 0..self.total_columns {
-            if encodings[i] == ENCODING_PLAIN {
-                out.extend_from_slice(&self.value_buffers[i]);
-            } else if encodings[i] == ENCODING_DICT {
-                let bw = bit_width(self.get_dict_size(i));
-                let packed_bytes = (self.non_null_counts[i] * bw).div_ceil(8);
-                let data_start = out.len();
-                out.resize(data_start + packed_bytes, 0);
-                self.write_dict_bit_packed(i, &mut out, data_start);
-            }
+        for (col, &encoding) in plan.encodings.iter().enumerate() {
+            self.write_values(col, encoding, out)?;
         }
+        Ok(())
+    }
 
+    pub fn finish(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_encoded(&mut out)
+            .expect("writing into a Vec cannot fail");
         out
     }
 
-    #[allow(clippy::needless_range_loop)]
+    pub(crate) fn has_integer_buffers(&self) -> bool {
+        self.integer_buffers.iter().any(Option::is_some)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn use_wide_integer_buffers(&mut self) {
+        assert_eq!(self.num_rows, 0);
+        for buffer in &mut self.integer_buffers {
+            *buffer = None;
+        }
+    }
+
+    pub(crate) fn encoding_plan(&self) -> BucketEncodingPlan {
+        let (encodings, has_nulls) = self.compute_encodings();
+        let page_sizes = (0..self.total_columns)
+            .map(|col| {
+                let nulls = if has_nulls[col] {
+                    self.col_num_rows(col).div_ceil(8)
+                } else {
+                    0
+                };
+                match encodings[col] {
+                    ENCODING_ALL_NULL => None,
+                    ENCODING_CONST => has_nulls[col].then_some(nulls),
+                    ENCODING_DICT => Some(nulls + self.dict_encoded_size(col)),
+                    ENCODING_PLAIN => Some(nulls + self.logical_value_size(col)),
+                    _ => unreachable!(),
+                }
+            })
+            .collect();
+        BucketEncodingPlan {
+            encodings,
+            has_nulls,
+            page_sizes,
+        }
+    }
+
+    pub(crate) fn page_size(&self, plan: &BucketEncodingPlan, col: usize) -> usize {
+        if plan.encodings[col] == ENCODING_ALL_NULL {
+            return 0;
+        }
+        2 + plan.page_sizes[col].unwrap_or(0)
+            + if plan.encodings[col] == ENCODING_CONST {
+                self.first_value_len[col]
+            } else {
+                0
+            }
+    }
+
+    pub(crate) fn write_page(
+        &self,
+        plan: &BucketEncodingPlan,
+        col: usize,
+        out: &mut impl Write,
+    ) -> io::Result<()> {
+        let encoding = plan.encodings[col];
+        if encoding == ENCODING_ALL_NULL {
+            return Ok(());
+        }
+        out.write_all(&[encoding, u8::from(plan.has_nulls[col])])?;
+        if encoding == ENCODING_CONST {
+            self.write_const(col, out)?;
+        }
+        self.write_page_data(plan, col, out)
+    }
+
+    fn write_page_data(
+        &self,
+        plan: &BucketEncodingPlan,
+        col: usize,
+        out: &mut impl Write,
+    ) -> io::Result<()> {
+        let encoding = plan.encodings[col];
+        if encoding == ENCODING_DICT {
+            self.write_dictionary(col, out)?;
+        }
+        if plan.has_nulls[col] {
+            self.write_nulls(col, out)?;
+        }
+        self.write_values(col, encoding, out)
+    }
+
     pub fn finish_paged(&self) -> PagedBucketOutput {
         if self.num_rows == 0 {
             return PagedBucketOutput {
@@ -738,73 +909,24 @@ impl BucketWriter {
                 children: self.children.clone(),
             };
         }
-
-        let (encodings, has_nulls) = self.compute_encodings();
-
+        let plan = self.encoding_plan();
         let mut const_data = vec![Vec::new(); self.total_columns];
-        let mut column_pages: Vec<Option<Vec<u8>>> = vec![None; self.total_columns];
-
-        for i in 0..self.total_columns {
-            let col_rows = self.col_num_rows(i);
-            let null_bitmap_bytes = col_rows.div_ceil(8);
-
-            match encodings[i] {
-                ENCODING_ALL_NULL => {}
-                ENCODING_CONST => {
-                    let len = self.first_value_len[i];
-                    const_data[i] = self.value_buffers[i][..len].to_vec();
-                    if has_nulls[i] {
-                        column_pages[i] = Some(self.null_bitmaps[i][..null_bitmap_bytes].to_vec());
-                    }
-                }
-                ENCODING_DICT => {
-                    let mut page = Vec::new();
-                    if let Some(ref dict) = self.long_dict_maps[i] {
-                        let num_entries = dict.len();
-                        varint::encode(&mut page, num_entries as u32);
-                        let w = self.fixed_widths[i];
-                        let mut keys = vec![0u64; num_entries];
-                        for (&key, &idx) in dict {
-                            keys[idx] = key;
-                        }
-                        for key in &keys {
-                            write_fixed_key_to_vec(&mut page, *key, w);
-                        }
-                    } else if let Some(ref dict) = self.byte_dict_maps[i] {
-                        let num_entries = dict.len();
-                        varint::encode(&mut page, num_entries as u32);
-                        let mut keys: Vec<(&Vec<u8>, &usize)> = dict.iter().collect();
-                        keys.sort_by_key(|&(_, idx)| *idx);
-                        for (key, _) in keys {
-                            page.extend_from_slice(key);
-                        }
-                    }
-                    if has_nulls[i] {
-                        page.extend_from_slice(&self.null_bitmaps[i][..null_bitmap_bytes]);
-                    }
-                    let dict_size = self.get_dict_size(i);
-                    let bw = bit_width(dict_size);
-                    let packed_bytes = (self.non_null_counts[i] * bw).div_ceil(8);
-                    let data_start = page.len();
-                    page.resize(data_start + packed_bytes, 0);
-                    self.write_dict_bit_packed(i, &mut page, data_start);
-                    column_pages[i] = Some(page);
-                }
-                ENCODING_PLAIN => {
-                    let mut page = Vec::new();
-                    if has_nulls[i] {
-                        page.extend_from_slice(&self.null_bitmaps[i][..null_bitmap_bytes]);
-                    }
-                    page.extend_from_slice(&self.value_buffers[i]);
-                    column_pages[i] = Some(page);
-                }
-                _ => {}
+        let mut column_pages = vec![None; self.total_columns];
+        for col in 0..self.total_columns {
+            if plan.encodings[col] == ENCODING_CONST {
+                self.write_const(col, &mut const_data[col])
+                    .expect("Vec write");
+            }
+            if let Some(size) = plan.page_sizes[col] {
+                let mut page = Vec::with_capacity(size);
+                self.write_page_data(&plan, col, &mut page)
+                    .expect("Vec write");
+                column_pages[col] = Some(page);
             }
         }
-
         PagedBucketOutput {
-            encodings,
-            has_nulls,
+            encodings: plan.encodings,
+            has_nulls: plan.has_nulls,
             const_data,
             column_pages,
             num_primary: self.num_primary,
@@ -812,10 +934,110 @@ impl BucketWriter {
         }
     }
 
+    fn write_const(&self, col: usize, out: &mut impl Write) -> io::Result<()> {
+        if let Some(buffer) = &self.integer_buffers[col] {
+            let key = buffer.keys().next().expect("non-null constant");
+            out.write_all(&key.to_be_bytes()[8 - self.fixed_widths[col] as usize..])
+        } else {
+            out.write_all(&self.value_buffers[col][..self.first_value_len[col]])
+        }
+    }
+
+    fn write_dictionary(&self, col: usize, out: &mut impl Write) -> io::Result<()> {
+        if let Some(dict) = &self.long_dict_maps[col] {
+            write_varint(out, dict.len() as u32)?;
+            let mut keys = vec![0; dict.len()];
+            for (&key, &index) in dict {
+                keys[index] = key;
+            }
+            for key in keys {
+                out.write_all(&key.to_be_bytes()[8 - self.fixed_widths[col] as usize..])?;
+            }
+        } else if let Some(dict) = &self.byte_dict_maps[col] {
+            write_varint(out, dict.len() as u32)?;
+            let mut keys: Vec<_> = dict.iter().collect();
+            keys.sort_unstable_by_key(|(_, index)| **index);
+            for (key, _) in keys {
+                out.write_all(key)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_nulls(&self, col: usize, out: &mut impl Write) -> io::Result<()> {
+        out.write_all(&self.null_bitmaps[col][..self.col_num_rows(col).div_ceil(8)])
+    }
+
+    fn write_values(&self, col: usize, encoding: u8, out: &mut impl Write) -> io::Result<()> {
+        match encoding {
+            ENCODING_PLAIN => match &self.integer_buffers[col] {
+                Some(buffer) => buffer.write_to(out),
+                None => out.write_all(&self.value_buffers[col]),
+            },
+            ENCODING_DICT => self.write_dict_indices(col, out),
+            _ => Ok(()),
+        }
+    }
+
+    fn write_dict_indices(&self, col: usize, out: &mut impl Write) -> io::Result<()> {
+        let width = self.fixed_widths[col];
+        let bits = bit_width(self.get_dict_size(col));
+        let mut integer_keys = self.integer_buffers[col].as_ref().map(|b| b.keys());
+        let mut pos = 0;
+        let mut scratch = [0; 16 * 1024];
+        let mut used = 0;
+        let mut pending = 0u128;
+        let mut pending_bits = 0;
+        // Value buffers contain only non-null values, in row order.
+        for _ in 0..self.non_null_counts[col] {
+            let index = if let Some(dict) = &self.long_dict_maps[col] {
+                let key = if let Some(keys) = &mut integer_keys {
+                    keys.next().expect("non-null integer key")
+                } else {
+                    let key = values::extract_fixed_key(&self.value_buffers[col], pos, width);
+                    pos += width as usize;
+                    key
+                };
+                dict[&key]
+            } else {
+                let len = if width > 0 {
+                    width as usize
+                } else {
+                    let len = varint::decode(&self.value_buffers[col], &mut pos.clone())
+                        .expect("internal varint in value buffer");
+                    varint::encoded_size(len) + len as usize
+                };
+                let key = &self.value_buffers[col][pos..pos + len];
+                pos += len;
+                self.byte_dict_maps[col].as_ref().unwrap()[key]
+            };
+            pending |= (index as u128) << pending_bits;
+            pending_bits += bits;
+            while pending_bits >= 8 {
+                scratch[used] = pending as u8;
+                used += 1;
+                pending >>= 8;
+                pending_bits -= 8;
+                if used == scratch.len() {
+                    out.write_all(&scratch)?;
+                    used = 0;
+                }
+            }
+        }
+        if pending_bits > 0 {
+            scratch[used] = pending as u8;
+            used += 1;
+        }
+        out.write_all(&scratch[..used])
+    }
+
     pub fn reset(&mut self) {
         for i in 0..self.total_columns {
             self.null_bitmaps[i].fill(0);
             self.value_buffers[i].clear();
+            if let Some(buffer) = &mut self.integer_buffers[i] {
+                buffer.clear();
+            }
             self.non_null_counts[i] = 0;
             self.const_tracking[i] = true;
             self.first_value_len[i] = 0;
@@ -846,42 +1068,6 @@ impl BucketWriter {
             return dict.len();
         }
         0
-    }
-
-    fn write_dict_bit_packed(&self, col: usize, buf: &mut [u8], data_start: usize) -> usize {
-        let dict_size = self.get_dict_size(col);
-        let bw = bit_width(dict_size);
-        let w = self.fixed_widths[col];
-        let mut bit_offset = 0usize;
-        let mut val_pos = 0usize;
-
-        for r in 0..self.col_num_rows(col) {
-            let is_null = (self.null_bitmaps[col][r / 8] & (1 << (r % 8))) != 0;
-            if !is_null {
-                let idx = if let Some(ref dict) = self.long_dict_maps[col] {
-                    let key = values::extract_fixed_key(&self.value_buffers[col], val_pos, w);
-                    val_pos += w as usize;
-                    *dict.get(&key).unwrap()
-                } else if let Some(ref dict) = self.byte_dict_maps[col] {
-                    let value_len = if w > 0 {
-                        w as usize
-                    } else {
-                        let var_len =
-                            varint::decode(&self.value_buffers[col], &mut val_pos.clone())
-                                .expect("internal varint in value buffer");
-                        varint::encoded_size(var_len) + var_len as usize
-                    };
-                    let slice = &self.value_buffers[col][val_pos..val_pos + value_len];
-                    val_pos += value_len;
-                    *dict.get(slice).unwrap()
-                } else {
-                    unreachable!()
-                };
-                write_bit_packed(buf, data_start, bit_offset, idx, bw);
-                bit_offset += bw;
-            }
-        }
-        bit_offset
     }
 
     fn dict_encoded_size(&self, col: usize) -> usize {
@@ -937,7 +1123,7 @@ impl BucketWriter {
                     }
                 }
                 ENCODING_PLAIN => {
-                    size += self.value_buffers[i].len();
+                    size += self.logical_value_size(i);
                 }
                 _ => {}
             }
@@ -1662,33 +1848,20 @@ fn bit_width(num_entries: usize) -> usize {
     usize::BITS as usize - (num_entries - 1).leading_zeros() as usize
 }
 
-fn write_bit_packed(buf: &mut [u8], byte_base: usize, bit_offset: usize, value: usize, bw: usize) {
-    if bw == 0 {
-        return;
-    }
-    let start_byte = byte_base + bit_offset / 8;
-    let bit_shift = bit_offset % 8;
-    let mut bits = (value as u64) << bit_shift;
-    let total_bits = bit_shift + bw;
-    let num_bytes = total_bits.div_ceil(8);
-    for i in 0..num_bytes {
-        buf[start_byte + i] |= (bits & 0xFF) as u8;
-        bits >>= 8;
-    }
-}
-
 fn equals_first_value(buf: &[u8], offset: usize, len: usize) -> bool {
     buf[..len] == buf[offset..offset + len]
 }
 
-fn write_fixed_key_to_vec(buf: &mut Vec<u8>, key: u64, width: i32) {
-    match width {
-        1 => buf.push(key as u8),
-        2 => buf.extend_from_slice(&(key as u16).to_be_bytes()),
-        4 => buf.extend_from_slice(&(key as u32).to_be_bytes()),
-        8 => buf.extend_from_slice(&key.to_be_bytes()),
-        _ => {}
+fn write_varint(out: &mut impl Write, mut value: u32) -> io::Result<()> {
+    let mut bytes = [0; 5];
+    let mut len = 0;
+    while value >= 128 {
+        bytes[len] = (value as u8) | 0x80;
+        value >>= 7;
+        len += 1;
     }
+    bytes[len] = value as u8;
+    out.write_all(&bytes[..len + 1])
 }
 
 #[cfg(test)]
@@ -1818,6 +1991,96 @@ mod tests {
         let data = writer.finish();
         let h = header_size(&data);
         assert_eq!(data[h] & 0x03, ENCODING_CONST);
+    }
+
+    fn compact_integer_test_array(dt: &DataType, values: &[Option<i64>]) -> ArrayRef {
+        match dt {
+            DataType::Int16 => Arc::new(Int16Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| v as i16))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Int32 => Arc::new(Int32Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| v as i32))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Int64 => Arc::new(Int64Array::from(values.to_vec())),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_compact_integer_lazy_dictionary_after_nulls_promotion_and_reset() {
+        for dt in [DataType::Int16, DataType::Int32, DataType::Int64] {
+            let mut compact = BucketWriter::new(&[&dt], 32768, 2);
+            let mut wide = BucketWriter::new(&[&dt], 32768, 2);
+            wide.use_wide_integer_buffers();
+            let append =
+                |compact: &mut BucketWriter, wide: &mut BucketWriter, values: &[Option<i64>]| {
+                    // Slice the source and append at non-byte-aligned destination offsets.
+                    let mut padded = vec![Some(99)];
+                    padded.extend_from_slice(values);
+                    let array = compact_integer_test_array(&dt, &padded).slice(1, values.len());
+                    assert_eq!(
+                        compact.write_columns(&[array.as_ref()], &[&dt]).unwrap(),
+                        wide.write_columns(&[array.as_ref()], &[&dt]).unwrap()
+                    );
+                    assert_eq!(compact.estimated_raw_size(), wide.estimated_raw_size());
+                    assert_eq!(compact.finish(), wide.finish());
+                    assert_eq!(
+                        compact.finish_paged().column_pages,
+                        wide.finish_paged().column_pages
+                    );
+                };
+            append(&mut compact, &mut wide, &[None; 65]);
+            append(&mut compact, &mut wide, &vec![Some(255); 4095]);
+            assert_eq!(compact.dict_tracking[0], DictTracking::Pending);
+            assert!(compact.long_dict_maps[0].is_none());
+            append(
+                &mut compact,
+                &mut wide,
+                &[None, Some(255), Some(-1), None, Some(-1)],
+            );
+            assert_eq!(compact.dict_tracking[0], DictTracking::Active);
+            assert_eq!(compact.long_dict_maps[0].as_ref().unwrap().len(), 2);
+            assert_eq!(compact.compute_encodings().0, vec![ENCODING_DICT]);
+
+            compact.reset();
+            wide.reset();
+            append(&mut compact, &mut wide, &vec![Some(7); 100]);
+            assert_eq!(compact.dict_tracking[0], DictTracking::Pending);
+            assert!(compact.long_dict_maps[0].as_ref().unwrap().is_empty());
+            append(&mut compact, &mut wide, &[Some(8), None, Some(7)]);
+            let dict = compact.long_dict_maps[0].as_ref().unwrap();
+            assert_eq!(dict.len(), 2);
+            assert_eq!(dict[&7], 0);
+            assert_eq!(dict[&8], 1);
+        }
+    }
+
+    #[test]
+    fn test_compact_integer_dictionary_limit_stays_disabled_until_reset() {
+        for limit in [0, 1, 2] {
+            let dt = DataType::Int64;
+            let mut compact = BucketWriter::new(&[&dt], 32768, limit);
+            let prefix = Int64Array::from(vec![-1; 100]);
+            compact.write_columns(&[&prefix], &[&dt]).unwrap();
+            assert!(compact.long_dict_maps[0].is_none());
+            let varied = Int64Array::from(vec![Some(255), None, Some(256), Some(-1)]);
+            compact.write_columns(&[&varied], &[&dt]).unwrap();
+            assert_eq!(compact.dict_tracking[0], DictTracking::Disabled);
+            assert!(compact.long_dict_maps[0].is_none());
+            compact.write_columns(&[&prefix], &[&dt]).unwrap();
+            assert_eq!(compact.dict_tracking[0], DictTracking::Disabled);
+            assert_eq!(compact.compute_encodings().0, vec![ENCODING_PLAIN]);
+            compact.reset();
+            compact.write_columns(&[&prefix], &[&dt]).unwrap();
+            assert_eq!(compact.dict_tracking[0], DictTracking::Pending);
+            assert_eq!(compact.compute_encodings().0, vec![ENCODING_CONST]);
+        }
     }
 
     #[test]

@@ -440,6 +440,20 @@ impl<S: OutputFile> MosaicWriter<S> {
             if bw.is_empty() {
                 continue;
             }
+            if bw.has_integer_buffers() {
+                let offset = self.out.pos();
+                let (layout, uncompressed_size) = write_integer_bucket(
+                    &mut self.out,
+                    bw,
+                    self.compression,
+                    self.zstd_level,
+                    self.page_size_threshold,
+                )?;
+                bucket_offsets[b] = offset;
+                bucket_layouts[b] = layout;
+                actual_uncompressed_sizes[b] = uncompressed_size;
+                continue;
+            }
             let est_size = bw.estimated_raw_size();
             let try_paged =
                 self.compression == COMPRESSION_ZSTD && est_size >= self.page_size_threshold;
@@ -721,6 +735,186 @@ impl<S: OutputFile> MosaicWriter<S> {
         self.out.flush()?;
         Ok(())
     }
+}
+
+/// Adapt the existing output API without adding seek or temporary-file
+/// requirements to C, JNI or custom output callbacks.
+struct OutputWriter<'a, S>(&'a mut S);
+
+impl<S: OutputFile> io::Write for OutputWriter<'_, S> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.write(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+const INTEGER_OUTPUT_BUFFER_SIZE: usize = 16 * 1024;
+
+// Coalesce flags, dictionary entries and value chunks before calling the sink.
+// Unlike BufWriter, this has no flushing Drop: a failed callback may already
+// have written a prefix, so neither errors nor unwinding may retry its bytes.
+struct BufferedOutputWriter<'a, S> {
+    out: &'a mut S,
+    buffer: Vec<u8>,
+}
+
+impl<'a, S: OutputFile> BufferedOutputWriter<'a, S> {
+    fn new(out: &'a mut S) -> Self {
+        Self {
+            out,
+            buffer: Vec::with_capacity(INTEGER_OUTPUT_BUFFER_SIZE),
+        }
+    }
+
+    fn drain(&mut self) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            self.out.write(&self.buffer)?;
+            self.buffer.clear();
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        // Drain the encoding buffer only; the sink is flushed when the file closes.
+        self.drain()
+    }
+}
+
+impl<S: OutputFile> io::Write for BufferedOutputWriter<'_, S> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > INTEGER_OUTPUT_BUFFER_SIZE - self.buffer.len() {
+            self.drain()?;
+        }
+        if bytes.len() >= INTEGER_OUTPUT_BUFFER_SIZE {
+            self.out.write(bytes)?;
+        } else {
+            self.buffer.extend_from_slice(bytes);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.drain()?;
+        self.out.flush()
+    }
+}
+
+// Small encoded units use the existing one-shot compressor. This bounds the
+// materialized input while avoiding streaming context overhead for tiny pages.
+const INTEGER_ENCODING_BUFFER_LIMIT: usize = 1024 * 1024;
+
+fn compress_integer_unit<W: io::Write>(
+    mut output: W,
+    level: i32,
+    size: usize,
+    encode: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
+) -> io::Result<W> {
+    check_zstd_block_size(size, "integer encoded unit size")?;
+    if size <= INTEGER_ENCODING_BUFFER_LIMIT {
+        let mut raw = Vec::with_capacity(size);
+        encode(&mut raw)?;
+        if raw.len() != size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "integer encoded size mismatch",
+            ));
+        }
+        let compressed = zstd::bulk::compress(&raw, level).map_err(io::Error::other)?;
+        output.write_all(&compressed)?;
+        Ok(output)
+    } else {
+        let mut encoder = zstd::stream::write::Encoder::new(output, level)?;
+        encoder.set_pledged_src_size(Some(size as u64))?;
+        encode(&mut encoder)?;
+        encoder.finish()
+    }
+}
+
+fn write_integer_bucket<S: OutputFile>(
+    out: &mut S,
+    bucket: &BucketWriter,
+    compression: u8,
+    level: i32,
+    page_threshold: usize,
+) -> io::Result<(BucketLayout, usize)> {
+    let raw_size = bucket.estimated_raw_size();
+    let plan = bucket.encoding_plan();
+    let page_count = plan.page_sizes.iter().filter(|p| p.is_some()).count();
+    let page_bytes: usize = plan.page_sizes.iter().flatten().sum();
+    let paged = compression == COMPRESSION_ZSTD
+        && raw_size >= page_threshold
+        && page_bytes
+            .checked_div(page_count)
+            .is_some_and(|avg| avg >= page_threshold);
+    let start = out.pos();
+    if !paged {
+        match compression {
+            COMPRESSION_NONE => {
+                let mut buffered = BufferedOutputWriter::new(out);
+                bucket.write_encoded(&mut buffered)?;
+                buffered.finish()?;
+            }
+            COMPRESSION_ZSTD => {
+                check_zstd_block_size(raw_size, "bucket uncompressed size")?;
+                compress_integer_unit(OutputWriter(out), level, raw_size, |mut sink| {
+                    bucket.write_encoded(&mut sink)
+                })?;
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Unsupported compression",
+                ))
+            }
+        }
+        return Ok((
+            BucketLayout::Monolithic {
+                compressed_size: (out.pos() - start) as usize,
+                uncompressed_size: raw_size,
+            },
+            raw_size,
+        ));
+    }
+
+    // The format puts compressed slot lengths before the slots. Retain only
+    // compressed slots here, not full-width values or uncompressed pages.
+    let mut slots = Vec::with_capacity(plan.encodings.len());
+    for col in 0..plan.encodings.len() {
+        let size = bucket.page_size(&plan, col);
+        let mut slot = Vec::new();
+        if size != 0 {
+            check_zstd_block_size(size, "page uncompressed size")?;
+            varint::encode(&mut slot, to_u32(size, "page uncompressed size")?);
+            slot = compress_integer_unit(slot, level, size, |mut sink| {
+                bucket.write_page(&plan, col, &mut sink)
+            })?;
+        }
+        slots.push(slot);
+    }
+    if !bucket.children().is_empty() {
+        out.write(&(bucket.children().len() as u16).to_le_bytes())?;
+        for child in bucket.children() {
+            out.write(&(child.num_elements as u32).to_le_bytes())?;
+        }
+    }
+    for slot in &slots {
+        out.write(&to_u32(slot.len(), "paged slot size")?.to_le_bytes())?;
+    }
+    for slot in &slots {
+        if !slot.is_empty() {
+            out.write(slot)?;
+        }
+    }
+    Ok((
+        BucketLayout::Paged {
+            total_size: (out.pos() - start) as usize,
+        },
+        page_bytes,
+    ))
 }
 
 impl<S: OutputFile> Drop for MosaicWriter<S> {
@@ -1320,3 +1514,7 @@ mod tests {
         assert_eq!(stats[1].column_index, 2);
     }
 }
+
+#[cfg(test)]
+#[path = "writer_integer_tests.rs"]
+mod integer_tests;
