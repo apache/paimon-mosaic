@@ -113,23 +113,12 @@ impl BucketWriter {
                 _ => None,
             })
             .collect();
-        let value_buffers = integer_buffers
-            .iter()
-            .map(|integer| {
-                if integer.is_some() {
-                    Vec::new()
-                } else {
-                    Vec::with_capacity(1024)
-                }
-            })
-            .collect();
-
         BucketWriter {
             num_primary,
             total_columns,
             fixed_widths,
             null_bitmaps: vec![vec![0u8; 128]; total_columns],
-            value_buffers,
+            value_buffers: vec![Vec::new(); total_columns],
             integer_buffers,
             non_null_counts: vec![0; total_columns],
             const_tracking: vec![true; total_columns],
@@ -1991,6 +1980,20 @@ mod tests {
         let data = writer.finish();
         let h = header_size(&data);
         assert_eq!(data[h] & 0x03, ENCODING_CONST);
+    }
+
+    #[test]
+    fn test_all_null_wide_columns_do_not_preallocate_value_payloads() {
+        let types = vec![&DataType::Float64; 10_000];
+        let mut writer = BucketWriter::new(&types, 32768, 255);
+        let nulls = Float64Array::new_null(65);
+        let arrays = vec![&nulls as &dyn Array; types.len()];
+        for _ in 0..2 {
+            writer.write_columns(&arrays, &types).unwrap();
+            let allocated: usize = writer.value_buffers.iter().map(Vec::capacity).sum();
+            assert!(allocated <= 1024, "all-null payload capacity: {allocated}");
+            writer.reset();
+        }
     }
 
     fn compact_integer_test_array(dt: &DataType, values: &[Option<i64>]) -> ArrayRef {

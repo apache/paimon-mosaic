@@ -741,9 +741,19 @@ impl<S: OutputFile> MosaicWriter<S> {
 /// requirements to C, JNI or custom output callbacks.
 struct OutputWriter<'a, S>(&'a mut S);
 
+fn terminal_output_error(error: io::Error) -> io::Error {
+    // OutputFile may fail after writing a prefix. Prevent Write::write_all and
+    // Zstd from retrying Interrupted errors and duplicating that prefix.
+    if error.kind() == io::ErrorKind::Interrupted {
+        io::Error::other(error)
+    } else {
+        error
+    }
+}
+
 impl<S: OutputFile> io::Write for OutputWriter<'_, S> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.write(bytes)?;
+        self.0.write(bytes).map_err(terminal_output_error)?;
         Ok(bytes.len())
     }
 
@@ -772,7 +782,9 @@ impl<'a, S: OutputFile> BufferedOutputWriter<'a, S> {
 
     fn drain(&mut self) -> io::Result<()> {
         if !self.buffer.is_empty() {
-            self.out.write(&self.buffer)?;
+            self.out
+                .write(&self.buffer)
+                .map_err(terminal_output_error)?;
             self.buffer.clear();
         }
         Ok(())
@@ -790,7 +802,7 @@ impl<S: OutputFile> io::Write for BufferedOutputWriter<'_, S> {
             self.drain()?;
         }
         if bytes.len() >= INTEGER_OUTPUT_BUFFER_SIZE {
-            self.out.write(bytes)?;
+            self.out.write(bytes).map_err(terminal_output_error)?;
         } else {
             self.buffer.extend_from_slice(bytes);
         }
