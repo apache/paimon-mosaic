@@ -6,10 +6,10 @@ anstyle@1.0.14	X					X
 anstyle-parse@1.0.0	X					X
 anstyle-query@1.1.5	X					X
 anstyle-wincon@3.0.11	X					X
-arrow-array@58.4.0	X					X
-arrow-buffer@58.4.0	X
-arrow-data@58.4.0	X
-arrow-schema@58.4.0	X
+arrow-array@59.3.0	X					X
+arrow-buffer@59.3.0	X
+arrow-data@59.3.0	X
+arrow-schema@59.3.0	X
 autocfg@1.5.1	X					X
 bitflags@2.13.1	X					X
 bumpalo@3.20.3	X					X
@@ -51,7 +51,7 @@ libm@0.2.16						X
 linux-raw-sys@0.12.1	X	X				X
 log@0.4.33	X					X
 memchr@2.8.3						X			X
-num-bigint@0.4.8	X					X
+num-bigint@0.5.1	X					X
 num-complex@0.4.6	X					X
 num-integer@0.1.47	X					X
 num-traits@0.2.19	X					X
