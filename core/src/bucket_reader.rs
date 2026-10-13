@@ -977,11 +977,10 @@ fn build_array(
                 scatter_binary_offsets(offsets, data, scatter_bitmap, num_rows);
             let offset_buf = OffsetBuffer::new(ScalarBuffer::from(i32_offsets));
             match dt {
-                DataType::Utf8 => Arc::new(StringArray::new(
-                    offset_buf,
-                    Buffer::from_vec(out_data),
-                    null_buf,
-                )),
+                DataType::Utf8 => Arc::new(
+                    StringArray::try_new(offset_buf, Buffer::from_vec(out_data), null_buf)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
+                ),
                 DataType::Decimal128(p, s) => {
                     let bin = BinaryArray::new(offset_buf, Buffer::from_vec(out_data), null_buf);
                     let i128_values: Vec<i128> = (0..num_rows)
@@ -2459,6 +2458,17 @@ fn read_u64(buf: &[u8], pos: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_array_non_utf8_returns_invalid_data_without_panicking() {
+        let data = RawColumnData::Binary {
+            offsets: vec![0, 2],
+            data: vec![0xff, 0xfe],
+        };
+        let err = build_array(data, &DataType::Utf8, None, 1, false)
+            .expect_err("non-UTF-8 data must not build a StringArray");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
 
     fn null_bitmap(num_rows: usize, non_null_rows: &[usize]) -> Vec<u8> {
         let mut bitmap = vec![u8::MAX; num_rows.div_ceil(8)];
