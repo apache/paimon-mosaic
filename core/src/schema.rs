@@ -355,6 +355,17 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_empty_column_name() {
+        let columns = vec![("".to_string(), DataType::Int32, true)];
+        assert!(MosaicSchema::validate(&columns).is_err());
+
+        // Without the check, such a schema reaches the writer and produces a file
+        // that deserialize() refuses, leaving the data unreadable.
+        let serialized = MosaicSchema::new(columns, 1).serialize();
+        assert!(MosaicSchema::deserialize(&serialized).is_err());
+    }
+
+    #[test]
     fn test_serialize_deserialize_sorted_order() {
         let columns = vec![
             ("name".to_string(), DataType::Utf8, true),
