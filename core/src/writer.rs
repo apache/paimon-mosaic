@@ -20,7 +20,7 @@ use std::io;
 use arrow_array::*;
 use arrow_schema::Schema;
 
-use crate::bucket_writer::{BucketWriter, PagedBucketOutput};
+use crate::bucket_writer::{BucketWriter, PagedBucketOutput, PreparedBucket};
 use crate::schema::MosaicSchema;
 use crate::spec::*;
 use crate::stats::{self, ColumnStats, StatsCollector};
@@ -440,11 +440,14 @@ impl<S: OutputFile> MosaicWriter<S> {
             if bw.is_empty() {
                 continue;
             }
+            // Keep dictionaries only for the bucket currently being encoded.
+            // The view borrows buffered values and drops on output errors too.
+            let bw = bw.prepare();
             if bw.has_integer_buffers() {
                 let offset = self.out.pos();
                 let (layout, uncompressed_size) = write_integer_bucket(
                     &mut self.out,
-                    bw,
+                    &bw,
                     self.compression,
                     self.zstd_level,
                     self.page_size_threshold,
@@ -486,12 +489,14 @@ impl<S: OutputFile> MosaicWriter<S> {
                     .filter_map(|p| p.as_ref())
                     .map(|p| p.len())
                     .sum();
+                drop(bw);
                 let total_size = self.write_paged_bucket(&paged)?;
                 bucket_layouts[b] = BucketLayout::Paged { total_size };
                 actual_uncompressed_sizes[b] = paged_raw_size;
                 bucket_offsets[b] = self.out.pos() - total_size as u64;
             } else {
-                let raw = self.bucket_writers[b].as_ref().unwrap().finish();
+                let raw = bw.finish();
+                drop(bw);
                 let comp_size = self.write_compressed(&raw)?;
                 bucket_layouts[b] = BucketLayout::Monolithic {
                     compressed_size: comp_size,
@@ -848,7 +853,7 @@ fn compress_integer_unit<W: io::Write>(
 
 fn write_integer_bucket<S: OutputFile>(
     out: &mut S,
-    bucket: &BucketWriter,
+    bucket: &PreparedBucket<'_>,
     compression: u8,
     level: i32,
     page_threshold: usize,
