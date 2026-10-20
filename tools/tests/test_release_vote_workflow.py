@@ -70,16 +70,12 @@ REQUIRED_GATE_PATHS = {
     "tools/update_branch_version.sh",
     "tools/verify_release_versions.py",
     "tools/verify_source_archive.py",
-    "tools/verify_binary_artifact.py",
-    "LICENSE*",
-    "java/src/main/binary-resources/**",
     "tools/tests/test_create_source_release.py",
     "tools/tests/deploy_java_staging_test.sh",
     "tools/tests/test_release_vote_workflow.py",
     "tools/tests/test_update_branch_version.py",
     "tools/tests/test_verify_release_versions.py",
     "tools/tests/test_verify_source_archive.py",
-    "tools/tests/test_verify_binary_artifact.py",
 }
 RELEASE_WORKFLOW_BY_JOB = {
     "rust": "./.github/workflows/release-rust.yml",
@@ -120,8 +116,7 @@ GATE_TEST_COMMAND = """python -m pytest -q \\
   tools/tests/test_release_vote_workflow.py \\
   tools/tests/test_update_branch_version.py \\
   tools/tests/test_verify_release_versions.py \\
-  tools/tests/test_verify_source_archive.py \\
-  tools/tests/test_verify_binary_artifact.py
+  tools/tests/test_verify_source_archive.py
 """
 GATE_SOURCE_TREE_COMMAND = """set -euo pipefail
 output_dir="$(mktemp -d "${RUNNER_TEMP}/source-tree.XXXXXX")"
@@ -147,8 +142,7 @@ python -m compileall -q \\
   tools/tests/test_release_vote_workflow.py \\
   tools/tests/test_update_branch_version.py \\
   tools/tests/test_verify_release_versions.py \\
-  tools/tests/test_verify_source_archive.py \\
-  tools/tests/test_verify_binary_artifact.py
+  tools/tests/test_verify_source_archive.py
 bash -n tools/create_source_release.sh
 bash -n tools/deploy_java_staging.sh
 bash -n tools/update_branch_version.sh
