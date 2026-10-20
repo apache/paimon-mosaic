@@ -32,12 +32,16 @@ on:
       - "tools/update_branch_version.sh"
       - "tools/verify_release_versions.py"
       - "tools/verify_source_archive.py"
+      - "tools/verify_binary_artifact.py"
+      - "LICENSE*"
+      - "java/src/main/binary-resources/**"
       - "tools/tests/test_create_source_release.py"
       - "tools/tests/deploy_java_staging_test.sh"
       - "tools/tests/test_release_vote_workflow.py"
       - "tools/tests/test_update_branch_version.py"
       - "tools/tests/test_verify_release_versions.py"
       - "tools/tests/test_verify_source_archive.py"
+      - "tools/tests/test_verify_binary_artifact.py"
   push:
     branches: [main, "release-*"]
     paths:
@@ -52,12 +56,16 @@ on:
       - "tools/update_branch_version.sh"
       - "tools/verify_release_versions.py"
       - "tools/verify_source_archive.py"
+      - "tools/verify_binary_artifact.py"
+      - "LICENSE*"
+      - "java/src/main/binary-resources/**"
       - "tools/tests/test_create_source_release.py"
       - "tools/tests/deploy_java_staging_test.sh"
       - "tools/tests/test_release_vote_workflow.py"
       - "tools/tests/test_update_branch_version.py"
       - "tools/tests/test_verify_release_versions.py"
       - "tools/tests/test_verify_source_archive.py"
+      - "tools/tests/test_verify_binary_artifact.py"
   workflow_dispatch:
 
 permissions:
@@ -86,7 +94,8 @@ jobs:
             tools/tests/test_release_vote_workflow.py \
             tools/tests/test_update_branch_version.py \
             tools/tests/test_verify_release_versions.py \
-            tools/tests/test_verify_source_archive.py
+            tools/tests/test_verify_source_archive.py \
+            tools/tests/test_verify_binary_artifact.py
 
       - name: Test local Java staging
         shell: bash
@@ -122,7 +131,8 @@ jobs:
             tools/tests/test_release_vote_workflow.py \
             tools/tests/test_update_branch_version.py \
             tools/tests/test_verify_release_versions.py \
-            tools/tests/test_verify_source_archive.py
+            tools/tests/test_verify_source_archive.py \
+            tools/tests/test_verify_binary_artifact.py
           bash -n tools/create_source_release.sh
           bash -n tools/deploy_java_staging.sh
           bash -n tools/update_branch_version.sh

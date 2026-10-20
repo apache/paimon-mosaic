@@ -31,7 +31,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 LEGAL_FILES = ("LICENSE", "NOTICE", "LICENSE-binary")
 WHEEL_LEGAL_SOURCES = {
-    "LICENSE": "LICENSE",
     "NOTICE": "java/src/main/binary-resources/META-INF/NOTICE",
     "LICENSE-binary": "LICENSE-binary-ffi",
 }
@@ -79,6 +78,20 @@ def require_canonical_content(archive, artifact, archive_prefix, sources):
             raise ValueError(f"{artifact}!/{entry} does not match repository {source}")
 
 
+def binary_license_content(inventory):
+    return (ROOT / "LICENSE").read_bytes().rstrip() + b"\n\n" + (
+        ROOT / inventory
+    ).read_bytes()
+
+
+def require_binary_license(archive, artifact, entry, inventory):
+    if archive.read(entry) != binary_license_content(inventory):
+        raise ValueError(
+            f"{artifact}!/{entry} must contain the Apache license and the "
+            f"complete third-party license inventory from {inventory}"
+        )
+
+
 def verify_wheel(artifact):
     with zipfile.ZipFile(artifact) as archive:
         names = archive.namelist()
@@ -91,6 +104,8 @@ def verify_wheel(artifact):
         dist_legal = [f"{dist_info}licenses/{name}" for name in LEGAL_FILES]
         package_legal = [f"mosaic/{name}" for name in LEGAL_FILES]
         require_entries(archive, artifact, dist_legal + package_legal)
+        for entry in ("mosaic/LICENSE", f"{dist_info}licenses/LICENSE"):
+            require_binary_license(archive, artifact, entry, "LICENSE-binary-ffi")
         require_canonical_content(
             archive, artifact, "mosaic", WHEEL_LEGAL_SOURCES
         )
@@ -126,6 +141,7 @@ def verify_jar(artifact, native_files):
             "org/apache/paimon/mosaic/NativeLib.class",
         ) + tuple(native_files)
         require_entries(archive, artifact, required)
+        require_binary_license(archive, artifact, "META-INF/LICENSE", "LICENSE-binary")
         require_canonical_content(
             archive,
             artifact,
@@ -187,6 +203,12 @@ def resolved_runtime_dependencies(metadata, root_name):
 
 
 def verify_source_legal_inventory():
+    java_license = ROOT / "java/src/main/binary-resources/META-INF/LICENSE"
+    if java_license.read_bytes() != binary_license_content("LICENSE-binary"):
+        raise ValueError(
+            "Java binary LICENSE is stale: regenerate it from LICENSE and "
+            "LICENSE-binary with tools/generate_license_reports.py"
+        )
     metadata_by_target = [cargo_metadata(target) for target in SUPPORTED_TARGETS]
     for root_name, license_name in (
         ("paimon-mosaic-ffi", "LICENSE-binary-ffi"),

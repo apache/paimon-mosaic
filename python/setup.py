@@ -73,9 +73,14 @@ def _stage_legal_files(destination_dir):
             source = os.path.join(here, name)
         if not os.path.isfile(source):
             raise RuntimeError(f"required binary legal file is missing: {source}")
+        with open(source, "rb") as source_file:
+            source_bytes = source_file.read()
+        if name == "LICENSE" and source == os.path.join(here, "../LICENSE"):
+            # Build the primary binary LICENSE from the maintained inventory.
+            # An sdist already carries this combined file; do not append twice.
+            with open(os.path.join(here, "../LICENSE-binary-ffi"), "rb") as licenses:
+                source_bytes = source_bytes.rstrip() + b"\n\n" + licenses.read()
         if os.path.exists(destination):
-            with open(source, "rb") as source_file:
-                source_bytes = source_file.read()
             with open(destination, "rb") as destination_file:
                 destination_bytes = destination_file.read()
             if source_bytes != destination_bytes:
@@ -83,7 +88,8 @@ def _stage_legal_files(destination_dir):
                     f"staged binary legal file does not match source: {destination}"
                 )
             continue
-        shutil.copy2(source, destination)
+        with open(destination, "wb") as destination_file:
+            destination_file.write(source_bytes)
         staged.append(destination)
 
     return staged

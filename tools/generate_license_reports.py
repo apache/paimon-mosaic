@@ -440,14 +440,10 @@ def generated_files(root: Path) -> dict[Path, str]:
     apache_license = (root / "LICENSE").read_text(encoding="utf-8")
     project_notice = (root / "NOTICE").read_text(encoding="utf-8")
 
-    java_report_paths = [
-        f"META-INF/licenses/{target}/THIRD-PARTY-LICENSES.html"
-        for target in TARGETS
-    ]
-    java_license = binary_license(
-        apache_license,
-        "This binary JAR bundles Rust native libraries for four release targets.",
-        java_report_paths,
+    java_license = (
+        apache_license.rstrip()
+        + "\n\n"
+        + (root / "LICENSE-binary").read_text(encoding="utf-8")
     )
     result[
         root / "java/src/main/binary-resources/META-INF/LICENSE"

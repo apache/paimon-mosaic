@@ -67,3 +67,21 @@ def test_generate_removes_obsolete_target_report(tmp_path: Path) -> None:
 
     assert expected.read_text(encoding="utf-8") == "current\n"
     assert not obsolete.exists()
+
+
+def test_java_license_contains_the_packaged_inventory(tmp_path, monkeypatch):
+    (tmp_path / "LICENSE").write_text("Apache license\n", encoding="utf-8")
+    (tmp_path / "LICENSE-binary").write_text(
+        "Bundled JNI component license\n", encoding="utf-8"
+    )
+    (tmp_path / "NOTICE").write_text("Project notice\n", encoding="utf-8")
+    monkeypatch.setattr(generator, "verify_cargo_about", lambda root: None)
+    monkeypatch.setattr(generator, "generate_base_report", lambda *args: "report")
+    monkeypatch.setattr(generator, "cargo_metadata", lambda *args: {})
+    monkeypatch.setattr(generator, "third_party_notices", lambda *args: ())
+    monkeypatch.setattr(generator, "complete_report", lambda *args: "report")
+
+    files = generator.generated_files(tmp_path)
+    assert files[tmp_path / "java/src/main/binary-resources/META-INF/LICENSE"] == (
+        "Apache license\n\nBundled JNI component license\n"
+    )
