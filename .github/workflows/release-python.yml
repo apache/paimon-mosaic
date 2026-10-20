@@ -75,6 +75,12 @@ jobs:
             cargo build --release -p paimon-mosaic-ffi &&
             cp target/release/libpaimon_mosaic_ffi.so {package}/mosaic/
 
+      - name: Verify and load wheel
+        run: |
+          python3 tools/verify_binary_artifact.py --wheel "wheelhouse/*.whl"
+          python -m pip install --force-reinstall wheelhouse/*.whl
+          python -c "import mosaic; print(mosaic.__file__)"
+
       - name: Upload wheels
         uses: actions/upload-artifact@v5
         with:
@@ -133,6 +139,12 @@ jobs:
           rm python/dist/*.whl
           mv python/dist/repaired/*.whl python/dist/
 
+      - name: Verify and load wheel
+        run: |
+          python3 tools/verify_binary_artifact.py --wheel "python/dist/*.whl"
+          python -m pip install --force-reinstall python/dist/*.whl
+          python -c "import mosaic; print(mosaic.__file__)"
+
       - name: Upload wheel
         uses: actions/upload-artifact@v5
         with:
@@ -175,6 +187,13 @@ jobs:
       - name: Build wheel
         working-directory: python
         run: python -m build --wheel
+
+      - name: Verify and load wheel
+        shell: bash
+        run: |
+          python tools/verify_binary_artifact.py --wheel "python/dist/*.whl"
+          python -m pip install --force-reinstall python/dist/*.whl
+          python -c "import mosaic; print(mosaic.__file__)"
 
       - name: Upload wheel
         uses: actions/upload-artifact@v5

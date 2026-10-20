@@ -20,7 +20,7 @@ use std::io;
 use arrow_array::*;
 use arrow_schema::Schema;
 
-use crate::bucket_writer::{BucketWriter, PagedBucketOutput};
+use crate::bucket_writer::{BucketWriter, PagedBucketOutput, PreparedBucket};
 use crate::schema::MosaicSchema;
 use crate::spec::*;
 use crate::stats::{self, ColumnStats, StatsCollector};
@@ -170,6 +170,19 @@ impl<S: OutputFile> MosaicWriter<S> {
         schema: MosaicSchema,
         options: WriterOptions,
     ) -> io::Result<Self> {
+        let columns = schema
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+        MosaicSchema::validate(&columns)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let batch_col_map: Vec<usize> = (0..schema.columns.len()).collect();
         Self::from_mosaic_schema_with_map(out, schema, options, batch_col_map)
     }
@@ -334,6 +347,7 @@ impl<S: OutputFile> MosaicWriter<S> {
                 ),
             ));
         }
+        self.validate_batch_schema(batch)?;
 
         for (i, col) in self.schema.columns.iter().enumerate() {
             let array = batch.column(self.batch_col_map[i]);
@@ -391,6 +405,25 @@ impl<S: OutputFile> MosaicWriter<S> {
         Ok(())
     }
 
+    fn validate_batch_schema(&self, batch: &RecordBatch) -> io::Result<()> {
+        let batch_schema = batch.schema();
+        for (i, col) in self.schema.columns.iter().enumerate() {
+            let batch_field = batch_schema.field(self.batch_col_map[i]);
+            if batch_field.name() != &col.name {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "field name mismatch at column {}: schema has '{}' but batch has '{}'",
+                        self.batch_col_map[i],
+                        col.name,
+                        batch_field.name()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn flush_row_group(&mut self) -> io::Result<()> {
         if self.current_row_group_rows == 0 {
             return Ok(());
@@ -405,6 +438,23 @@ impl<S: OutputFile> MosaicWriter<S> {
             let b = self.active_buckets[ai];
             let bw = self.bucket_writers[b].as_ref().unwrap();
             if bw.is_empty() {
+                continue;
+            }
+            // Keep dictionaries only for the bucket currently being encoded.
+            // The view borrows buffered values and drops on output errors too.
+            let bw = bw.prepare();
+            if bw.has_integer_buffers() {
+                let offset = self.out.pos();
+                let (layout, uncompressed_size) = write_integer_bucket(
+                    &mut self.out,
+                    &bw,
+                    self.compression,
+                    self.zstd_level,
+                    self.page_size_threshold,
+                )?;
+                bucket_offsets[b] = offset;
+                bucket_layouts[b] = layout;
+                actual_uncompressed_sizes[b] = uncompressed_size;
                 continue;
             }
             let est_size = bw.estimated_raw_size();
@@ -439,12 +489,14 @@ impl<S: OutputFile> MosaicWriter<S> {
                     .filter_map(|p| p.as_ref())
                     .map(|p| p.len())
                     .sum();
+                drop(bw);
                 let total_size = self.write_paged_bucket(&paged)?;
                 bucket_layouts[b] = BucketLayout::Paged { total_size };
                 actual_uncompressed_sizes[b] = paged_raw_size;
                 bucket_offsets[b] = self.out.pos() - total_size as u64;
             } else {
-                let raw = self.bucket_writers[b].as_ref().unwrap().finish();
+                let raw = bw.finish();
+                drop(bw);
                 let comp_size = self.write_compressed(&raw)?;
                 bucket_layouts[b] = BucketLayout::Monolithic {
                     compressed_size: comp_size,
@@ -690,6 +742,198 @@ impl<S: OutputFile> MosaicWriter<S> {
     }
 }
 
+/// Adapt the existing output API without adding seek or temporary-file
+/// requirements to C, JNI or custom output callbacks.
+struct OutputWriter<'a, S>(&'a mut S);
+
+fn terminal_output_error(error: io::Error) -> io::Error {
+    // OutputFile may fail after writing a prefix. Prevent Write::write_all and
+    // Zstd from retrying Interrupted errors and duplicating that prefix.
+    if error.kind() == io::ErrorKind::Interrupted {
+        io::Error::other(error)
+    } else {
+        error
+    }
+}
+
+impl<S: OutputFile> io::Write for OutputWriter<'_, S> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.write(bytes).map_err(terminal_output_error)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+const INTEGER_OUTPUT_BUFFER_SIZE: usize = 16 * 1024;
+
+// Coalesce flags, dictionary entries and value chunks before calling the sink.
+// Unlike BufWriter, this has no flushing Drop: a failed callback may already
+// have written a prefix, so neither errors nor unwinding may retry its bytes.
+struct BufferedOutputWriter<'a, S> {
+    out: &'a mut S,
+    buffer: Vec<u8>,
+}
+
+impl<'a, S: OutputFile> BufferedOutputWriter<'a, S> {
+    fn new(out: &'a mut S) -> Self {
+        Self {
+            out,
+            buffer: Vec::with_capacity(INTEGER_OUTPUT_BUFFER_SIZE),
+        }
+    }
+
+    fn drain(&mut self) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            self.out
+                .write(&self.buffer)
+                .map_err(terminal_output_error)?;
+            self.buffer.clear();
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        // Drain the encoding buffer only; the sink is flushed when the file closes.
+        self.drain()
+    }
+}
+
+impl<S: OutputFile> io::Write for BufferedOutputWriter<'_, S> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > INTEGER_OUTPUT_BUFFER_SIZE - self.buffer.len() {
+            self.drain()?;
+        }
+        if bytes.len() >= INTEGER_OUTPUT_BUFFER_SIZE {
+            self.out.write(bytes).map_err(terminal_output_error)?;
+        } else {
+            self.buffer.extend_from_slice(bytes);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.drain()?;
+        self.out.flush()
+    }
+}
+
+// Small encoded units use the existing one-shot compressor. This bounds the
+// materialized input while avoiding streaming context overhead for tiny pages.
+const INTEGER_ENCODING_BUFFER_LIMIT: usize = 1024 * 1024;
+
+fn compress_integer_unit<W: io::Write>(
+    mut output: W,
+    level: i32,
+    size: usize,
+    encode: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
+) -> io::Result<W> {
+    check_zstd_block_size(size, "integer encoded unit size")?;
+    if size <= INTEGER_ENCODING_BUFFER_LIMIT {
+        let mut raw = Vec::with_capacity(size);
+        encode(&mut raw)?;
+        if raw.len() != size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "integer encoded size mismatch",
+            ));
+        }
+        let compressed = zstd::bulk::compress(&raw, level).map_err(io::Error::other)?;
+        output.write_all(&compressed)?;
+        Ok(output)
+    } else {
+        let mut encoder = zstd::stream::write::Encoder::new(output, level)?;
+        encoder.set_pledged_src_size(Some(size as u64))?;
+        encode(&mut encoder)?;
+        encoder.finish()
+    }
+}
+
+fn write_integer_bucket<S: OutputFile>(
+    out: &mut S,
+    bucket: &PreparedBucket<'_>,
+    compression: u8,
+    level: i32,
+    page_threshold: usize,
+) -> io::Result<(BucketLayout, usize)> {
+    let raw_size = bucket.estimated_raw_size();
+    let plan = bucket.encoding_plan();
+    let page_count = plan.page_sizes.iter().filter(|p| p.is_some()).count();
+    let page_bytes: usize = plan.page_sizes.iter().flatten().sum();
+    let paged = compression == COMPRESSION_ZSTD
+        && raw_size >= page_threshold
+        && page_bytes
+            .checked_div(page_count)
+            .is_some_and(|avg| avg >= page_threshold);
+    let start = out.pos();
+    if !paged {
+        match compression {
+            COMPRESSION_NONE => {
+                let mut buffered = BufferedOutputWriter::new(out);
+                bucket.write_encoded(&mut buffered)?;
+                buffered.finish()?;
+            }
+            COMPRESSION_ZSTD => {
+                check_zstd_block_size(raw_size, "bucket uncompressed size")?;
+                compress_integer_unit(OutputWriter(out), level, raw_size, |mut sink| {
+                    bucket.write_encoded(&mut sink)
+                })?;
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Unsupported compression",
+                ))
+            }
+        }
+        return Ok((
+            BucketLayout::Monolithic {
+                compressed_size: (out.pos() - start) as usize,
+                uncompressed_size: raw_size,
+            },
+            raw_size,
+        ));
+    }
+
+    // The format puts compressed slot lengths before the slots. Retain only
+    // compressed slots here, not full-width values or uncompressed pages.
+    let mut slots = Vec::with_capacity(plan.encodings.len());
+    for col in 0..plan.encodings.len() {
+        let size = bucket.page_size(&plan, col);
+        let mut slot = Vec::new();
+        if size != 0 {
+            check_zstd_block_size(size, "page uncompressed size")?;
+            varint::encode(&mut slot, to_u32(size, "page uncompressed size")?);
+            slot = compress_integer_unit(slot, level, size, |mut sink| {
+                bucket.write_page(&plan, col, &mut sink)
+            })?;
+        }
+        slots.push(slot);
+    }
+    if !bucket.children().is_empty() {
+        out.write(&(bucket.children().len() as u16).to_le_bytes())?;
+        for child in bucket.children() {
+            out.write(&(child.num_elements as u32).to_le_bytes())?;
+        }
+    }
+    for slot in &slots {
+        out.write(&to_u32(slot.len(), "paged slot size")?.to_le_bytes())?;
+    }
+    for slot in &slots {
+        if !slot.is_empty() {
+            out.write(slot)?;
+        }
+    }
+    Ok((
+        BucketLayout::Paged {
+            total_size: (out.pos() - start) as usize,
+        },
+        page_bytes,
+    ))
+}
+
 impl<S: OutputFile> Drop for MosaicWriter<S> {
     fn drop(&mut self) {
         if self.state == WriterState::Open {
@@ -873,6 +1117,58 @@ mod tests {
     }
 
     #[test]
+    fn test_new_rejects_empty_column_name_before_writing() {
+        let arrow_schema = Schema::new(vec![Field::new("", DataType::Int32, true)]);
+        let state = Arc::new(Mutex::new(FailingOutputState::default()));
+        let out = FailOnceOutputFile {
+            state: Arc::clone(&state),
+            fail: false,
+        };
+
+        let result = MosaicWriter::new(out, &arrow_schema, WriterOptions::default());
+        let error = match result {
+            Ok(writer) => {
+                std::mem::forget(writer);
+                panic!("empty column name should be rejected");
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(io::ErrorKind::InvalidInput, error.kind());
+        assert!(error.to_string().contains("empty column name"));
+        let state = state.lock().unwrap();
+        assert_eq!(0, state.write_calls);
+        assert_eq!(0, state.flush_calls);
+        assert!(state.bytes.is_empty());
+    }
+
+    #[test]
+    fn test_from_mosaic_schema_rejects_empty_column_name_before_writing() {
+        let schema = MosaicSchema::new(vec![("".to_string(), DataType::Int32, true)], 1);
+        let state = Arc::new(Mutex::new(FailingOutputState::default()));
+        let out = FailOnceOutputFile {
+            state: Arc::clone(&state),
+            fail: false,
+        };
+
+        let result = MosaicWriter::from_mosaic_schema(out, schema, WriterOptions::default());
+        let error = match result {
+            Ok(writer) => {
+                std::mem::forget(writer);
+                panic!("empty column name should be rejected");
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(io::ErrorKind::InvalidInput, error.kind());
+        assert!(error.to_string().contains("empty column name"));
+        let state = state.lock().unwrap();
+        assert_eq!(0, state.write_calls);
+        assert_eq!(0, state.flush_calls);
+        assert!(state.bytes.is_empty());
+    }
+
+    #[test]
     fn test_write_simple_file() {
         let arrow_schema = Schema::new(vec![
             Field::new("name", DataType::Utf8, true),
@@ -1040,7 +1336,7 @@ mod tests {
 
         let batch2 = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int32, false),
+                Field::new("id", DataType::Int32, true),
                 Field::new("name", DataType::Utf8, true),
             ])),
             vec![
@@ -1051,6 +1347,86 @@ mod tests {
         .unwrap();
         let result = writer.write_batch(&batch2);
         assert!(result.is_ok());
+
+        let batch3 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![None, Some("world")])),
+            ],
+        )
+        .unwrap();
+        let result = writer.write_batch(&batch3);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_write_batch_rejects_reordered_schema() {
+        let arrow_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let out = MemOutputFile::new();
+        let mut writer = MosaicWriter::new(out, &arrow_schema, WriterOptions::default()).unwrap();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        writer.write_batch(&batch).unwrap();
+
+        let reordered_schema = Schema::new(vec![
+            Field::new("b", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
+        ]);
+        let reordered_batch = RecordBatch::try_new(
+            Arc::new(reordered_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![30, 40])),
+                Arc::new(Int32Array::from(vec![3, 4])),
+            ],
+        )
+        .unwrap();
+
+        let err = writer.write_batch(&reordered_batch).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("field name mismatch"));
+    }
+
+    #[test]
+    fn test_write_batch_name_mismatch_reports_mapped_batch_index() {
+        let arrow_schema = Schema::new(vec![
+            Field::new("z", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
+        ]);
+        let out = MemOutputFile::new();
+        let mut writer = MosaicWriter::new(out, &arrow_schema, WriterOptions::default()).unwrap();
+
+        let mismatched_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("z", DataType::Int32, false),
+                Field::new("x", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![3, 4])),
+            ],
+        )
+        .unwrap();
+
+        let err = writer.write_batch(&mismatched_batch).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "field name mismatch at column 1: schema has 'a' but batch has 'x'"
+        );
     }
 
     #[test]
@@ -1155,3 +1531,7 @@ mod tests {
         assert_eq!(stats[1].column_index, 2);
     }
 }
+
+#[cfg(test)]
+#[path = "writer_integer_tests.rs"]
+mod integer_tests;

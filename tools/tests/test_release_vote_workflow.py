@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+import subprocess
 
 import pytest
 import yaml
@@ -153,6 +154,25 @@ else
 fi
 git diff --check "$(git merge-base HEAD "${comparison_ref}")" HEAD
 """
+
+
+def test_binary_licenses_keep_canonical_bytes_with_autocrlf(tmp_path: Path) -> None:
+    names = ("LICENSE-binary", "LICENSE-binary-ffi")
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    for name in (".gitattributes", *names):
+        (tmp_path / name).write_bytes((ROOT / name).read_bytes())
+    subprocess.run(
+        ["git", "add", "--", ".gitattributes", *names], cwd=tmp_path, check=True
+    )
+    for name in names:
+        (tmp_path / name).unlink()
+    subprocess.run(
+        ["git", "-c", "core.autocrlf=true", "checkout-index", "--", *names],
+        cwd=tmp_path,
+        check=True,
+    )
+    for name in names:
+        assert (tmp_path / name).read_bytes() == (ROOT / name).read_bytes(), name
 
 
 def load_workflow(path: Path) -> dict:

@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Build helper: copies the pre-built native library into the package directory."""
+"""Build helper: stages the native library and binary-distribution legal files."""
 
 import os
 import platform
@@ -24,6 +24,14 @@ import shutil
 from setuptools import Distribution, setup
 from setuptools.command.build_py import build_py
 from wheel.bdist_wheel import bdist_wheel
+
+
+LEGAL_FILES = ("LICENSE", "NOTICE", "LICENSE-binary")
+LEGAL_SOURCE_FILES = {
+    "LICENSE": "../LICENSE",
+    "NOTICE": "../java/src/main/binary-resources/META-INF/NOTICE",
+    "LICENSE-binary": "../LICENSE-binary-ffi",
+}
 
 
 def _lib_name():
@@ -53,6 +61,34 @@ def _find_native_lib():
     return None
 
 
+def _stage_legal_files(destination_dir):
+    here = os.path.dirname(os.path.abspath(__file__))
+    staged = []
+
+    for name in LEGAL_FILES:
+        source = os.path.join(here, LEGAL_SOURCE_FILES[name])
+        destination = os.path.join(destination_dir, name)
+        if not os.path.isfile(source):
+            # An extracted sdist carries these files alongside setup.py.
+            source = os.path.join(here, name)
+        if not os.path.isfile(source):
+            raise RuntimeError(f"required binary legal file is missing: {source}")
+        if os.path.exists(destination):
+            with open(source, "rb") as source_file:
+                source_bytes = source_file.read()
+            with open(destination, "rb") as destination_file:
+                destination_bytes = destination_file.read()
+            if source_bytes != destination_bytes:
+                raise RuntimeError(
+                    f"staged binary legal file does not match source: {destination}"
+                )
+            continue
+        shutil.copy2(source, destination)
+        staged.append(destination)
+
+    return staged
+
+
 class BuildPyWithNativeLib(build_py):
     def run(self):
         src = _find_native_lib()
@@ -61,7 +97,14 @@ class BuildPyWithNativeLib(build_py):
                 os.path.dirname(os.path.abspath(__file__)), "mosaic", _lib_name()
             )
             shutil.copy2(src, dst)
-        super().run()
+        staged_legal_files = _stage_legal_files(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "mosaic")
+        )
+        try:
+            super().run()
+        finally:
+            for path in staged_legal_files:
+                os.remove(path)
 
 
 class PlatformWheel(bdist_wheel):
@@ -83,7 +126,14 @@ class BinaryDistribution(Distribution):
         return True
 
 
-setup(
-    cmdclass={"build_py": BuildPyWithNativeLib, "bdist_wheel": PlatformWheel},
-    distclass=BinaryDistribution,
+staged_distribution_legal_files = _stage_legal_files(
+    os.path.dirname(os.path.abspath(__file__))
 )
+try:
+    setup(
+        cmdclass={"build_py": BuildPyWithNativeLib, "bdist_wheel": PlatformWheel},
+        distclass=BinaryDistribution,
+    )
+finally:
+    for path in staged_distribution_legal_files:
+        os.remove(path)

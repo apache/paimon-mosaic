@@ -116,6 +116,41 @@
                 <plugins>
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-resources-plugin</artifactId>
+                        <version>3.3.1</version>
+                        <executions>
+                            <execution>
+                                <id>copy-binary-legal-resources</id>
+                                <phase>prepare-package</phase>
+                                <goals>
+                                    <goal>copy-resources</goal>
+                                </goals>
+                                <configuration>
+                                    <outputDirectory>${project.build.outputDirectory}</outputDirectory>
+                                    <overwrite>true</overwrite>
+                                    <resources>
+                                        <resource>
+                                            <directory>${project.basedir}/..</directory>
+                                            <targetPath>META-INF</targetPath>
+                                            <filtering>false</filtering>
+                                            <includes>
+                                                <include>LICENSE-binary</include>
+                                            </includes>
+                                        </resource>
+                                        <resource>
+                                            <directory>src/main/binary-resources</directory>
+                                            <filtering>false</filtering>
+                                            <includes>
+                                                <include>META-INF/NOTICE</include>
+                                            </includes>
+                                        </resource>
+                                    </resources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-gpg-plugin</artifactId>
                         <version>3.2.8</version>
                         <executions>
@@ -150,6 +185,8 @@
                         <configuration>
                             <excludes>
                                 <exclude>native/**</exclude>
+                                <exclude>LICENSE-binary</exclude>
+                                <exclude>**/LICENSE-binary</exclude>
                             </excludes>
                         </configuration>
                     </plugin>

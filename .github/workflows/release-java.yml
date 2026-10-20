@@ -188,23 +188,19 @@ jobs:
             test -s "$artifact"
           done
 
-          if jar tf "$sources_jar" | grep -Eq '^native/'; then
-            echo "Sources JAR contains native resources" >&2
-            exit 1
-          fi
+          python3 tools/verify_binary_artifact.py --jar "$jar_file"
 
           for entry in \
-            org/apache/paimon/mosaic/NativeLib.class \
-            native/linux/x86_64/libpaimon_mosaic_jni.so \
-            native/linux/aarch64/libpaimon_mosaic_jni.so \
-            native/macos/aarch64/libpaimon_mosaic_jni.dylib \
-            native/windows/x86_64/paimon_mosaic_jni.dll \
-            META-INF/LICENSE \
-            META-INF/NOTICE \
-            META-INF/DEPENDENCIES
+            META-INF/DEPENDENCIES \
+            org/apache/paimon/mosaic/NativeLib.class
           do
             jar tf "$jar_file" | grep -qx "$entry"
           done
+
+          if jar tf "$sources_jar" | grep -Eq '^(native/|META-INF/LICENSE-binary$)'; then
+            echo "Sources JAR contains binary-only resources" >&2
+            exit 1
+          fi
 
           java -cp "$jar_file:java/target/test-classes" \
             org.apache.paimon.mosaic.MosaicNativeLoaderSmokeTest

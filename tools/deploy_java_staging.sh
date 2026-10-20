@@ -248,7 +248,7 @@ else
 fi
 
 check_java_package_inputs_clean() {
-  local paths=(java tools/deploy_java_staging.sh)
+  local paths=(java LICENSE-binary tools/deploy_java_staging.sh tools/verify_binary_artifact.py)
   local untracked
 
   if ! git -C "$REPO_DIR" diff --quiet -- "${paths[@]}" ||
@@ -556,7 +556,7 @@ validate_maven_artifacts() {
   done
 
   for artifact in "$sources_jar" "$ci_sources_jar"; do
-    if grep -Eq '^native/' <<<"$(jar tf "$artifact")"; then
+    if grep -Eq '^(native/|META-INF/LICENSE-binary$)' <<<"$(jar tf "$artifact")"; then
       echo "Sources jar contains binary-only resources: $artifact" >&2
       exit 1
     fi
@@ -572,6 +572,7 @@ validate_maven_artifacts() {
       native/windows/x86_64/paimon_mosaic_jni.dll \
       META-INF/LICENSE \
       META-INF/NOTICE \
+      META-INF/LICENSE-binary \
       META-INF/DEPENDENCIES
     do
       if ! jar tf "$main_jar" | grep -qx "$entry"; then
@@ -579,6 +580,7 @@ validate_maven_artifacts() {
         exit 1
       fi
     done
+    python3 "$REPO_DIR/tools/verify_binary_artifact.py" --jar "$main_jar"
   done
 
   local test_classes="$REPO_DIR/java/target/test-classes"
