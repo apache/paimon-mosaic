@@ -169,9 +169,28 @@ impl StatsCollector {
     }
 }
 
+/// Whether a stats value is a floating-point NaN.
+///
+/// NaN is unordered against every value, so [`compare_values`] returns `None` for
+/// any pair involving it. A NaN bound could therefore never be replaced by the
+/// comparisons in [`update_min_max`], pinning a row group's min and max to NaN and
+/// making the range useless for row-group skipping. Treat a NaN bound as
+/// replaceable instead, matching Parquet's rule that NaN takes no part in min/max.
+fn is_nan(value: &Value) -> bool {
+    match value {
+        Value::Float(x) => x.is_nan(),
+        Value::Double(x) => x.is_nan(),
+        _ => false,
+    }
+}
+
 fn update_min_max(tracker: &mut ColTracker, value: Value) {
+    // An all-NaN column keeps NaN bounds so that a row group with any non-null
+    // value still has both min and max set, which serialize_stats requires.
+    let value_is_nan = is_nan(&value);
     let update_min = match &tracker.min {
         None => true,
+        Some(cur) if is_nan(cur) => !value_is_nan,
         Some(cur) => compare_values(&value, cur) == Some(Ordering::Less),
     };
     if update_min {
@@ -179,6 +198,7 @@ fn update_min_max(tracker: &mut ColTracker, value: Value) {
     }
     let update_max = match &tracker.max {
         None => true,
+        Some(cur) if is_nan(cur) => !value_is_nan,
         Some(cur) => compare_values(&value, cur) == Some(Ordering::Greater),
     };
     if update_max {
@@ -567,6 +587,44 @@ mod tests {
             Some(Value::Double(v)) => assert!((*v - 3.0).abs() < 1e-10),
             other => panic!("expected Double(3.0), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_stats_nan_does_not_pin_min_max() {
+        let columns = vec![(0usize, 0usize, DataType::Float64)];
+        let mut collector = StatsCollector::new(&columns);
+
+        // NaN first: it must not survive as either bound once real values arrive.
+        collector.update(&[Value::Double(f64::NAN)]);
+        collector.update(&[Value::Double(3.0)]);
+        collector.update(&[Value::Double(7.0)]);
+        collector.update(&[Value::Double(f64::NAN)]);
+
+        let stats = collector.finish();
+        match &stats[0].min {
+            Some(Value::Double(v)) => assert!((*v - 3.0).abs() < 1e-10),
+            other => panic!("expected Double(3.0), got {:?}", other),
+        }
+        match &stats[0].max {
+            Some(Value::Double(v)) => assert!((*v - 7.0).abs() < 1e-10),
+            other => panic!("expected Double(7.0), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stats_all_nan_keeps_both_bounds_set() {
+        // serialize_stats only writes min/max when both are Some, while
+        // deserialize_stats reads them whenever null_count < num_rows. An all-NaN
+        // column must therefore still report both bounds or the stats block desyncs.
+        let columns = vec![(0usize, 0usize, DataType::Float32)];
+        let mut collector = StatsCollector::new(&columns);
+        collector.update(&[Value::Float(f32::NAN)]);
+        collector.update(&[Value::Float(f32::NAN)]);
+
+        let stats = collector.finish();
+        assert_eq!(stats[0].null_count, 0);
+        assert!(matches!(&stats[0].min, Some(Value::Float(v)) if v.is_nan()));
+        assert!(matches!(&stats[0].max, Some(Value::Float(v)) if v.is_nan()));
     }
 
     #[test]
