@@ -209,8 +209,10 @@ paimon-mosaic-core = { git = "https://github.com/apache/paimon-mosaic", tag = "v
             </ol>
 
             <h3>Python (TestPyPI)</h3>
-            <p>The RC tag publishes wheels to TestPyPI after the Rust and Java release jobs succeed. Install and verify:</p>
-<pre><code>pip install -i https://test.pypi.org/simple/ paimon-mosaic==${RELEASE_VERSION}rc${RC_NUM}
+            <p>The RC tag publishes wheels to TestPyPI after the Rust and Java release jobs succeed. In a fresh virtual environment, install dependencies from PyPI first, then install the exact RC wheel from TestPyPI without resolving dependencies there:</p>
+<pre><code>python -m pip install --index-url https://pypi.org/simple/ pyarrow
+python -m pip install --no-deps --index-url https://test.pypi.org/simple/ paimon-mosaic==${RELEASE_VERSION}rc${RC_NUM}
+python -m pip check
 python -c "import mosaic; print('OK')"</code></pre>
             <p>Verify wheels are available for: Linux x86_64, Linux aarch64, macOS aarch64, Windows x86_64.</p>
 

@@ -63,8 +63,13 @@ def test_sdist_to_wheel_preserves_canonical_legal_files(tmp_path):
     with tarfile.open(sdist) as archive:
         prefix = sdist.name.removesuffix(".tar.gz")
         for name, source in legal_sources.items():
+            expected = (ROOT / source).read_bytes()
+            if name == "LICENSE":
+                expected = expected.rstrip() + b"\n\n" + (
+                    ROOT / "LICENSE-binary-ffi"
+                ).read_bytes()
             with archive.extractfile(f"{prefix}/{name}") as legal_file:
-                assert legal_file.read() == (ROOT / source).read_bytes()
+                assert legal_file.read() == expected
 
     wheel, = (package / "dist").glob("*.whl")
     result = subprocess.run(
