@@ -248,7 +248,7 @@ else
 fi
 
 check_java_package_inputs_clean() {
-  local paths=(java LICENSE-binary tools/deploy_java_staging.sh tools/verify_binary_artifact.py)
+  local paths=(java LICENSE LICENSE-binary tools/deploy_java_staging.sh tools/verify_binary_artifact.py tools/release_checks.py)
   local untracked
 
   if ! git -C "$REPO_DIR" diff --quiet -- "${paths[@]}" ||
@@ -329,6 +329,16 @@ if ! command -v gh >/dev/null 2>&1; then
 fi
 
 validate_github_run
+
+MAVEN_VERSION=$(cd "$REPO_DIR/java" && "$MVN" --version)
+JAVA_HOME=$(printf '%s\n' "$MAVEN_VERSION" | python3 "$SCRIPT_DIR/release_checks.py" java-home)
+if command -v cygpath >/dev/null 2>&1; then
+  JAVA_HOME=$(cygpath -u "$JAVA_HOME")
+fi
+export JAVA_HOME
+export PATH="$JAVA_HOME/bin:$PATH"
+export TZ=UTC
+export MAVEN_OPTS="${MAVEN_OPTS:-} -Duser.timezone=UTC"
 
 cleanup_download_dir() {
   if [[ -n "$NATIVE_DIR" ]]; then
@@ -556,10 +566,15 @@ validate_maven_artifacts() {
   done
 
   for artifact in "$sources_jar" "$ci_sources_jar"; do
+    python3 "$REPO_DIR/tools/verify_binary_artifact.py" --sources-jar "$artifact"
     if grep -Eq '^(native/|META-INF/LICENSE-binary$)' <<<"$(jar tf "$artifact")"; then
       echo "Sources jar contains binary-only resources: $artifact" >&2
       exit 1
     fi
+  done
+
+  for artifact in "$javadoc_jar" "$ci_javadoc_jar"; do
+    python3 "$REPO_DIR/tools/verify_binary_artifact.py" --javadoc-jar "$artifact"
   done
 
   for main_jar in "$jar_file" "$ci_jar"
@@ -588,9 +603,9 @@ validate_maven_artifacts() {
     echo "Packaged JAR loader smoke test class is missing from test output." >&2
     exit 1
   fi
-  java -cp "$jar_file:$test_classes" \
+  "$JAVA_HOME/bin/java" -Djava.library.path=/nonexistent-mosaic-release-check -cp "$jar_file:$test_classes" \
     org.apache.paimon.mosaic.MosaicNativeLoaderSmokeTest
-  java -cp "$ci_jar:$test_classes" \
+  "$JAVA_HOME/bin/java" -Djava.library.path=/nonexistent-mosaic-release-check -cp "$ci_jar:$test_classes" \
     org.apache.paimon.mosaic.MosaicNativeLoaderSmokeTest
 }
 
@@ -613,7 +628,7 @@ echo ""
 if [[ "$DRY_RUN" == "true" ]]; then
   echo "Java staging dry run finished successfully."
 else
-  DEPLOY_CMD=("${MVN_BASE_CMD[@]}" deploy -Prelease "-DstagingDescription=$STAGING_DESCRIPTION")
+  DEPLOY_CMD=("${MVN_BASE_CMD[@]}" deploy -Prelease "-DstagingDescription=$STAGING_DESCRIPTION" -Dgpg.skip=false)
   if [[ "$SKIP_TESTS" == "true" ]]; then
     DEPLOY_CMD+=(-DskipTests)
   fi

@@ -67,6 +67,10 @@ REQUIRED_GATE_PATHS = {
     "java/src/test/java/org/apache/paimon/mosaic/MosaicNativeLoaderSmokeTest.java",
     "tools/create_source_release.sh",
     "tools/deploy_java_staging.sh",
+    "tools/release_checks.py",
+    "tools/verify_binary_artifact.py",
+    "tools/tests/test_release_checks.py",
+    "tools/tests/test_verify_binary_artifact.py",
     "tools/update_branch_version.sh",
     "tools/verify_release_versions.py",
     "tools/verify_source_archive.py",
@@ -113,6 +117,8 @@ python3 tools/verify_source_archive.py verify \\
 """
 GATE_TEST_COMMAND = """python -m pytest -q \\
   tools/tests/test_create_source_release.py \\
+  tools/tests/test_release_checks.py \\
+  tools/tests/test_verify_binary_artifact.py \\
   tools/tests/test_release_vote_workflow.py \\
   tools/tests/test_update_branch_version.py \\
   tools/tests/test_verify_release_versions.py \\
@@ -137,6 +143,8 @@ python3 tools/verify_source_archive.py verify \\
 GATE_STATIC_COMMAND = """set -euo pipefail
 python -m compileall -q \\
   tools/verify_release_versions.py \\
+  tools/release_checks.py \\
+  tools/verify_binary_artifact.py \\
   tools/verify_source_archive.py \\
   tools/tests/test_create_source_release.py \\
   tools/tests/test_release_vote_workflow.py \\

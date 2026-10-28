@@ -112,6 +112,9 @@
     <profiles>
         <profile>
             <id>release</id>
+            <properties>
+                <gpg.skip>false</gpg.skip>
+            </properties>
             <build>
                 <plugins>
                     <plugin>
@@ -163,10 +166,55 @@
                                 </goals>
                                 <configuration>
                                     <bestPractices>true</bestPractices>
+                                    <ascDirectory>${project.build.directory}</ascDirectory>
                                     <gpgArguments>
                                         <arg>--pinentry-mode</arg>
                                         <arg>loopback</arg>
                                     </gpgArguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-antrun-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>verify-signed-release-artifacts</id>
+                                <phase>verify</phase>
+                                <goals><goal>run</goal></goals>
+                                <configuration>
+                                    <skip>${gpg.skip}</skip>
+                                    <target>
+                                        <exec executable="python3" failonerror="true">
+                                            <arg value="${project.basedir}/../tools/verify_binary_artifact.py"/>
+                                            <arg value="--jar"/>
+                                            <arg value="${project.build.directory}/${project.build.finalName}.jar"/>
+                                            <arg value="--sources-jar"/>
+                                            <arg value="${project.build.directory}/${project.build.finalName}-sources.jar"/>
+                                            <arg value="--javadoc-jar"/>
+                                            <arg value="${project.build.directory}/${project.build.finalName}-javadoc.jar"/>
+                                        </exec>
+                                        <exec executable="python3" failonerror="true">
+                                            <arg value="${project.basedir}/../tools/release_checks.py"/>
+                                            <arg value="signatures"/>
+                                            <arg value="--gpg-executable"/><arg value="${gpg.executable}"/>
+                                            <arg value="--gpg-home"/><arg value="${gpg.homedir}"/>
+                                            <arg value="--signed-file"/>
+                                            <arg value="${project.build.directory}/${project.build.finalName}.pom.asc"/>
+                                            <arg value="${project.basedir}/pom.xml"/>
+                                            <arg value="--signed-file"/>
+                                            <arg value="${project.build.directory}/${project.build.finalName}.jar.asc"/>
+                                            <arg value="${project.build.directory}/${project.build.finalName}.jar"/>
+                                            <arg value="--signed-file"/>
+                                            <arg value="${project.build.directory}/${project.build.finalName}-sources.jar.asc"/>
+                                            <arg value="${project.build.directory}/${project.build.finalName}-sources.jar"/>
+                                            <arg value="--signed-file"/>
+                                            <arg value="${project.build.directory}/${project.build.finalName}-javadoc.jar.asc"/>
+                                            <arg value="${project.build.directory}/${project.build.finalName}-javadoc.jar"/>
+                                        </exec>
+                                    </target>
                                 </configuration>
                             </execution>
                         </executions>
@@ -219,7 +267,7 @@
                                 <configuration>
                                     <rules>
                                         <requireJavaVersion>
-                                            <version>1.8.0</version>
+                                            <version>[1.8,1.9)</version>
                                         </requireJavaVersion>
                                         <requireMavenVersion>
                                             <version>[3.1.1,)</version>

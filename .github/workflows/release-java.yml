@@ -188,7 +188,8 @@ jobs:
             test -s "$artifact"
           done
 
-          python3 tools/verify_binary_artifact.py --jar "$jar_file"
+          python3 tools/verify_binary_artifact.py --jar "$jar_file" \
+            --sources-jar "$sources_jar" --javadoc-jar "$javadoc_jar"
 
           for entry in \
             META-INF/DEPENDENCIES \

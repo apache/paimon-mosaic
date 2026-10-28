@@ -80,6 +80,11 @@ fi
 cd ..
 REPOSITORY=$(pwd -P)
 
+if ! python3 -c 'import tomllib' >/dev/null 2>&1; then
+  echo "Source release checks require python3 with tomllib (Python 3.11+). Select that interpreter as python3 and retry." >&2
+  exit 1
+fi
+
 if [[ -n $(git status --porcelain --untracked-files=all) ]]; then
   echo "The source release must be created from a clean Git worktree" >&2
   git status --short >&2
@@ -173,6 +178,9 @@ gpg \
   --detach-sign \
   --output "${ARTIFACT_DIR}/${SIGNATURE}" \
   "${ARTIFACT_DIR}/${ARCHIVE}"
+
+python3 tools/release_checks.py signatures \
+  --signed-file "${ARTIFACT_DIR}/${SIGNATURE}" "${ARTIFACT_DIR}/${ARCHIVE}"
 
 if (
   cd "${ARTIFACT_DIR}" &&

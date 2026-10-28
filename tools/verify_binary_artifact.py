@@ -20,10 +20,12 @@
 """Verify legal files and native resources in binary convenience artifacts."""
 
 import argparse
+from datetime import datetime, timezone
 import glob
 import json
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
@@ -152,6 +154,44 @@ def verify_jar(artifact, native_files):
     print(f"Verified Java JAR: {artifact}")
 
 
+def verify_java_auxiliary(artifact, javadoc=False):
+    pom = ET.parse(ROOT / "java/pom.xml")
+    ns = {"m": "http://maven.apache.org/POM/4.0.0"}
+    timestamp = pom.findtext("m:properties/m:project.build.outputTimestamp", namespaces=ns)
+    if timestamp is None:
+        raise ValueError("Java release POM must define project.build.outputTimestamp")
+    if timestamp.isdigit():
+        end = datetime.fromtimestamp(int(timestamp), timezone.utc).year
+    else:
+        end = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(timezone.utc).year
+    start = pom.findtext("m:inceptionYear", str(end), namespaces=ns)
+    years = start if start == str(end) else f"{start}-{end}"
+    with zipfile.ZipFile(artifact) as archive:
+        require_entries(archive, artifact, ("META-INF/LICENSE", "META-INF/NOTICE"))
+        if archive.read("META-INF/LICENSE").strip() != (ROOT / "LICENSE").read_bytes().strip():
+            raise ValueError(f"{artifact} must contain the canonical Apache LICENSE")
+        notice = archive.read("META-INF/NOTICE").decode("utf-8")
+        if f"Copyright {years} The Apache Software Foundation" not in notice:
+            raise ValueError(f"{artifact} NOTICE must use UTC copyright years {years}")
+        names = archive.namelist()
+        if any(name.startswith("native/") or name == "META-INF/LICENSE-binary" for name in names):
+            raise ValueError(f"{artifact} contains binary-only resources")
+        if javadoc:
+            require_entries(archive, artifact, ("META-INF/MANIFEST.MF",))
+            manifest = archive.read("META-INF/MANIFEST.MF").decode("utf-8")
+            if not any(
+                line.strip() in ("Build-Jdk-Spec: 1.8", "Build-Jdk-Spec: 8")
+                for line in manifest.splitlines()
+            ):
+                raise ValueError(f"{artifact} must be generated with JDK 8")
+            scripts = {name for name in names if name.endswith((".js", ".css"))}
+            if scripts != {"script.js", "stylesheet.css"} or any(
+                name.startswith(("legal/", "resources/")) for name in names
+            ):
+                raise ValueError(f"{artifact} contains unexpected Javadoc assets requiring license review")
+    print(f"Verified Java {'Javadoc' if javadoc else 'sources'} JAR: {artifact}")
+
+
 def cargo_metadata(target):
     return json.loads(
         subprocess.check_output(
@@ -261,6 +301,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wheel", nargs="+", default=[], help="Wheel path or glob")
     parser.add_argument("--jar", nargs="+", default=[], help="JAR path or glob")
+    parser.add_argument("--sources-jar", nargs="+", default=[], help="Java sources JAR path or glob")
+    parser.add_argument("--javadoc-jar", nargs="+", default=[], help="JDK 8 Javadoc JAR path or glob")
     parser.add_argument(
         "--jar-native",
         action="append",
@@ -277,8 +319,8 @@ def main():
     )
     args = parser.parse_args()
 
-    if not args.wheel and not args.jar and not args.source:
-        parser.error("at least one --source, --wheel, or --jar is required")
+    if not any((args.wheel, args.jar, args.source, args.sources_jar, args.javadoc_jar)):
+        parser.error("at least one artifact path or --source is required")
 
     try:
         if args.source:
@@ -287,11 +329,16 @@ def main():
             verify_wheel(artifact)
         for artifact in resolve_artifacts(args.jar):
             verify_jar(artifact, args.jar_native or JAR_NATIVE_FILES)
+        for artifact in resolve_artifacts(args.sources_jar):
+            verify_java_auxiliary(artifact)
+        for artifact in resolve_artifacts(args.javadoc_jar):
+            verify_java_auxiliary(artifact, javadoc=True)
     except (
         KeyError,
         OSError,
         subprocess.CalledProcessError,
         ValueError,
+        ET.ParseError,
         zipfile.BadZipFile,
     ) as error:
         print(f"Binary artifact verification failed: {error}", file=sys.stderr)

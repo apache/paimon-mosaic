@@ -73,7 +73,7 @@ def signing_home(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str]:
             "",
             "--quick-gen-key",
             "Release Test <release-test@example.invalid>",
-            "rsa1024",
+            "rsa2048",
             "sign",
             "0",
         ],
@@ -108,6 +108,7 @@ def initialize_release_repo(
         write(tools / SOURCE_SCRIPT.name, source_script)
     shutil.copy2(SOURCE_VERIFIER, tools / SOURCE_VERIFIER.name)
     shutil.copy2(VERSION_VERIFIER, tools / VERSION_VERIFIER.name)
+    shutil.copy2(ROOT / "tools/release_checks.py", tools / "release_checks.py")
 
     write(
         repo / "Cargo.toml",
@@ -240,6 +241,21 @@ def test_creates_verified_artifacts_from_signed_head_tag(
         cwd=repo,
         env=env,
     )
+
+
+def test_missing_tomllib_fails_before_creating_any_archive(tmp_path, signing_home):
+    repo, env, _ = initialize_release_repo(tmp_path, signing_home)
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    python = binary / "python3"
+    python.write_text("#!/bin/sh\nexit 1\n")
+    python.chmod(0o755)
+    env["PATH"] = str(binary) + os.pathsep + env["PATH"]
+    result = run_script(repo, env)
+    assert result.returncode != 0
+    assert "python3 with tomllib" in output(result)
+    assert not (repo / "tools/release").exists()
+    assert not list((repo / "tools").glob(".source-release.*"))
 
 
 @pytest.mark.parametrize("missing", ("RELEASE_VERSION", "RC_TAG"))
