@@ -251,7 +251,11 @@ def assert_gate_contract(workflow: dict) -> None:
         assert "if" not in step
         assert "continue-on-error" not in step
 
-    assert install_step["run"] == "python -m pip install pytest PyYAML"
+    assert install_step["run"].splitlines() == [
+        "python -m pip install pytest PyYAML",
+        "svn --version --quiet",
+        "svnadmin --version --quiet",
+    ]
     assert test_step["run"] == GATE_TEST_COMMAND
     assert staging_step["shell"] == "bash"
     assert staging_step["run"] == "bash tools/tests/deploy_java_staging_test.sh"
@@ -740,19 +744,14 @@ def test_release_documentation_describes_source_archive_preflight() -> None:
     assert "temporary source archive" in source
 
 
-def test_release_documentation_preserves_previous_rc_output_before_retry() -> None:
+def test_release_documentation_keeps_separate_candidate_outputs() -> None:
     source = RELEASE_DOCUMENTATION.read_text(encoding="utf-8")
     retry_section = source.partition('<h2 id="fix-any-issues">')[2].partition(
         '<h2 id="finalize-the-release">'
     )[0]
-    preserve_command = (
-        'mv tools/release "../paimon-mosaic-${RC_TAG}-artifacts"'
-    )
-
-    assert preserve_command in retry_section
-    assert retry_section.index(preserve_command) < retry_section.index(
-        "Increment <code>RC_NUM</code>"
-    )
+    assert "Keep the previous RC's local source artifacts" in retry_section
+    assert 'tools/release/${RC_TAG}/${RC_COMMIT_SHA}/' in source
+    assert 'mv tools/release' not in retry_section
 
 
 def test_release_vote_gate_matches_blocking_contract() -> None:

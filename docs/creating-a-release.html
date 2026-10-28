@@ -246,25 +246,22 @@ git checkout ${RC_TAG}
             <p>The release profile checks the main, sources and Javadoc JARs and verifies all four actual artifact signatures after GPG signing and before Nexus deployment. The signing key or subkey must be RSA with at least 2048 bits, as required by the <a href="https://infra.apache.org/release-distribution.html#sigs-and-sums">ASF distribution policy</a>; an RSA primary key does not make an Ed25519 signing subkey compliant. The same signature check runs before publishing the local source artifact directory. Unsigned <code>-Dgpg.skip=true</code> builds remain available for CI and local dry runs.</p>
 
             <h3>Create Source Release Artifacts</h3>
-            <p>Create source release artifacts from the same commit as the RC tag:</p>
+            <p>Run from the repository root. Create source release artifacts from the same commit as the RC tag and capture the verified output directory:</p>
 <pre><code>git checkout ${RC_TAG}
-cd tools
-RELEASE_VERSION=${RELEASE_VERSION} RC_TAG=${RC_TAG} ./create_source_release.sh</code></pre>
-            <p>This creates the following under <code>tools/release/</code>:</p>
+SOURCE_RELEASE_DIR=$(cd tools &amp;&amp; RELEASE_VERSION=${RELEASE_VERSION} RC_TAG=${RC_TAG} ./create_source_release.sh)</code></pre>
+            <p>This creates the following under <code>tools/release/${RC_TAG}/${RC_COMMIT_SHA}/</code>, where <code>RC_COMMIT_SHA</code> is the full commit resolved from the verified signed tag:</p>
             <ul>
                 <li><code>apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz</code> &mdash; source archive</li>
                 <li><code>apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz.asc</code> &mdash; GPG signature</li>
                 <li><code>apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz.sha512</code> &mdash; SHA-512 checksum</li>
             </ul>
+            <p>Build and verification messages go to stderr; stdout contains only the absolute output directory after all checks succeed. A failed run leaves <code>SOURCE_RELEASE_DIR</code> empty, even if it previously held an older candidate's directory. Existing candidate output is never overwritten.</p>
 
             <h3>Stage Artifacts to SVN</h3>
-<pre><code>svn checkout https://dist.apache.org/repos/dist/dev/paimon/ paimon-dist-dev --depth=immediates
-cd paimon-dist-dev
-mkdir paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}
-cp ../paimon-mosaic/tools/release/apache-paimon-mosaic-${RELEASE_VERSION}-src.* \
-   paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}/
-svn add paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}
-svn commit -m "Add paimon-mosaic ${RELEASE_VERSION} RC${RC_NUM}"</code></pre>
+            <p>In the same shell, upload only the directory returned by source packaging. The required-variable check stops the command if packaging failed or has not run in this shell. Do not upload the parent <code>tools/release/</code> directory; it may contain older candidates or legacy artifacts.</p>
+<pre><code>svn import "${SOURCE_RELEASE_DIR:?Source packaging must succeed first}" \
+  "https://dist.apache.org/repos/dist/dev/paimon/paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}" \
+  -m "Add paimon-mosaic ${RELEASE_VERSION} RC${RC_NUM}"</code></pre>
 
             <p><strong>Checklist:</strong></p>
             <ul>
@@ -318,14 +315,10 @@ Release Manager</code></pre>
             <p>If the vote reveals issues:</p>
             <ol>
                 <li>Fix them on the release branch via normal PRs.</li>
-                <li>Preserve the previous RC's local source artifacts outside the checkout so the next build does not overwrite them:
-<pre><code># From the paimon-mosaic checkout
-mv tools/release "../paimon-mosaic-${RC_TAG}-artifacts"</code></pre>
-                </li>
+                <li>Keep the previous RC's local source artifacts. The next RC uses a different output directory, so no move or deletion is needed.</li>
                 <li>Remove the old RC from dist dev (optional):
-<pre><code>cd paimon-dist-dev
-svn remove paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}
-svn commit -m "Remove paimon-mosaic ${RELEASE_VERSION} RC${RC_NUM} (superseded)"</code></pre>
+<pre><code>svn remove "https://dist.apache.org/repos/dist/dev/paimon/paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}" \
+  -m "Remove paimon-mosaic ${RELEASE_VERSION} RC${RC_NUM} (superseded)"</code></pre>
                 </li>
                 <li>Drop the Nexus staging repository via the <a href="https://repository.apache.org/#stagingRepositories">Nexus UI</a>.</li>
                 <li>Increment <code>RC_NUM</code>, then go back to <a href="#build-a-release-candidate">Build a release candidate</a>.</li>

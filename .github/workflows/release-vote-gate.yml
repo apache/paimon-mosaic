@@ -85,7 +85,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        run: python -m pip install pytest PyYAML
+        run: |
+          python -m pip install pytest PyYAML
+          svn --version --quiet
+          svnadmin --version --quiet
 
       - name: Run release vote tests
         run: |

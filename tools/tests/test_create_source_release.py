@@ -18,8 +18,10 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -184,7 +186,7 @@ def run_script(
     repo: Path,
     env: dict[str, str],
 ) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
+    result = subprocess.run(
         ["bash", SOURCE_SCRIPT.name],
         cwd=repo / "tools",
         env=env,
@@ -192,16 +194,25 @@ def run_script(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    if result.returncode:
+        assert result.stdout == b"", output(result)
+    return result
 
 
 def output(result: subprocess.CompletedProcess[bytes]) -> str:
     return (result.stdout + result.stderr).decode("utf-8", errors="replace")
 
 
-def artifact_paths(repo: Path) -> tuple[Path, Path, Path]:
+def artifact_paths(
+    repo: Path, rc_tag: str = RC_TAG, commit: str | None = None,
+) -> tuple[Path, Path, Path]:
+    if commit is None:
+        commit = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.decode().strip()
     archive = (
         repo
         / "tools/release"
+        / rc_tag
+        / commit
         / f"apache-paimon-mosaic-{VERSION}-src.tgz"
     )
     return archive, Path(f"{archive}.asc"), Path(f"{archive}.sha512")
@@ -217,6 +228,8 @@ def test_creates_verified_artifacts_from_signed_head_tag(
 
     assert result.returncode == 0, output(result)
     archive, signature, checksum = artifact_paths(repo)
+    assert result.stdout.decode() == str(archive.parent) + "\n"
+    assert set(archive.parent.iterdir()) == {archive, signature, checksum}
     assert archive.is_file()
     assert signature.is_file()
     assert checksum.is_file()
@@ -343,6 +356,111 @@ def test_existing_artifact_is_not_overwritten(
     assert archive.read_bytes() == b"existing artifact"
     assert not signature.exists()
     assert not checksum.exists()
+
+
+def next_candidate(repo, env, signing_home, *, mismatched_version=False):
+    if mismatched_version:
+        write(
+            repo / "python/pyproject.toml",
+            '[project]\nname = "paimon-mosaic"\nversion = "0.3.1"\n',
+        )
+    write(repo / "README.md", "next candidate\n")
+    run(["git", "add", "."], cwd=repo)
+    run(["git", "commit", "-q", "-m", "next candidate"], cwd=repo)
+    env["RC_TAG"] = f"v{VERSION}-rc2"
+    run(
+        ["git", "tag", "-s", "-u", signing_home[1], "-m", "RC2", env["RC_TAG"]],
+        cwd=repo, env=env,
+    )
+
+
+def test_next_candidate_preserves_previous_and_legacy_artifacts(tmp_path, signing_home):
+    repo, env, _ = initialize_release_repo(tmp_path, signing_home)
+    assert run_script(repo, env).returncode == 0
+    previous = artifact_paths(repo)
+    previous_bytes = [path.read_bytes() for path in previous]
+    legacy = repo / "tools/release/apache-paimon-mosaic-0.2.0-src.tgz"
+    legacy.write_bytes(b"legacy source package")
+
+    next_candidate(repo, env, signing_home)
+    result = run_script(repo, env)
+
+    assert result.returncode == 0, output(result)
+    archive, signature, checksum = artifact_paths(repo, env["RC_TAG"])
+    assert result.stdout.decode() == str(archive.parent) + "\n"
+    assert set(archive.parent.iterdir()) == {archive, signature, checksum}
+    assert [path.read_bytes() for path in previous] == previous_bytes
+    assert legacy.read_bytes() == b"legacy source package"
+    with tarfile.open(archive, "r:gz") as source:
+        assert source.pax_headers["comment"] == archive.parent.name
+        assert source.extractfile(f"paimon-mosaic-{VERSION}/README.md").read() == b"next candidate\n"
+
+
+@pytest.mark.parametrize("failure", (None, "versions", "signing", "checksum", "python", "existing"))
+def test_documented_native_svn_upload_cannot_reuse_old_output(tmp_path, signing_home, failure):
+    if not all(shutil.which(tool) for tool in ("svn", "svnadmin")):
+        pytest.skip("svn and svnadmin are required for the local upload integration test")
+    repo, env, _ = initialize_release_repo(tmp_path / "checkout with spaces", signing_home)
+    assert run_script(repo, env).returncode == 0
+    previous = artifact_paths(repo)
+    previous_bytes = [path.read_bytes() for path in previous]
+    next_candidate(repo, env, signing_home, mismatched_version=failure == "versions")
+    env["RC_NUM"] = "2"
+    # Simulate a shell left over from a successful earlier release attempt.
+    env["SOURCE_RELEASE_DIR"] = str(previous[0].parent)
+    if failure == "existing":
+        assert run_script(repo, env).returncode == 0
+        env["SOURCE_RELEASE_DIR"] = str(artifact_paths(repo, env["RC_TAG"])[0].parent)
+    if failure in ("signing", "checksum", "python"):
+        binary = tmp_path / "bin"
+        binary.mkdir()
+        if failure == "signing":
+            env["REAL_GPG"] = shutil.which("gpg")
+            command, body = "gpg", (
+                'for arg in "$@"; do\n'
+                '  if [ "$arg" = "--detach-sign" ]; then exit 42; fi\n'
+                'done\nexec "$REAL_GPG" "$@"\n'
+            )
+        else:
+            command = "python3" if failure == "python" else (
+                "shasum" if sys.platform == "darwin" else "sha512sum"
+            )
+            body = "exit 42\n"
+        wrapper = binary / command
+        write(wrapper, "#!/bin/sh\n" + body)
+        wrapper.chmod(0o755)
+        env["PATH"] = str(binary) + os.pathsep + env["PATH"]
+
+    svn_repo = tmp_path / "svn-repository"
+    run(["svnadmin", "create", str(svn_repo)], cwd=tmp_path)
+    svn_url = svn_repo.as_uri()
+    documentation = (ROOT / "docs/creating-a-release.html").read_text()
+    blocks = [html.unescape(block) for block in re.findall(
+        r"<pre><code>(.*?)</code></pre>", documentation, re.DOTALL,
+    )]
+    preparation = next(line for block in blocks for line in block.splitlines()
+                       if line.startswith("SOURCE_RELEASE_DIR="))
+    upload = next(block for block in blocks if block.startswith("svn import "))
+    upload = upload.replace("https://dist.apache.org/repos/dist/dev/paimon", svn_url)
+    # Intentionally no `set -e` or &&: execute the actual documented upload
+    # even after packaging fails, just as separately pasted RM commands do.
+    result = subprocess.run(
+        ["bash", "-c", preparation + "\n" + upload],
+        cwd=repo, env=env, capture_output=True,
+    )
+    if failure:
+        assert result.returncode != 0, output(result)
+        assert "Source packaging must succeed first" in output(result)
+        assert run(["svn", "list", svn_url], cwd=repo).stdout == b""
+    else:
+        assert result.returncode == 0, output(result)
+        exported = tmp_path / "exported"
+        run(["svn", "export", f"{svn_url}/paimon-mosaic-{VERSION}-rc2", str(exported)], cwd=repo)
+        artifacts = artifact_paths(repo, env["RC_TAG"])
+        assert {path.name for path in exported.iterdir()} == {path.name for path in artifacts}
+        for artifact in artifacts:
+            assert (exported / artifact.name).read_bytes() == artifact.read_bytes()
+    assert [path.read_bytes() for path in previous] == previous_bytes
 
 
 def test_release_version_must_match_rc_tag(

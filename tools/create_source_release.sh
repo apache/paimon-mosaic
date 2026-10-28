@@ -17,7 +17,7 @@
 # limitations under the License.
 #
 
-# Create ASF source release artifacts under tools/release/:
+# Create ASF source release artifacts under tools/release/{RC_TAG}/{commit}/:
 #   apache-paimon-mosaic-{version}-src.tgz
 #   apache-paimon-mosaic-{version}-src.tgz.asc
 #   apache-paimon-mosaic-{version}-src.tgz.sha512
@@ -25,11 +25,17 @@
 # Usage:
 #   cd tools
 #   RELEASE_VERSION=0.3.0 RC_TAG=v0.3.0-rc1 ./create_source_release.sh
+#
+# Diagnostics go to stderr. Only a successful run prints the verified output
+# directory to stdout, for capture by the explicit SVN upload command.
 
 # fail immediately
 set -o errexit
 set -o nounset
 set -o pipefail
+
+# Keep stdout empty on every failure, including failures in child commands.
+exec 3>&1 1>&2
 
 # Do not let inherited Git variables redirect checks or replace signature
 # verification.
@@ -135,7 +141,7 @@ ARCHIVE="apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz"
 SIGNATURE="${ARCHIVE}.asc"
 CHECKSUM="${ARCHIVE}.sha512"
 ARCHIVE_ROOT="paimon-mosaic-${RELEASE_VERSION}"
-RELEASE_DIR="${CURR_DIR}/release"
+RELEASE_DIR="${CURR_DIR}/release/${RC_TAG}/${TAG_COMMIT}"
 
 if [[ -e "${RELEASE_DIR}" || -L "${RELEASE_DIR}" ]]; then
   echo "Release output already exists and will not be overwritten: ${RELEASE_DIR}" >&2
@@ -207,6 +213,7 @@ python3 tools/verify_source_archive.py verify \
 
 # The staging and release directories share a filesystem, so this publishes
 # the fully verified artifact set with one atomic directory rename.
+mkdir -p "$(dirname "${RELEASE_DIR}")"
 python3 -c \
   'import os, sys; os.rename(sys.argv[1], sys.argv[2])' \
   "${ARTIFACT_DIR}" \
@@ -216,7 +223,8 @@ trap - EXIT
 rm -rf "${STAGING_DIR}"
 
 echo ""
-echo "Source release created successfully. Artifacts in tools/release/:"
+echo "Source release created successfully. Artifacts in ${RELEASE_DIR}:"
 ls -la "${RELEASE_DIR}"/apache-paimon-mosaic-*
 echo ""
 echo "Next: upload contents to SVN (see docs/creating-a-release.html)."
+printf '%s\n' "${RELEASE_DIR}" >&3
