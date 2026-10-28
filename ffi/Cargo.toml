@@ -27,8 +27,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 mosaic-core = { path = "../core", package = "paimon-mosaic-core" }
-arrow-schema = "58"
-arrow-array = { version = "58", features = ["ffi"] }
+arrow-schema = "59"
+arrow-array = { version = "59", features = ["ffi"] }
 
 [build-dependencies]
 cbindgen = "0.27"

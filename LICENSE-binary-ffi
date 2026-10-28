@@ -8,7 +8,7 @@ Except for the components listed below, Apache Paimon Mosaic selects the
 Apache License, Version 2.0 option for dependencies that offer it. The full
 Apache License, Version 2.0 text is in LICENSE.
 
-arrow-array 58.4.0
+arrow-array 59.3.2
 ------------------
 
 This component is distributed under both the Apache License, Version 2.0 and
