@@ -1,10 +1,10 @@
 crate	Apache-2.0	Apache-2.0 WITH LLVM-exception	BSD-2-Clause	BSL-1.0	CC0-1.0	LGPL-2.1-or-later	MIT	Unicode-3.0	Unlicense
 ahash@0.8.12	X						X
 android_system_properties@0.1.6	X						X
-arrow-array@58.4.0	X						X
-arrow-buffer@58.4.0	X
-arrow-data@58.4.0	X
-arrow-schema@58.4.0	X
+arrow-array@59.3.2	X						X
+arrow-buffer@59.3.2	X
+arrow-data@59.3.2	X
+arrow-schema@59.3.2	X
 autocfg@1.5.1	X						X
 bitflags@2.13.1	X						X
 bumpalo@3.20.3	X						X
@@ -39,7 +39,7 @@ libc@0.2.189	X						X
 libm@0.2.16							X
 log@0.4.33	X						X
 memchr@2.8.3							X		X
-num-bigint@0.4.8	X						X
+num-bigint@0.5.1	X						X
 num-complex@0.4.6	X						X
 num-integer@0.1.47	X						X
 num-traits@0.2.19	X						X
