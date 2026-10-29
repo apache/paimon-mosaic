@@ -35,6 +35,12 @@ def repository(tmp_path, monkeypatch):
         "LICENSE-binary": b"JNI third-party licenses\n",
         "LICENSE-binary-ffi": b"FFI third-party licenses\n",
         "java/src/main/binary-resources/META-INF/NOTICE": b"Binary notices\n",
+        "java/pom.xml": (
+            b'<project xmlns="http://maven.apache.org/POM/4.0.0">'
+            b'<inceptionYear>2026</inceptionYear><properties>'
+            b'<project.build.outputTimestamp>2026-01-01T00:00:00Z'
+            b'</project.build.outputTimestamp></properties></project>'
+        ),
     }.items():
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,3 +133,40 @@ def test_rejects_stale_java_license_before_resolving_dependencies(repository):
     path.write_bytes(b"Apache license\n")
     with pytest.raises(ValueError, match="Java binary LICENSE is stale"):
         verifier.verify_source_legal_inventory()
+
+
+def auxiliary_entries():
+    return {
+        "META-INF/LICENSE": b"Apache license\n",
+        "META-INF/NOTICE": b"Mosaic\nCopyright 2026 The Apache Software Foundation\n",
+        "META-INF/MANIFEST.MF": b"Manifest-Version: 1.0\r\nBuild-Jdk-Spec: 1.8\r\n",
+        "script.js": b"JDK8 script",
+        "stylesheet.css": b"JDK8 stylesheet",
+    }
+
+
+@pytest.mark.parametrize("javadoc", [False, True])
+def test_accepts_java_auxiliary_license_and_utc_notice(repository, tmp_path, javadoc):
+    artifact = tmp_path / "auxiliary.jar"
+    with zipfile.ZipFile(artifact, "w") as z:
+        for name, data in auxiliary_entries().items():
+            z.writestr(name, data)
+    verifier.verify_java_auxiliary(artifact, javadoc=javadoc)
+
+
+@pytest.mark.parametrize("entry,data,message", [
+    ("META-INF/NOTICE", b"Copyright 2025 The Apache Software Foundation", "UTC copyright"),
+    ("META-INF/LICENSE", b"incomplete", "canonical Apache LICENSE"),
+    ("META-INF/MANIFEST.MF", b"Build-Jdk-Spec: 11", "generated with JDK 8"),
+    ("resources/jquery.js", b"extra third party library", "license review"),
+    ("native/linux/x86_64/library.so", b"binary", "binary-only"),
+])
+def test_rejects_invalid_java_auxiliary_artifact(repository, tmp_path, entry, data, message):
+    entries = auxiliary_entries()
+    entries[entry] = data
+    artifact = tmp_path / "bad.jar"
+    with zipfile.ZipFile(artifact, "w") as z:
+        for name, value in entries.items():
+            z.writestr(name, value)
+    with pytest.raises(ValueError, match=message):
+        verifier.verify_java_auxiliary(artifact, javadoc=True)

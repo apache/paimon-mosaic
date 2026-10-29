@@ -24,6 +24,7 @@ set -o pipefail
 SOURCE_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 REAL_PYTHON=$(command -v python3)
 TEST_ROOT=$(mktemp -d)
+TEST_ROOT=$(cd "$TEST_ROOT" && pwd -P)
 trap 'rm -rf "$TEST_ROOT"' EXIT
 TESTS=0
 FIXTURES=0
@@ -59,6 +60,7 @@ new_fixture() {
     "$MOCK_BIN" \
     "$STAGE_TMPDIR"
   cp "$SOURCE_REPO/tools/deploy_java_staging.sh" "$FIXTURE/tools/"
+  cp "$SOURCE_REPO/tools/release_checks.py" "$FIXTURE/tools/"
   cp "$SOURCE_REPO/java/src/test/java/org/apache/paimon/mosaic/MosaicNativeLoaderSmokeTest.java" \
     "$FIXTURE/java/src/test/java/org/apache/paimon/mosaic/"
   cat > "$FIXTURE/java/pom.xml" <<'POM'
@@ -114,7 +116,12 @@ MOCK
   cat > "$MOCK_BIN/mvn" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "$*" == --version ]]; then
+  printf 'Apache Maven 3.8.8\nJava version: %s, vendor: Test, runtime: %s/jre\n' "${MOCK_MAVEN_JAVA_VERSION:-1.8.0_502}" "$MOCK_BIN"
+  exit 0
+fi
 printf 'mvn %s\n' "$*" >> "$MOCK_LOG"
+printf 'environment %s %s\n' "$JAVA_HOME" "$TZ" >> "$MOCK_LOG"
 mkdir -p target/test-classes/org/apache/paimon/mosaic
 printf class > target/test-classes/org/apache/paimon/mosaic/MosaicNativeLoaderSmokeTest.class
 if [[ "${OMIT_LOCAL_MAIN:-0}" != 1 ]]; then
@@ -161,8 +168,15 @@ MOCK
   cat > "$MOCK_BIN/java" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-}" == -XshowSettings:properties ]]; then
+  printf '    java.version = 1.8.0_502\n    os.name = Mac OS X\n    os.arch = %s\n' "${MOCK_JAVA_ARCH:-aarch64}"
+  exit 0
+fi
 printf 'java %s\n' "$*" >> "$MOCK_LOG"
 MOCK
+  mkdir -p "$MOCK_BIN/bin"
+  for tool in java jar; do ln -s "../$tool" "$MOCK_BIN/bin/$tool"; done
+  for tool in javac javadoc; do printf '#!/bin/sh\nexit 0\n' > "$MOCK_BIN/bin/$tool"; chmod +x "$MOCK_BIN/bin/$tool"; done
   cat > "$MOCK_BIN/file" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -202,6 +216,7 @@ run_stage() {
     PATH="$MOCK_BIN:$PATH" \
     TMPDIR="$STAGE_TMPDIR" \
     MOCK_LOG="$MOCK_LOG" \
+    MOCK_BIN="$MOCK_BIN" \
     MOCK_RUN_SHA="${MOCK_RUN_SHA:-$HEAD_SHA}" \
     MOCK_TAG=v1.2.3-rc1 \
     REAL_PYTHON="$REAL_PYTHON" \
@@ -238,12 +253,13 @@ assert_contains "$MOCK_LOG" "--dir $STAGE_TMPDIR/paimon-mosaic-java-staging."
 assert_contains "$MOCK_LOG" "mvn clean verify -Prelease -Dgpg.skip=true -DskipTests"
 assert_not_contains "$MOCK_LOG" "mvn deploy"
 [[ $(grep -c '^java ' "$MOCK_LOG") -eq 2 ]] || fail "dry-run must smoke local and CI JARs"
-[[ $(grep -c '^python3 .*verify_binary_artifact.py' "$MOCK_LOG") -eq 2 ]] ||
-  fail "dry-run must verify local and CI JAR contents"
+[[ $(grep -c '^python3 .*verify_binary_artifact.py' "$MOCK_LOG") -eq 6 ]] ||
+  fail "dry-run must verify local and CI main, sources and Javadoc JAR contents"
 assert_stage_cleanup
 [[ ! -e "$FIXTURE/java/src/main/resources/native" ]] ||
   fail "default cleanup must remove staged Java resources"
-pass "successful dry-run validates all five artifacts and both JARs, and removes staging downloads"
+assert_contains "$MOCK_LOG" "environment $MOCK_BIN UTC"
+pass "successful dry-run validates all five artifacts, all JAR types, and uses Maven's JDK and UTC"
 
 new_fixture
 settings="$FIXTURE/settings.xml"
@@ -308,5 +324,19 @@ fi
 assert_not_contains "$MOCK_LOG" "mvn deploy"
 assert_stage_cleanup
 pass "failing runs remove staging downloads and block deploy"
+
+new_fixture
+export MOCK_MAVEN_JAVA_VERSION=11.0.1
+if run_stage --dry-run > "$FIXTURE/output" 2>&1; then fail "JDK11 must be rejected"; fi
+assert_contains "$FIXTURE/output" "Maven running on JDK 8"
+assert_not_contains "$MOCK_LOG" "run download"
+unset MOCK_MAVEN_JAVA_VERSION
+new_fixture
+export MOCK_JAVA_ARCH=x86_64
+if run_stage --dry-run > "$FIXTURE/output" 2>&1; then fail "Intel macOS JVM must be rejected before build"; fi
+assert_contains "$FIXTURE/output" "macos/x86_64"
+assert_not_contains "$MOCK_LOG" "run download"
+unset MOCK_JAVA_ARCH
+pass "unsupported Maven JDK and JVM architecture fail before downloading artifacts"
 
 echo "PASS: $TESTS focused Java staging tests"
