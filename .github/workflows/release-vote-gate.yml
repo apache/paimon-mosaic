@@ -86,6 +86,8 @@ jobs:
 
       - name: Install test dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y subversion
           python -m pip install pytest PyYAML
           svn --version --quiet
           svnadmin --version --quiet

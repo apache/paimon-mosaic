@@ -252,6 +252,8 @@ def assert_gate_contract(workflow: dict) -> None:
         assert "continue-on-error" not in step
 
     assert install_step["run"].splitlines() == [
+        "sudo apt-get update",
+        "sudo apt-get install -y subversion",
         "python -m pip install pytest PyYAML",
         "svn --version --quiet",
         "svnadmin --version --quiet",
